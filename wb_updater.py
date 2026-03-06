@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-Ежедневный сбор данных Wildberries с сохранением в Cloud.ru Object Storage.
+Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
 Основной упор на отчёт "Позиции по ключам" (keywords).
-Использует имена секретов: WB_STATS_KEY_TOPFACE, WB_PROMO_KEY_TOPFACE.
+Использует секреты: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME,
+WB_STATS_KEY_TOPFACE, WB_PROMO_KEY_TOPFACE.
 """
 
 import os
@@ -30,34 +31,28 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# ========================== КЛАСС ДЛЯ РАБОТЫ С CLOUD.RU ==========================
+# ========================== КЛАСС ДЛЯ РАБОТЫ С YANDEX CLOUD ==========================
 
 class S3Storage:
-    """Клиент для работы с S3-совместимым хранилищем Cloud.ru."""
+    """Клиент для работы с S3-совместимым хранилищем Yandex Cloud."""
 
-    def __init__(self, tenant_id: str, access_key: str, secret_key: str, bucket_name: str):
+    def __init__(self, access_key: str, secret_key: str, bucket_name: str):
         """
-        :param tenant_id: ID тенанта (например, "3bd21226-c7be-4960-8403-9f8d48a5eaa2")
-        :param access_key: Access Key (Key ID)
-        :param secret_key: Secret Key
+        :param access_key: Access Key ID
+        :param secret_key: Secret Access Key
         :param bucket_name: имя бакета
         """
         self.bucket = bucket_name
-        # Полный ключ доступа = tenant_id:access_key
-        # Убедимся, что в access_key нет лишнего двоеточия (если вдруг)
-        if ':' in access_key:
-            # Если access_key уже содержит tenant_id, берём только часть после двоеточия
-            access_key = access_key.split(':', 1)[-1]
-        full_access_key = f"{tenant_id}:{access_key}"
-        print(f"🔑 DEBUG: формируем полный ключ (первые 5 символов): {full_access_key[:10]}...")
         self.s3 = boto3.client(
             's3',
-            endpoint_url='https://s3.cloud.ru',
-            aws_access_key_id=full_access_key,
+            endpoint_url='https://storage.yandexcloud.net',
+            aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name='ru-central-1',
-            config=Config(signature_version='s3v4')  # обязательная подпись для Cloud.ru
+            region_name='ru-central1',
+            config=Config(signature_version='s3v4')  # обязательная подпись для Yandex Cloud
         )
+        # Небольшая отладка (первые символы ключа) – безопасно, покажет только начало
+        print(f"🔑 DEBUG: подключение к Yandex Cloud, Access Key (первые 5 символов): {access_key[:5]}...")
 
     def read_excel(self, key: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
         """Скачивает Excel-файл из бакета и читает его."""
@@ -114,7 +109,7 @@ class S3Storage:
 
 class WildberriesDailyUpdater:
     """
-    Ежедневный сборщик данных Wildberries с хранением в S3 (Cloud.ru).
+    Ежедневный сборщик данных Wildberries с хранением в S3 (Yandex Cloud).
     """
 
     def __init__(self, api_keys: Dict[str, Dict[str, str]], s3: S3Storage):
@@ -540,22 +535,21 @@ class WildberriesDailyUpdater:
         return True
 
     # ====================== ЗАГОТОВКИ ДЛЯ ДРУГИХ ОТЧЁТОВ ======================
-    # (пока просто заглушки, чтобы можно было запустить)
 
     def update_orders(self, store_name: str) -> bool:
-        self.log("⚠️ Метод update_orders пока не реализован, пропускаем")
+        self.log(f"⚠️ Метод update_orders пока не реализован, пропускаем")
         return True
 
     def update_stocks(self, store_name: str) -> bool:
-        self.log("⚠️ Метод update_stocks пока не реализован, пропускаем")
+        self.log(f"⚠️ Метод update_stocks пока не реализован, пропускаем")
         return True
 
     def update_finance(self, store_name: str) -> bool:
-        self.log("⚠️ Метод update_finance пока не реализован, пропускаем")
+        self.log(f"⚠️ Метод update_finance пока не реализован, пропускаем")
         return True
 
     def update_funnel(self, store_name: str) -> bool:
-        self.log("⚠️ Метод update_funnel пока не реализован, пропускаем")
+        self.log(f"⚠️ Метод update_funnel пока не реализован, пропускаем")
         return True
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
@@ -592,10 +586,9 @@ class WildberriesDailyUpdater:
 if __name__ == "__main__":
     # Читаем все необходимые переменные окружения
     required_env = [
-        'CLOUD_RU_TENANT_ID',
-        'CLOUD_RU_ACCESS_KEY',
-        'CLOUD_RU_SECRET_KEY',
-        'CLOUD_RU_BUCKET',
+        'YC_ACCESS_KEY_ID',
+        'YC_SECRET_ACCESS_KEY',
+        'YC_BUCKET_NAME',
         'WB_STATS_KEY_TOPFACE',
         'WB_PROMO_KEY_TOPFACE'
     ]
@@ -605,12 +598,11 @@ if __name__ == "__main__":
         print("Убедитесь, что они заданы (в GitHub Secrets или локально в .env)")
         exit(1)
 
-    # Создаём экземпляр S3Storage
+    # Создаём экземпляр S3Storage для Yandex Cloud
     s3 = S3Storage(
-        tenant_id=os.environ['CLOUD_RU_TENANT_ID'],
-        access_key=os.environ['CLOUD_RU_ACCESS_KEY'],
-        secret_key=os.environ['CLOUD_RU_SECRET_KEY'],
-        bucket_name=os.environ['CLOUD_RU_BUCKET']
+        access_key=os.environ['YC_ACCESS_KEY_ID'],
+        secret_key=os.environ['YC_SECRET_ACCESS_KEY'],
+        bucket_name=os.environ['YC_BUCKET_NAME']
     )
 
     # Формируем словарь с ключами Wildberries
