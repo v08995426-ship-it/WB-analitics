@@ -590,8 +590,8 @@ if __name__ == "__main__":
     'CLOUD_RU_ACCESS_KEY',
     'CLOUD_RU_SECRET_KEY',
     'CLOUD_RU_BUCKET',
-    'WB_STATS_KEY_topface',
-    'WB_PROMO_KEY_topface'
+    'WB_STATS_KEY_TOPFACE',
+    'WB_PROMO_KEY_TOPFACE'
 ]
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
@@ -610,8 +610,8 @@ if __name__ == "__main__":
     # Формируем словарь с ключами Wildberries
     api_keys = {
     'TOPFACE': {
-        'stats': os.environ['WB_STATS_KEY_topface'],
-        'promo': os.environ['WB_PROMO_KEY_topface']
+        'stats': os.environ['WB_STATS_KEY_TOPFACE'],
+        'promo': os.environ['WB_PROMO_KEY_TOPFACE']
     }
 
         # При необходимости добавьте другие магазины
