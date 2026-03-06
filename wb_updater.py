@@ -586,13 +586,13 @@ class WildberriesDailyUpdater:
 if __name__ == "__main__":
     # Читаем все необходимые переменные окружения
     required_env = [
-        'CLOUD_RU_TENANT_ID',
-        'CLOUD_RU_ACCESS_KEY',
-        'CLOUD_RU_SECRET_KEY',
-        'CLOUD_RU_BUCKET',
-        'WB_STATS_KEY',
-        'WB_PROMO_KEY'
-    ]
+    'CLOUD_RU_TENANT_ID',
+    'CLOUD_RU_ACCESS_KEY',
+    'CLOUD_RU_SECRET_KEY',
+    'CLOUD_RU_BUCKET',
+    'WB_STATS_KEY_TOPFACE',
+    'WB_PROMO_KEY_TOPFACE'
+]
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
@@ -609,10 +609,11 @@ if __name__ == "__main__":
 
     # Формируем словарь с ключами Wildberries
     api_keys = {
-        'TOPFACE': {
-            'stats': os.environ['WB_STATS_KEY'],
-            'promo': os.environ['WB_PROMO_KEY']
-        }
+    'TOPFACE': {
+        'stats': os.environ['WB_STATS_KEY_TOPFACE'],
+        'promo': os.environ['WB_PROMO_KEY_TOPFACE']
+    }
+}
         # При необходимости добавьте другие магазины
     }
 
