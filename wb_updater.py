@@ -613,7 +613,7 @@ if __name__ == "__main__":
         'stats': os.environ['WB_STATS_KEY_TOPFACE'],
         'promo': os.environ['WB_PROMO_KEY_TOPFACE']
     }
-}
+
         # При необходимости добавьте другие магазины
     }
 
