@@ -23,12 +23,9 @@ jobs:
 
       - name: Запускаем скрипт
         env:
-          # Cloud.ru
-          CLOUD_RU_TENANT_ID: ${{ secrets.CLOUD_RU_TENANT_ID }}
-          CLOUD_RU_ACCESS_KEY: ${{ secrets.CLOUD_RU_ACCESS_KEY }}
-          CLOUD_RU_SECRET_KEY: ${{ secrets.CLOUD_RU_SECRET_KEY }}
-          CLOUD_RU_BUCKET: ${{ secrets.CLOUD_RU_BUCKET }}
-          # Wildberries
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
           WB_STATS_KEY_TOPFACE: ${{ secrets.WB_STATS_KEY_TOPFACE }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
         run: python wb_updater.py TOPFACE
