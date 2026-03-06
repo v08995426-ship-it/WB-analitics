@@ -29,6 +29,6 @@ jobs:
           CLOUD_RU_SECRET_KEY: ${{ secrets.CLOUD_RU_SECRET_KEY }}
           CLOUD_RU_BUCKET: ${{ secrets.CLOUD_RU_BUCKET }}
           # Wildberries
-          WB_STATS_KEY: ${{ secrets.WB_STATS_KEY }}
-          WB_PROMO_KEY: ${{ secrets.WB_PROMO_KEY }}
+          WB_STATS_KEY: ${{ secrets.WB_STATS_KEY_topface }}
+          WB_PROMO_KEY: ${{ secrets.WB_PROMO_KEY_topface }}
         run: python wb_updater.py TOPFACE
