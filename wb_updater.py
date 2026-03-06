@@ -4,6 +4,7 @@
 """
 Ежедневный сбор данных Wildberries с сохранением в Cloud.ru Object Storage.
 Основной упор на отчёт "Позиции по ключам" (keywords).
+Использует имена секретов: WB_STATS_KEY_TOPFACE, WB_PROMO_KEY_TOPFACE.
 """
 
 import os
@@ -43,7 +44,12 @@ class S3Storage:
         """
         self.bucket = bucket_name
         # Полный ключ доступа = tenant_id:access_key
+        # Убедимся, что в access_key нет лишнего двоеточия (если вдруг)
+        if ':' in access_key:
+            # Если access_key уже содержит tenant_id, берём только часть после двоеточия
+            access_key = access_key.split(':', 1)[-1]
         full_access_key = f"{tenant_id}:{access_key}"
+        print(f"🔑 DEBUG: формируем полный ключ (первые 5 символов): {full_access_key[:10]}...")
         self.s3 = boto3.client(
             's3',
             endpoint_url='https://s3.cloud.ru',
@@ -146,7 +152,7 @@ class WildberriesDailyUpdater:
             },
             'keywords': {
                 'name': 'Позиции по Ключам',
-                'folder': 'Поисковые запросы',  # обратите внимание – папка для этого отчёта
+                'folder': 'Поисковые запросы',
                 'filename': 'Позиции по Ключам.xlsx',
                 'date_column': 'Дата',
                 'id_columns': ['Дата', 'Поисковый запрос', 'Артикул WB', 'Фильтр']
@@ -173,9 +179,9 @@ class WildberriesDailyUpdater:
 
     # ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
 
-    def log(self, message: str, level: str = "INFO"):
-        """Простое логирование в stdout."""
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}")
+    def log(self, message: str, level: str = "INFO", end: str = "\n"):
+        """Логирование в stdout с возможностью задать окончание строки."""
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}", end=end)
 
     def _get_s3_key(self, store_name: str, report_type: str, filename: Optional[str] = None) -> str:
         """Формирует ключ (путь) в бакете для указанного отчёта."""
@@ -537,19 +543,19 @@ class WildberriesDailyUpdater:
     # (пока просто заглушки, чтобы можно было запустить)
 
     def update_orders(self, store_name: str) -> bool:
-        self.log(f"⚠️ Метод update_orders пока не реализован, пропускаем")
+        self.log("⚠️ Метод update_orders пока не реализован, пропускаем")
         return True
 
     def update_stocks(self, store_name: str) -> bool:
-        self.log(f"⚠️ Метод update_stocks пока не реализован, пропускаем")
+        self.log("⚠️ Метод update_stocks пока не реализован, пропускаем")
         return True
 
     def update_finance(self, store_name: str) -> bool:
-        self.log(f"⚠️ Метод update_finance пока не реализован, пропускаем")
+        self.log("⚠️ Метод update_finance пока не реализован, пропускаем")
         return True
 
     def update_funnel(self, store_name: str) -> bool:
-        self.log(f"⚠️ Метод update_funnel пока не реализован, пропускаем")
+        self.log("⚠️ Метод update_funnel пока не реализован, пропускаем")
         return True
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
@@ -586,13 +592,13 @@ class WildberriesDailyUpdater:
 if __name__ == "__main__":
     # Читаем все необходимые переменные окружения
     required_env = [
-    'CLOUD_RU_TENANT_ID',
-    'CLOUD_RU_ACCESS_KEY',
-    'CLOUD_RU_SECRET_KEY',
-    'CLOUD_RU_BUCKET',
-    'WB_STATS_KEY_TOPFACE',
-    'WB_PROMO_KEY_TOPFACE'
-]
+        'CLOUD_RU_TENANT_ID',
+        'CLOUD_RU_ACCESS_KEY',
+        'CLOUD_RU_SECRET_KEY',
+        'CLOUD_RU_BUCKET',
+        'WB_STATS_KEY_TOPFACE',
+        'WB_PROMO_KEY_TOPFACE'
+    ]
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
@@ -609,11 +615,10 @@ if __name__ == "__main__":
 
     # Формируем словарь с ключами Wildberries
     api_keys = {
-    'TOPFACE': {
-        'stats': os.environ['WB_STATS_KEY_TOPFACE'],
-        'promo': os.environ['WB_PROMO_KEY_TOPFACE']
-    }
-
+        'TOPFACE': {
+            'stats': os.environ['WB_STATS_KEY_TOPFACE'],
+            'promo': os.environ['WB_PROMO_KEY_TOPFACE']
+        }
         # При необходимости добавьте другие магазины
     }
 
