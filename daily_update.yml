@@ -1,0 +1,34 @@
+name: Ежедневное обновление данных WB
+
+on:
+  schedule:
+    # Запуск в 8:00 по Москве (5:00 UTC)
+    - cron: '0 5 * * *'
+  workflow_dispatch:   # позволяет запускать вручную из интерфейса
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Клонируем репозиторий
+        uses: actions/checkout@v4
+
+      - name: Устанавливаем Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Устанавливаем зависимости
+        run: pip install pandas openpyxl requests boto3 pytz
+
+      - name: Запускаем скрипт
+        env:
+          # Cloud.ru
+          CLOUD_RU_TENANT_ID: ${{ secrets.CLOUD_RU_TENANT_ID }}
+          CLOUD_RU_ACCESS_KEY: ${{ secrets.CLOUD_RU_ACCESS_KEY }}
+          CLOUD_RU_SECRET_KEY: ${{ secrets.CLOUD_RU_SECRET_KEY }}
+          CLOUD_RU_BUCKET: ${{ secrets.CLOUD_RU_BUCKET }}
+          # Wildberries
+          WB_STATS_KEY: ${{ secrets.WB_STATS_KEY }}
+          WB_PROMO_KEY: ${{ secrets.WB_PROMO_KEY }}
+        run: python wb_updater.py TOPFACE
