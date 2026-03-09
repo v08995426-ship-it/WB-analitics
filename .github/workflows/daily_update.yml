@@ -2,9 +2,8 @@ name: Ежедневное обновление данных WB
 
 on:
   schedule:
-    # Запуск в 8:00 по Москве (5:00 UTC)
-    - cron: '0 5 * * *'
-  workflow_dispatch:   # позволяет запускать вручную из интерфейса
+    - cron: '0 5 * * *'   # 8:00 MSK
+  workflow_dispatch:
 
 jobs:
   update:
@@ -28,4 +27,4 @@ jobs:
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
           WB_STATS_KEY_TOPFACE: ${{ secrets.WB_STATS_KEY_TOPFACE }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: python wb_updater.py TOPFACE
+        run: python wb_updater.py
