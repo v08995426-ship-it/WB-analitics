@@ -84,10 +84,14 @@ class S3Storage:
             tmp_path = tmp.name
         try:
             df.to_excel(tmp_path, index=False, sheet_name=sheet_name)
-            self.s3.upload_file(tmp_path, self.bucket, key)
+            self.upload_file(tmp_path, key)
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def upload_file(self, local_path: str, key: str):
+        """Загружает локальный файл в бакет."""
+        self.s3.upload_file(local_path, self.bucket, key)
 
     def file_exists(self, key: str) -> bool:
         """Проверяет существование файла в бакете."""
@@ -193,8 +197,8 @@ class WildberriesDailyUpdater:
                 'api_url': 'https://advert-api.wildberries.ru/api/advert/v2/adverts',
                 'api_method': 'GET',
                 'key_type': 'promo',
-                'weekly': True,          # для рекламы тоже создаём недельные бэкапы
-                'retention_days': 30,     # храним только 30 дней (специфика рекламы)
+                'weekly': True,
+                'retention_days': 30,
             }
         }
 
@@ -283,7 +287,8 @@ class WildberriesDailyUpdater:
                     for sheet_name, sheet_df in extra_sheets.items():
                         if not sheet_df.empty:
                             sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-            self.s3.upload_file(tmp_path, self.bucket, key)
+            # Загружаем файл в S3
+            self.s3.upload_file(tmp_path, key)
             self.log(f"✅ Отчёт сохранён: {key}, записей: {len(df)}")
             if extra_sheets:
                 self.log(f"   + дополнительные листы: {', '.join(extra_sheets.keys())}")
@@ -525,39 +530,39 @@ class WildberriesDailyUpdater:
 
     # ---------- Остатки ----------
     def update_stocks(self, store_name: str) -> bool:
-        """Обновление остатков (ежедневный срез)."""
+        """
+        Обновление остатков. Загружаем только за вчерашний день (текущий срез),
+        добавляем запись с датой запроса. Удаляем старые записи (>90 дней).
+        """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         config = self.reports_config['stocks']
 
+        # Загружаем существующие данные
         existing_df = self._load_existing_report(store_name, 'stocks')
         if not existing_df.empty and 'Дата запроса' in existing_df.columns:
             existing_dates = set(pd.to_datetime(existing_df['Дата запроса']).dt.strftime('%Y-%m-%d').unique())
         else:
             existing_dates = set()
 
-        start_date, end_date = self._get_date_range_90_days()
-        required_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
+        # Дата, за которую будем загружать остатки (вчера)
+        target_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-        dates_to_load = [d for d in required_dates if d not in existing_dates]
-        if not dates_to_load:
-            self.log("✅ Все данные по остаткам уже загружены")
-            return True
-
-        self.log(f"📅 Будет загружено дней: {len(dates_to_load)}")
-        api_key = self.api_keys[store_name][config['key_type']]
-        headers = {"Authorization": api_key.strip()}
-        all_new_data = []
-
-        for i, date_str in enumerate(dates_to_load, 1):
-            self.log(f"📅 Загрузка остатков за {date_str}...")
+        if target_date in existing_dates:
+            self.log(f"✅ Данные за {target_date} уже есть, пропускаем загрузку")
+            # Всё равно нужно удалить старые записи и сохранить
+            # (это делается в конце)
+        else:
+            self.log(f"📅 Загрузка остатков за {target_date}...")
+            api_key = self.api_keys[store_name][config['key_type']]
+            headers = {"Authorization": api_key.strip()}
             try:
-                params = {"dateFrom": date_str}
+                params = {"dateFrom": target_date}
                 resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data:
                         df_day = pd.DataFrame(data)
-                        df_day['Дата запроса'] = date_str
+                        df_day['Дата запроса'] = target_date
                         df_day['Магазин'] = store_name
                         df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         rename_map = {
@@ -581,29 +586,38 @@ class WildberriesDailyUpdater:
                             'SCCode': 'Код контракта'
                         }
                         df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
-                        all_new_data.append(df_day)
+                        # Объединяем с существующими данными
+                        combined = pd.concat([existing_df, df_day], ignore_index=True) if not existing_df.empty else df_day
                         self.log(f"✅ Получено {len(df_day)} записей")
+                        existing_df = combined
                     else:
-                        self.log(f"ℹ️ Нет данных за {date_str}")
+                        self.log(f"ℹ️ Нет данных за {target_date}")
                 elif resp.status_code == 429:
                     self.log(f"⚠️ Лимит запросов, ждём 65 сек...")
                     time.sleep(65)
-                    continue
+                    return False
                 else:
                     self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                    return False
             except Exception as e:
                 self.log(f"❌ Исключение при запросе: {e}")
+                return False
 
-            if i < len(dates_to_load):
-                time.sleep(self.delays['stocks'])
+        # Удаляем устаревшие данные (старше 90 дней по дате запроса)
+        if not existing_df.empty:
+            cutoff_date = (datetime.now() - timedelta(days=self.data_period_days)).strftime('%Y-%m-%d')
+            existing_df['Дата запроса_dt'] = pd.to_datetime(existing_df['Дата запроса'])
+            filtered = existing_df[existing_df['Дата запроса_dt'] >= cutoff_date].copy()
+            filtered.drop(columns=['Дата запроса_dt'], inplace=True)
+            self.log(f"🗑️ Удалено записей старше {cutoff_date}: {len(existing_df) - len(filtered)}")
+            existing_df = filtered
 
-        if all_new_data:
-            new_df = pd.concat(all_new_data, ignore_index=True)
-            combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-            if self._save_report(combined, store_name, 'stocks'):
-                for df_day in all_new_data:
-                    date_obj = datetime.strptime(df_day['Дата запроса'].iloc[0], '%Y-%m-%d')
-                    self._save_weekly(df_day, store_name, 'stocks', date_obj)
+        # Сохраняем основной файл
+        if self._save_report(existing_df, store_name, 'stocks'):
+            # Сохраняем недельные данные (если есть новые)
+            if target_date not in existing_dates:
+                date_obj = datetime.strptime(target_date, '%Y-%m-%d')
+                self._save_weekly(df_day, store_name, 'stocks', date_obj)
             return True
         return True
 
