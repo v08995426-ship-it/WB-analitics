@@ -51,13 +51,20 @@ class S3Storage:
         :param bucket_name: имя бакета
         """
         self.bucket = bucket_name
+        # Настраиваем таймауты и повторные попытки
+        client_config = Config(
+            signature_version='s3v4',
+            read_timeout=300,
+            connect_timeout=60,
+            retries={'max_attempts': 5}
+        )
         self.s3 = boto3.client(
             's3',
             endpoint_url='https://storage.yandexcloud.net',
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
             region_name='ru-central1',
-            config=Config(signature_version='s3v4')
+            config=client_config
         )
         print(f"🔑 DEBUG: подключение к Yandex Cloud, Access Key (первые 5 символов): {access_key[:5]}...")
 
@@ -264,6 +271,7 @@ class WildberriesDailyUpdater:
         """
         key = self._get_s3_key(store_name, report_type)
         config = self.reports_config[report_type]
+        start_save = time.time()
 
         # Дедупликация основного df
         before = len(df)
@@ -291,7 +299,8 @@ class WildberriesDailyUpdater:
                             sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
             # Загружаем файл в S3
             self.s3.upload_file(tmp_path, key)
-            self.log(f"✅ Отчёт сохранён: {key}, записей: {len(df)}")
+            elapsed = time.time() - start_save
+            self.log(f"✅ Отчёт сохранён: {key}, записей: {len(df)} (за {elapsed:.1f} сек)")
             if extra_sheets:
                 self.log(f"   + дополнительные листы: {', '.join(extra_sheets.keys())}")
             return True
@@ -307,6 +316,7 @@ class WildberriesDailyUpdater:
         if not self.reports_config[report_type]['weekly']:
             return
         week_key = self._get_weekly_key(store_name, report_type, date)
+        start_save = time.time()
         try:
             existing = self.s3.read_excel(week_key)
         except:
@@ -321,7 +331,8 @@ class WildberriesDailyUpdater:
         else:
             combined = df
         self.s3.write_excel(week_key, combined)
-        self.log(f"💾 Недельные данные сохранены: {week_key}")
+        elapsed = time.time() - start_save
+        self.log(f"💾 Недельные данные сохранены: {week_key} (за {elapsed:.1f} сек)")
 
     def _remove_outdated_data(self, df: pd.DataFrame, config: dict, retention_days: int) -> pd.DataFrame:
         """Удаляет строки с датой старше retention_days дней."""
