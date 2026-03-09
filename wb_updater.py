@@ -13,6 +13,8 @@
 
 Все отчёты хранят данные за последние 90 дней (кроме рекламы – 30 дней),
 удаляя устаревшее. Для ключевых отчётов создаются недельные файлы (бэкапы).
+Загрузка происходит только за завершённые дни (вчера и ранее).
+Данные сохраняются после каждого дня, чтобы минимизировать потери при сбоях.
 """
 
 import os
@@ -473,9 +475,9 @@ class WildberriesDailyUpdater:
                 break
         return all_items
 
-    # ---------- Заказы ----------
+    # ---------- Заказы (сохраняем после каждого дня) ----------
     def update_orders(self, store_name: str) -> bool:
-        """Обновление данных по заказам."""
+        """Обновление данных по заказам. Сохраняем после каждого дня."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Заказы для магазина {store_name}")
         config = self.reports_config['orders']
         existing_df = self._load_existing_report(store_name, 'orders')
@@ -496,7 +498,7 @@ class WildberriesDailyUpdater:
         self.log(f"📅 Будет загружено дней: {len(dates_to_load)}")
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": api_key.strip()}
-        all_data = []
+        current_df = existing_df.copy()
 
         for i, date_str in enumerate(dates_to_load, 1):
             self.log(f"📅 Загрузка дня {i}/{len(dates_to_load)}: {date_str}")
@@ -507,28 +509,30 @@ class WildberriesDailyUpdater:
                     day_df['store'] = store_name
                     if 'date' in day_df.columns:
                         day_df['date'] = pd.to_datetime(day_df['date']).dt.strftime('%Y-%m-%d')
-                    all_data.append(day_df)
+                    # Объединяем с текущим датафреймом и сохраняем
+                    current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
                     self.log(f"✅ Получено {len(day_df)} записей")
                 else:
                     self.log("ℹ️ Нет данных за этот день")
+                    continue
             else:
-                self.log("⚠️ Не удалось получить данные")
+                self.log("⚠️ Не удалось получить данные, пропускаем день")
+                continue
+
+            # Сохраняем после каждого дня
+            if self._save_report(current_df, store_name, 'orders'):
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                self._save_weekly(day_df, store_name, 'orders', date_obj)
+            else:
+                self.log(f"❌ Ошибка сохранения после дня {date_str}, но продолжаем")
 
             # Пауза между днями
             if i < len(dates_to_load):
                 time.sleep(self.delays['orders'])
 
-        if all_data:
-            new_df = pd.concat(all_data, ignore_index=True)
-            combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-            if self._save_report(combined, store_name, 'orders'):
-                for day_df in all_data:
-                    date_obj = datetime.strptime(day_df['date'].iloc[0], '%Y-%m-%d')
-                    self._save_weekly(day_df, store_name, 'orders', date_obj)
-            return True
         return True
 
-    # ---------- Остатки ----------
+    # ---------- Остатки (только за вчера, сохраняем сразу) ----------
     def update_stocks(self, store_name: str) -> bool:
         """
         Обновление остатков. Загружаем только за вчерашний день (текущий срез),
@@ -549,8 +553,6 @@ class WildberriesDailyUpdater:
 
         if target_date in existing_dates:
             self.log(f"✅ Данные за {target_date} уже есть, пропускаем загрузку")
-            # Всё равно нужно удалить старые записи и сохранить
-            # (это делается в конце)
         else:
             self.log(f"📅 Загрузка остатков за {target_date}...")
             api_key = self.api_keys[store_name][config['key_type']]
@@ -587,9 +589,8 @@ class WildberriesDailyUpdater:
                         }
                         df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
                         # Объединяем с существующими данными
-                        combined = pd.concat([existing_df, df_day], ignore_index=True) if not existing_df.empty else df_day
+                        existing_df = pd.concat([existing_df, df_day], ignore_index=True) if not existing_df.empty else df_day
                         self.log(f"✅ Получено {len(df_day)} записей")
-                        existing_df = combined
                     else:
                         self.log(f"ℹ️ Нет данных за {target_date}")
                 elif resp.status_code == 429:
@@ -621,9 +622,9 @@ class WildberriesDailyUpdater:
             return True
         return True
 
-    # ---------- Финансовые показатели ----------
+    # ---------- Финансовые показатели (сохраняем после каждого дня) ----------
     def update_finance(self, store_name: str) -> bool:
-        """Обновление финансовых показателей."""
+        """Обновление финансовых показателей. Сохраняем после каждого дня."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name}")
         config = self.reports_config['finance']
         existing_df = self._load_existing_report(store_name, 'finance')
@@ -644,7 +645,7 @@ class WildberriesDailyUpdater:
         self.log(f"📅 Будет загружено дней: {len(dates_to_load)}")
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
-        all_data = []
+        current_df = existing_df.copy()
 
         for i, date_str in enumerate(dates_to_load, 1):
             self.log(f"📅 Загрузка дня {i}/{len(dates_to_load)}: {date_str}")
@@ -654,25 +655,25 @@ class WildberriesDailyUpdater:
                 day_df['store'] = store_name
                 if 'rr_dt' in day_df.columns:
                     day_df['rr_dt'] = pd.to_datetime(day_df['rr_dt']).dt.strftime('%Y-%m-%d')
-                all_data.append(day_df)
+                current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
                 self.log(f"✅ Получено {len(day_df)} записей")
             else:
                 self.log("ℹ️ Нет данных за этот день")
+                continue
+
+            # Сохраняем после каждого дня
+            if self._save_report(current_df, store_name, 'finance'):
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                self._save_weekly(day_df, store_name, 'finance', date_obj)
+            else:
+                self.log(f"❌ Ошибка сохранения после дня {date_str}, но продолжаем")
 
             if i < len(dates_to_load):
                 time.sleep(self.delays['finance'])
 
-        if all_data:
-            new_df = pd.concat(all_data, ignore_index=True)
-            combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-            if self._save_report(combined, store_name, 'finance'):
-                for day_df in all_data:
-                    date_obj = datetime.strptime(day_df['rr_dt'].iloc[0], '%Y-%m-%d')
-                    self._save_weekly(day_df, store_name, 'finance', date_obj)
-            return True
         return True
 
-    # ---------- Позиции по ключам ----------
+    # ---------- Позиции по ключам (уже сохраняются после каждого батча, оставляем как есть) ----------
     def update_keywords(self, store_name: str) -> bool:
         """Инкрементальное обновление данных по поисковым запросам (только по заданным категориям)."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} (фильтр по категориям)")
@@ -822,14 +823,10 @@ class WildberriesDailyUpdater:
 
                 if batch_data:
                     new_df = pd.DataFrame(batch_data)
-                    if not existing_df.empty:
-                        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-                    else:
-                        combined_df = new_df
-                    if self._save_report(combined_df, store_name, 'keywords'):
-                        existing_df = combined_df
-                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                    self._save_weekly(new_df, store_name, 'keywords', date_obj)
+                    existing_df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
+                    if self._save_report(existing_df, store_name, 'keywords'):
+                        date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                        self._save_weekly(new_df, store_name, 'keywords', date_obj)
 
                 if batch_idx < len(batches):
                     self.log("    ⏳ Пауза 20 сек между батчами...")
@@ -946,11 +943,12 @@ class WildberriesDailyUpdater:
         self.log("❌ Не удалось получить отчёт воронки")
         return False
 
-    # ---------- Реклама ----------
+    # ---------- Реклама (сохраняем после каждого дня) ----------
     def update_adverts(self, store_name: str) -> bool:
         """
         Обновление данных по рекламным кампаниям.
         Загружает статистику за последние 30 дней.
+        Сохраняем после каждого дня.
         """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
@@ -1031,11 +1029,14 @@ class WildberriesDailyUpdater:
         for cid, d in missing:
             missing_by_date[d].append(cid)
 
-        all_new_data = []
+        # Будем накапливать новые данные, но сохранять после каждого дня
+        current_df = existing_df.copy()
         stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
+
         for date_str, cids in missing_by_date.items():
             self.log(f"📅 Загрузка статистики за {date_str} для {len(cids)} кампаний...")
             chunks = [cids[i:i+30] for i in range(0, len(cids), 30)]
+            day_data = []
             for chunk in chunks:
                 ids_param = ','.join(map(str, chunk))
                 params = {
@@ -1080,7 +1081,7 @@ class WildberriesDailyUpdater:
                                             row['ДРР'] = round(row['Расход'] / (row['Сумма заказов'] * 0.88) * 100, 2)
                                         else:
                                             row['ДРР'] = 0
-                                        all_new_data.append(row)
+                                        day_data.append(row)
                                 success = True
                             else:
                                 self.log(f"    ℹ️ Нет данных за {date_str} для этой группы")
@@ -1097,58 +1098,61 @@ class WildberriesDailyUpdater:
                         self.log(f"    ❌ Исключение: {e}")
                         break
                 time.sleep(30)
+
+            if day_data:
+                day_df = pd.DataFrame(day_data)
+                # Приводим названия предметов к единому регистру
+                if 'Название предмета' in day_df.columns:
+                    day_df['Название предмета'] = day_df['Название предмета'].str.strip().str.lower().str.capitalize()
+                current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
+
+                # Сохраняем после каждого дня
+                # Пересоздаём дополнительные отчёты на основе current_df
+                extra_sheets = {}
+                if not current_df.empty:
+                    # Ежедневный отчёт по категориям
+                    daily_cat = current_df.groupby(['Дата', 'Название предмета']).agg({
+                        'Показы': 'sum',
+                        'Клики': 'sum',
+                        'Заказы': 'sum',
+                        'Расход': 'sum',
+                        'Сумма заказов': 'sum'
+                    }).reset_index()
+                    daily_cat['CTR'] = (daily_cat['Клики'] / daily_cat['Показы'] * 100).round(2)
+                    daily_cat['CPC'] = (daily_cat['Расход'] / daily_cat['Клики']).round(2)
+                    daily_cat['CR'] = (daily_cat['Заказы'] / daily_cat['Клики'] * 100).round(2)
+                    daily_cat['ROI'] = ((daily_cat['Сумма заказов'] - daily_cat['Расход']) / daily_cat['Расход'] * 100).round(2)
+                    daily_cat['ДРР'] = (daily_cat['Расход'] / (daily_cat['Сумма заказов'] * 0.88) * 100).round(2)
+                    daily_cat = daily_cat.sort_values(['Дата', 'Расход'], ascending=[True, False])
+                    extra_sheets['Отчет_по_Категории'] = daily_cat
+
+                    # Итоговый отчёт по категориям
+                    summary_cat = current_df.groupby('Название предмета').agg({
+                        'Показы': 'sum',
+                        'Клики': 'sum',
+                        'Заказы': 'sum',
+                        'Расход': 'sum',
+                        'Сумма заказов': 'sum'
+                    }).reset_index()
+                    summary_cat['CTR'] = (summary_cat['Клики'] / summary_cat['Показы'] * 100).round(2)
+                    summary_cat['CPC'] = (summary_cat['Расход'] / summary_cat['Клики']).round(2)
+                    summary_cat['CR'] = (summary_cat['Заказы'] / summary_cat['Клики'] * 100).round(2)
+                    summary_cat['ROI'] = ((summary_cat['Сумма заказов'] - summary_cat['Расход']) / summary_cat['Расход'] * 100).round(2)
+                    summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
+                    summary_cat = summary_cat.sort_values('Расход', ascending=False)
+                    extra_sheets['Отчет_по_Категории_Итог'] = summary_cat
+
+                if self._save_report(current_df, store_name, 'adverts', extra_sheets):
+                    # Сохраняем недельные данные
+                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                    self._save_weekly(day_df, store_name, 'adverts', date_obj)
+                else:
+                    self.log(f"❌ Ошибка сохранения после дня {date_str}, но продолжаем")
+            else:
+                self.log(f"ℹ️ Нет новых данных за {date_str}")
+
             time.sleep(self.delays['adverts'])
 
-        if all_new_data:
-            new_df = pd.DataFrame(all_new_data)
-            # Приводим названия предметов к единому регистру
-            if 'Название предмета' in new_df.columns:
-                new_df['Название предмета'] = new_df['Название предмета'].str.strip().str.lower().str.capitalize()
-            combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-
-            # Формируем дополнительные отчёты по категориям
-            extra_sheets = {}
-            if not combined.empty:
-                # Ежедневный отчёт по категориям
-                daily_cat = combined.groupby(['Дата', 'Название предмета']).agg({
-                    'Показы': 'sum',
-                    'Клики': 'sum',
-                    'Заказы': 'sum',
-                    'Расход': 'sum',
-                    'Сумма заказов': 'sum'
-                }).reset_index()
-                daily_cat['CTR'] = (daily_cat['Клики'] / daily_cat['Показы'] * 100).round(2)
-                daily_cat['CPC'] = (daily_cat['Расход'] / daily_cat['Клики']).round(2)
-                daily_cat['CR'] = (daily_cat['Заказы'] / daily_cat['Клики'] * 100).round(2)
-                daily_cat['ROI'] = ((daily_cat['Сумма заказов'] - daily_cat['Расход']) / daily_cat['Расход'] * 100).round(2)
-                daily_cat['ДРР'] = (daily_cat['Расход'] / (daily_cat['Сумма заказов'] * 0.88) * 100).round(2)
-                daily_cat = daily_cat.sort_values(['Дата', 'Расход'], ascending=[True, False])
-                extra_sheets['Отчет_по_Категории'] = daily_cat
-
-                # Итоговый отчёт по категориям
-                summary_cat = combined.groupby('Название предмета').agg({
-                    'Показы': 'sum',
-                    'Клики': 'sum',
-                    'Заказы': 'sum',
-                    'Расход': 'sum',
-                    'Сумма заказов': 'sum'
-                }).reset_index()
-                summary_cat['CTR'] = (summary_cat['Клики'] / summary_cat['Показы'] * 100).round(2)
-                summary_cat['CPC'] = (summary_cat['Расход'] / summary_cat['Клики']).round(2)
-                summary_cat['CR'] = (summary_cat['Заказы'] / summary_cat['Клики'] * 100).round(2)
-                summary_cat['ROI'] = ((summary_cat['Сумма заказов'] - summary_cat['Расход']) / summary_cat['Расход'] * 100).round(2)
-                summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
-                summary_cat = summary_cat.sort_values('Расход', ascending=False)
-                extra_sheets['Отчет_по_Категории_Итог'] = summary_cat
-
-            # Сохраняем основной файл с дополнительными листами
-            if self._save_report(combined, store_name, 'adverts', extra_sheets):
-                # Сохраняем недельные файлы
-                for _, row in new_df.iterrows():
-                    date_obj = datetime.strptime(row['Дата'], '%Y-%m-%d')
-                    day_df = pd.DataFrame([row.to_dict()])
-                    self._save_weekly(day_df, store_name, 'adverts', date_obj)
-            return True
         return True
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
