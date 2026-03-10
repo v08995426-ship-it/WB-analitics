@@ -3,19 +3,7 @@
 
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
-Поддерживает все основные отчёты:
-- Заказы (статистика)
-- История остатков (ежедневный срез)
-- Финансовые показатели (детализация по дням)
-- Позиции по ключам (топ-100 поисковых запросов по выбранным категориям)
-- Воронка продаж (сложный отчёт через генерацию)
-- Реклама (список кампаний и статистика по дням за последние 30 дней)
-
-Все отчёты хранят данные за последние 90 дней (кроме рекламы – 30 дней),
-удаляя устаревшее. Для ключевых отчётов создаются недельные файлы (бэкапы).
-Загрузка происходит только за завершённые дни (вчера и ранее).
-Для финансовых показателей основной файл сохраняется один раз в конце,
-чтобы избежать огромных задержек при перезаписи растущего файла после каждого дня.
+Поддерживает все основные отчёты, включая выгрузку остатков из 1С.
 """
 
 import os
@@ -207,6 +195,18 @@ class WildberriesDailyUpdater:
                 'key_type': 'promo',
                 'weekly': True,
                 'retention_days': 30,
+            },
+            # НОВЫЙ ОТЧЁТ: Остатки из 1С
+            '1c_stocks': {
+                'name': 'Остатки 1С',
+                'folder': 'Остатки',
+                'filename': 'Остатки_1С.xlsx',          # имя файла в бакете
+                'date_column': 'Дата',                   # для возможной очистки (если потребуется)
+                'id_columns': [],                         # дедупликация не нужна, т.к. файл перезаписывается
+                'api_url': None,                           # не используется
+                'key_type': None,
+                'weekly': False,
+                'retention_days': 90,
             }
         }
 
@@ -218,6 +218,7 @@ class WildberriesDailyUpdater:
             'keywords': 70,
             'funnel': 30,
             'adverts': 30,
+            '1c_stocks': 0,   # для 1С задержка не нужна
         }
 
         # Список категорий для фильтрации артикулов в keywords
@@ -1179,18 +1180,85 @@ class WildberriesDailyUpdater:
 
         return True
 
+    # ---------- НОВЫЙ МЕТОД: Остатки из 1С ----------
+    def update_1c_stocks(self, store_name: str = '1С') -> bool:
+        """
+        Загружает файл с остатками из 1С по внешнему URL (например, опубликованный HTTP-сервис)
+        и сохраняет его в бакет Yandex Cloud в папку Отчёты/Остатки/1С/Остатки_1С.xlsx.
+        Файл перезаписывается ежедневно.
+        Для аутентификации используются переменные окружения:
+        - URL_1C_STOCKS : ссылка на файл (Excel или CSV)
+        - _1C_USER      : имя пользователя (если требуется базовая аутентификация)
+        - _1C_PASSWORD  : пароль
+        """
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки из 1С для магазина {store_name}")
+        config = self.reports_config['1c_stocks']
+
+        # Получаем настройки из переменных окружения
+        url_1c = os.environ.get('URL_1C_STOCKS')
+        username = os.environ.get('_1C_USER')
+        password = os.environ.get('_1C_PASSWORD')
+
+        if not url_1c:
+            self.log("❌ Переменная окружения URL_1C_STOCKS не задана. Невозможно загрузить данные из 1С.")
+            return False
+
+        # Подготовка аутентификации (Basic Auth)
+        auth = None
+        if username and password:
+            auth = (username, password)
+            self.log(f"🔐 Используется базовая аутентификация для пользователя {username}")
+
+        # Скачиваем файл
+        try:
+            self.log(f"📥 Скачивание файла из 1С: {url_1c}")
+            resp = requests.get(url_1c, auth=auth, timeout=120, stream=True)
+            if resp.status_code != 200:
+                self.log(f"❌ Ошибка при скачивании: HTTP {resp.status_code}")
+                return False
+
+            # Сохраняем во временный файл
+            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                tmp_path = tmp.name
+                for chunk in resp.iter_content(chunk_size=8192):
+                    tmp.write(chunk)
+            self.log(f"📦 Файл временно сохранён: {tmp_path}")
+
+            # Формируем ключ в бакете: Отчёты/Остатки/1С/Остатки_1С.xlsx
+            key = self._get_s3_key(store_name, '1c_stocks')
+            self.log(f"☁️ Загрузка в бакет: {key}")
+
+            # Загружаем файл в S3
+            self.s3.upload_file(tmp_path, key)
+            self.log(f"✅ Файл успешно сохранён в бакет: {key}")
+
+            # Можно также сохранить копию с датой, если нужно хранить историю
+            # Но по условию задачи достаточно ежедневной перезаписи
+
+            return True
+
+        except Exception as e:
+            self.log(f"❌ Исключение при обработке: {e}")
+            traceback.print_exc()
+            return False
+        finally:
+            # Удаляем временный файл
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                self.log("🧹 Временный файл удалён")
+
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
 
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         """
         Запускает обновление для указанного магазина.
-        Если reports = None, обновляются все отчёты.
+        Если reports = None, обновляются все отчёты, включая '1c_stocks'.
         """
-        all_reports = ['orders', 'stocks', 'finance', 'keywords', 'funnel', 'adverts']
+        all_reports = ['orders', 'stocks', 'finance', 'keywords', 'funnel', 'adverts', '1c_stocks']
         if reports is None:
             reports = all_reports
 
-        self.log(f"🚀 Начало обновления для магазина {store_name}")
+        self.log(f"🚀 Начало обновления для магазина {store_name}. Запрошенные отчёты: {reports}")
         for report in reports:
             method_name = f"update_{report}"
             if hasattr(self, method_name):
@@ -1203,7 +1271,9 @@ class WildberriesDailyUpdater:
                     traceback.print_exc()
             else:
                 self.log(f"⚠️ Неизвестный тип отчёта: {report}")
-            time.sleep(30)
+            # Пауза между отчётами (кроме последнего)
+            if report != reports[-1]:
+                time.sleep(30)
 
         self.log("✅ Обновление завершено")
 
@@ -1219,10 +1289,16 @@ if __name__ == "__main__":
         'WB_STATS_KEY_TOPFACE',
         'WB_PROMO_KEY_TOPFACE'
     ]
+    # Для 1С обязательна только URL_1C_STOCKS, остальные опциональны
+    # Проверяем только обязательные для Wildberries
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
         exit(1)
+
+    # Проверяем наличие URL для 1С (необязательно, но предупредим)
+    if not os.environ.get('URL_1C_STOCKS'):
+        print("⚠️ Переменная URL_1C_STOCKS не задана. Отчёт '1c_stocks' будет пропущен.")
 
     s3 = S3Storage(
         access_key=os.environ['YC_ACCESS_KEY_ID'],
