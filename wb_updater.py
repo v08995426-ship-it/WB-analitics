@@ -62,7 +62,7 @@ class S3Storage:
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             data = obj['Body'].read()
-            if sheet_name:
+            if sheet_name is not None:
                 df = pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
             else:
                 df = pd.read_excel(io.BytesIO(data))
@@ -234,13 +234,19 @@ class WildberriesDailyUpdater:
         return f"Отчёты/{config['folder']}/{store_name}/Недельные/{filename}"
 
     def _load_weekly_data(self, store_name: str, report_type: str, week_date: datetime) -> pd.DataFrame:
-        """Загружает данные из недельного файла за указанную неделю (week_date — любая дата недели)."""
+        """
+        Загружает данные из недельного файла за указанную неделю.
+        Сначала пытается прочитать лист с именем из конфига, если не получается — читает первый лист.
+        """
         key = self._get_weekly_key(store_name, report_type, week_date)
         self.log(f"📥 Загрузка недельного файла: {key}")
         try:
+            # Пытаемся прочитать с указанным именем листа
             df = self.s3.read_excel(key, sheet_name=self.reports_config[report_type]['name'])
             if df.empty:
-                return pd.DataFrame()
+                # Если пусто, возможно, файл есть, но лист другой — попробуем прочитать первый лист
+                df = self.s3.read_excel(key, sheet_name=0)  # первый лист по индексу
+                self.log(f"ℹ️ Лист '{self.reports_config[report_type]['name']}' не найден, прочитан первый лист")
             # Приводим колонку с датой к единому формату
             date_col = self.reports_config[report_type]['date_column']
             if date_col in df.columns:
