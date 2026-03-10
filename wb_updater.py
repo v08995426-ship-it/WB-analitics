@@ -5,6 +5,7 @@
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
 Автоматическое получение артикулов из заказов для отчёта по ключам.
+Формат для keywords: Неделя ГГГГ-WНН.xlsx
 """
 
 import os
@@ -205,7 +206,7 @@ class WildberriesDailyUpdater:
             'orders': 65,
             'stocks': 65,
             'finance': 65,
-            'keywords': 70,
+            'keywords': 90,      # увеличено для предотвращения 429
             'funnel': 30,
             'adverts': 30,
             '1c_stocks': 0,
@@ -227,10 +228,14 @@ class WildberriesDailyUpdater:
         return date - timedelta(days=date.weekday())
 
     def _get_weekly_key(self, store_name: str, report_type: str, date: datetime) -> str:
-        """Генерирует ключ для недельного файла (например, Заказы_2025-W10.xlsx)."""
+        """Генерирует ключ для недельного файла."""
         year, week, _ = date.isocalendar()
         config = self.reports_config[report_type]
-        filename = f"{config['name']}_{year}-W{week:02d}.xlsx"
+        if report_type == 'keywords':
+            # Специальный формат для поисковых запросов
+            filename = f"Неделя {year}-W{week:02d}.xlsx"
+        else:
+            filename = f"{config['name']}_{year}-W{week:02d}.xlsx"
         return f"Отчёты/{config['folder']}/{store_name}/Недельные/{filename}"
 
     def _load_weekly_data(self, store_name: str, report_type: str, week_date: datetime) -> pd.DataFrame:
@@ -375,7 +380,7 @@ class WildberriesDailyUpdater:
             return self._fetch_finance_day(config, headers, date_str)
         # Для других отчётов обработка в их собственных методах
 
-        max_attempts = 3
+        max_attempts = 5  # увеличено для борьбы с 429
         for attempt in range(max_attempts):
             try:
                 if method == 'GET':
@@ -386,7 +391,7 @@ class WildberriesDailyUpdater:
                 if resp.status_code == 200:
                     return resp.json()
                 elif resp.status_code == 429:
-                    wait = 60 * (attempt + 1)
+                    wait = 60 * (attempt + 1)  # экспоненциальная задержка: 60, 120, 180...
                     self.log(f"    ⚠ Лимит запросов (429), попытка {attempt+1}/{max_attempts}, ждём {wait} сек...")
                     time.sleep(wait)
                 elif resp.status_code == 204:
@@ -656,7 +661,7 @@ class WildberriesDailyUpdater:
 
         return True
 
-    # ---------- Позиции по ключам ----------
+    # ---------- Позиции по ключам (исправленная версия) ----------
     def update_keywords(self, store_name: str) -> bool:
         """Инкрементальное обновление данных по поисковым запросам понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
@@ -705,10 +710,15 @@ class WildberriesDailyUpdater:
             for date in dates:
                 date_str = date.strftime('%Y-%m-%d')
                 for nm_id in articles:
+                    # Проверяем, есть ли все три фильтра для этого артикула и даты
+                    missing_filters = []
                     for f in filters:
                         if (date_str, nm_id, f) not in existing_keys:
-                            missing_by_date[date_str].append(nm_id)
-                            break  # достаточно одного отсутствующего фильтра, чтобы загрузить артикул
+                            missing_filters.append(f)
+                    if missing_filters:
+                        # Если не хватает хотя бы одного фильтра, артикул нужно загрузить
+                        missing_by_date[date_str].append(nm_id)
+                        # Можно также логировать, каких фильтров не хватает, но для загрузки достаточно артикула
 
             if not missing_by_date:
                 self.log(f"✅ Все данные за неделю уже загружены")
@@ -721,9 +731,11 @@ class WildberriesDailyUpdater:
                 self.log(f"📅 Загрузка дня {date_str}, артикулов: {len(nm_ids)}")
                 # Разбиваем на батчи по 50
                 batches = [nm_ids[i:i+50] for i in range(0, len(nm_ids), 50)]
-                for batch in batches:
+                for batch_idx, batch in enumerate(batches, 1):
+                    self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
                     batch_data = []
                     for filter_field in filters:
+                        self.log(f"    🔍 Фильтр {filter_field}", end="")
                         payload = {
                             "currentPeriod": {"start": date_str, "end": date_str},
                             "nmIds": batch,
@@ -733,7 +745,7 @@ class WildberriesDailyUpdater:
                             "orderBy": {"field": filter_field, "mode": "desc"},
                             "limit": 100
                         }
-                        max_retries = 3
+                        max_retries = 5  # увеличено для борьбы с 429
                         for attempt in range(max_retries):
                             try:
                                 resp = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -785,13 +797,14 @@ class WildberriesDailyUpdater:
                                             "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
                                         }
                                         batch_data.append(row)
+                                    self.log(f" -> ✓ {len(items)} записей")
                                     break
                                 elif resp.status_code == 429:
                                     wait = 60 * (attempt + 1)
-                                    self.log(f"    ⚠ Лимит, ждём {wait} сек...")
+                                    self.log(f" -> ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
                                     time.sleep(wait)
                                 else:
-                                    self.log(f"    ❌ Ошибка {resp.status_code}")
+                                    self.log(f" -> ❌ Ошибка {resp.status_code}")
                                     break
                             except Exception as e:
                                 self.log(f"    ❌ Исключение: {e}")
@@ -799,15 +812,23 @@ class WildberriesDailyUpdater:
                                     time.sleep(10)
                                 else:
                                     break
-                        time.sleep(20)  # пауза между фильтрами
+                        # Пауза между фильтрами (кроме последнего)
+                        if filter_field != filters[-1]:
+                            time.sleep(30)
 
                     if batch_data:
                         batch_df = pd.DataFrame(batch_data)
                         new_data.append(batch_df)
 
-                    time.sleep(20)  # пауза между батчами
+                    # Пауза между батчами (кроме последнего)
+                    if batch_idx < len(batches):
+                        self.log("    ⏳ Пауза 30 сек между батчами...")
+                        time.sleep(30)
 
-                time.sleep(self.delays['keywords'])
+                # Пауза между днями (кроме последнего)
+                if date_str != list(missing_by_date.keys())[-1]:
+                    self.log("⏳ Пауза 90 сек между днями...")
+                    time.sleep(90)
 
             if new_data:
                 new_df = pd.concat(new_data, ignore_index=True)
