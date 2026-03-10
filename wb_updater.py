@@ -4,6 +4,7 @@
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
 Поддерживает все основные отчёты, включая выгрузку остатков из 1С.
+Версия с повышенной устойчивостью к ошибкам.
 """
 
 import os
@@ -200,17 +201,17 @@ class WildberriesDailyUpdater:
             '1c_stocks': {
                 'name': 'Остатки 1С',
                 'folder': 'Остатки',
-                'filename': 'Остатки_1С.xlsx',          # имя файла в бакете
-                'date_column': 'Дата',                   # для возможной очистки (если потребуется)
-                'id_columns': [],                         # дедупликация не нужна, т.к. файл перезаписывается
-                'api_url': None,                           # не используется
+                'filename': 'Остатки_1С.xlsx',
+                'date_column': 'Дата',
+                'id_columns': [],
+                'api_url': None,
                 'key_type': None,
                 'weekly': False,
                 'retention_days': 90,
             }
         }
 
-        # Задержки между запросами (секунды) – соответствуют лимитам API
+        # Задержки между запросами (секунды)
         self.delays = {
             'orders': 65,
             'stocks': 65,
@@ -218,7 +219,7 @@ class WildberriesDailyUpdater:
             'keywords': 70,
             'funnel': 30,
             'adverts': 30,
-            '1c_stocks': 0,   # для 1С задержка не нужна
+            '1c_stocks': 0,
         }
 
         # Список категорий для фильтрации артикулов в keywords
@@ -241,7 +242,7 @@ class WildberriesDailyUpdater:
         return f"Отчёты/{folder}/{store_name}/{filename}"
 
     def _get_weekly_key(self, store_name: str, report_type: str, date: datetime) -> str:
-        """Генерирует ключ для недельного файла (например, Заказы_2025-W10.xlsx)."""
+        """Генерирует ключ для недельного файла."""
         year, week, _ = date.isocalendar()
         config = self.reports_config[report_type]
         filename = f"{config['name']}_{year}-W{week:02d}.xlsx"
@@ -256,7 +257,6 @@ class WildberriesDailyUpdater:
             if df.empty:
                 self.log("ℹ️ Файл не найден или пуст, будет создан новый")
                 return pd.DataFrame()
-            # Приводим колонку с датой к строковому формату для единообразия
             date_col = self.reports_config[report_type]['date_column']
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
@@ -304,6 +304,7 @@ class WildberriesDailyUpdater:
             return True
         except Exception as e:
             self.log(f"❌ Ошибка сохранения {key}: {e}")
+            traceback.print_exc()
             return False
         finally:
             if os.path.exists(tmp_path):
@@ -321,7 +322,6 @@ class WildberriesDailyUpdater:
             existing = pd.DataFrame()
         if not existing.empty:
             combined = pd.concat([existing, df], ignore_index=True)
-            # дедупликация по ключевым колонкам
             id_cols = self.reports_config[report_type]['id_columns']
             id_cols_present = [c for c in id_cols if c in combined.columns]
             if id_cols_present:
@@ -371,7 +371,6 @@ class WildberriesDailyUpdater:
             if df.empty:
                 self.log("⚠️ Файл заказов пуст или не найден")
                 return []
-            # Ищем колонки с артикулом и предметом
             nm_col = None
             subj_col = None
             possible_nm = ['nmId', 'nmID', 'Артикул WB', 'Артикул']
@@ -387,7 +386,6 @@ class WildberriesDailyUpdater:
             if nm_col is None or subj_col is None:
                 self.log("⚠️ В заказах не найдены нужные колонки")
                 return []
-            # Приводим subject к нижнему регистру для сравнения
             df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
             target_lower = [s.lower() for s in subjects]
             mask = df[subj_col].isin(target_lower)
@@ -402,7 +400,7 @@ class WildberriesDailyUpdater:
     # ====================== МЕТОДЫ ДЛЯ КАЖДОГО ОТЧЁТА ======================
 
     def _make_request(self, config: dict, headers: dict, date_str: str, **kwargs) -> Optional[Any]:
-        """Универсальный метод для выполнения API-запроса (упрощённый)."""
+        """Универсальный метод для выполнения API-запроса с повторными попытками."""
         url = config['api_url']
         method = config['api_method']
         params = {}
@@ -413,44 +411,46 @@ class WildberriesDailyUpdater:
         elif config['name'] == 'Остатки':
             params = {"dateFrom": date_str}
         elif config['name'] == 'Финансовые показатели':
-            # Для финансов требуется постраничная загрузка, обработаем отдельно
             return self._fetch_finance_day(config, headers, date_str)
-        elif config['name'] == 'Позиции по Ключам':
-            # Обрабатывается отдельно с батчами
-            pass
-        elif config['name'] == 'Воронка продаж':
-            pass
-        elif config['name'] == 'Реклама':
-            # для рекламы не используется этот метод
-            pass
+        # Для других отчётов обработка в их собственных методах
 
-        try:
-            if method == 'GET':
-                resp = requests.get(url, headers=headers, params=params, timeout=60)
-            else:
-                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                if method == 'GET':
+                    resp = requests.get(url, headers=headers, params=params, timeout=60)
+                else:
+                    resp = requests.post(url, headers=headers, json=payload, timeout=60)
 
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code == 429:
-                self.log(f"    ⚠ Лимит запросов (429), ждём 60 сек...")
-                time.sleep(60)
-                return None
-            elif resp.status_code == 204:
-                return []  # нет данных
-            else:
-                self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
-                return None
-        except Exception as e:
-            self.log(f"    ❌ Исключение при запросе: {e}")
-            return None
+                if resp.status_code == 200:
+                    return resp.json()
+                elif resp.status_code == 429:
+                    wait = 60 * (attempt + 1)
+                    self.log(f"    ⚠ Лимит запросов (429), попытка {attempt+1}/{max_attempts}, ждём {wait} сек...")
+                    time.sleep(wait)
+                elif resp.status_code == 204:
+                    return []  # нет данных
+                else:
+                    self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                    if attempt < max_attempts - 1:
+                        time.sleep(10)
+                    else:
+                        return None
+            except Exception as e:
+                self.log(f"    ❌ Исключение при запросе: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(10)
+                else:
+                    return None
+        return None
 
     def _fetch_finance_day(self, config: dict, headers: dict, date_str: str) -> List[dict]:
-        """Загружает финансовые показатели за день с учётом постраничности."""
+        """Загружает финансовые показатели за день с учётом постраничности и повторными попытками."""
         url = config['api_url']
         all_items = []
         rrdid = 0
         limit = 100000
+        max_attempts = 3
         while True:
             params = {
                 "dateFrom": date_str,
@@ -459,28 +459,35 @@ class WildberriesDailyUpdater:
                 "rrdid": rrdid,
                 "period": "daily"
             }
-            try:
-                resp = requests.get(url, headers=headers, params=params, timeout=60)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if not data:
-                        break
-                    all_items.extend(data)
-                    last_rrdid = data[-1].get("rrd_id", 0)
-                    if len(data) < limit or last_rrdid <= rrdid:
-                        break
-                    rrdid = last_rrdid
-                elif resp.status_code == 204:
-                    break
-                elif resp.status_code == 429:
-                    self.log("    ⚠ Лимит, ждём 65 сек...")
-                    time.sleep(65)
-                else:
-                    self.log(f"    ❌ Ошибка {resp.status_code}")
-                    break
-            except Exception as e:
-                self.log(f"    ❌ Исключение: {e}")
-                break
+            for attempt in range(max_attempts):
+                try:
+                    resp = requests.get(url, headers=headers, params=params, timeout=60)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if not data:
+                            return all_items
+                        all_items.extend(data)
+                        last_rrdid = data[-1].get("rrd_id", 0)
+                        if len(data) < limit or last_rrdid <= rrdid:
+                            return all_items
+                        rrdid = last_rrdid
+                        break  # успешно, переходим к следующей странице
+                    elif resp.status_code == 204:
+                        return all_items
+                    elif resp.status_code == 429:
+                        wait = 60 * (attempt + 1)
+                        self.log(f"    ⚠ Лимит, попытка {attempt+1}/{max_attempts}, ждём {wait} сек...")
+                        time.sleep(wait)
+                    else:
+                        self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                        if attempt == max_attempts - 1:
+                            return all_items
+                        time.sleep(10)
+                except Exception as e:
+                    self.log(f"    ❌ Исключение: {e}")
+                    if attempt == max_attempts - 1:
+                        return all_items
+                    time.sleep(10)
         return all_items
 
     # ---------- Заказы ----------
@@ -517,7 +524,6 @@ class WildberriesDailyUpdater:
                     day_df['store'] = store_name
                     if 'date' in day_df.columns:
                         day_df['date'] = pd.to_datetime(day_df['date']).dt.strftime('%Y-%m-%d')
-                    # Объединяем с текущим датафреймом
                     current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
                     self.log(f"✅ Получено {len(day_df)} записей")
                 else:
@@ -527,14 +533,12 @@ class WildberriesDailyUpdater:
                 self.log("⚠️ Не удалось получить данные, пропускаем день")
                 continue
 
-            # Сохраняем после каждого дня
             self._last_save_start = time.time()
             if self._save_report(current_df, store_name, 'orders'):
                 self._save_weekly(day_df, store_name, 'orders', datetime.strptime(date_str, '%Y-%m-%d'))
             else:
                 self.log(f"❌ Ошибка сохранения после дня {date_str}, но продолжаем")
 
-            # Пауза между днями
             if i < len(dates_to_load):
                 time.sleep(self.delays['orders'])
 
@@ -542,9 +546,7 @@ class WildberriesDailyUpdater:
 
     # ---------- Остатки ----------
     def update_stocks(self, store_name: str) -> bool:
-        """
-        Обновление остатков. Загружаем только за вчерашний день.
-        """
+        """Обновление остатков. Загружаем только за вчерашний день."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         config = self.reports_config['stocks']
 
@@ -608,7 +610,6 @@ class WildberriesDailyUpdater:
                 self.log(f"❌ Исключение при запросе: {e}")
                 return False
 
-        # Удаляем устаревшие данные
         if not existing_df.empty:
             cutoff_date = (datetime.now() - timedelta(days=self.data_period_days)).strftime('%Y-%m-%d')
             existing_df['Дата запроса_dt'] = pd.to_datetime(existing_df['Дата запроса'])
@@ -617,24 +618,17 @@ class WildberriesDailyUpdater:
             self.log(f"🗑️ Удалено записей старше {cutoff_date}: {len(existing_df) - len(filtered)}")
             existing_df = filtered
 
-        # Сохраняем основной файл
         self._last_save_start = time.time()
         if self._save_report(existing_df, store_name, 'stocks'):
-            # Сохраняем недельные данные, если был новый день
             if target_date not in existing_dates and 'df_day' in locals():
                 self._save_weekly(df_day, store_name, 'stocks', datetime.strptime(target_date, '%Y-%m-%d'))
             return True
         return True
 
-    # ---------- Финансовые показатели (оптимизировано: основной файл сохраняется один раз в конце) ----------
+    # ---------- Финансовые показатели ----------
     def update_finance(self, store_name: str) -> bool:
-        """
-        Обновление финансовых показателей.
-        Загружаем все недостающие дни, но основной файл сохраняем только один раз в конце,
-        чтобы избежать огромных задержек при перезаписи растущего файла после каждого дня.
-        Недельные файлы сохраняем после каждого дня (они маленькие).
-        """
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name} (оптимизированное сохранение)")
+        """Обновление финансовых показателей. Сохраняем основной файл один раз в конце."""
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name}")
         config = self.reports_config['finance']
         existing_df = self._load_existing_report(store_name, 'finance')
         start_date, end_date = self._get_date_range_90_days()
@@ -672,14 +666,11 @@ class WildberriesDailyUpdater:
                 self.log("ℹ️ Нет данных за этот день")
                 continue
 
-            # Сохраняем недельные файлы после каждого дня (они небольшие)
             self._save_weekly(day_df, store_name, 'finance', datetime.strptime(date_str, '%Y-%m-%d'))
 
-            # Пауза между днями (обязательно для соблюдения лимита API)
             if i < len(dates_to_load):
                 time.sleep(self.delays['finance'])
 
-        # После загрузки всех дней сохраняем основной файл один раз
         if loaded_days > 0:
             self.log(f"💾 Сохраняем итоговый файл с {len(current_df)} записями...")
             self._last_save_start = time.time()
@@ -696,7 +687,7 @@ class WildberriesDailyUpdater:
     # ---------- Позиции по ключам ----------
     def update_keywords(self, store_name: str) -> bool:
         """Инкрементальное обновление данных по поисковым запросам (только по заданным категориям)."""
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} (фильтр по категориям)")
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
 
         articles = self._get_articles_by_subjects(store_name, self.target_subjects)
         if not articles:
@@ -964,24 +955,18 @@ class WildberriesDailyUpdater:
         self.log("❌ Не удалось получить отчёт воронки")
         return False
 
-    # ---------- Реклама (оптимизировано: основной файл сохраняется один раз в конце) ----------
+    # ---------- Реклама ----------
     def update_adverts(self, store_name: str) -> bool:
-        """
-        Обновление данных по рекламным кампаниям.
-        Загружает статистику за последние 30 дней.
-        Сохраняем основной файл один раз в конце, недельные – после каждого дня.
-        """
+        """Обновление данных по рекламным кампаниям."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
-        # Загружаем базу данных с ID кампаний и артикулами
         base_key = f"Отчёты/{config['folder']}/{store_name}/База данных.xlsx"
         try:
             df_base = self.s3.read_excel(base_key, sheet_name='Кампании')
             if df_base.empty:
                 self.log("❌ Файл База данных.xlsx пуст или не найден")
                 return False
-            # Первая колонка – ID кампании, вторая – артикул WB (если есть)
             campaign_ids = df_base.iloc[:, 0].dropna().astype(int).tolist()
             id_to_article = {}
             if len(df_base.columns) >= 2:
@@ -991,7 +976,6 @@ class WildberriesDailyUpdater:
             self.log(f"❌ Ошибка чтения База данных.xlsx: {e}")
             return False
 
-        # Загружаем существующую статистику
         existing_df = self._load_existing_report(store_name, 'adverts')
         if not existing_df.empty:
             existing_df['Дата'] = pd.to_datetime(existing_df['Дата']).dt.strftime('%Y-%m-%d')
@@ -999,11 +983,9 @@ class WildberriesDailyUpdater:
         else:
             existing_keys = set()
 
-        # Определяем диапазон дат за последние 30 дней (без сегодня)
         start_date, end_date = self._get_date_range_last_n_days(30)
         required_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(30)]
 
-        # Собираем недостающие комбинации (кампания, дата)
         missing = []
         for cid in campaign_ids:
             for d in required_dates:
@@ -1016,7 +998,6 @@ class WildberriesDailyUpdater:
 
         self.log(f"📊 Необходимо загрузить {len(missing)} записей (кампания, дата)")
 
-        # Получаем актуальную информацию о кампаниях (названия, предметы) через advert-api
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
@@ -1045,12 +1026,10 @@ class WildberriesDailyUpdater:
 
         self.log(f"✅ Получена информация о {len(campaigns_info)} кампаниях")
 
-        # Группируем недостающие записи по датам
         missing_by_date = defaultdict(list)
         for cid, d in missing:
             missing_by_date[d].append(cid)
 
-        # Будем накапливать данные и сохранять основной файл в конце
         current_df = existing_df.copy()
         loaded_days = 0
         stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
@@ -1127,14 +1106,12 @@ class WildberriesDailyUpdater:
                     day_df['Название предмета'] = day_df['Название предмета'].str.strip().str.lower().str.capitalize()
                 current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
                 loaded_days += 1
-                # Сохраняем недельные файлы после каждого дня
                 self._save_weekly(day_df, store_name, 'adverts', datetime.strptime(date_str, '%Y-%m-%d'))
             else:
                 self.log(f"ℹ️ Нет новых данных за {date_str}")
 
             time.sleep(self.delays['adverts'])
 
-        # После загрузки всех дней сохраняем основной файл с дополнительными отчётами
         if loaded_days > 0:
             self.log(f"💾 Сохраняем итоговый файл рекламы с {len(current_df)} записями...")
             extra_sheets = {}
@@ -1183,33 +1160,25 @@ class WildberriesDailyUpdater:
     # ---------- НОВЫЙ МЕТОД: Остатки из 1С ----------
     def update_1c_stocks(self, store_name: str = '1С') -> bool:
         """
-        Загружает файл с остатками из 1С по внешнему URL (например, опубликованный HTTP-сервис)
-        и сохраняет его в бакет Yandex Cloud в папку Отчёты/Остатки/1С/Остатки_1С.xlsx.
-        Файл перезаписывается ежедневно.
-        Для аутентификации используются переменные окружения:
-        - URL_1C_STOCKS : ссылка на файл (Excel или CSV)
-        - _1C_USER      : имя пользователя (если требуется базовая аутентификация)
-        - _1C_PASSWORD  : пароль
+        Загружает файл с остатками из 1С по внешнему URL и сохраняет в бакет.
         """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки из 1С для магазина {store_name}")
         config = self.reports_config['1c_stocks']
 
-        # Получаем настройки из переменных окружения
         url_1c = os.environ.get('URL_1C_STOCKS')
         username = os.environ.get('_1C_USER')
         password = os.environ.get('_1C_PASSWORD')
 
         if not url_1c:
-            self.log("❌ Переменная окружения URL_1C_STOCKS не задана. Невозможно загрузить данные из 1С.")
+            self.log("❌ Переменная окружения URL_1C_STOCKS не задана. Пропускаем.")
             return False
 
-        # Подготовка аутентификации (Basic Auth)
         auth = None
         if username and password:
             auth = (username, password)
             self.log(f"🔐 Используется базовая аутентификация для пользователя {username}")
 
-        # Скачиваем файл
+        tmp_path = None
         try:
             self.log(f"📥 Скачивание файла из 1С: {url_1c}")
             resp = requests.get(url_1c, auth=auth, timeout=120, stream=True)
@@ -1217,23 +1186,16 @@ class WildberriesDailyUpdater:
                 self.log(f"❌ Ошибка при скачивании: HTTP {resp.status_code}")
                 return False
 
-            # Сохраняем во временный файл
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
                 tmp_path = tmp.name
                 for chunk in resp.iter_content(chunk_size=8192):
                     tmp.write(chunk)
             self.log(f"📦 Файл временно сохранён: {tmp_path}")
 
-            # Формируем ключ в бакете: Отчёты/Остатки/1С/Остатки_1С.xlsx
             key = self._get_s3_key(store_name, '1c_stocks')
             self.log(f"☁️ Загрузка в бакет: {key}")
-
-            # Загружаем файл в S3
             self.s3.upload_file(tmp_path, key)
             self.log(f"✅ Файл успешно сохранён в бакет: {key}")
-
-            # Можно также сохранить копию с датой, если нужно хранить историю
-            # Но по условию задачи достаточно ежедневной перезаписи
 
             return True
 
@@ -1242,8 +1204,7 @@ class WildberriesDailyUpdater:
             traceback.print_exc()
             return False
         finally:
-            # Удаляем временный файл
-            if os.path.exists(tmp_path):
+            if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
                 self.log("🧹 Временный файл удалён")
 
@@ -1269,6 +1230,7 @@ class WildberriesDailyUpdater:
                 except Exception as e:
                     self.log(f"❌ Критическая ошибка в {report}: {e}")
                     traceback.print_exc()
+                    self.log(f"📊 Отчёт {report}: ❌ (исключение)")
             else:
                 self.log(f"⚠️ Неизвестный тип отчёта: {report}")
             # Пауза между отчётами (кроме последнего)
@@ -1289,14 +1251,11 @@ if __name__ == "__main__":
         'WB_STATS_KEY_TOPFACE',
         'WB_PROMO_KEY_TOPFACE'
     ]
-    # Для 1С обязательна только URL_1C_STOCKS, остальные опциональны
-    # Проверяем только обязательные для Wildberries
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
         exit(1)
 
-    # Проверяем наличие URL для 1С (необязательно, но предупредим)
     if not os.environ.get('URL_1C_STOCKS'):
         print("⚠️ Переменная URL_1C_STOCKS не задана. Отчёт '1c_stocks' будет пропущен.")
 
