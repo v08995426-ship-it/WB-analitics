@@ -3,8 +3,8 @@
 
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
-Поддерживает все основные отчёты, включая выгрузку остатков из 1С.
-Версия с повышенной устойчивостью к ошибкам.
+Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
+Автоматическое получение артикулов из заказов для отчёта по ключам.
 """
 
 import os
@@ -15,6 +15,7 @@ import uuid
 import zipfile
 import tempfile
 import traceback
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
 import warnings
@@ -116,6 +117,7 @@ class S3Storage:
 class WildberriesDailyUpdater:
     """
     Ежедневный сборщик данных Wildberries с хранением в S3 (Yandex Cloud).
+    Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
     """
 
     def __init__(self, api_keys: Dict[str, Dict[str, str]], s3: S3Storage):
@@ -128,86 +130,73 @@ class WildberriesDailyUpdater:
         self.start_time = datetime.now(pytz.timezone('Europe/Moscow'))
         self.data_period_days = 90
 
-        # Конфигурация отчётов
+        # Конфигурация отчётов (только метаданные, без общего файла)
         self.reports_config = {
             'orders': {
                 'name': 'Заказы',
                 'folder': 'Заказы',
-                'filename': 'Заказы.xlsx',
                 'date_column': 'date',
                 'id_columns': ['date', 'gNumber', 'srid'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v1/supplier/orders',
                 'api_method': 'GET',
                 'key_type': 'stats',
-                'weekly': True,
             },
             'stocks': {
                 'name': 'Остатки',
                 'folder': 'Остатки',
-                'filename': 'Остатки.xlsx',
                 'date_column': 'Дата запроса',
                 'id_columns': ['Дата запроса', 'Артикул WB', 'Склад'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v1/supplier/stocks',
                 'api_method': 'GET',
                 'key_type': 'stats',
-                'weekly': True,
             },
             'finance': {
                 'name': 'Финансовые показатели',
                 'folder': 'Финансовые показатели',
-                'filename': 'Финансовые показатели.xlsx',
                 'date_column': 'rr_dt',
                 'id_columns': ['rr_dt', 'rrd_id', 'nm_id'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod',
                 'api_method': 'GET',
                 'key_type': 'stats',
-                'weekly': True,
             },
             'keywords': {
                 'name': 'Позиции по Ключам',
                 'folder': 'Поисковые запросы',
-                'filename': 'Позиции по Ключам.xlsx',
                 'date_column': 'Дата',
                 'id_columns': ['Дата', 'Поисковый запрос', 'Артикул WB', 'Фильтр'],
                 'api_url': 'https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/search-texts',
                 'api_method': 'POST',
                 'key_type': 'promo',
-                'weekly': True,
             },
             'funnel': {
                 'name': 'Воронка продаж',
                 'folder': 'Воронка продаж',
-                'filename': 'Воронка продаж.xlsx',
+                'filename': 'Воронка продаж.xlsx',  # единый файл
                 'date_column': 'dt',
                 'id_columns': ['dt', 'nmID'],
                 'api_url': 'https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads',
                 'api_method': 'POST',
                 'key_type': 'promo',
-                'weekly': False,
+                'retention_days': 90,
             },
             'adverts': {
                 'name': 'Реклама',
                 'folder': 'Реклама',
-                'filename': 'Реклама.xlsx',
                 'date_column': 'Дата',
                 'id_columns': ['ID кампании', 'Дата'],
                 'api_url': 'https://advert-api.wildberries.ru/api/advert/v2/adverts',
                 'api_method': 'GET',
                 'key_type': 'promo',
-                'weekly': True,
                 'retention_days': 30,
             },
-            # НОВЫЙ ОТЧЁТ: Остатки из 1С
             '1c_stocks': {
                 'name': 'Остатки 1С',
                 'folder': 'Остатки',
-                'filename': 'Остатки_1С.xlsx',
-                'date_column': 'Дата',
+                'filename': 'Остатки_1С.xlsx',  # ежедневно перезаписываемый файл
+                'date_column': None,
                 'id_columns': [],
                 'api_url': None,
                 'key_type': None,
-                'weekly': False,
-                'retention_days': 90,
             }
         }
 
@@ -233,30 +222,26 @@ class WildberriesDailyUpdater:
         """Логирование в stdout с принудительным сбросом буфера."""
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}", end=end, flush=True)
 
-    def _get_s3_key(self, store_name: str, report_type: str, filename: Optional[str] = None) -> str:
-        """Формирует ключ (путь) в бакете для указанного отчёта."""
-        config = self.reports_config[report_type]
-        folder = config['folder']
-        if filename is None:
-            filename = config['filename']
-        return f"Отчёты/{folder}/{store_name}/{filename}"
+    def _get_week_start(self, date: datetime) -> datetime:
+        """Возвращает дату понедельника недели, содержащей date."""
+        return date - timedelta(days=date.weekday())
 
     def _get_weekly_key(self, store_name: str, report_type: str, date: datetime) -> str:
-        """Генерирует ключ для недельного файла."""
+        """Генерирует ключ для недельного файла (например, Заказы_2025-W10.xlsx)."""
         year, week, _ = date.isocalendar()
         config = self.reports_config[report_type]
         filename = f"{config['name']}_{year}-W{week:02d}.xlsx"
         return f"Отчёты/{config['folder']}/{store_name}/Недельные/{filename}"
 
-    def _load_existing_report(self, store_name: str, report_type: str) -> pd.DataFrame:
-        """Загружает существующий основной отчёт из бакета."""
-        key = self._get_s3_key(store_name, report_type)
-        self.log(f"📥 Загрузка отчёта {report_type} для {store_name} из {key}")
+    def _load_weekly_data(self, store_name: str, report_type: str, week_date: datetime) -> pd.DataFrame:
+        """Загружает данные из недельного файла за указанную неделю (week_date — любая дата недели)."""
+        key = self._get_weekly_key(store_name, report_type, week_date)
+        self.log(f"📥 Загрузка недельного файла: {key}")
         try:
             df = self.s3.read_excel(key, sheet_name=self.reports_config[report_type]['name'])
             if df.empty:
-                self.log("ℹ️ Файл не найден или пуст, будет создан новый")
                 return pd.DataFrame()
+            # Приводим колонку с датой к единому формату
             date_col = self.reports_config[report_type]['date_column']
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
@@ -265,86 +250,31 @@ class WildberriesDailyUpdater:
             self.log(f"⚠️ Ошибка загрузки {key}: {e}")
             return pd.DataFrame()
 
-    def _save_report(self, df: pd.DataFrame, store_name: str, report_type: str, extra_sheets: Optional[Dict[str, pd.DataFrame]] = None) -> bool:
-        """
-        Сохраняет отчёт в бакет (перезапись). Если передан extra_sheets, добавляет их как дополнительные листы.
-        """
-        key = self._get_s3_key(store_name, report_type)
+    def _save_weekly_data(self, df: pd.DataFrame, store_name: str, report_type: str, week_date: datetime) -> bool:
+        """Сохраняет данные в недельный файл с дедупликацией."""
+        if df.empty:
+            return True
+        key = self._get_weekly_key(store_name, report_type, week_date)
         config = self.reports_config[report_type]
 
-        # Дедупликация основного df
+        # Дедупликация
         before = len(df)
-        if config['id_columns'] and not df.empty:
+        if config['id_columns']:
             existing_cols = [c for c in config['id_columns'] if c in df.columns]
             if existing_cols:
                 df = df.drop_duplicates(subset=existing_cols, keep='last')
                 after = len(df)
                 if before > after:
-                    self.log(f"🔍 Удалено дубликатов: {before - after}")
-
-        # Удаление устаревших данных
-        retention = config.get('retention_days', self.data_period_days)
-        df = self._remove_outdated_data(df, config, retention)
+                    self.log(f"🔍 Удалено дубликатов в недельном файле: {before - after}")
 
         try:
-            # Сохраняем во временный файл
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-                tmp_path = tmp.name
-            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-                df.to_excel(writer, sheet_name=config['name'], index=False)
-                if extra_sheets:
-                    for sheet_name, sheet_df in extra_sheets.items():
-                        if not sheet_df.empty:
-                            sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-            # Загружаем файл в S3
-            self.s3.upload_file(tmp_path, key)
-            self.log(f"✅ Отчёт сохранён: {key}, записей: {len(df)} (за {time.time()-self._last_save_start:.1f} сек)")
-            if extra_sheets:
-                self.log(f"   + дополнительные листы: {', '.join(extra_sheets.keys())}")
+            self.s3.write_excel(key, df, sheet_name=config['name'])
+            self.log(f"✅ Недельный файл сохранён: {key}, записей: {len(df)}")
             return True
         except Exception as e:
             self.log(f"❌ Ошибка сохранения {key}: {e}")
             traceback.print_exc()
             return False
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    def _save_weekly(self, df: pd.DataFrame, store_name: str, report_type: str, date: datetime):
-        """Сохраняет данные в недельный файл."""
-        if not self.reports_config[report_type]['weekly']:
-            return
-        week_key = self._get_weekly_key(store_name, report_type, date)
-        start = time.time()
-        try:
-            existing = self.s3.read_excel(week_key)
-        except:
-            existing = pd.DataFrame()
-        if not existing.empty:
-            combined = pd.concat([existing, df], ignore_index=True)
-            id_cols = self.reports_config[report_type]['id_columns']
-            id_cols_present = [c for c in id_cols if c in combined.columns]
-            if id_cols_present:
-                combined = combined.drop_duplicates(subset=id_cols_present, keep='last')
-        else:
-            combined = df
-        self.s3.write_excel(week_key, combined)
-        self.log(f"💾 Недельные данные сохранены: {week_key} (за {time.time()-start:.1f} сек)")
-
-    def _remove_outdated_data(self, df: pd.DataFrame, config: dict, retention_days: int) -> pd.DataFrame:
-        """Удаляет строки с датой старше retention_days дней."""
-        if df.empty:
-            return df
-        date_col = config['date_column']
-        if date_col not in df.columns:
-            return df
-        today = datetime.now(pytz.timezone('Europe/Moscow')).date()
-        end_date = today - timedelta(days=1)
-        start_date = end_date - timedelta(days=retention_days - 1)
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df = df[df[date_col].notna()]
-        df = df[(df[date_col] >= pd.Timestamp(start_date)) & (df[date_col] <= pd.Timestamp(end_date))]
-        return df
 
     def _get_date_range_90_days(self) -> Tuple[datetime, datetime]:
         """Возвращает диапазон дат за последние 90 дней (без сегодня)."""
@@ -362,40 +292,65 @@ class WildberriesDailyUpdater:
 
     def _get_articles_by_subjects(self, store_name: str, subjects: List[str]) -> List[int]:
         """
-        Извлекает уникальные nmId из файла заказов магазина,
-        отфильтрованные по заданным subject.
+        Извлекает уникальные nmId из всех недельных файлов заказов магазина,
+        отфильтрованные по заданным subject (регистронезависимо).
         """
-        orders_key = self._get_s3_key(store_name, 'orders')
-        try:
-            df = self.s3.read_excel(orders_key, sheet_name='Заказы')
-            if df.empty:
-                self.log("⚠️ Файл заказов пуст или не найден")
-                return []
-            nm_col = None
-            subj_col = None
-            possible_nm = ['nmId', 'nmID', 'Артикул WB', 'Артикул']
-            possible_subj = ['subject', 'Предмет', 'subjectName', 'Название предмета']
-            for c in possible_nm:
-                if c in df.columns:
-                    nm_col = c
-                    break
-            for c in possible_subj:
-                if c in df.columns:
-                    subj_col = c
-                    break
-            if nm_col is None or subj_col is None:
-                self.log("⚠️ В заказах не найдены нужные колонки")
-                return []
-            df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
-            target_lower = [s.lower() for s in subjects]
-            mask = df[subj_col].isin(target_lower)
-            filtered = df.loc[mask, nm_col].dropna().unique()
-            articles = [int(a) for a in filtered if pd.notna(a)]
-            self.log(f"✅ Получено {len(articles)} артикулов из заказов по заданным категориям")
-            return articles
-        except Exception as e:
-            self.log(f"❌ Ошибка чтения заказов: {e}")
+        self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
+
+        # Получаем список всех недельных файлов заказов
+        prefix = f"Отчёты/Заказы/{store_name}/Недельные/"
+        all_files = self.s3.list_files(prefix)
+        if not all_files:
+            self.log("⚠️ Не найдено недельных файлов заказов")
             return []
+
+        articles_set = set()
+        possible_nm_cols = ['nmId', 'nmID', 'Артикул WB', 'Артикул']
+        possible_subj_cols = ['subject', 'Предмет', 'subjectName', 'Название предмета']
+
+        for file_key in all_files:
+            self.log(f"📄 Обработка файла: {file_key}")
+            try:
+                df = self.s3.read_excel(file_key, sheet_name='Заказы')
+                if df.empty:
+                    continue
+
+                # Определяем колонки
+                nm_col = None
+                for col in possible_nm_cols:
+                    if col in df.columns:
+                        nm_col = col
+                        break
+                subj_col = None
+                for col in possible_subj_cols:
+                    if col in df.columns:
+                        subj_col = col
+                        break
+
+                if nm_col is None or subj_col is None:
+                    self.log(f"⚠️ В файле {file_key} не найдены колонки с артикулом или предметом")
+                    continue
+
+                # Приводим предмет к нижнему регистру для сравнения
+                df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
+                target_lower = [s.lower() for s in subjects]
+
+                # Фильтруем и добавляем артикулы
+                mask = df[subj_col].isin(target_lower)
+                filtered = df.loc[mask, nm_col].dropna().unique()
+                for val in filtered:
+                    try:
+                        articles_set.add(int(val))
+                    except (ValueError, TypeError):
+                        continue
+
+            except Exception as e:
+                self.log(f"❌ Ошибка при обработке файла {file_key}: {e}")
+                continue
+
+        articles = list(articles_set)
+        self.log(f"✅ Собрано {len(articles)} уникальных артикулов из заказов")
+        return articles
 
     # ====================== МЕТОДЫ ДЛЯ КАЖДОГО ОТЧЁТА ======================
 
@@ -492,278 +447,293 @@ class WildberriesDailyUpdater:
 
     # ---------- Заказы ----------
     def update_orders(self, store_name: str) -> bool:
-        """Обновление данных по заказам. Сохраняем после каждого дня."""
+        """Обновление данных по заказам. Сохраняем понедельно, догружая недостающие дни."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Заказы для магазина {store_name}")
         config = self.reports_config['orders']
-        existing_df = self._load_existing_report(store_name, 'orders')
+
         start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
+        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
 
-        if not existing_df.empty:
-            existing_df['date'] = pd.to_datetime(existing_df['date']).dt.strftime('%Y-%m-%d')
-            existing_dates = set(existing_df['date'].unique())
-        else:
-            existing_dates = set()
+        weeks = defaultdict(list)
+        for d in all_dates:
+            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
+            weeks[week_start].append(d)
 
-        dates_to_load = [d for d in all_dates if d not in existing_dates]
-        if not dates_to_load:
-            self.log("✅ Все данные по заказам уже загружены")
-            return True
-
-        self.log(f"📅 Будет загружено дней: {len(dates_to_load)}")
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": api_key.strip()}
-        current_df = existing_df.copy()
 
-        for i, date_str in enumerate(dates_to_load, 1):
-            self.log(f"📅 Загрузка дня {i}/{len(dates_to_load)}: {date_str}")
-            data = self._make_request(config, headers, date_str)
-            if data and isinstance(data, list):
-                day_df = pd.DataFrame(data)
-                if not day_df.empty:
-                    day_df['store'] = store_name
-                    if 'date' in day_df.columns:
-                        day_df['date'] = pd.to_datetime(day_df['date']).dt.strftime('%Y-%m-%d')
-                    current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
-                    self.log(f"✅ Получено {len(day_df)} записей")
-                else:
-                    self.log("ℹ️ Нет данных за этот день")
-                    continue
+        for week_start, dates in weeks.items():
+            self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
+            weekly_df = self._load_weekly_data(store_name, 'orders', week_start)
+            if not weekly_df.empty:
+                existing_dates = set(pd.to_datetime(weekly_df['date']).dt.date.unique()) if 'date' in weekly_df.columns else set()
             else:
-                self.log("⚠️ Не удалось получить данные, пропускаем день")
+                existing_dates = set()
+
+            dates_to_load = [d for d in dates if d not in existing_dates]
+            if not dates_to_load:
+                self.log(f"✅ Все дни недели уже загружены")
                 continue
 
-            self._last_save_start = time.time()
-            if self._save_report(current_df, store_name, 'orders'):
-                self._save_weekly(day_df, store_name, 'orders', datetime.strptime(date_str, '%Y-%m-%d'))
-            else:
-                self.log(f"❌ Ошибка сохранения после дня {date_str}, но продолжаем")
+            self.log(f"📅 Недостающие дни: {[d.strftime('%Y-%m-%d') for d in dates_to_load]}")
 
-            if i < len(dates_to_load):
-                time.sleep(self.delays['orders'])
+            new_data = []
+            for date in dates_to_load:
+                date_str = date.strftime('%Y-%m-%d')
+                self.log(f"📅 Загрузка дня: {date_str}")
+                data = self._make_request(config, headers, date_str)
+                if data and isinstance(data, list):
+                    day_df = pd.DataFrame(data)
+                    if not day_df.empty:
+                        day_df['store'] = store_name
+                        if 'date' in day_df.columns:
+                            day_df['date'] = pd.to_datetime(day_df['date']).dt.strftime('%Y-%m-%d')
+                        new_data.append(day_df)
+                        self.log(f"✅ Получено {len(day_df)} записей")
+                    else:
+                        self.log(f"ℹ️ Нет данных за {date_str}")
+                else:
+                    self.log(f"⚠️ Не удалось получить данные за {date_str}")
+
+                if date != dates_to_load[-1]:
+                    time.sleep(self.delays['orders'])
+
+            if new_data:
+                new_df = pd.concat(new_data, ignore_index=True)
+                if weekly_df.empty:
+                    weekly_df = new_df
+                else:
+                    weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
+
+                self._save_weekly_data(weekly_df, store_name, 'orders', week_start)
+            else:
+                self.log(f"ℹ️ Нет новых данных за неделю")
 
         return True
 
     # ---------- Остатки ----------
     def update_stocks(self, store_name: str) -> bool:
-        """Обновление остатков. Загружаем только за вчерашний день."""
+        """Обновление остатков. Загружаем только за вчерашний день и добавляем в соответствующий недельный файл."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         config = self.reports_config['stocks']
 
-        existing_df = self._load_existing_report(store_name, 'stocks')
-        if not existing_df.empty and 'Дата запроса' in existing_df.columns:
-            existing_dates = set(pd.to_datetime(existing_df['Дата запроса']).dt.strftime('%Y-%m-%d').unique())
+        target_date = (datetime.now() - timedelta(days=1)).date()
+        week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
+
+        weekly_df = self._load_weekly_data(store_name, 'stocks', week_start)
+        if not weekly_df.empty:
+            existing_dates = set(pd.to_datetime(weekly_df['Дата запроса']).dt.date.unique()) if 'Дата запроса' in weekly_df.columns else set()
         else:
             existing_dates = set()
 
-        target_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
         if target_date in existing_dates:
-            self.log(f"✅ Данные за {target_date} уже есть, пропускаем загрузку")
-        else:
-            self.log(f"📅 Загрузка остатков за {target_date}...")
-            api_key = self.api_keys[store_name][config['key_type']]
-            headers = {"Authorization": api_key.strip()}
-            try:
-                params = {"dateFrom": target_date}
-                resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data:
-                        df_day = pd.DataFrame(data)
-                        df_day['Дата запроса'] = target_date
-                        df_day['Магазин'] = store_name
-                        df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        rename_map = {
-                            'lastChangeDate': 'Дата последнего изменения',
-                            'warehouseName': 'Склад',
-                            'supplierArticle': 'Артикул продавца',
-                            'nmId': 'Артикул WB',
-                            'barcode': 'Баркод',
-                            'quantity': 'Доступно для продажи',
-                            'inWayToClient': 'В пути к клиенту',
-                            'inWayFromClient': 'В пути от клиента',
-                            'quantityFull': 'Полное количество',
-                            'category': 'Категория',
-                            'subject': 'Предмет',
-                            'brand': 'Бренд',
-                            'techSize': 'Размер',
-                            'Price': 'Цена',
-                            'Discount': 'Скидка',
-                            'isSupply': 'Договор поставки',
-                            'isRealization': 'Договор реализации',
-                            'SCCode': 'Код контракта'
-                        }
-                        df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
-                        existing_df = pd.concat([existing_df, df_day], ignore_index=True) if not existing_df.empty else df_day
-                        self.log(f"✅ Получено {len(df_day)} записей")
-                    else:
-                        self.log(f"ℹ️ Нет данных за {target_date}")
-                elif resp.status_code == 429:
-                    self.log(f"⚠️ Лимит запросов, ждём 65 сек...")
-                    time.sleep(65)
-                    return False
-                else:
-                    self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
-                    return False
-            except Exception as e:
-                self.log(f"❌ Исключение при запросе: {e}")
-                return False
-
-        if not existing_df.empty:
-            cutoff_date = (datetime.now() - timedelta(days=self.data_period_days)).strftime('%Y-%m-%d')
-            existing_df['Дата запроса_dt'] = pd.to_datetime(existing_df['Дата запроса'])
-            filtered = existing_df[existing_df['Дата запроса_dt'] >= cutoff_date].copy()
-            filtered.drop(columns=['Дата запроса_dt'], inplace=True)
-            self.log(f"🗑️ Удалено записей старше {cutoff_date}: {len(existing_df) - len(filtered)}")
-            existing_df = filtered
-
-        self._last_save_start = time.time()
-        if self._save_report(existing_df, store_name, 'stocks'):
-            if target_date not in existing_dates and 'df_day' in locals():
-                self._save_weekly(df_day, store_name, 'stocks', datetime.strptime(target_date, '%Y-%m-%d'))
+            self.log(f"✅ Данные за {target_date} уже есть в недельном файле, пропускаем")
             return True
+
+        self.log(f"📅 Загрузка остатков за {target_date}...")
+        api_key = self.api_keys[store_name][config['key_type']]
+        headers = {"Authorization": api_key.strip()}
+        try:
+            params = {"dateFrom": target_date.strftime('%Y-%m-%d')}
+            resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    df_day = pd.DataFrame(data)
+                    df_day['Дата запроса'] = target_date.strftime('%Y-%m-%d')
+                    df_day['Магазин'] = store_name
+                    df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    rename_map = {
+                        'lastChangeDate': 'Дата последнего изменения',
+                        'warehouseName': 'Склад',
+                        'supplierArticle': 'Артикул продавца',
+                        'nmId': 'Артикул WB',
+                        'barcode': 'Баркод',
+                        'quantity': 'Доступно для продажи',
+                        'inWayToClient': 'В пути к клиенту',
+                        'inWayFromClient': 'В пути от клиента',
+                        'quantityFull': 'Полное количество',
+                        'category': 'Категория',
+                        'subject': 'Предмет',
+                        'brand': 'Бренд',
+                        'techSize': 'Размер',
+                        'Price': 'Цена',
+                        'Discount': 'Скидка',
+                        'isSupply': 'Договор поставки',
+                        'isRealization': 'Договор реализации',
+                        'SCCode': 'Код контракта'
+                    }
+                    df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
+
+                    if weekly_df.empty:
+                        weekly_df = df_day
+                    else:
+                        weekly_df = pd.concat([weekly_df, df_day], ignore_index=True)
+
+                    self._save_weekly_data(weekly_df, store_name, 'stocks', week_start)
+                    self.log(f"✅ Данные за {target_date} добавлены в недельный файл")
+                else:
+                    self.log(f"ℹ️ Нет данных за {target_date}")
+            elif resp.status_code == 429:
+                self.log(f"⚠️ Лимит запросов, ждём 65 сек...")
+                time.sleep(65)
+                return False
+            else:
+                self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                return False
+        except Exception as e:
+            self.log(f"❌ Исключение при запросе: {e}")
+            return False
+
         return True
 
     # ---------- Финансовые показатели ----------
     def update_finance(self, store_name: str) -> bool:
-        """Обновление финансовых показателей. Сохраняем основной файл один раз в конце."""
+        """Обновление финансовых показателей понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name}")
         config = self.reports_config['finance']
-        existing_df = self._load_existing_report(store_name, 'finance')
+
         start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
+        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
 
-        if not existing_df.empty:
-            existing_df['rr_dt'] = pd.to_datetime(existing_df['rr_dt']).dt.strftime('%Y-%m-%d')
-            existing_dates = set(existing_df['rr_dt'].unique())
-        else:
-            existing_dates = set()
+        weeks = defaultdict(list)
+        for d in all_dates:
+            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
+            weeks[week_start].append(d)
 
-        dates_to_load = [d for d in all_dates if d not in existing_dates]
-        if not dates_to_load:
-            self.log("✅ Все финансовые данные уже загружены")
-            return True
-
-        self.log(f"📅 Будет загружено дней: {len(dates_to_load)}")
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
-        current_df = existing_df.copy()
-        loaded_days = 0
 
-        for i, date_str in enumerate(dates_to_load, 1):
-            self.log(f"📅 Загрузка дня {i}/{len(dates_to_load)}: {date_str}")
-            day_data = self._fetch_finance_day(config, headers, date_str)
-            if day_data:
-                day_df = pd.DataFrame(day_data)
-                day_df['store'] = store_name
-                if 'rr_dt' in day_df.columns:
-                    day_df['rr_dt'] = pd.to_datetime(day_df['rr_dt']).dt.strftime('%Y-%m-%d')
-                current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
-                loaded_days += 1
-                self.log(f"✅ Получено {len(day_df)} записей")
+        for week_start, dates in weeks.items():
+            self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
+            weekly_df = self._load_weekly_data(store_name, 'finance', week_start)
+            if not weekly_df.empty:
+                existing_dates = set(pd.to_datetime(weekly_df['rr_dt']).dt.date.unique()) if 'rr_dt' in weekly_df.columns else set()
             else:
-                self.log("ℹ️ Нет данных за этот день")
+                existing_dates = set()
+
+            dates_to_load = [d for d in dates if d not in existing_dates]
+            if not dates_to_load:
+                self.log(f"✅ Все дни недели уже загружены")
                 continue
 
-            self._save_weekly(day_df, store_name, 'finance', datetime.strptime(date_str, '%Y-%m-%d'))
+            self.log(f"📅 Недостающие дни: {[d.strftime('%Y-%m-%d') for d in dates_to_load]}")
 
-            if i < len(dates_to_load):
-                time.sleep(self.delays['finance'])
+            new_data = []
+            for date in dates_to_load:
+                date_str = date.strftime('%Y-%m-%d')
+                self.log(f"📅 Загрузка дня: {date_str}")
+                day_data = self._fetch_finance_day(config, headers, date_str)
+                if day_data:
+                    day_df = pd.DataFrame(day_data)
+                    day_df['store'] = store_name
+                    if 'rr_dt' in day_df.columns:
+                        day_df['rr_dt'] = pd.to_datetime(day_df['rr_dt']).dt.strftime('%Y-%m-%d')
+                    new_data.append(day_df)
+                    self.log(f"✅ Получено {len(day_df)} записей")
+                else:
+                    self.log(f"ℹ️ Нет данных за {date_str}")
 
-        if loaded_days > 0:
-            self.log(f"💾 Сохраняем итоговый файл с {len(current_df)} записями...")
-            self._last_save_start = time.time()
-            if self._save_report(current_df, store_name, 'finance'):
-                self.log(f"✅ Финансовые данные успешно обновлены, добавлено {loaded_days} дней")
+                if date != dates_to_load[-1]:
+                    time.sleep(self.delays['finance'])
+
+            if new_data:
+                new_df = pd.concat(new_data, ignore_index=True)
+                if weekly_df.empty:
+                    weekly_df = new_df
+                else:
+                    weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
+
+                self._save_weekly_data(weekly_df, store_name, 'finance', week_start)
             else:
-                self.log("❌ Ошибка сохранения итогового файла")
-                return False
-        else:
-            self.log("⚠️ Ни одного нового дня не загружено")
+                self.log(f"ℹ️ Нет новых данных за неделю")
 
         return True
 
     # ---------- Позиции по ключам ----------
     def update_keywords(self, store_name: str) -> bool:
-        """Инкрементальное обновление данных по поисковым запросам (только по заданным категориям)."""
+        """Инкрементальное обновление данных по поисковым запросам понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
 
+        # Получаем актуальные артикулы из заказов
         articles = self._get_articles_by_subjects(store_name, self.target_subjects)
         if not articles:
-            self.log("⚠️ Нет артикулов из заказов по заданным категориям, используем резервный список")
-            articles = [87705142, 110254021, 118217701, 111944302, 110561153]
+            self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
+            return False
 
-        existing_df = self._load_existing_report(store_name, 'keywords')
-        if existing_df.empty:
-            self.log("📊 Существующий файл пуст, будет создан новый")
-        else:
-            self.log(f"📊 Загружено существующих записей: {len(existing_df)}")
+        self.log(f"📦 Будет обработано артикулов: {len(articles)}")
 
         start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range((end_date - start_date).days + 1)]
-        filters = ["orders", "openCard", "addToCart"]
+        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
 
-        missing_by_date = {}
-        if not existing_df.empty:
-            existing_df['Дата'] = existing_df['Дата'].astype(str)
-
-        for date_str in all_dates:
-            missing_articles = []
-            for nm_id in articles:
-                if existing_df.empty:
-                    missing_articles.append(nm_id)
-                else:
-                    mask = (existing_df['Дата'] == date_str) & (existing_df['Артикул WB'] == nm_id)
-                    day_data = existing_df[mask]
-                    present_filters = set(day_data['Фильтр'].unique()) if 'Фильтр' in day_data.columns else set()
-                    if not set(filters).issubset(present_filters):
-                        missing_articles.append(nm_id)
-            if missing_articles:
-                missing_by_date[date_str] = missing_articles
-
-        total_missing = sum(len(v) for v in missing_by_date.values())
-        if total_missing == 0:
-            self.log("✅ Все данные по ключам уже загружены")
-            return True
-
-        self.log(f"📊 Обнаружено пропусков: {total_missing} комбинаций (дата, артикул)")
-        sorted_dates = sorted(missing_by_date.keys(), reverse=True)
-        self.log(f"📅 Будет загружено дней: {len(sorted_dates)}")
+        weeks = defaultdict(list)
+        for d in all_dates:
+            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
+            weeks[week_start].append(d)
 
         api_key = self.api_keys[store_name]['promo']
         headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
         url = self.reports_config['keywords']['api_url']
 
-        errors = []
-        for date_idx, date_str in enumerate(sorted_dates, 1):
-            articles_for_date = missing_by_date[date_str]
-            self.log(f"📅 День {date_idx}/{len(sorted_dates)}: {date_str}, артикулов: {len(articles_for_date)}")
+        filters = ["orders", "openCard", "addToCart"]
 
-            batches = [articles_for_date[i:i+50] for i in range(0, len(articles_for_date), 50)]
-            for batch_idx, batch in enumerate(batches, 1):
-                self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
-                batch_data = []
+        for week_start, dates in weeks.items():
+            self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
+            weekly_df = self._load_weekly_data(store_name, 'keywords', week_start)
 
-                for filter_field in filters:
-                    self.log(f"    🔍 Фильтр {filter_field}", end="")
-                    payload = {
-                        "currentPeriod": {"start": date_str, "end": date_str},
-                        "nmIds": batch,
-                        "topOrderBy": filter_field,
-                        "includeSubstitutedSKUs": False,
-                        "includeSearchTexts": True,
-                        "orderBy": {"field": filter_field, "mode": "desc"},
-                        "limit": 100
-                    }
-                    max_retries = 3
-                    for attempt in range(max_retries):
+            # Создаём множество существующих комбинаций (дата, артикул, фильтр)
+            existing_keys = set()
+            if not weekly_df.empty:
+                for _, row in weekly_df.iterrows():
+                    d = row.get('Дата')
+                    nm = row.get('Артикул WB')
+                    f = row.get('Фильтр')
+                    if d and nm and f:
                         try:
-                            resp = requests.post(url, headers=headers, json=payload, timeout=60)
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                items = data.get('data', {}).get('items', [])
-                                if items:
+                            existing_keys.add((str(d), int(nm), f))
+                        except:
+                            pass
+
+            # Определяем недостающие комбинации для этой недели
+            missing_by_date = defaultdict(list)
+            for date in dates:
+                date_str = date.strftime('%Y-%m-%d')
+                for nm_id in articles:
+                    for f in filters:
+                        if (date_str, nm_id, f) not in existing_keys:
+                            missing_by_date[date_str].append(nm_id)
+                            break  # достаточно одного отсутствующего фильтра, чтобы загрузить артикул
+
+            if not missing_by_date:
+                self.log(f"✅ Все данные за неделю уже загружены")
+                continue
+
+            self.log(f"📅 Недостающие дни: {list(missing_by_date.keys())}")
+
+            new_data = []
+            for date_str, nm_ids in missing_by_date.items():
+                self.log(f"📅 Загрузка дня {date_str}, артикулов: {len(nm_ids)}")
+                # Разбиваем на батчи по 50
+                batches = [nm_ids[i:i+50] for i in range(0, len(nm_ids), 50)]
+                for batch in batches:
+                    batch_data = []
+                    for filter_field in filters:
+                        payload = {
+                            "currentPeriod": {"start": date_str, "end": date_str},
+                            "nmIds": batch,
+                            "topOrderBy": filter_field,
+                            "includeSubstitutedSKUs": False,
+                            "includeSearchTexts": True,
+                            "orderBy": {"field": filter_field, "mode": "desc"},
+                            "limit": 100
+                        }
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+                                if resp.status_code == 200:
+                                    data = resp.json()
+                                    items = data.get('data', {}).get('items', [])
                                     for item in items:
                                         text = item.get('text', '').strip()
                                         if not text:
@@ -809,59 +779,52 @@ class WildberriesDailyUpdater:
                                             "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
                                         }
                                         batch_data.append(row)
-                                    self.log(f" -> ✓ {len(items)} записей")
+                                    break
+                                elif resp.status_code == 429:
+                                    wait = 60 * (attempt + 1)
+                                    self.log(f"    ⚠ Лимит, ждём {wait} сек...")
+                                    time.sleep(wait)
                                 else:
-                                    self.log(f" -> ℹ️ нет данных")
-                                break
-                            elif resp.status_code == 429:
-                                wait = 60 * (attempt + 1)
-                                self.log(f"    ⚠ Лимит, ждём {wait} сек...", end="")
-                                time.sleep(wait)
-                            else:
-                                self.log(f" -> ❌ ошибка {resp.status_code}")
-                                break
-                        except Exception as e:
-                            self.log(f"    ❌ Исключение: {e}")
-                            if attempt < max_retries - 1:
-                                time.sleep(10)
-                            else:
-                                for nm_id in batch:
-                                    errors.append((date_str, nm_id, filter_field))
-                            break
+                                    self.log(f"    ❌ Ошибка {resp.status_code}")
+                                    break
+                            except Exception as e:
+                                self.log(f"    ❌ Исключение: {e}")
+                                if attempt < max_retries - 1:
+                                    time.sleep(10)
+                                else:
+                                    break
+                        time.sleep(20)  # пауза между фильтрами
 
-                    if filter_field != filters[-1]:
-                        time.sleep(20)
+                    if batch_data:
+                        batch_df = pd.DataFrame(batch_data)
+                        new_data.append(batch_df)
 
-                if batch_data:
-                    new_df = pd.DataFrame(batch_data)
-                    existing_df = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-                    self._last_save_start = time.time()
-                    if self._save_report(existing_df, store_name, 'keywords'):
-                        self._save_weekly(new_df, store_name, 'keywords', datetime.strptime(date_str, '%Y-%m-%d'))
+                    time.sleep(20)  # пауза между батчами
 
-                if batch_idx < len(batches):
-                    self.log("    ⏳ Пауза 20 сек между батчами...")
-                    time.sleep(20)
+                time.sleep(self.delays['keywords'])
 
-            if date_idx < len(sorted_dates):
-                self.log("⏳ Пауза 20 сек между днями...")
-                time.sleep(20)
+            if new_data:
+                new_df = pd.concat(new_data, ignore_index=True)
+                if weekly_df.empty:
+                    weekly_df = new_df
+                else:
+                    weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
 
-        if errors:
-            self.log(f"\n⚠ Зафиксировано {len(errors)} ошибок.")
-        else:
-            self.log("✅ Все данные успешно загружены")
+                self._save_weekly_data(weekly_df, store_name, 'keywords', week_start)
+            else:
+                self.log(f"ℹ️ Нет новых данных за неделю")
+
         return True
 
     # ---------- Воронка продаж ----------
     def update_funnel(self, store_name: str) -> bool:
-        """Обновление воронки продаж (сложный отчёт через генерацию)."""
+        """Обновление воронки продаж (сложный отчёт через генерацию). Сохраняется в единый файл."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name}")
         config = self.reports_config['funnel']
 
-        key = self._get_s3_key(store_name, 'funnel')
+        key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
         if self.s3.file_exists(key):
-            df_existing = self._load_existing_report(store_name, 'funnel')
+            df_existing = self.s3.read_excel(key, sheet_name=config['name'])
             if not df_existing.empty:
                 start_date, _ = self._get_date_range_90_days()
                 date_col = config['date_column']
@@ -943,7 +906,8 @@ class WildberriesDailyUpdater:
                                 if 'dt' in df.columns:
                                     df['dt'] = pd.to_datetime(df['dt']).dt.strftime('%Y-%m-%d')
                                 self._last_save_start = time.time()
-                                self._save_report(df, store_name, 'funnel')
+                                self.s3.write_excel(key, df, sheet_name=config['name'])
+                                self.log(f"✅ Воронка продаж сохранена: {key}")
                                 return True
                 elif resp.status_code == 202:
                     self.log(f"⏳ Отчёт ещё не готов, попытка {attempt}/30")
@@ -957,7 +921,7 @@ class WildberriesDailyUpdater:
 
     # ---------- Реклама ----------
     def update_adverts(self, store_name: str) -> bool:
-        """Обновление данных по рекламным кампаниям."""
+        """Обновление данных по рекламным кампаниям понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
@@ -976,27 +940,13 @@ class WildberriesDailyUpdater:
             self.log(f"❌ Ошибка чтения База данных.xlsx: {e}")
             return False
 
-        existing_df = self._load_existing_report(store_name, 'adverts')
-        if not existing_df.empty:
-            existing_df['Дата'] = pd.to_datetime(existing_df['Дата']).dt.strftime('%Y-%m-%d')
-            existing_keys = set(zip(existing_df['ID кампании'], existing_df['Дата']))
-        else:
-            existing_keys = set()
-
         start_date, end_date = self._get_date_range_last_n_days(30)
-        required_dates = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(30)]
+        all_dates = [(start_date + timedelta(days=i)).date() for i in range(30)]
 
-        missing = []
-        for cid in campaign_ids:
-            for d in required_dates:
-                if (cid, d) not in existing_keys:
-                    missing.append((cid, d))
-
-        if not missing:
-            self.log("✅ Все рекламные данные за последние 30 дней уже загружены")
-            return True
-
-        self.log(f"📊 Необходимо загрузить {len(missing)} записей (кампания, дата)")
+        weeks = defaultdict(list)
+        for d in all_dates:
+            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
+            weeks[week_start].append(d)
 
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
@@ -1026,141 +976,127 @@ class WildberriesDailyUpdater:
 
         self.log(f"✅ Получена информация о {len(campaigns_info)} кампаниях")
 
-        missing_by_date = defaultdict(list)
-        for cid, d in missing:
-            missing_by_date[d].append(cid)
+        for week_start, dates in weeks.items():
+            self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
+            weekly_df = self._load_weekly_data(store_name, 'adverts', week_start)
 
-        current_df = existing_df.copy()
-        loaded_days = 0
-        stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
+            existing_keys = set()
+            if not weekly_df.empty:
+                for _, row in weekly_df.iterrows():
+                    cid = row.get('ID кампании')
+                    d = row.get('Дата')
+                    if cid and d:
+                        existing_keys.add((cid, d))
 
-        for date_str, cids in missing_by_date.items():
-            self.log(f"📅 Загрузка статистики за {date_str} для {len(cids)} кампаний...")
-            chunks = [cids[i:i+30] for i in range(0, len(cids), 30)]
-            day_data = []
-            for chunk in chunks:
-                ids_param = ','.join(map(str, chunk))
-                params = {
-                    'ids': ids_param,
-                    'beginDate': date_str,
-                    'endDate': date_str
-                }
-                retries = 0
-                success = False
-                while retries < 3 and not success:
-                    try:
-                        resp = requests.get(stats_url, headers=headers, params=params, timeout=60)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            if data:
-                                for camp in data:
-                                    camp_id = camp.get('advertId')
-                                    days = camp.get('days', [])
-                                    for day in days:
-                                        day_date = day.get('date', '').split('T')[0]
-                                        if day_date != date_str:
-                                            continue
-                                        row = {
-                                            'ID кампании': camp_id,
-                                            'Артикул WB': id_to_article.get(camp_id, ''),
-                                            'Название': campaigns_info.get(camp_id, {}).get('name', ''),
-                                            'Название предмета': campaigns_info.get(camp_id, {}).get('subject', ''),
-                                            'Дата': day_date,
-                                            'Показы': day.get('views', 0),
-                                            'Клики': day.get('clicks', 0),
-                                            'CTR': day.get('ctr', 0),
-                                            'CPC': day.get('cpc', 0),
-                                            'Заказы': day.get('orders', 0),
-                                            'CR': day.get('cr', 0),
-                                            'Расход': day.get('sum', 0),
-                                            'ATBS': day.get('atbs', 0),
-                                            'SHKS': day.get('shks', 0),
-                                            'Сумма заказов': day.get('sum_price', 0),
-                                            'Отменено': day.get('canceled', 0),
-                                        }
-                                        if row['Сумма заказов'] > 0:
-                                            row['ДРР'] = round(row['Расход'] / (row['Сумма заказов'] * 0.88) * 100, 2)
-                                        else:
-                                            row['ДРР'] = 0
-                                        day_data.append(row)
+            missing = []
+            for d in dates:
+                date_str = d.strftime('%Y-%m-%d')
+                for cid in campaign_ids:
+                    if (cid, date_str) not in existing_keys:
+                        missing.append((cid, date_str))
+
+            if not missing:
+                self.log(f"✅ Все данные за неделю уже загружены")
+                continue
+
+            self.log(f"📅 Недостающих записей: {len(missing)}")
+
+            missing_by_date = defaultdict(list)
+            for cid, date_str in missing:
+                missing_by_date[date_str].append(cid)
+
+            new_data = []
+            stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
+
+            for date_str, cids in missing_by_date.items():
+                self.log(f"📅 Загрузка статистики за {date_str} для {len(cids)} кампаний...")
+                chunks = [cids[i:i+30] for i in range(0, len(cids), 30)]
+                day_data = []
+                for chunk in chunks:
+                    ids_param = ','.join(map(str, chunk))
+                    params = {
+                        'ids': ids_param,
+                        'beginDate': date_str,
+                        'endDate': date_str
+                    }
+                    retries = 0
+                    success = False
+                    while retries < 3 and not success:
+                        try:
+                            resp = requests.get(stats_url, headers=headers, params=params, timeout=60)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                if data:
+                                    for camp in data:
+                                        camp_id = camp.get('advertId')
+                                        days = camp.get('days', [])
+                                        for day in days:
+                                            day_date = day.get('date', '').split('T')[0]
+                                            if day_date != date_str:
+                                                continue
+                                            row = {
+                                                'ID кампании': camp_id,
+                                                'Артикул WB': id_to_article.get(camp_id, ''),
+                                                'Название': campaigns_info.get(camp_id, {}).get('name', ''),
+                                                'Название предмета': campaigns_info.get(camp_id, {}).get('subject', ''),
+                                                'Дата': day_date,
+                                                'Показы': day.get('views', 0),
+                                                'Клики': day.get('clicks', 0),
+                                                'CTR': day.get('ctr', 0),
+                                                'CPC': day.get('cpc', 0),
+                                                'Заказы': day.get('orders', 0),
+                                                'CR': day.get('cr', 0),
+                                                'Расход': day.get('sum', 0),
+                                                'ATBS': day.get('atbs', 0),
+                                                'SHKS': day.get('shks', 0),
+                                                'Сумма заказов': day.get('sum_price', 0),
+                                                'Отменено': day.get('canceled', 0),
+                                            }
+                                            if row['Сумма заказов'] > 0:
+                                                row['ДРР'] = round(row['Расход'] / (row['Сумма заказов'] * 0.88) * 100, 2)
+                                            else:
+                                                row['ДРР'] = 0
+                                            day_data.append(row)
                                 success = True
+                            elif resp.status_code == 429:
+                                retries += 1
+                                wait = 60 * retries
+                                self.log(f"    ⚠️ Лимит, ждём {wait} сек...")
+                                time.sleep(wait)
                             else:
-                                self.log(f"    ℹ️ Нет данных за {date_str} для этой группы")
-                                success = True
-                        elif resp.status_code == 429:
-                            retries += 1
-                            wait = 60 * retries
-                            self.log(f"    ⚠️ Лимит, ждём {wait} сек...")
-                            time.sleep(wait)
-                        else:
-                            self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                                self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                                break
+                        except Exception as e:
+                            self.log(f"    ❌ Исключение: {e}")
                             break
-                    except Exception as e:
-                        self.log(f"    ❌ Исключение: {e}")
-                        break
-                time.sleep(30)
+                    time.sleep(30)
 
-            if day_data:
-                day_df = pd.DataFrame(day_data)
-                if 'Название предмета' in day_df.columns:
-                    day_df['Название предмета'] = day_df['Название предмета'].str.strip().str.lower().str.capitalize()
-                current_df = pd.concat([current_df, day_df], ignore_index=True) if not current_df.empty else day_df
-                loaded_days += 1
-                self._save_weekly(day_df, store_name, 'adverts', datetime.strptime(date_str, '%Y-%m-%d'))
+                if day_data:
+                    day_df = pd.DataFrame(day_data)
+                    if 'Название предмета' in day_df.columns:
+                        day_df['Название предмета'] = day_df['Название предмета'].str.strip().str.lower().str.capitalize()
+                    new_data.append(day_df)
+
+                time.sleep(self.delays['adverts'])
+
+            if new_data:
+                new_df = pd.concat(new_data, ignore_index=True)
+                if weekly_df.empty:
+                    weekly_df = new_df
+                else:
+                    weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
+
+                self._save_weekly_data(weekly_df, store_name, 'adverts', week_start)
             else:
-                self.log(f"ℹ️ Нет новых данных за {date_str}")
-
-            time.sleep(self.delays['adverts'])
-
-        if loaded_days > 0:
-            self.log(f"💾 Сохраняем итоговый файл рекламы с {len(current_df)} записями...")
-            extra_sheets = {}
-            if not current_df.empty:
-                daily_cat = current_df.groupby(['Дата', 'Название предмета']).agg({
-                    'Показы': 'sum',
-                    'Клики': 'sum',
-                    'Заказы': 'sum',
-                    'Расход': 'sum',
-                    'Сумма заказов': 'sum'
-                }).reset_index()
-                daily_cat['CTR'] = (daily_cat['Клики'] / daily_cat['Показы'] * 100).round(2)
-                daily_cat['CPC'] = (daily_cat['Расход'] / daily_cat['Клики']).round(2)
-                daily_cat['CR'] = (daily_cat['Заказы'] / daily_cat['Клики'] * 100).round(2)
-                daily_cat['ROI'] = ((daily_cat['Сумма заказов'] - daily_cat['Расход']) / daily_cat['Расход'] * 100).round(2)
-                daily_cat['ДРР'] = (daily_cat['Расход'] / (daily_cat['Сумма заказов'] * 0.88) * 100).round(2)
-                daily_cat = daily_cat.sort_values(['Дата', 'Расход'], ascending=[True, False])
-                extra_sheets['Отчет_по_Категории'] = daily_cat
-
-                summary_cat = current_df.groupby('Название предмета').agg({
-                    'Показы': 'sum',
-                    'Клики': 'sum',
-                    'Заказы': 'sum',
-                    'Расход': 'sum',
-                    'Сумма заказов': 'sum'
-                }).reset_index()
-                summary_cat['CTR'] = (summary_cat['Клики'] / summary_cat['Показы'] * 100).round(2)
-                summary_cat['CPC'] = (summary_cat['Расход'] / summary_cat['Клики']).round(2)
-                summary_cat['CR'] = (summary_cat['Заказы'] / summary_cat['Клики'] * 100).round(2)
-                summary_cat['ROI'] = ((summary_cat['Сумма заказов'] - summary_cat['Расход']) / summary_cat['Расход'] * 100).round(2)
-                summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
-                summary_cat = summary_cat.sort_values('Расход', ascending=False)
-                extra_sheets['Отчет_по_Категории_Итог'] = summary_cat
-
-            self._last_save_start = time.time()
-            if self._save_report(current_df, store_name, 'adverts', extra_sheets):
-                self.log(f"✅ Рекламные данные успешно обновлены, добавлено {loaded_days} дней")
-            else:
-                self.log("❌ Ошибка сохранения итогового файла")
-                return False
-        else:
-            self.log("⚠️ Ни одного нового дня не загружено")
+                self.log(f"ℹ️ Нет новых данных за неделю")
 
         return True
 
-    # ---------- НОВЫЙ МЕТОД: Остатки из 1С ----------
+    # ---------- Остатки из 1С ----------
     def update_1c_stocks(self, store_name: str = '1С') -> bool:
         """
-        Загружает файл с остатками из 1С по внешнему URL и сохраняет в бакет.
+        Загружает лист "Остатки из 1С" из Google Sheets (по ссылке) и сохраняет в бакет.
+        Ежедневно перезаписывает файл (недельное хранение не требуется).
         """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки из 1С для магазина {store_name}")
         config = self.reports_config['1c_stocks']
@@ -1178,10 +1114,23 @@ class WildberriesDailyUpdater:
             auth = (username, password)
             self.log(f"🔐 Используется базовая аутентификация для пользователя {username}")
 
+        google_match = re.search(r'docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)(?:/.*?gid=(\d+))?', url_1c)
+        if google_match:
+            spreadsheet_id = google_match.group(1)
+            gid = google_match.group(2)
+            if not gid:
+                self.log("❌ В ссылке на Google Sheets не найден параметр gid. Укажите ссылку на конкретный лист.")
+                return False
+            download_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=xlsx&gid={gid}"
+            self.log(f"📄 Обнаружена Google Sheets, gid={gid}. Будет скачан лист с этим gid.")
+        else:
+            download_url = url_1c
+            self.log("📄 Используется прямая ссылка на файл.")
+
         tmp_path = None
         try:
-            self.log(f"📥 Скачивание файла из 1С: {url_1c}")
-            resp = requests.get(url_1c, auth=auth, timeout=120, stream=True)
+            self.log(f"📥 Скачивание файла из: {download_url}")
+            resp = requests.get(download_url, auth=auth, timeout=120, stream=True)
             if resp.status_code != 200:
                 self.log(f"❌ Ошибка при скачивании: HTTP {resp.status_code}")
                 return False
@@ -1192,7 +1141,7 @@ class WildberriesDailyUpdater:
                     tmp.write(chunk)
             self.log(f"📦 Файл временно сохранён: {tmp_path}")
 
-            key = self._get_s3_key(store_name, '1c_stocks')
+            key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
             self.log(f"☁️ Загрузка в бакет: {key}")
             self.s3.upload_file(tmp_path, key)
             self.log(f"✅ Файл успешно сохранён в бакет: {key}")
@@ -1233,7 +1182,6 @@ class WildberriesDailyUpdater:
                     self.log(f"📊 Отчёт {report}: ❌ (исключение)")
             else:
                 self.log(f"⚠️ Неизвестный тип отчёта: {report}")
-            # Пауза между отчётами (кроме последнего)
             if report != reports[-1]:
                 time.sleep(30)
 
@@ -1243,7 +1191,6 @@ class WildberriesDailyUpdater:
 # ========================== ТОЧКА ВХОДА ==========================
 
 if __name__ == "__main__":
-    # Читаем переменные окружения
     required_env = [
         'YC_ACCESS_KEY_ID',
         'YC_SECRET_ACCESS_KEY',
