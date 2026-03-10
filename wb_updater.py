@@ -276,15 +276,15 @@ class WildberriesDailyUpdater:
             traceback.print_exc()
             return False
 
-    def _get_date_range_90_days(self) -> Tuple[datetime, datetime]:
-        """Возвращает диапазон дат за последние 90 дней (без сегодня)."""
+    def _get_date_range_90_days(self) -> Tuple[datetime.date, datetime.date]:
+        """Возвращает диапазон дат за последние 90 дней (без сегодня) как объекты date."""
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
         end_date = today - timedelta(days=1)
         start_date = end_date - timedelta(days=self.data_period_days - 1)
         return start_date, end_date
 
-    def _get_date_range_last_n_days(self, n: int) -> Tuple[datetime, datetime]:
-        """Возвращает диапазон дат за последние n дней (без сегодня)."""
+    def _get_date_range_last_n_days(self, n: int) -> Tuple[datetime.date, datetime.date]:
+        """Возвращает диапазон дат за последние n дней (без сегодня) как объекты date."""
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
         end_date = today - timedelta(days=1)
         start_date = end_date - timedelta(days=n - 1)
@@ -451,8 +451,8 @@ class WildberriesDailyUpdater:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Заказы для магазина {store_name}")
         config = self.reports_config['orders']
 
-        start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
+        start_date, end_date = self._get_date_range_90_days()  # оба — date
+        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
         for d in all_dates:
@@ -593,8 +593,8 @@ class WildberriesDailyUpdater:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name}")
         config = self.reports_config['finance']
 
-        start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
+        start_date, end_date = self._get_date_range_90_days()  # оба — date
+        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
         for d in all_dates:
@@ -664,7 +664,7 @@ class WildberriesDailyUpdater:
         self.log(f"📦 Будет обработано артикулов: {len(articles)}")
 
         start_date, end_date = self._get_date_range_90_days()
-        all_dates = [(start_date + timedelta(days=i)).date() for i in range((end_date - start_date).days + 1)]
+        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
         for d in all_dates:
@@ -941,7 +941,7 @@ class WildberriesDailyUpdater:
             return False
 
         start_date, end_date = self._get_date_range_last_n_days(30)
-        all_dates = [(start_date + timedelta(days=i)).date() for i in range(30)]
+        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
         for d in all_dates:
