@@ -9,6 +9,8 @@
 Финансовые показатели: проверяется только последняя неделя.
 Всегда читается первый лист в файле.
 Добавлены повторные попытки для ошибочных комбинаций.
+Порядок отчётов: keywords – последний.
+Глубина загрузки keywords задаётся переменной KEYWORDS_DAYS (по умолчанию 90).
 """
 
 import os
@@ -111,6 +113,8 @@ class WildberriesDailyUpdater:
         self.s3 = s3
         self.start_time = datetime.now(pytz.timezone('Europe/Moscow'))
         self.data_period_days = 90
+        # Глубина загрузки для keywords (можно задать через переменную окружения)
+        self.keywords_days = int(os.environ.get('KEYWORDS_DAYS', 90))
         self.keyword_errors = []  # для сбора ошибок поисковых запросов
 
         self.reports_config = {
@@ -194,6 +198,7 @@ class WildberriesDailyUpdater:
 
         self.target_subjects = ['Помады', 'Косметические карандаши', 'Кисти косметические', 'Блески']
         self.log(f"🚀 Запуск обновления данных. Время: {self.start_time}")
+        self.log(f"📊 Глубина загрузки для keywords: {self.keywords_days} дней")
 
     # ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
     def log(self, message: str, level: str = "INFO", end: str = "\n"):
@@ -424,6 +429,7 @@ class WildberriesDailyUpdater:
         config = self.reports_config['orders']
         start_date, end_date = self._get_date_range_90_days()
         all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
         weeks = defaultdict(list)
         for d in all_dates:
             week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
@@ -759,7 +765,9 @@ class WildberriesDailyUpdater:
 
         self.log(f"📦 Будет обработано артикулов: {len(articles)}")
 
-        start_date, end_date = self._get_date_range_90_days()
+        # Используем глубину, заданную переменной KEYWORDS_DAYS
+        end_date = datetime.now(pytz.timezone('Europe/Moscow')).date() - timedelta(days=1)
+        start_date = end_date - timedelta(days=self.keywords_days - 1)
         all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
@@ -1280,7 +1288,8 @@ class WildberriesDailyUpdater:
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
-        all_reports = ['orders', 'stocks', 'finance', 'keywords', 'funnel', 'adverts', '1c_stocks']
+        # keywords – последний в списке
+        all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', '1c_stocks', 'keywords']
         if reports is None:
             reports = all_reports
 
