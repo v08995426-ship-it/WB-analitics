@@ -8,9 +8,7 @@
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
 Финансовые показатели: проверяется только последняя неделя.
 Всегда читается первый лист в файле.
-Добавлены повторные попытки для ошибочных комбинаций.
-Порядок отчётов: keywords – последний.
-Глубина загрузки keywords задаётся переменной KEYWORDS_DAYS (по умолчанию 90).
+Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 """
 
 import os
@@ -113,8 +111,6 @@ class WildberriesDailyUpdater:
         self.s3 = s3
         self.start_time = datetime.now(pytz.timezone('Europe/Moscow'))
         self.data_period_days = 90
-        # Глубина загрузки для keywords (можно задать через переменную окружения)
-        self.keywords_days = int(os.environ.get('KEYWORDS_DAYS', 90))
         self.keyword_errors = []  # для сбора ошибок поисковых запросов
 
         self.reports_config = {
@@ -198,7 +194,6 @@ class WildberriesDailyUpdater:
 
         self.target_subjects = ['Помады', 'Косметические карандаши', 'Кисти косметические', 'Блески']
         self.log(f"🚀 Запуск обновления данных. Время: {self.start_time}")
-        self.log(f"📊 Глубина загрузки для keywords: {self.keywords_days} дней")
 
     # ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
     def log(self, message: str, level: str = "INFO", end: str = "\n"):
@@ -746,7 +741,7 @@ class WildberriesDailyUpdater:
                             for nm_id in batch:
                                 new_errors.append((date_str, nm_id, filter_field))
                         break
-                time.sleep(30)  # пауза между батчами
+                time.sleep(30)
 
         self.keyword_errors = new_errors
         if self.keyword_errors:
@@ -754,201 +749,201 @@ class WildberriesDailyUpdater:
         else:
             self.log("✅ Все ошибки устранены")
 
-    # ---------- Позиции по ключам ----------
+    # ---------- Позиции по ключам (загрузка только за предыдущий день) ----------
     def update_keywords(self, store_name: str) -> bool:
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
+        """
+        Загружает данные по поисковым запросам только за предыдущий день (вчера).
+        Проверяет наличие всех трёх фильтров для всех актуальных артикулов в недельном файле.
+        Если каких-то фильтров не хватает – догружает их.
+        """
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} (только за вчера)")
 
+        # 1. Получаем актуальные артикулы из заказов
         articles = self._get_articles_by_subjects(store_name, self.target_subjects)
         if not articles:
             self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
             return False
 
-        self.log(f"📦 Будет обработано артикулов: {len(articles)}")
+        self.log(f"📦 Актуальных артикулов: {len(articles)}")
 
-        # Используем глубину, заданную переменной KEYWORDS_DAYS
-        end_date = datetime.now(pytz.timezone('Europe/Moscow')).date() - timedelta(days=1)
-        start_date = end_date - timedelta(days=self.keywords_days - 1)
-        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        # 2. Определяем целевую дату – вчера
+        target_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
+        target_date_str = target_date.strftime('%Y-%m-%d')
+        self.log(f"📅 Целевая дата: {target_date_str}")
 
-        weeks = defaultdict(list)
-        for d in all_dates:
-            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
-            weeks[week_start].append(d)
+        # 3. Определяем неделю, к которой относится целевая дата
+        week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
+        self.log(f"📅 Неделя начинается: {week_start.strftime('%Y-%m-%d')}")
 
-        # Сортируем недели по убыванию (сначала новые)
-        sorted_weeks = sorted(weeks.items(), key=lambda x: x[0], reverse=True)
+        # 4. Загружаем существующий недельный файл (если есть)
+        weekly_df = self._load_weekly_data(store_name, 'keywords', week_start)
 
+        # 5. Формируем множество существующих комбинаций (дата, артикул, фильтр) для целевой даты
+        existing_keys = set()
+        if not weekly_df.empty:
+            # Фильтруем только строки за целевую дату (на всякий случай)
+            day_df = weekly_df[weekly_df['Дата'] == target_date_str].copy()
+            if not day_df.empty:
+                day_df['Артикул WB'] = day_df['Артикул WB'].astype(int)
+                for _, row in day_df.iterrows():
+                    nm = row['Артикул WB']
+                    f = row['Фильтр']
+                    existing_keys.add((target_date_str, nm, f))
+                self.log(f"🔍 В недельном файле найдено {len(existing_keys)} записей за {target_date_str}")
+            else:
+                self.log(f"ℹ️ За {target_date_str} в недельном файле записей нет")
+
+        filters = ["orders", "openCard", "addToCart"]
+
+        # 6. Определяем, каких фильтров не хватает для каждого артикула
+        missing_articles = []  # список артикулов, по которым не хватает хотя бы одного фильтра
+        for nm_id in articles:
+            missing_filters = []
+            for f in filters:
+                if (target_date_str, nm_id, f) not in existing_keys:
+                    missing_filters.append(f)
+            if missing_filters:
+                missing_articles.append(nm_id)
+                if len(missing_articles) <= 3:  # логируем первые несколько для отладки
+                    self.log(f"❌ Для артикула {nm_id} пропущены фильтры: {missing_filters}")
+
+        if not missing_articles:
+            self.log(f"✅ Все данные за {target_date_str} уже загружены полностью.")
+            return True
+
+        self.log(f"📅 Необходимо загрузить данные для {len(missing_articles)} артикулов")
+
+        # 7. Загружаем недостающие данные
         api_key = self.api_keys[store_name]['promo']
         headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
         url = self.reports_config['keywords']['api_url']
 
-        filters = ["orders", "openCard", "addToCart"]
-
         # Сброс списка ошибок перед началом
         self.keyword_errors = []
 
-        for week_start, dates in sorted_weeks:
-            self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
-            weekly_df = self._load_weekly_data(store_name, 'keywords', week_start)
+        # Загружаем все артикулы сразу (разбиваем на батчи по 50)
+        new_data = []
+        batches = [missing_articles[i:i+50] for i in range(0, len(missing_articles), 50)]
+        for batch_idx, batch in enumerate(batches, 1):
+            self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
+            batch_data = []
+            for filter_field in filters:
+                self.log(f"    🔍 Фильтр {filter_field}", end="")
+                payload = {
+                    "currentPeriod": {"start": target_date_str, "end": target_date_str},
+                    "nmIds": batch,
+                    "topOrderBy": filter_field,
+                    "includeSubstitutedSKUs": False,
+                    "includeSearchTexts": True,
+                    "orderBy": {"field": filter_field, "mode": "desc"},
+                    "limit": 100
+                }
+                max_retries = 5
+                success = False
+                for attempt in range(max_retries):
+                    try:
+                        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            items = data.get('data', {}).get('items', [])
+                            for item in items:
+                                text = item.get('text', '').strip()
+                                if not text:
+                                    continue
+                                row = {
+                                    "Дата": target_date_str,
+                                    "Магазин": store_name,
+                                    "Поисковый запрос": text,
+                                    "Фильтр": filter_field,
+                                    "Артикул WB": item.get("nmId", ""),
+                                    "Предмет": item.get("subjectName", ""),
+                                    "Бренд": item.get("brandName", ""),
+                                    "Артикул продавца": item.get("vendorCode", ""),
+                                    "Название товара": item.get("name", ""),
+                                    "Рейтинг карточки": item.get("rating", 0),
+                                    "Рейтинг отзывов": item.get("feedbackRating", 0),
+                                    "Частота запросов": item.get("frequency", {}).get("current", 0),
+                                    "Частота динамика %": item.get("frequency", {}).get("dynamics", 0),
+                                    "Частота за неделю": item.get("weekFrequency", 0),
+                                    "Медианная позиция": item.get("medianPosition", {}).get("current", 0),
+                                    "Медианная позиция динамика %": item.get("medianPosition", {}).get("dynamics", 0),
+                                    "Средняя позиция": item.get("avgPosition", {}).get("current", 0),
+                                    "Средняя позиция динамика %": item.get("avgPosition", {}).get("dynamics", 0),
+                                    "Переходы в карточку": item.get("openCard", {}).get("current", 0),
+                                    "Переходы динамика %": item.get("openCard", {}).get("dynamics", 0),
+                                    "% выше конкурентов (переходы)": item.get("openCard", {}).get("percentile", 0),
+                                    "Добавления в корзину": item.get("addToCart", {}).get("current", 0),
+                                    "Добавления динамика %": item.get("addToCart", {}).get("dynamics", 0),
+                                    "% выше конкурентов (добавления)": item.get("addToCart", {}).get("percentile", 0),
+                                    "Заказы": item.get("orders", {}).get("current", 0),
+                                    "Заказы динамика %": item.get("orders", {}).get("dynamics", 0),
+                                    "% выше конкурентов (заказы)": item.get("orders", {}).get("percentile", 0),
+                                    "Конверсия в заказ %": item.get("cartToOrder", {}).get("current", 0),
+                                    "Конверсия в заказ динамика %": item.get("cartToOrder", {}).get("dynamics", 0),
+                                    "% выше конкурентов (конв. в заказ)": item.get("cartToOrder", {}).get("percentile", 0),
+                                    "Конверсия в корзину %": item.get("openToCart", {}).get("current", 0),
+                                    "Конверсия в корзину динамика %": item.get("openToCart", {}).get("dynamics", 0),
+                                    "% выше конкурентов (конв. в корзину)": item.get("openToCart", {}).get("percentile", 0),
+                                    "Видимость %": item.get("visibility", {}).get("current", 0),
+                                    "Видимость динамика %": item.get("visibility", {}).get("dynamics", 0),
+                                    "Есть рейтинг карточки": item.get("isCardRated", False),
+                                    "Минимальная цена": item.get("price", {}).get("minPrice", 0),
+                                    "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
+                                }
+                                batch_data.append(row)
+                            self.log(f" -> ✓ {len(items)} записей")
+                            success = True
+                            break
+                        elif resp.status_code == 429:
+                            wait = 60 * (attempt + 1)
+                            self.log(f" -> ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                            time.sleep(wait)
+                        elif resp.status_code in (502, 503, 504):
+                            wait = 30 * (attempt + 1)
+                            self.log(f" -> ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                            time.sleep(wait)
+                        else:
+                            self.log(f" -> ❌ Ошибка {resp.status_code}")
+                            break
+                    except Exception as e:
+                        self.log(f"    ❌ Исключение: {e}")
+                        if attempt < max_retries - 1:
+                            time.sleep(10)
+                        else:
+                            break
+                if not success:
+                    # Запоминаем ошибочные комбинации
+                    for nm_id in batch:
+                        self.keyword_errors.append((target_date_str, nm_id, filter_field))
+                # Пауза между фильтрами (кроме последнего)
+                if filter_field != filters[-1]:
+                    time.sleep(30)
 
-            existing_keys = set()
-            if not weekly_df.empty:
-                weekly_df['Дата'] = weekly_df['Дата'].astype(str)
-                weekly_df['Артикул WB'] = weekly_df['Артикул WB'].astype(int)
-                for _, row in weekly_df.iterrows():
-                    d = row['Дата']
-                    nm = row['Артикул WB']
-                    f = row['Фильтр']
-                    existing_keys.add((d, nm, f))
+            if batch_data:
+                batch_df = pd.DataFrame(batch_data)
+                new_data.append(batch_df)
 
-                self.log(f"🔍 В недельном файле найдено {len(existing_keys)} уникальных комбинаций")
+            # Пауза между батчами
+            if batch_idx < len(batches):
+                self.log("    ⏳ Пауза 30 сек между батчами...")
+                time.sleep(30)
+
+        # 8. Если есть новые данные – объединяем с существующими и сохраняем
+        if new_data:
+            new_df = pd.concat(new_data, ignore_index=True)
+            if weekly_df.empty:
+                weekly_df = new_df
             else:
-                self.log(f"ℹ️ Недельный файл пуст или не существует")
+                weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
 
-            missing_by_date = defaultdict(list)
-            for date in dates:
-                date_str = date.strftime('%Y-%m-%d')
-                for nm_id in articles:
-                    missing_filters = []
-                    for f in filters:
-                        if (date_str, nm_id, f) not in existing_keys:
-                            missing_filters.append(f)
-                    if missing_filters:
-                        missing_by_date[date_str].append(nm_id)
-                        if len(missing_by_date[date_str]) <= 3:
-                            self.log(f"❌ Для даты {date_str} артикул {nm_id} пропущены фильтры: {missing_filters}")
+            self._save_weekly_data(weekly_df, store_name, 'keywords', week_start)
+            self.log(f"✅ Данные за {target_date_str} успешно добавлены в недельный файл")
+        else:
+            self.log(f"ℹ️ Нет новых данных для {target_date_str}")
 
-            if not missing_by_date:
-                self.log(f"✅ Все данные за неделю уже загружены")
-                continue
-
-            self.log(f"📅 Недостающие дни: {list(missing_by_date.keys())}")
-            total_missing = sum(len(v) for v in missing_by_date.values())
-            self.log(f"📊 Всего пропущено комбинаций (дата, артикул): {total_missing}")
-
-            new_data = []
-            for date_str, nm_ids in missing_by_date.items():
-                self.log(f"📅 Загрузка дня {date_str}, артикулов: {len(nm_ids)}")
-                batches = [nm_ids[i:i+50] for i in range(0, len(nm_ids), 50)]
-                for batch_idx, batch in enumerate(batches, 1):
-                    self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
-                    batch_data = []
-                    for filter_field in filters:
-                        self.log(f"    🔍 Фильтр {filter_field}", end="")
-                        payload = {
-                            "currentPeriod": {"start": date_str, "end": date_str},
-                            "nmIds": batch,
-                            "topOrderBy": filter_field,
-                            "includeSubstitutedSKUs": False,
-                            "includeSearchTexts": True,
-                            "orderBy": {"field": filter_field, "mode": "desc"},
-                            "limit": 100
-                        }
-                        max_retries = 5
-                        success = False
-                        for attempt in range(max_retries):
-                            try:
-                                resp = requests.post(url, headers=headers, json=payload, timeout=120)
-                                if resp.status_code == 200:
-                                    data = resp.json()
-                                    items = data.get('data', {}).get('items', [])
-                                    for item in items:
-                                        text = item.get('text', '').strip()
-                                        if not text:
-                                            continue
-                                        row = {
-                                            "Дата": date_str,
-                                            "Магазин": store_name,
-                                            "Поисковый запрос": text,
-                                            "Фильтр": filter_field,
-                                            "Артикул WB": item.get("nmId", ""),
-                                            "Предмет": item.get("subjectName", ""),
-                                            "Бренд": item.get("brandName", ""),
-                                            "Артикул продавца": item.get("vendorCode", ""),
-                                            "Название товара": item.get("name", ""),
-                                            "Рейтинг карточки": item.get("rating", 0),
-                                            "Рейтинг отзывов": item.get("feedbackRating", 0),
-                                            "Частота запросов": item.get("frequency", {}).get("current", 0),
-                                            "Частота динамика %": item.get("frequency", {}).get("dynamics", 0),
-                                            "Частота за неделю": item.get("weekFrequency", 0),
-                                            "Медианная позиция": item.get("medianPosition", {}).get("current", 0),
-                                            "Медианная позиция динамика %": item.get("medianPosition", {}).get("dynamics", 0),
-                                            "Средняя позиция": item.get("avgPosition", {}).get("current", 0),
-                                            "Средняя позиция динамика %": item.get("avgPosition", {}).get("dynamics", 0),
-                                            "Переходы в карточку": item.get("openCard", {}).get("current", 0),
-                                            "Переходы динамика %": item.get("openCard", {}).get("dynamics", 0),
-                                            "% выше конкурентов (переходы)": item.get("openCard", {}).get("percentile", 0),
-                                            "Добавления в корзину": item.get("addToCart", {}).get("current", 0),
-                                            "Добавления динамика %": item.get("addToCart", {}).get("dynamics", 0),
-                                            "% выше конкурентов (добавления)": item.get("addToCart", {}).get("percentile", 0),
-                                            "Заказы": item.get("orders", {}).get("current", 0),
-                                            "Заказы динамика %": item.get("orders", {}).get("dynamics", 0),
-                                            "% выше конкурентов (заказы)": item.get("orders", {}).get("percentile", 0),
-                                            "Конверсия в заказ %": item.get("cartToOrder", {}).get("current", 0),
-                                            "Конверсия в заказ динамика %": item.get("cartToOrder", {}).get("dynamics", 0),
-                                            "% выше конкурентов (конв. в заказ)": item.get("cartToOrder", {}).get("percentile", 0),
-                                            "Конверсия в корзину %": item.get("openToCart", {}).get("current", 0),
-                                            "Конверсия в корзину динамика %": item.get("openToCart", {}).get("dynamics", 0),
-                                            "% выше конкурентов (конв. в корзину)": item.get("openToCart", {}).get("percentile", 0),
-                                            "Видимость %": item.get("visibility", {}).get("current", 0),
-                                            "Видимость динамика %": item.get("visibility", {}).get("dynamics", 0),
-                                            "Есть рейтинг карточки": item.get("isCardRated", False),
-                                            "Минимальная цена": item.get("price", {}).get("minPrice", 0),
-                                            "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
-                                        }
-                                        batch_data.append(row)
-                                    self.log(f" -> ✓ {len(items)} записей")
-                                    success = True
-                                    break
-                                elif resp.status_code == 429:
-                                    wait = 60 * (attempt + 1)
-                                    self.log(f" -> ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
-                                    time.sleep(wait)
-                                elif resp.status_code in (502, 503, 504):
-                                    wait = 30 * (attempt + 1)
-                                    self.log(f" -> ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
-                                    time.sleep(wait)
-                                else:
-                                    self.log(f" -> ❌ Ошибка {resp.status_code}")
-                                    break
-                            except Exception as e:
-                                self.log(f"    ❌ Исключение: {e}")
-                                if attempt < max_retries - 1:
-                                    time.sleep(10)
-                                else:
-                                    break
-                        if not success:
-                            # Запоминаем ошибочные комбинации
-                            for nm_id in batch:
-                                self.keyword_errors.append((date_str, nm_id, filter_field))
-                        if filter_field != filters[-1]:
-                            time.sleep(30)
-
-                    if batch_data:
-                        batch_df = pd.DataFrame(batch_data)
-                        new_data.append(batch_df)
-
-                    if batch_idx < len(batches):
-                        self.log("    ⏳ Пауза 30 сек между батчами...")
-                        time.sleep(30)
-
-                if date_str != list(missing_by_date.keys())[-1]:
-                    self.log("⏳ Пауза 90 сек между днями...")
-                    time.sleep(90)
-
-            if new_data:
-                new_df = pd.concat(new_data, ignore_index=True)
-                if weekly_df.empty:
-                    weekly_df = new_df
-                else:
-                    weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
-
-                self._save_weekly_data(weekly_df, store_name, 'keywords', week_start)
-            else:
-                self.log(f"ℹ️ Нет новых данных за неделю")
-
-        # Повторные попытки для ошибочных комбинаций
-        self._retry_keyword_errors(store_name)
+        # 9. Повторные попытки для ошибочных комбинаций
+        if self.keyword_errors:
+            self._retry_keyword_errors(store_name)
 
         return True
 
