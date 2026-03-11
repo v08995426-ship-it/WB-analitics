@@ -8,7 +8,7 @@
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
 Финансовые показатели: проверяется только последняя неделя.
 Всегда читается первый лист в файле.
-Добавлено подробное логирование содержимого файлов.
+Добавлен механизм повторных попыток для неудачных комбинаций (дата, артикул, фильтр).
 """
 
 import os
@@ -21,7 +21,7 @@ import tempfile
 import traceback
 import re
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple, Any, Set
+from typing import List, Dict, Optional, Tuple, Any, Set, Union
 import warnings
 from collections import defaultdict
 
@@ -61,7 +61,7 @@ class S3Storage:
         )
         print(f"🔑 DEBUG: подключение к Yandex Cloud, Access Key (первые 5 символов): {access_key[:5]}...")
 
-    def read_excel(self, key: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+    def read_excel(self, key: str, sheet_name: Optional[Union[int, str]] = None) -> pd.DataFrame:
         """Скачивает Excel-файл из бакета и читает его."""
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -235,7 +235,7 @@ class WildberriesDailyUpdater:
     def _load_weekly_data(self, store_name: str, report_type: str, week_date: datetime) -> pd.DataFrame:
         """
         Загружает данные из недельного файла за указанную неделю.
-        Всегда читает первый лист. Выводит подробную информацию о содержимом.
+        Всегда читает первый лист. Выводит статистику по файлу.
         """
         key = self._get_weekly_key(store_name, report_type, week_date)
         self.log(f"📥 Загрузка недельного файла: {key}")
@@ -245,19 +245,21 @@ class WildberriesDailyUpdater:
                 self.log(f"ℹ️ Файл пуст")
                 return df
 
-            # Логируем колонки
             self.log(f"📋 Колонки в файле: {list(df.columns)}")
 
             date_col = self.reports_config[report_type]['date_column']
             if date_col in df.columns:
-                # Приводим дату к строковому формату
                 df[date_col] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
-                unique_dates = df[date_col].unique()
-                self.log(f"📊 В файле {len(df)} записей, даты: {sorted(unique_dates)}")
+                unique_dates = sorted(df[date_col].unique())
+                self.log(f"📊 В файле {len(df)} записей, даты: {unique_dates}")
+
+                if report_type == 'keywords' and 'Фильтр' in df.columns and 'Артикул WB' in df.columns:
+                    filters_present = df['Фильтр'].unique()
+                    articles_count = df['Артикул WB'].nunique()
+                    self.log(f"🔍 Фильтры в файле: {list(filters_present)}, уникальных артикулов: {articles_count}")
             else:
-                self.log(f"⚠️ Колонка даты '{date_col}' не найдена в файле")
-                # Если колонки даты нет, возможно, данные в другом формате — логируем первые 5 строк для анализа
-                self.log(f"📋 Первые 5 строк:\n{df.head().to_string()}")
+                self.log(f"⚠️ Колонка даты '{date_col}' не найдена")
+
             return df
         except Exception as e:
             self.log(f"⚠️ Ошибка загрузки {key}: {e}")
@@ -372,9 +374,9 @@ class WildberriesDailyUpdater:
         for attempt in range(max_attempts):
             try:
                 if method == 'GET':
-                    resp = requests.get(url, headers=headers, params=params, timeout=60)
+                    resp = requests.get(url, headers=headers, params=params, timeout=120)
                 else:
-                    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+                    resp = requests.post(url, headers=headers, json=payload, timeout=120)
 
                 if resp.status_code == 200:
                     return resp.json()
@@ -384,6 +386,10 @@ class WildberriesDailyUpdater:
                     time.sleep(wait)
                 elif resp.status_code == 204:
                     return []
+                elif resp.status_code in (502, 503, 504):
+                    wait = 30 * (attempt + 1)
+                    self.log(f"    ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_attempts}, ждём {wait} сек...")
+                    time.sleep(wait)
                 else:
                     self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
                     if attempt < max_attempts - 1:
@@ -414,7 +420,7 @@ class WildberriesDailyUpdater:
             }
             for attempt in range(max_attempts):
                 try:
-                    resp = requests.get(url, headers=headers, params=params, timeout=60)
+                    resp = requests.get(url, headers=headers, params=params, timeout=120)
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
@@ -661,7 +667,7 @@ class WildberriesDailyUpdater:
         self.log("✅ Финансовые показатели успешно обновлены")
         return True
 
-    # ---------- Позиции по ключам ----------
+    # ---------- Позиции по ключам (с расширенным логированием и повторными попытками) ----------
     def update_keywords(self, store_name: str) -> bool:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
 
@@ -686,27 +692,29 @@ class WildberriesDailyUpdater:
 
         filters = ["orders", "openCard", "addToCart"]
 
+        failed_combinations = []  # список (date_str, nm_id, filter_field)
+
         for week_start, dates in weeks.items():
             self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
             weekly_df = self._load_weekly_data(store_name, 'keywords', week_start)
 
             existing_keys = set()
             if not weekly_df.empty:
-                # Проверяем наличие нужных колонок
-                if 'Дата' in weekly_df.columns and 'Артикул WB' in weekly_df.columns and 'Фильтр' in weekly_df.columns:
-                    for _, row in weekly_df.iterrows():
-                        d = row['Дата']
-                        nm = row['Артикул WB']
-                        f = row['Фильтр']
-                        if pd.notna(d) and pd.notna(nm) and pd.notna(f):
-                            try:
-                                existing_keys.add((str(d), int(nm), f))
-                            except:
-                                pass
-                else:
-                    self.log(f"⚠️ В недельном файле отсутствуют необходимые колонки ('Дата', 'Артикул WB', 'Фильтр'). Колонки: {list(weekly_df.columns)}")
-                    # Всё равно продолжаем, но существующие ключи не сможем определить
-                    existing_keys = set()
+                # Приводим типы для единообразия
+                weekly_df['Дата'] = weekly_df['Дата'].astype(str)
+                weekly_df['Артикул WB'] = weekly_df['Артикул WB'].astype(int)
+                for _, row in weekly_df.iterrows():
+                    d = row['Дата']
+                    nm = row['Артикул WB']
+                    f = row['Фильтр']
+                    existing_keys.add((d, nm, f))
+
+                self.log(f"🔍 В недельном файле найдено {len(existing_keys)} уникальных комбинаций (дата, артикул, фильтр)")
+                sample_keys = list(existing_keys)[:5]
+                self.log(f"📋 Примеры существующих ключей: {sample_keys}")
+
+            else:
+                self.log(f"ℹ️ Недельный файл пуст или не существует")
 
             missing_by_date = defaultdict(list)
             for date in dates:
@@ -718,12 +726,16 @@ class WildberriesDailyUpdater:
                             missing_filters.append(f)
                     if missing_filters:
                         missing_by_date[date_str].append(nm_id)
+                        if len(missing_by_date[date_str]) <= 3:
+                            self.log(f"❌ Для даты {date_str} артикул {nm_id} пропущены фильтры: {missing_filters}")
 
             if not missing_by_date:
                 self.log(f"✅ Все данные за неделю уже загружены")
                 continue
 
             self.log(f"📅 Недостающие дни: {list(missing_by_date.keys())}")
+            total_missing = sum(len(v) for v in missing_by_date.values())
+            self.log(f"📊 Всего пропущено комбинаций (дата, артикул): {total_missing}")
 
             new_data = []
             for date_str, nm_ids in missing_by_date.items():
@@ -744,9 +756,10 @@ class WildberriesDailyUpdater:
                             "limit": 100
                         }
                         max_retries = 5
+                        success = False
                         for attempt in range(max_retries):
                             try:
-                                resp = requests.post(url, headers=headers, json=payload, timeout=60)
+                                resp = requests.post(url, headers=headers, json=payload, timeout=120)
                                 if resp.status_code == 200:
                                     data = resp.json()
                                     items = data.get('data', {}).get('items', [])
@@ -796,10 +809,15 @@ class WildberriesDailyUpdater:
                                         }
                                         batch_data.append(row)
                                     self.log(f" -> ✓ {len(items)} записей")
+                                    success = True
                                     break
                                 elif resp.status_code == 429:
                                     wait = 60 * (attempt + 1)
                                     self.log(f" -> ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                                    time.sleep(wait)
+                                elif resp.status_code in (502, 503, 504):
+                                    wait = 30 * (attempt + 1)
+                                    self.log(f" -> ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
                                     time.sleep(wait)
                                 else:
                                     self.log(f" -> ❌ Ошибка {resp.status_code}")
@@ -810,6 +828,11 @@ class WildberriesDailyUpdater:
                                     time.sleep(10)
                                 else:
                                     break
+                        if not success:
+                            # Запоминаем все артикулы в этом батче для этого фильтра как неудачные
+                            for nm_id in batch:
+                                failed_combinations.append((date_str, nm_id, filter_field))
+                            self.log(f"    ❌ Не удалось загрузить фильтр {filter_field} для батча, добавлено {len(batch)} комбинаций в список ошибок")
                         if filter_field != filters[-1]:
                             time.sleep(30)
 
@@ -835,6 +858,128 @@ class WildberriesDailyUpdater:
                 self._save_weekly_data(weekly_df, store_name, 'keywords', week_start)
             else:
                 self.log(f"ℹ️ Нет новых данных за неделю")
+
+        # После обработки всех недель пробуем повторно загрузить неудачные комбинации
+        if failed_combinations:
+            self.log(f"\n🔄 Начинаем повторные попытки для {len(failed_combinations)} неудачных комбинаций")
+            # Группируем по дате и фильтру для более эффективной загрузки
+            retry_by_date_filter = defaultdict(list)
+            for date_str, nm_id, filter_field in failed_combinations:
+                retry_by_date_filter[(date_str, filter_field)].append(nm_id)
+
+            total_retry_success = 0
+            for (date_str, filter_field), nm_ids in retry_by_date_filter.items():
+                # Убираем дубликаты артикулов
+                nm_ids = list(set(nm_ids))
+                self.log(f"📅 Повторная загрузка для {date_str}, фильтр {filter_field}, артикулов: {len(nm_ids)}")
+
+                # Используем меньшие батчи (по 10) для повышения вероятности успеха
+                batches = [nm_ids[i:i+10] for i in range(0, len(nm_ids), 10)]
+                for batch_idx, batch in enumerate(batches, 1):
+                    self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
+                    payload = {
+                        "currentPeriod": {"start": date_str, "end": date_str},
+                        "nmIds": batch,
+                        "topOrderBy": filter_field,
+                        "includeSubstitutedSKUs": False,
+                        "includeSearchTexts": True,
+                        "orderBy": {"field": filter_field, "mode": "desc"},
+                        "limit": 100
+                    }
+                    max_retries = 7  # больше попыток
+                    success = False
+                    for attempt in range(max_retries):
+                        try:
+                            resp = requests.post(url, headers=headers, json=payload, timeout=150)  # увеличен таймаут
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                items = data.get('data', {}).get('items', [])
+                                if items:
+                                    # Сохраняем полученные данные
+                                    batch_data = []
+                                    for item in items:
+                                        text = item.get('text', '').strip()
+                                        if not text:
+                                            continue
+                                        row = {
+                                            "Дата": date_str,
+                                            "Магазин": store_name,
+                                            "Поисковый запрос": text,
+                                            "Фильтр": filter_field,
+                                            "Артикул WB": item.get("nmId", ""),
+                                            "Предмет": item.get("subjectName", ""),
+                                            "Бренд": item.get("brandName", ""),
+                                            "Артикул продавца": item.get("vendorCode", ""),
+                                            "Название товара": item.get("name", ""),
+                                            "Рейтинг карточки": item.get("rating", 0),
+                                            "Рейтинг отзывов": item.get("feedbackRating", 0),
+                                            "Частота запросов": item.get("frequency", {}).get("current", 0),
+                                            "Частота динамика %": item.get("frequency", {}).get("dynamics", 0),
+                                            "Частота за неделю": item.get("weekFrequency", 0),
+                                            "Медианная позиция": item.get("medianPosition", {}).get("current", 0),
+                                            "Медианная позиция динамика %": item.get("medianPosition", {}).get("dynamics", 0),
+                                            "Средняя позиция": item.get("avgPosition", {}).get("current", 0),
+                                            "Средняя позиция динамика %": item.get("avgPosition", {}).get("dynamics", 0),
+                                            "Переходы в карточку": item.get("openCard", {}).get("current", 0),
+                                            "Переходы динамика %": item.get("openCard", {}).get("dynamics", 0),
+                                            "% выше конкурентов (переходы)": item.get("openCard", {}).get("percentile", 0),
+                                            "Добавления в корзину": item.get("addToCart", {}).get("current", 0),
+                                            "Добавления динамика %": item.get("addToCart", {}).get("dynamics", 0),
+                                            "% выше конкурентов (добавления)": item.get("addToCart", {}).get("percentile", 0),
+                                            "Заказы": item.get("orders", {}).get("current", 0),
+                                            "Заказы динамика %": item.get("orders", {}).get("dynamics", 0),
+                                            "% выше конкурентов (заказы)": item.get("orders", {}).get("percentile", 0),
+                                            "Конверсия в заказ %": item.get("cartToOrder", {}).get("current", 0),
+                                            "Конверсия в заказ динамика %": item.get("cartToOrder", {}).get("dynamics", 0),
+                                            "% выше конкурентов (конв. в заказ)": item.get("cartToOrder", {}).get("percentile", 0),
+                                            "Конверсия в корзину %": item.get("openToCart", {}).get("current", 0),
+                                            "Конверсия в корзину динамика %": item.get("openToCart", {}).get("dynamics", 0),
+                                            "% выше конкурентов (конв. в корзину)": item.get("openToCart", {}).get("percentile", 0),
+                                            "Видимость %": item.get("visibility", {}).get("current", 0),
+                                            "Видимость динамика %": item.get("visibility", {}).get("dynamics", 0),
+                                            "Есть рейтинг карточки": item.get("isCardRated", False),
+                                            "Минимальная цена": item.get("price", {}).get("minPrice", 0),
+                                            "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
+                                        }
+                                        batch_data.append(row)
+                                    # Сохраняем в соответствующий недельный файл
+                                    week_date = datetime.strptime(date_str, '%Y-%m-%d')
+                                    week_start = self._get_week_start(week_date)
+                                    # Загружаем текущие данные недели
+                                    weekly_retry_df = self._load_weekly_data(store_name, 'keywords', week_start)
+                                    if weekly_retry_df.empty:
+                                        weekly_retry_df = pd.DataFrame(batch_data)
+                                    else:
+                                        weekly_retry_df = pd.concat([weekly_retry_df, pd.DataFrame(batch_data)], ignore_index=True)
+                                    self._save_weekly_data(weekly_retry_df, store_name, 'keywords', week_start)
+                                    total_retry_success += len(batch_data)
+                                    self.log(f"      ✅ Успешно загружено {len(batch_data)} записей")
+                                else:
+                                    self.log(f"      ℹ️ Нет данных для этого батча")
+                                success = True
+                                break
+                            elif resp.status_code == 429:
+                                wait = 60 * (attempt + 1)
+                                self.log(f"      ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                                time.sleep(wait)
+                            elif resp.status_code in (502, 503, 504):
+                                wait = 30 * (attempt + 1)
+                                self.log(f"      ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                                time.sleep(wait)
+                            else:
+                                self.log(f"      ❌ Ошибка {resp.status_code}")
+                                break
+                        except Exception as e:
+                            self.log(f"      ❌ Исключение: {e}")
+                            if attempt < max_retries - 1:
+                                time.sleep(10)
+                            else:
+                                break
+                    if not success:
+                        self.log(f"      ❌ Не удалось загрузить батч после {max_retries} попыток")
+                    time.sleep(30)  # пауза между батчами
+
+            self.log(f"🔄 Повторные попытки завершены. Успешно загружено {total_retry_success} записей.")
 
         return True
 
@@ -1002,12 +1147,11 @@ class WildberriesDailyUpdater:
 
             existing_keys = set()
             if not weekly_df.empty:
-                if 'ID кампании' in weekly_df.columns and 'Дата' in weekly_df.columns:
-                    for _, row in weekly_df.iterrows():
-                        cid = row.get('ID кампании')
-                        d = row.get('Дата')
-                        if cid and d:
-                            existing_keys.add((cid, d))
+                for _, row in weekly_df.iterrows():
+                    cid = row.get('ID кампании')
+                    d = row.get('Дата')
+                    if cid and d:
+                        existing_keys.add((cid, d))
 
             missing = []
             for d in dates:
