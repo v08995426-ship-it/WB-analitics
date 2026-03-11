@@ -8,6 +8,7 @@
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
 Финансовые показатели: проверяется только последняя неделя.
 Всегда читается первый лист в файле.
+Добавлено подробное логирование содержимого файлов.
 """
 
 import os
@@ -65,12 +66,11 @@ class S3Storage:
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
             data = obj['Body'].read()
-            # Если sheet_name не указан, pandas читает первый лист
             df = pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
             return df
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
-                return pd.DataFrame()  # файл не найден
+                return pd.DataFrame()
             else:
                 raise e
         except Exception as e:
@@ -172,7 +172,7 @@ class WildberriesDailyUpdater:
             'funnel': {
                 'name': 'Воронка продаж',
                 'folder': 'Воронка продаж',
-                'filename': 'Воронка продаж.xlsx',  # единый файл
+                'filename': 'Воронка продаж.xlsx',
                 'date_column': 'dt',
                 'id_columns': ['dt', 'nmID'],
                 'api_url': 'https://seller-analytics-api.wildberries.ru/api/v2/nm-report/downloads',
@@ -193,7 +193,7 @@ class WildberriesDailyUpdater:
             '1c_stocks': {
                 'name': 'Остатки 1С',
                 'folder': 'Остатки',
-                'filename': 'Остатки_1С.xlsx',  # ежедневно перезаписываемый файл
+                'filename': 'Остатки_1С.xlsx',
                 'date_column': None,
                 'id_columns': [],
                 'api_url': None,
@@ -201,7 +201,6 @@ class WildberriesDailyUpdater:
             }
         }
 
-        # Задержки между запросами (секунды)
         self.delays = {
             'orders': 65,
             'stocks': 65,
@@ -212,7 +211,6 @@ class WildberriesDailyUpdater:
             '1c_stocks': 0,
         }
 
-        # Список категорий для фильтрации артикулов в keywords
         self.target_subjects = ['Помады', 'Косметические карандаши', 'Кисти косметические', 'Блески']
 
         self.log(f"🚀 Запуск обновления данных. Время: {self.start_time}")
@@ -220,15 +218,12 @@ class WildberriesDailyUpdater:
     # ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
 
     def log(self, message: str, level: str = "INFO", end: str = "\n"):
-        """Логирование в stdout с принудительным сбросом буфера."""
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {message}", end=end, flush=True)
 
     def _get_week_start(self, date: datetime) -> datetime:
-        """Возвращает дату понедельника недели, содержащей date."""
         return date - timedelta(days=date.weekday())
 
     def _get_weekly_key(self, store_name: str, report_type: str, date: datetime) -> str:
-        """Генерирует ключ для недельного файла."""
         year, week, _ = date.isocalendar()
         config = self.reports_config[report_type]
         if report_type == 'keywords':
@@ -240,24 +235,35 @@ class WildberriesDailyUpdater:
     def _load_weekly_data(self, store_name: str, report_type: str, week_date: datetime) -> pd.DataFrame:
         """
         Загружает данные из недельного файла за указанную неделю.
-        Всегда читает первый лист (sheet_name=0).
+        Всегда читает первый лист. Выводит подробную информацию о содержимом.
         """
         key = self._get_weekly_key(store_name, report_type, week_date)
         self.log(f"📥 Загрузка недельного файла: {key}")
         try:
-            df = self.s3.read_excel(key, sheet_name=0)  # Всегда первый лист
+            df = self.s3.read_excel(key, sheet_name=0)
             if df.empty:
+                self.log(f"ℹ️ Файл пуст")
                 return df
+
+            # Логируем колонки
+            self.log(f"📋 Колонки в файле: {list(df.columns)}")
+
             date_col = self.reports_config[report_type]['date_column']
             if date_col in df.columns:
+                # Приводим дату к строковому формату
                 df[date_col] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+                unique_dates = df[date_col].unique()
+                self.log(f"📊 В файле {len(df)} записей, даты: {sorted(unique_dates)}")
+            else:
+                self.log(f"⚠️ Колонка даты '{date_col}' не найдена в файле")
+                # Если колонки даты нет, возможно, данные в другом формате — логируем первые 5 строк для анализа
+                self.log(f"📋 Первые 5 строк:\n{df.head().to_string()}")
             return df
         except Exception as e:
             self.log(f"⚠️ Ошибка загрузки {key}: {e}")
             return pd.DataFrame()
 
     def _save_weekly_data(self, df: pd.DataFrame, store_name: str, report_type: str, week_date: datetime) -> bool:
-        """Сохраняет данные в недельный файл с дедупликацией."""
         if df.empty:
             return True
         key = self._get_weekly_key(store_name, report_type, week_date)
@@ -273,7 +279,6 @@ class WildberriesDailyUpdater:
                     self.log(f"🔍 Удалено дубликатов в недельном файле: {before - after}")
 
         try:
-            # Сохраняем с именем листа из конфига, но при чтении будем всегда брать первый лист.
             self.s3.write_excel(key, df, sheet_name=config['name'])
             self.log(f"✅ Недельный файл сохранён: {key}, записей: {len(df)}")
             return True
@@ -283,24 +288,18 @@ class WildberriesDailyUpdater:
             return False
 
     def _get_date_range_90_days(self) -> Tuple[datetime.date, datetime.date]:
-        """Возвращает диапазон дат за последние 90 дней (без сегодня) как объекты date."""
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
         end_date = today - timedelta(days=1)
         start_date = end_date - timedelta(days=self.data_period_days - 1)
         return start_date, end_date
 
     def _get_date_range_last_n_days(self, n: int) -> Tuple[datetime.date, datetime.date]:
-        """Возвращает диапазон дат за последние n дней (без сегодня) как объекты date."""
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
         end_date = today - timedelta(days=1)
         start_date = end_date - timedelta(days=n - 1)
         return start_date, end_date
 
     def _get_articles_by_subjects(self, store_name: str, subjects: List[str]) -> List[int]:
-        """
-        Извлекает уникальные nmId из всех недельных файлов заказов магазина,
-        отфильтрованные по заданным subject (регистронезависимо).
-        """
         self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
 
         prefix = f"Отчёты/Заказы/{store_name}/Недельные/"
@@ -316,7 +315,6 @@ class WildberriesDailyUpdater:
         for file_key in all_files:
             self.log(f"📄 Обработка файла: {file_key}")
             try:
-                # Читаем первый лист
                 df = self.s3.read_excel(file_key, sheet_name=0)
                 if df.empty:
                     continue
@@ -358,7 +356,6 @@ class WildberriesDailyUpdater:
     # ====================== МЕТОДЫ ДЛЯ КАЖДОГО ОТЧЁТА ======================
 
     def _make_request(self, config: dict, headers: dict, date_str: str, **kwargs) -> Optional[Any]:
-        """Универсальный метод для выполнения API-запроса с повторными попытками."""
         url = config['api_url']
         method = config['api_method']
         params = {}
@@ -402,7 +399,6 @@ class WildberriesDailyUpdater:
         return None
 
     def _fetch_finance_day(self, config: dict, headers: dict, date_str: str) -> List[dict]:
-        """Загружает финансовые показатели за день с учётом постраничности и повторными попытками."""
         url = config['api_url']
         all_items = []
         rrdid = 0
@@ -449,7 +445,6 @@ class WildberriesDailyUpdater:
 
     # ---------- Заказы ----------
     def update_orders(self, store_name: str) -> bool:
-        """Обновление данных по заказам. Сохраняем понедельно, догружая недостающие дни."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Заказы для магазина {store_name}")
         config = self.reports_config['orders']
 
@@ -515,7 +510,6 @@ class WildberriesDailyUpdater:
 
     # ---------- Остатки ----------
     def update_stocks(self, store_name: str) -> bool:
-        """Обновление остатков. Загружаем только за вчерашний день и добавляем в соответствующий недельный файл."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         config = self.reports_config['stocks']
 
@@ -591,10 +585,6 @@ class WildberriesDailyUpdater:
 
     # ---------- Финансовые показатели (оптимизировано) ----------
     def update_finance(self, store_name: str) -> bool:
-        """
-        Обновление финансовых показателей. Загружает данные только за последнюю неделю,
-        чтобы минимизировать время проверки. Для старых недель проверяет только наличие файлов.
-        """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name} (оптимизировано)")
         config = self.reports_config['finance']
 
@@ -673,7 +663,6 @@ class WildberriesDailyUpdater:
 
     # ---------- Позиции по ключам ----------
     def update_keywords(self, store_name: str) -> bool:
-        """Инкрементальное обновление данных по поисковым запросам понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
 
         articles = self._get_articles_by_subjects(store_name, self.target_subjects)
@@ -703,15 +692,21 @@ class WildberriesDailyUpdater:
 
             existing_keys = set()
             if not weekly_df.empty:
-                for _, row in weekly_df.iterrows():
-                    d = row.get('Дата')
-                    nm = row.get('Артикул WB')
-                    f = row.get('Фильтр')
-                    if d and nm and f:
-                        try:
-                            existing_keys.add((str(d), int(nm), f))
-                        except:
-                            pass
+                # Проверяем наличие нужных колонок
+                if 'Дата' in weekly_df.columns and 'Артикул WB' in weekly_df.columns and 'Фильтр' in weekly_df.columns:
+                    for _, row in weekly_df.iterrows():
+                        d = row['Дата']
+                        nm = row['Артикул WB']
+                        f = row['Фильтр']
+                        if pd.notna(d) and pd.notna(nm) and pd.notna(f):
+                            try:
+                                existing_keys.add((str(d), int(nm), f))
+                            except:
+                                pass
+                else:
+                    self.log(f"⚠️ В недельном файле отсутствуют необходимые колонки ('Дата', 'Артикул WB', 'Фильтр'). Колонки: {list(weekly_df.columns)}")
+                    # Всё равно продолжаем, но существующие ключи не сможем определить
+                    existing_keys = set()
 
             missing_by_date = defaultdict(list)
             for date in dates:
@@ -845,13 +840,12 @@ class WildberriesDailyUpdater:
 
     # ---------- Воронка продаж ----------
     def update_funnel(self, store_name: str) -> bool:
-        """Обновление воронки продаж (сложный отчёт через генерацию). Сохраняется в единый файл."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name}")
         config = self.reports_config['funnel']
 
         key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
         if self.s3.file_exists(key):
-            df_existing = self.s3.read_excel(key, sheet_name=0)  # читаем первый лист
+            df_existing = self.s3.read_excel(key, sheet_name=0)
             if not df_existing.empty:
                 start_date, _ = self._get_date_range_90_days()
                 date_col = config['date_column']
@@ -948,13 +942,12 @@ class WildberriesDailyUpdater:
 
     # ---------- Реклама ----------
     def update_adverts(self, store_name: str) -> bool:
-        """Обновление данных по рекламным кампаниям понедельно."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
         base_key = f"Отчёты/{config['folder']}/{store_name}/База данных.xlsx"
         try:
-            df_base = self.s3.read_excel(base_key, sheet_name=0)  # первый лист
+            df_base = self.s3.read_excel(base_key, sheet_name=0)
             if df_base.empty:
                 self.log("❌ Файл База данных.xlsx пуст или не найден")
                 return False
@@ -1009,11 +1002,12 @@ class WildberriesDailyUpdater:
 
             existing_keys = set()
             if not weekly_df.empty:
-                for _, row in weekly_df.iterrows():
-                    cid = row.get('ID кампании')
-                    d = row.get('Дата')
-                    if cid and d:
-                        existing_keys.add((cid, d))
+                if 'ID кампании' in weekly_df.columns and 'Дата' in weekly_df.columns:
+                    for _, row in weekly_df.iterrows():
+                        cid = row.get('ID кампании')
+                        d = row.get('Дата')
+                        if cid and d:
+                            existing_keys.add((cid, d))
 
             missing = []
             for d in dates:
@@ -1121,10 +1115,6 @@ class WildberriesDailyUpdater:
 
     # ---------- Остатки из 1С ----------
     def update_1c_stocks(self, store_name: str = '1С') -> bool:
-        """
-        Загружает лист "Остатки из 1С" из Google Sheets (по ссылке) и сохраняет в бакет.
-        Ежедневно перезаписывает файл (недельное хранение не требуется).
-        """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки из 1С для магазина {store_name}")
         config = self.reports_config['1c_stocks']
 
@@ -1187,10 +1177,6 @@ class WildberriesDailyUpdater:
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
 
     def run_daily_update(self, store_name: str, reports: List[str] = None):
-        """
-        Запускает обновление для указанного магазина.
-        Если reports = None, обновляются все отчёты, включая '1c_stocks'.
-        """
         all_reports = ['orders', 'stocks', 'finance', 'keywords', 'funnel', 'adverts', '1c_stocks']
         if reports is None:
             reports = all_reports
