@@ -10,7 +10,7 @@
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
-Добавлено детальное логирование в цикле отчётов.
+Добавлено формирование единого объединённого отчёта (воронка + заказы + реклама).
 """
 
 import os
@@ -1340,6 +1340,232 @@ class WildberriesDailyUpdater:
                 os.remove(tmp_path)
                 self.log("🧹 Временный файл удалён")
 
+    # ---------- Единый объединённый отчёт ----------
+    def create_unified_report(self, store_name: str) -> bool:
+        """
+        Формирует единый отчёт из данных воронки продаж, заказов и рекламы за последние 90 дней.
+        Сохраняет результат в папку "Объединенный отчет".
+        """
+        self.log(f"\n📌 ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА для магазина {store_name}")
+
+        # 1. Определяем диапазон дат (последние 90 дней)
+        start_date, end_date = self._get_date_range_90_days()
+        self.log(f"📅 Период данных: {start_date} - {end_date}")
+
+        # 2. Загружаем воронку продаж (единый файл)
+        funnel_key = f"Отчёты/{self.reports_config['funnel']['folder']}/{store_name}/{self.reports_config['funnel']['filename']}"
+        self.log(f"📥 Загрузка воронки продаж: {funnel_key}")
+        funnel_df = self.s3.read_excel(funnel_key, sheet_name=0)
+        if funnel_df.empty:
+            self.log("❌ Не удалось загрузить данные воронки продаж. Отчёт не будет создан.")
+            return False
+        # Приводим дату и фильтруем по периоду
+        funnel_df['dt'] = pd.to_datetime(funnel_df['dt'], errors='coerce')
+        funnel_df = funnel_df[(funnel_df['dt'] >= pd.Timestamp(start_date)) & (funnel_df['dt'] <= pd.Timestamp(end_date))]
+        self.log(f"📊 Воронка продаж: {len(funnel_df)} записей")
+
+        # 3. Загружаем заказы из всех недельных файлов
+        orders_prefix = f"Отчёты/{self.reports_config['orders']['folder']}/{store_name}/Недельные/"
+        orders_files = self.s3.list_files(orders_prefix)
+        orders_list = []
+        for file_key in orders_files:
+            self.log(f"📥 Загрузка заказов: {file_key}")
+            df = self.s3.read_excel(file_key, sheet_name=0)
+            if not df.empty:
+                df['dt'] = pd.to_datetime(df['date'], errors='coerce')
+                df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+                orders_list.append(df)
+        if orders_list:
+            orders_df = pd.concat(orders_list, ignore_index=True)
+            self.log(f"📊 Заказы: {len(orders_df)} записей")
+        else:
+            orders_df = pd.DataFrame()
+            self.log("⚠️ Нет данных по заказам за период")
+
+        # 4. Загружаем рекламу из всех недельных файлов
+        adverts_prefix = f"Отчёты/{self.reports_config['adverts']['folder']}/{store_name}/Недельные/"
+        adverts_files = self.s3.list_files(adverts_prefix)
+        adverts_list = []
+        for file_key in adverts_files:
+            self.log(f"📥 Загрузка рекламы: {file_key}")
+            df = self.s3.read_excel(file_key, sheet_name=0)
+            if not df.empty:
+                df['dt'] = pd.to_datetime(df['Дата'], errors='coerce')
+                df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+                adverts_list.append(df)
+        if adverts_list:
+            adverts_df = pd.concat(adverts_list, ignore_index=True)
+            self.log(f"📊 Реклама: {len(adverts_df)} записей")
+        else:
+            adverts_df = pd.DataFrame()
+            self.log("⚠️ Нет данных по рекламе за период")
+
+        # 5. Если нет данных ни одного из источников, выходим
+        if funnel_df.empty and orders_df.empty and adverts_df.empty:
+            self.log("❌ Нет данных для формирования отчёта")
+            return False
+
+        # 6. Группировка и подготовка данных
+        # Воронка уже готова, оставляем как есть (там есть nmID, dt и другие поля)
+        funnel_df.rename(columns={'nmID': 'nmID'}, inplace=True)
+
+        # Заказы: группируем по nmID и dt
+        if not orders_df.empty:
+            # Определяем нужные колонки
+            agg_dict = {}
+            if 'priceWithDisc' in orders_df.columns:
+                agg_dict['priceWithDisc'] = 'sum'
+            if 'spp' in orders_df.columns:
+                agg_dict['spp'] = 'mean'
+            if 'finishedPrice' in orders_df.columns:
+                agg_dict['finishedPrice'] = 'mean'
+            if 'subject' in orders_df.columns:
+                agg_dict['subject'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
+            if 'supplierArticle' in orders_df.columns:
+                agg_dict['supplierArticle'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
+            # Локальные заказы – используем mapping из этапа 2
+            if 'warehouseName' in orders_df.columns and 'oblastOkrugName' in orders_df.columns:
+                # Функция определения локальности
+                local_mapping = {
+                    'Екатеринбург - Перспективная 14': ['Уральский федеральный округ'],
+                    'Котовск': ['Центральный федеральный округ'],
+                    'Коледино': ['Центральный федеральный округ'],
+                    'Краснодар': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
+                    'Владимир': ['Центральный федеральный округ'],
+                    'Рязань (Тюшевское)': ['Центральный федеральный округ'],
+                    'Невинномысск': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
+                    'Тула': ['Центральный федеральный округ'],
+                    'Белые Столбы': ['Центральный федеральный округ'],
+                    'Самара (Новосемейкино)': ['Приволжский федеральный округ'],
+                    'Электросталь': ['Центральный федеральный округ'],
+                    'Санкт-Петербург Уткина Заводь': ['Северо-Западный федеральный округ'],
+                    'Казань': ['Приволжский федеральный округ'],
+                    'Воронеж': ['Центральный федеральный округ'],
+                    'Пенза': ['Приволжский федеральный округ'],
+                    'Новосибирск': ['Сибирский федеральный округ', 'Дальневосточный федеральный округ'],
+                    'Волгоград': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
+                    'Сарапул': ['Приволжский федеральный округ']
+                }
+                def is_local(row):
+                    try:
+                        warehouse = str(row['warehouseName']).strip()
+                        oblast = str(row['oblastOkrugName']).strip()
+                        for key, values in local_mapping.items():
+                            if key in warehouse and oblast in values:
+                                return 1
+                        return 0
+                    except:
+                        return 0
+                orders_df['is_local'] = orders_df.apply(is_local, axis=1)
+                agg_dict['is_local'] = 'mean'  # процент локальных
+            # Выполняем группировку
+            orders_grouped = orders_df.groupby(['nmID', 'dt']).agg(agg_dict).reset_index()
+            orders_grouped.rename(columns={
+                'priceWithDisc': 'total_priceWithDisc',
+                'spp': 'avg_spp',
+                'finishedPrice': 'avg_finishedPrice',
+                'is_local': 'local_orders_percent'
+            }, inplace=True)
+            self.log(f"📊 Заказы сгруппированы: {len(orders_grouped)} записей")
+        else:
+            orders_grouped = pd.DataFrame()
+
+        # Реклама: группируем по nmID и dt (суммируем метрики)
+        if not adverts_df.empty:
+            # Приводим колонки к единому виду
+            rename_dict = {}
+            if 'Артикул WB' in adverts_df.columns:
+                rename_dict['Артикул WB'] = 'nmID'
+            if 'ID кампании' in adverts_df.columns:
+                rename_dict['ID кампании'] = 'campaign_id'
+            adverts_df.rename(columns=rename_dict, inplace=True)
+            # Выбираем нужные колонки
+            adverts_agg = adverts_df.groupby(['nmID', 'dt']).agg({
+                'Расход': 'sum',
+                'Показы': 'sum',
+                'Клики': 'sum',
+                'CTR': 'mean',  # средний CTR? обычно сумма показов и кликов, CTR потом пересчитаем
+                'CPC': 'mean',
+                'Заказы': 'sum',
+                'Сумма заказов': 'sum'
+            }).reset_index()
+            # Пересчитаем CTR и CPC (хотя они уже есть)
+            adverts_agg['CTR'] = (adverts_agg['Клики'] / adverts_agg['Показы'] * 100).round(2)
+            adverts_agg['CPC'] = (adverts_agg['Расход'] / adverts_agg['Клики']).round(2)
+            self.log(f"📊 Реклама сгруппирована: {len(adverts_agg)} записей")
+        else:
+            adverts_agg = pd.DataFrame()
+
+        # 7. Объединяем
+        merged = funnel_df.copy()
+        if not orders_grouped.empty:
+            merged = pd.merge(merged, orders_grouped, on=['nmID', 'dt'], how='left')
+        if not adverts_agg.empty:
+            merged = pd.merge(merged, adverts_agg, on=['nmID', 'dt'], how='left')
+        # Заполняем NaN нулями для числовых колонок
+        for col in merged.columns:
+            if col not in ['nmID', 'dt', 'subject', 'supplierArticle']:
+                merged[col] = merged[col].fillna(0)
+
+        self.log(f"📊 Объединено записей: {len(merged)}")
+
+        # 8. Перевод названий колонок (как в этапе 2)
+        column_translation = {
+            'nmID': 'ID товара',
+            'dt': 'Дата',
+            'subject': 'Категория',
+            'supplierArticle': 'Артикул поставщика',
+            'brand': 'Бренд',
+            'openCardCount': 'Открытия карточки',
+            'addToCartCount': 'Добавления в корзину',
+            'ordersCount': 'Количество заказов',
+            'cartToOrderCount': 'Конверсия корзина-заказ',
+            'total_priceWithDisc': 'Сумма заказов (со скидкой)',
+            'avg_spp': 'Средняя себестоимость (СПП)',
+            'avg_finishedPrice': 'Средняя конечная цена',
+            'local_orders_percent': 'Доля локальных заказов (%)',
+            'priceWithDisc': 'Цена со скидкой',
+            'spp': 'Себестоимость (СПП)',
+            'finishedPrice': 'Конечная цена',
+            'warehouseName': 'Склад',
+            'oblastOkrugName': 'Федеральный округ',
+            'regionName': 'Регион',
+            'is_local': 'Локальный заказ',
+            'viewCount': 'Просмотры',
+            'clickCount': 'Клики',
+            'ctr': 'CTR',
+            'conversion': 'Конверсия',
+            'Расход': 'Расход на рекламу',
+            'Показы': 'Показы',
+            'Клики': 'Клики РК',
+            'CTR_x': 'CTR РК',
+            'CPC_x': 'CPC (цена клика)',
+            'CPA': 'CPA (цена заказа)',
+            'ROAS': 'ROAS',
+            'Заказы': 'Заказы из рекламы',
+            'Сумма заказов': 'Сумма заказов из рекламы'
+        }
+        # Простое переименование совпадающих колонок
+        merged.rename(columns=column_translation, inplace=True)
+
+        # 9. Сохраняем результат
+        output_folder = "Объединенный отчет"
+        output_filename = "Объединенный_отчет.xlsx"
+        output_key = f"Отчёты/{output_folder}/{store_name}/{output_filename}"
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            merged.to_excel(tmp_path, index=False, sheet_name='Объединенный отчет')
+            self.s3.upload_file(tmp_path, output_key)
+            self.log(f"✅ Единый отчёт сохранён: {output_key}")
+            return True
+        except Exception as e:
+            self.log(f"❌ Ошибка сохранения единого отчёта: {e}")
+            return False
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', '1c_stocks', 'keywords']
@@ -1365,7 +1591,18 @@ class WildberriesDailyUpdater:
                 self.log(f"⏳ Пауза 30 секунд перед следующим отчётом...")
                 time.sleep(30)
 
+        # После всех отчётов формируем единый отчёт
+        self.log_section("ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА")
+        self.create_unified_report(store_name)
+
         self.log("✅ Обновление завершено")
+
+    def log_section(self, title: str):
+        """Вспомогательный метод для заголовка раздела"""
+        self.log("")
+        self.log("=" * 80)
+        self.log(f"📌 {title}")
+        self.log("=" * 80)
 
 
 # ========================== ТОЧКА ВХОДА ==========================
