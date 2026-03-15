@@ -11,6 +11,7 @@
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
 Добавлено формирование единого объединённого отчёта (воронка + заказы + реклама).
+Добавлен расчёт экономики (валовая прибыль и юнит-экономика) для последней полной недели.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
 """
 
@@ -1567,6 +1568,221 @@ class WildberriesDailyUpdater:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
+    # ====================== РАСЧЁТ ЭКОНОМИКИ ======================
+    def calculate_economics(self, store_name: str):
+        """
+        Расчёт экономических показателей для последней полной недели.
+        Сохраняет результаты в файл Экономика.xlsx с двумя листами:
+        - Валовая прибыль (детальные суммы по артикулам)
+        - Юнит экономика (средние показатели на единицу)
+        """
+        self.log_section("РАСЧЁТ ЭКОНОМИКИ")
+
+        # 1. Определяем последнюю полную неделю
+        today = datetime.now(pytz.timezone('Europe/Moscow')).date()
+        # Если сегодня воскресенье (6), то последняя полная неделя закончилась вчера.
+        # Вообще последняя полная неделя – это неделя, которая закончилась в последнее воскресенье.
+        # Вычисляем последнее воскресенье, которое <= вчера
+        yesterday = today - timedelta(days=1)
+        days_since_sunday = (yesterday.weekday() + 1) % 7  # сколько дней прошло с воскресенья
+        end_of_last_week = yesterday - timedelta(days=days_since_sunday)
+        start_of_last_week = end_of_last_week - timedelta(days=6)
+
+        week_number = f"{start_of_last_week.isocalendar()[0]}-W{start_of_last_week.isocalendar()[1]:02d}"
+        self.log(f"📅 Неделя расчёта: {week_number} ({start_of_last_week} - {end_of_last_week})")
+
+        # 2. Загружаем финансовый отчёт за эту неделю
+        finance_key = f"Отчёты/Финансовые показатели/{store_name}/Недельные/Финансовые показатели_{week_number}.xlsx"
+        finance_df = self.s3.read_excel(finance_key, sheet_name=0)
+        if finance_df.empty:
+            self.log(f"❌ Финансовый отчёт за неделю {week_number} не найден. Расчёт отменён.")
+            return
+
+        # 3. Загружаем остатки на начало недели
+        stocks_key = f"Отчёты/Остатки/{store_name}/Недельные/Остатки_{week_number}.xlsx"
+        stocks_df = self.s3.read_excel(stocks_key, sheet_name=0)
+        if stocks_df.empty:
+            self.log(f"⚠️ Остатки за неделю {week_number} не найдены. Хранение не будет распределено.")
+            stocks_start = pd.DataFrame()
+        else:
+            stocks_df['Дата запроса'] = pd.to_datetime(stocks_df['Дата запроса']).dt.date
+            stocks_start = stocks_df[stocks_df['Дата запроса'] == start_of_last_week].copy()
+            if stocks_start.empty:
+                self.log(f"⚠️ Нет остатков на дату {start_of_last_week}. Хранение не распределено.")
+                stocks_start = pd.DataFrame()
+
+        # 4. Загружаем себестоимость
+        cost_key = f"Отчёты/Себестоимость/Себестоимость.xlsx"
+        cost_df = self.s3.read_excel(cost_key, sheet_name=0)
+        if cost_df.empty:
+            self.log(f"❌ Файл себестоимости не найден. Расчёт отменён.")
+            return
+        # Предполагаем, что в файле есть колонки: "Артикул WB" (индекс 2) и "Себестоимость"
+        # Переименуем для удобства
+        cost_df.rename(columns={cost_df.columns[2]: 'nm_id', 'Себестоимость': 'cost_price'}, inplace=True)
+        # Оставляем только нужные колонки, удаляем дубликаты (берём последнее значение)
+        cost_df = cost_df[['nm_id', 'cost_price']].drop_duplicates(subset='nm_id', keep='last')
+
+        # 5. Загружаем рекламные расходы за неделю
+        advert_key = f"Отчёты/Реклама/{store_name}/Недельные/Реклама_{week_number}.xlsx"
+        advert_df = self.s3.read_excel(advert_key, sheet_name=0)
+        if not advert_df.empty and 'Артикул WB' in advert_df.columns and 'Расход' in advert_df.columns:
+            advert_agg = advert_df.groupby('Артикул WB')['Расход'].sum().reset_index()
+            advert_agg.rename(columns={'Артикул WB': 'nm_id', 'Расход': 'advert_cost'}, inplace=True)
+        else:
+            self.log(f"ℹ️ Нет данных по рекламе за неделю {week_number}.")
+            advert_agg = pd.DataFrame(columns=['nm_id', 'advert_cost'])
+
+        # 6. Определяем типы операций для агрегации
+        # Список возможных типов расходов (логистика, хранение, прочее)
+        expense_types = [
+            'Логистика',
+            'Возмещение издержек по перевозке/по складским операциям с товаром',
+            'Штрафы',
+            'Платная приёмка',
+            'Услуги WB Продвижения'
+        ]
+
+        # Группируем финансовый отчёт по nm_id и вычисляем агрегаты
+        results = []
+        for nm_id, group in finance_df.groupby('nm_id'):
+            # Продажи
+            sales = group[group['doc_type_name'] == 'Продажа']
+            returns = group[group['doc_type_name'] == 'Возврат']
+            compensations = group[group['doc_type_name'] == 'Компенсация скидки по программе лояльности']
+            expenses = group[group['doc_type_name'].isin(expense_types)]
+
+            # Количество
+            qty_sold = sales['quantity'].sum() - returns['quantity'].sum()
+            if qty_sold <= 0:
+                continue  # нет продаж – нет расчёта
+
+            # Выручка
+            revenue = sales['retail_amount'].sum() - returns['retail_amount'].sum()
+
+            # Денежный поток
+            cash_flow = (
+                sales['ppvz_for_pay'].sum()
+                - returns['ppvz_for_pay'].sum()  # в файле положительные, вычитаем
+                + compensations['ppvz_for_pay'].sum()
+                + expenses['ppvz_for_pay'].sum()  # они уже отрицательные
+            )
+
+            # Себестоимость
+            cost_row = cost_df[cost_df['nm_id'] == nm_id]
+            if not cost_row.empty:
+                cost_price = cost_row.iloc[0]['cost_price']
+                total_cost = qty_sold * cost_price
+            else:
+                self.log(f"⚠️ Для артикула {nm_id} нет себестоимости. Прибыль будет завышена.")
+                total_cost = 0
+
+            # Реклама
+            adv_row = advert_agg[advert_agg['nm_id'] == nm_id]
+            advert_cost = adv_row.iloc[0]['advert_cost'] if not adv_row.empty else 0
+
+            # Хранение (распределение)
+            if not stocks_start.empty:
+                # Общий остаток всех товаров на начало недели
+                total_stock_all = stocks_start['Доступно для продажи'].sum()
+                # Остаток данного артикула (сумма по складам)
+                sku_stock = stocks_start[stocks_start['Артикул WB'] == nm_id]['Доступно для продажи'].sum()
+                # Общая стоимость хранения за неделю – сумма по строкам expense с типом "Хранение"
+                # В наших данных пока нет отдельного типа, поэтому берём 0.
+                # Если появится, можно искать по вхождению слова "Хранение" в doc_type_name
+                storage_fee_rows = group[group['doc_type_name'].str.contains('Хранение', na=False)]
+                if not storage_fee_rows.empty:
+                    total_storage_cost = abs(storage_fee_rows['ppvz_for_pay'].sum())
+                else:
+                    total_storage_cost = 0
+                if total_stock_all > 0 and total_storage_cost > 0:
+                    storage_cost = (sku_stock / total_stock_all) * total_storage_cost
+                else:
+                    storage_cost = 0
+            else:
+                storage_cost = 0
+
+            # Налоги
+            nds = revenue * 0.07
+            profit_base = cash_flow - total_cost - storage_cost - advert_cost
+            profit_tax = max(0, profit_base) * 0.15
+
+            # Валовая прибыль
+            gross_profit = profit_base - nds - profit_tax
+
+            # Средние комиссии (берём из последней продажи)
+            if not sales.empty:
+                sales_sorted = sales.sort_values('sale_dt', ascending=False)
+                last_commission = sales_sorted.iloc[0]['commission_percent']
+                last_acquiring = sales_sorted.iloc[0]['acquiring_percent']
+                avg_price = revenue / qty_sold
+                avg_logistics = abs(expenses[expenses['doc_type_name'].isin(['Логистика', 'Возмещение издержек по перевозке/по складским операциям с товаром'])]['ppvz_for_pay'].sum()) / qty_sold
+                avg_storage = storage_cost / qty_sold
+                avg_advert = advert_cost / qty_sold
+                avg_tax = (nds + profit_tax) / qty_sold
+                avg_profit = gross_profit / qty_sold
+            else:
+                last_commission = 0
+                last_acquiring = 0
+                avg_price = 0
+                avg_logistics = 0
+                avg_storage = 0
+                avg_advert = 0
+                avg_tax = 0
+                avg_profit = 0
+
+            results.append({
+                'nm_id': nm_id,
+                'week': week_number,
+                'revenue': round(revenue, 2),
+                'cash_flow': round(cash_flow, 2),
+                'total_cost': round(total_cost, 2),
+                'storage_cost': round(storage_cost, 2),
+                'advert_cost': round(advert_cost, 2),
+                'nds': round(nds, 2),
+                'profit_tax': round(profit_tax, 2),
+                'gross_profit': round(gross_profit, 2),
+                'qty_sold': qty_sold,
+                'avg_price': round(avg_price, 2),
+                'last_commission_percent': last_commission,
+                'last_acquiring_percent': last_acquiring,
+                'avg_logistics_per_unit': round(avg_logistics, 2),
+                'avg_storage_per_unit': round(avg_storage, 2),
+                'avg_advert_per_unit': round(avg_advert, 2),
+                'avg_tax_per_unit': round(avg_tax, 2),
+                'avg_profit_per_unit': round(avg_profit, 2),
+            })
+
+        if not results:
+            self.log("❌ Нет данных для формирования отчёта.")
+            return
+
+        # 7. Формируем итоговые DataFrame
+        gross_df = pd.DataFrame(results)[['nm_id', 'week', 'revenue', 'cash_flow', 'total_cost',
+                                          'storage_cost', 'advert_cost', 'nds', 'profit_tax', 'gross_profit']]
+        unit_df = pd.DataFrame(results)[['nm_id', 'week', 'avg_price', 'last_commission_percent',
+                                         'last_acquiring_percent', 'avg_logistics_per_unit',
+                                         'avg_storage_per_unit', 'avg_advert_per_unit',
+                                         'avg_tax_per_unit', 'avg_profit_per_unit']]
+
+        # 8. Сохраняем результат
+        output_key = f"Отчёты/Финансовые показатели/{store_name}/Экономика.xlsx"
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+                gross_df.to_excel(writer, sheet_name='Валовая прибыль', index=False)
+                unit_df.to_excel(writer, sheet_name='Юнит экономика', index=False)
+            self.s3.upload_file(tmp_path, output_key)
+            self.log(f"✅ Экономика сохранена: {output_key}")
+        except Exception as e:
+            self.log(f"❌ Ошибка сохранения экономики: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        self.log("✅ Расчёт экономики завершён.")
+
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         # Исключаем 1c_stocks из списка по умолчанию (можно вернуть позже, добавив в список)
@@ -1596,6 +1812,9 @@ class WildberriesDailyUpdater:
         self.log_section("ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА")
         self.create_unified_report(store_name)
 
+        self.log_section("РАСЧЁТ ЭКОНОМИКИ")
+        self.calculate_economics(store_name)
+
         self.log("✅ Обновление завершено")
 
     def log_section(self, title: str):
@@ -1619,10 +1838,6 @@ if __name__ == "__main__":
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
         exit(1)
-
-    # Если хотите позже включить 1c_stocks, раскомментируйте строку ниже и добавьте '1c_stocks' в список reports
-    # if not os.environ.get('URL_1C_STOCKS'):
-    #     print("⚠️ Переменная URL_1C_STOCKS не задана. Отчёт '1c_stocks' будет пропущен.")
 
     s3 = S3Storage(
         access_key=os.environ['YC_ACCESS_KEY_ID'],
