@@ -10,7 +10,6 @@
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
-Добавлен расчёт экономики (валовая прибыль и юнит-экономика) для последней полной недели.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
 """
 
@@ -24,6 +23,7 @@ import tempfile
 import traceback
 import re
 import sys
+import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
 import warnings
@@ -1083,6 +1083,21 @@ class WildberriesDailyUpdater:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
+        # Проверяем, не обновлялись ли данные сегодня (по файлу истории)
+        history_key = f"Отчёты/{config['folder']}/{store_name}/История_рекламы_14дней.xlsx"
+        if self.s3.file_exists(history_key):
+            try:
+                df_history = self.s3.read_excel(history_key, sheet_name=0)
+                if not df_history.empty and 'Дата запроса' in df_history.columns:
+                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    # Проверяем, есть ли записи с сегодняшней датой запроса
+                    today_records = df_history[df_history['Дата запроса'].str.startswith(today_str)]
+                    if not today_records.empty:
+                        self.log(f"✅ Данные рекламы за сегодня уже загружены ({len(today_records)} записей в истории). Пропускаем обновление.")
+                        return True
+            except Exception as e:
+                self.log(f"⚠️ Ошибка при проверке истории рекламы: {e}, продолжаем обновление")
+
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
@@ -1440,8 +1455,6 @@ class WildberriesDailyUpdater:
             combined = new_rows
 
         # Оставляем только последние 14 дней по дате статистики (поле 'Дата')
-        # Но мы хотим сохранять все записи за последние 14 дней, включая разные даты запроса.
-        # Просто ограничим по дате статистики: оставляем записи, где Дата >= сегодня-14
         cutoff_date = (datetime.now() - timedelta(days=14)).date()
         combined['Дата'] = pd.to_datetime(combined['Дата']).dt.date
         combined = combined[combined['Дата'] >= cutoff_date]
@@ -1513,234 +1526,6 @@ class WildberriesDailyUpdater:
                 os.remove(tmp_path)
                 self.log("🧹 Временный файл удалён")
 
-    # ====================== РАСЧЁТ ЭКОНОМИКИ ======================
-    def calculate_economics(self, store_name: str):
-        """
-        Расчёт экономических показателей для последней полной недели.
-        Сохраняет результаты в файл Экономика.xlsx с двумя листами:
-        - Валовая прибыль (детальные суммы по артикулам)
-        - Юнит экономика (средние показатели на единицу)
-        """
-        self.log_section("РАСЧЁТ ЭКОНОМИКИ")
-
-        # 1. Определяем последнюю полную неделю
-        today = datetime.now(pytz.timezone('Europe/Moscow')).date()
-        yesterday = today - timedelta(days=1)
-        days_since_sunday = (yesterday.weekday() + 1) % 7  # сколько дней прошло с воскресенья
-        end_of_last_week = yesterday - timedelta(days=days_since_sunday)
-        start_of_last_week = end_of_last_week - timedelta(days=6)
-
-        week_number = f"{start_of_last_week.isocalendar()[0]}-W{start_of_last_week.isocalendar()[1]:02d}"
-        self.log(f"📅 Неделя расчёта: {week_number} ({start_of_last_week} - {end_of_last_week})")
-
-        # 2. Загружаем финансовый отчёт за эту неделю
-        finance_key = f"Отчёты/Финансовые показатели/{store_name}/Недельные/Финансовые показатели_{week_number}.xlsx"
-        finance_df = self.s3.read_excel(finance_key, sheet_name=0)
-        if finance_df.empty:
-            self.log(f"❌ Финансовый отчёт за неделю {week_number} не найден. Расчёт отменён.")
-            return
-
-        # 3. Загружаем остатки на начало недели
-        stocks_key = f"Отчёты/Остатки/{store_name}/Недельные/Остатки_{week_number}.xlsx"
-        stocks_df = self.s3.read_excel(stocks_key, sheet_name=0)
-        if stocks_df.empty:
-            self.log(f"⚠️ Остатки за неделю {week_number} не найдены. Хранение не будет распределено.")
-            stocks_start = pd.DataFrame()
-        else:
-            stocks_df['Дата запроса'] = pd.to_datetime(stocks_df['Дата запроса']).dt.date
-            stocks_start = stocks_df[stocks_df['Дата запроса'] == start_of_last_week].copy()
-            if stocks_start.empty:
-                self.log(f"⚠️ Нет остатков на дату {start_of_last_week}. Хранение не распределено.")
-                stocks_start = pd.DataFrame()
-
-        # 4. Загружаем себестоимость
-        cost_key = f"Отчёты/Себестоимость/Себестоимость.xlsx"
-        cost_df = self.s3.read_excel(cost_key, sheet_name=0)
-        if cost_df.empty:
-            self.log(f"❌ Файл себестоимости не найден. Расчёт отменён.")
-            return
-
-        # Определяем колонки с артикулом и себестоимостью
-        nm_col = None
-        cost_col = None
-        for col in cost_df.columns:
-            col_lower = col.lower()
-            if 'артикул' in col_lower or 'nm_id' in col_lower or 'nmid' in col_lower or 'wb' in col_lower:
-                nm_col = col
-            if 'себестоимость' in col_lower or 'стоимость' in col_lower or 'cost' in col_lower:
-                cost_col = col
-
-        if nm_col is None:
-            self.log("❌ Не удалось определить колонку с артикулом в файле себестоимости. Расчёт отменён.")
-            return
-        if cost_col is None:
-            self.log("❌ Не удалось определить колонку с себестоимостью в файле себестоимости. Расчёт отменён.")
-            return
-
-        cost_df = cost_df[[nm_col, cost_col]].drop_duplicates(subset=nm_col, keep='last')
-        cost_df.rename(columns={nm_col: 'nm_id', cost_col: 'cost_price'}, inplace=True)
-
-        # 5. Загружаем рекламные расходы за неделю
-        advert_key = f"Отчёты/Реклама/{store_name}/Недельные/Реклама_{week_number}.xlsx"
-        # Пытаемся прочитать лист Статистика_Итого
-        advert_df = self.s3.read_excel(advert_key, sheet_name='Статистика_Итого')
-        if advert_df.empty:
-            # Если нет, пробуем первый лист
-            advert_df = self.s3.read_excel(advert_key, sheet_name=0)
-        if not advert_df.empty and 'Артикул WB' in advert_df.columns and 'Расход' in advert_df.columns:
-            advert_agg = advert_df.groupby('Артикул WB')['Расход'].sum().reset_index()
-            advert_agg.rename(columns={'Артикул WB': 'nm_id', 'Расход': 'advert_cost'}, inplace=True)
-        else:
-            self.log(f"ℹ️ Нет данных по рекламе за неделю {week_number}.")
-            advert_agg = pd.DataFrame(columns=['nm_id', 'advert_cost'])
-
-        # 6. Определяем типы операций для агрегации
-        expense_types = [
-            'Логистика',
-            'Возмещение издержек по перевозке/по складским операциям с товаром',
-            'Штрафы',
-            'Платная приёмка',
-            'Услуги WB Продвижения'
-        ]
-
-        # Группируем финансовый отчёт по nm_id и вычисляем агрегаты
-        results = []
-        for nm_id, group in finance_df.groupby('nm_id'):
-            # Продажи
-            sales = group[group['doc_type_name'] == 'Продажа']
-            returns = group[group['doc_type_name'] == 'Возврат']
-            compensations = group[group['doc_type_name'] == 'Компенсация скидки по программе лояльности']
-            expenses = group[group['doc_type_name'].isin(expense_types)]
-
-            # Количество
-            qty_sold = sales['quantity'].sum() - returns['quantity'].sum()
-            if qty_sold <= 0:
-                continue  # нет продаж – нет расчёта
-
-            # Выручка
-            revenue = sales['retail_amount'].sum() - returns['retail_amount'].sum()
-
-            # Денежный поток
-            cash_flow = (
-                sales['ppvz_for_pay'].sum()
-                - returns['ppvz_for_pay'].sum()  # в файле положительные, вычитаем
-                + compensations['ppvz_for_pay'].sum()
-                + expenses['ppvz_for_pay'].sum()  # они уже отрицательные
-            )
-
-            # Себестоимость
-            cost_row = cost_df[cost_df['nm_id'] == nm_id]
-            if not cost_row.empty:
-                cost_price = cost_row.iloc[0]['cost_price']
-                total_cost = qty_sold * cost_price
-            else:
-                self.log(f"⚠️ Для артикула {nm_id} нет себестоимости. Прибыль будет завышена.")
-                total_cost = 0
-
-            # Реклама
-            adv_row = advert_agg[advert_agg['nm_id'] == nm_id]
-            advert_cost = adv_row.iloc[0]['advert_cost'] if not adv_row.empty else 0
-
-            # Хранение (распределение)
-            if not stocks_start.empty:
-                # Общий остаток всех товаров на начало недели
-                total_stock_all = stocks_start['Доступно для продажи'].sum()
-                # Остаток данного артикула (сумма по складам)
-                sku_stock = stocks_start[stocks_start['Артикул WB'] == nm_id]['Доступно для продажи'].sum()
-                # Общая стоимость хранения за неделю – сумма по строкам expense с типом "Хранение"
-                storage_fee_rows = group[group['doc_type_name'].str.contains('Хранение', na=False)]
-                if not storage_fee_rows.empty:
-                    total_storage_cost = abs(storage_fee_rows['ppvz_for_pay'].sum())
-                else:
-                    total_storage_cost = 0
-                if total_stock_all > 0 and total_storage_cost > 0:
-                    storage_cost = (sku_stock / total_stock_all) * total_storage_cost
-                else:
-                    storage_cost = 0
-            else:
-                storage_cost = 0
-
-            # Налоги
-            nds = revenue * 0.07
-            profit_base = cash_flow - total_cost - storage_cost - advert_cost
-            profit_tax = max(0, profit_base) * 0.15
-
-            # Валовая прибыль
-            gross_profit = profit_base - nds - profit_tax
-
-            # Средние комиссии (берём из последней продажи)
-            if not sales.empty:
-                sales_sorted = sales.sort_values('sale_dt', ascending=False)
-                last_commission = sales_sorted.iloc[0]['commission_percent']
-                last_acquiring = sales_sorted.iloc[0]['acquiring_percent']
-                avg_price = revenue / qty_sold
-                avg_logistics = abs(expenses[expenses['doc_type_name'].isin(['Логистика', 'Возмещение издержек по перевозке/по складским операциям с товаром'])]['ppvz_for_pay'].sum()) / qty_sold
-                avg_storage = storage_cost / qty_sold
-                avg_advert = advert_cost / qty_sold
-                avg_tax = (nds + profit_tax) / qty_sold
-                avg_profit = gross_profit / qty_sold
-            else:
-                last_commission = 0
-                last_acquiring = 0
-                avg_price = 0
-                avg_logistics = 0
-                avg_storage = 0
-                avg_advert = 0
-                avg_tax = 0
-                avg_profit = 0
-
-            results.append({
-                'nm_id': nm_id,
-                'week': week_number,
-                'revenue': round(revenue, 2),
-                'cash_flow': round(cash_flow, 2),
-                'total_cost': round(total_cost, 2),
-                'storage_cost': round(storage_cost, 2),
-                'advert_cost': round(advert_cost, 2),
-                'nds': round(nds, 2),
-                'profit_tax': round(profit_tax, 2),
-                'gross_profit': round(gross_profit, 2),
-                'qty_sold': qty_sold,
-                'avg_price': round(avg_price, 2),
-                'last_commission_percent': last_commission,
-                'last_acquiring_percent': last_acquiring,
-                'avg_logistics_per_unit': round(avg_logistics, 2),
-                'avg_storage_per_unit': round(avg_storage, 2),
-                'avg_advert_per_unit': round(avg_advert, 2),
-                'avg_tax_per_unit': round(avg_tax, 2),
-                'avg_profit_per_unit': round(avg_profit, 2),
-            })
-
-        if not results:
-            self.log("❌ Нет данных для формирования отчёта.")
-            return
-
-        # 7. Формируем итоговые DataFrame
-        gross_df = pd.DataFrame(results)[['nm_id', 'week', 'revenue', 'cash_flow', 'total_cost',
-                                          'storage_cost', 'advert_cost', 'nds', 'profit_tax', 'gross_profit']]
-        unit_df = pd.DataFrame(results)[['nm_id', 'week', 'avg_price', 'last_commission_percent',
-                                         'last_acquiring_percent', 'avg_logistics_per_unit',
-                                         'avg_storage_per_unit', 'avg_advert_per_unit',
-                                         'avg_tax_per_unit', 'avg_profit_per_unit']]
-
-        # 8. Сохраняем результат
-        output_key = f"Отчёты/Финансовые показатели/{store_name}/Экономика.xlsx"
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-                gross_df.to_excel(writer, sheet_name='Валовая прибыль', index=False)
-                unit_df.to_excel(writer, sheet_name='Юнит экономика', index=False)
-            self.s3.upload_file(tmp_path, output_key)
-            self.log(f"✅ Экономика сохранена: {output_key}")
-        except Exception as e:
-            self.log(f"❌ Ошибка сохранения экономики: {e}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        self.log("✅ Расчёт экономики завершён.")
-
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         # Исключаем 1c_stocks из списка по умолчанию (можно вернуть позже, добавив в список)
@@ -1767,9 +1552,6 @@ class WildberriesDailyUpdater:
                 self.log(f"⏳ Пауза 30 секунд перед следующим отчётом...")
                 time.sleep(30)
 
-        self.log_section("РАСЧЁТ ЭКОНОМИКИ")
-        self.calculate_economics(store_name)
-
         self.log("✅ Обновление завершено")
 
     def log_section(self, title: str):
@@ -1786,18 +1568,17 @@ def show_menu() -> int:
     print("\n" + "="*60)
     print("ВЫБЕРИТЕ ДЕЙСТВИЕ:")
     print("="*60)
-    print("1. Полное ежедневное обновление (все отчёты + экономика)")
-    print("2. Только расчёт экономики (еженедельно)")
-    print("3. Обновить конкретный отчёт")
-    print("4. Выход")
+    print("1. Полное ежедневное обновление (все отчёты)")
+    print("2. Обновить конкретный отчёт")
+    print("3. Выход")
     print("="*60)
     while True:
         try:
-            choice = int(input("Введите номер действия (1-4): "))
-            if 1 <= choice <= 4:
+            choice = int(input("Введите номер действия (1-3): "))
+            if 1 <= choice <= 3:
                 return choice
             else:
-                print("Ошибка: введите число от 1 до 4.")
+                print("Ошибка: введите число от 1 до 3.")
         except (EOFError, KeyboardInterrupt):
             # В неинтерактивном режиме или при прерывании возвращаем 1 (полное обновление) или выход
             return 1
@@ -1834,6 +1615,14 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
 
 def main():
     """Основная функция запуска с поддержкой меню."""
+    parser = argparse.ArgumentParser(description='Wildberries Daily Updater')
+    parser.add_argument('--full', action='store_true', help='Полное ежедневное обновление (все отчёты)')
+    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords'], 
+                        help='Обновить конкретный отчёт')
+    parser.add_argument('--store', type=str, default='TOPFACE', help='Название магазина (по умолчанию TOPFACE)')
+    
+    args = parser.parse_args()
+
     required_env = [
         'YC_ACCESS_KEY_ID',
         'YC_SECRET_ACCESS_KEY',
@@ -1853,35 +1642,44 @@ def main():
     )
 
     api_keys = {
-        'TOPFACE': {
+        args.store: {
             'stats': os.environ['WB_STATS_KEY_TOPFACE'],
             'promo': os.environ['WB_PROMO_KEY_TOPFACE']
         }
     }
 
     updater = WildberriesDailyUpdater(api_keys, s3)
-    store = 'TOPFACE'
+    store = args.store
 
-    # Если запуск в неинтерактивном режиме (например, в CI/CD), выполняем полное обновление без меню
-    if not sys.stdin.isatty():
-        updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
+    # Если переданы аргументы, выполняем соответствующее действие
+    if args.full:
         updater.run_daily_update(store)
         return
+    if args.report:
+        updater.log(f"➡️ Запуск обновления отчёта: {args.report}")
+        method = getattr(updater, f"update_{args.report}")
+        success = method(store)
+        updater.log(f"📊 Отчёт {args.report}: {'✅' if success else '❌'}")
+        return
 
-    while True:
-        choice = show_menu()
-        if choice == 1:
-            updater.run_daily_update(store)
-        elif choice == 2:
-            updater.log_section("РАСЧЁТ ЭКОНОМИКИ (отдельный запуск)")
-            updater.calculate_economics(store)
-        elif choice == 3:
-            run_specific_report(updater, store)
-        elif choice == 4:
-            print("Выход из программы.")
-            break
-        print("\n" + "="*60)
-        input("Нажмите Enter, чтобы вернуться в меню...")
+    # Если аргументы не переданы, проверяем интерактивность
+    if sys.stdin.isatty():
+        # Интерактивный режим: показываем меню
+        while True:
+            choice = show_menu()
+            if choice == 1:
+                updater.run_daily_update(store)
+            elif choice == 2:
+                run_specific_report(updater, store)
+            elif choice == 3:
+                print("Выход из программы.")
+                break
+            print("\n" + "="*60)
+            input("Нажмите Enter, чтобы вернуться в меню...")
+    else:
+        # Неинтерактивный режим без аргументов: по умолчанию полное обновление
+        updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
+        updater.run_daily_update(store)
 
 if __name__ == "__main__":
     main()
