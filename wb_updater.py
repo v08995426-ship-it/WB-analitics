@@ -1,4 +1,5 @@
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
@@ -1378,7 +1379,7 @@ class WildberriesDailyUpdater:
             self.s3.write_excel_multi(weekly_key, sheets)
             self.log(f"✅ Недельный файл с несколькими листами сохранён: {weekly_key}")
 
-        # 7. Дополнительно формируем отчёты по категориям за каждый день и итоговый
+        # 7. Дополнительно формируем отчёты по категориям и единый аналитический файл
         if not daily_df.empty:
             # Отчёт по категориям за каждый день
             daily_cat = daily_df.groupby(['Дата', 'Название предмета']).agg({
@@ -1410,13 +1411,17 @@ class WildberriesDailyUpdater:
             summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
             summary_cat = summary_cat.sort_values('Расход', ascending=False)
 
+            # Сохраняем единый аналитический файл со всеми листами
             analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
             sheets_analytics = {
+                'Статистика_Ежедневно': daily_df,
+                'Статистика_Итого': summary_df,
+                'Список_кампаний': campaigns_df,
                 'Отчет_по_Категории': daily_cat,
                 'Отчет_по_Категории_Итог': summary_cat
             }
             self.s3.write_excel_multi(analytics_key, sheets_analytics)
-            self.log(f"📊 Аналитический отчёт сохранён: {analytics_key}")
+            self.log(f"📊 Аналитический отчёт сохранён: {analytics_key} (листы: {', '.join(sheets_analytics.keys())})")
 
         # 8. Сохраняем историческую таблицу за последние 14 дней (накопление)
         self._update_adverts_history(store_name, daily_df)
@@ -1579,7 +1584,7 @@ def show_menu() -> int:
             else:
                 print("Ошибка: введите число от 1 до 3.")
         except (EOFError, KeyboardInterrupt):
-            # В неинтерактивном режиме или при прерывании возвращаем 1 (полное обновление) или выход
+            # В неинтерактивном режиме или при прерывании возвращаем 1 (полное обновление)
             return 1
         except ValueError:
             print("Ошибка: введите число.")
