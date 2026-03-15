@@ -1,29 +1,27 @@
 import os
 import io
-import re
-import math
-import json
+import tempfile
 import traceback
-from datetime import datetime, timedelta, date
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
 
-import pandas as pd
-import numpy as np
 import boto3
+import pandas as pd
+import pytz
 from botocore.client import Config
 from botocore.exceptions import ClientError
-import pytz
 
 
-# ============================================================
+# =========================================================
 # НАСТРОЙКИ
-# ============================================================
+# =========================================================
 
 STORE_NAME = "TOPFACE"
 TIMEZONE = "Europe/Moscow"
 
-VAT_RATE = 7.0                # НДС, включён в цену
-PROFIT_TAX_RATE = 15.0        # налог на прибыль
+VAT_RATE = 7.0
+PROFIT_TAX_RATE = 15.0
+
 MIN_DLV_PRC = 0.8
 EXPENSIVE_WAREHOUSE_THRESHOLD = 1.6
 TARGET_DLV_PRC_CAP = 1.4
@@ -31,49 +29,187 @@ TARGET_DLV_PRC_CAP = 1.4
 ACCEPTANCE_LOOKBACK_WEEKS = 9
 RETENTION_WEEKS = 13
 
-FINANCE_FOLDER = f"Отчёты/Финансовые показатели/{STORE_NAME}/Недельные"
-STOCKS_FOLDER = f"Отчёты/Остатки/{STORE_NAME}/Недельные"
+ECONOMICS_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/Экономика.xlsx"
+FINANCE_PREFIX = f"Отчёты/Финансовые показатели/{STORE_NAME}/Недельные/"
+STOCKS_PREFIX = f"Отчёты/Остатки/{STORE_NAME}/Недельные/"
 ADVERT_ANALYTICS_KEY = f"Отчёты/Реклама/{STORE_NAME}/Анализ рекламы.xlsx"
+ADVERT_WEEKLY_PREFIX = f"Отчёты/Реклама/{STORE_NAME}/Недельные/"
 COST_KEY = "Отчёты/Себестоимость/Себестоимость.xlsx"
-OUTPUT_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/Экономика.xlsx"
 
-SHEET_UNIT = "Юнит экономика"
-SHEET_FACT = "Общий факт за неделю"
-SHEET_WOW = "Анализ неделя к неделе"
-SHEET_WH = "Склады_Коэффициенты"
+WEEK_SHEET_UNIT = "Юнит экономика"
+WEEK_SHEET_FACT = "Общий факт за неделю"
+WEEK_SHEET_ANALYSIS = "Анализ неделя к неделе"
+WEEK_SHEET_WAREHOUSES = "Склады_Коэффициенты"
 
-# Если хотите расширить список, добавите сюда:
-POSITIVE_COMPENSATION_OPS = {
+SALE_LIKE_OPERATIONS = {
+    "Продажа",
     "Компенсация ущерба",
     "Добровольная компенсация при возврате",
-}
-NEGATIVE_COMPENSATION_OPS = {
-    "Компенсация ущерба",
-    "Добровольная компенсация при возврате",
+    "Компенсация скидки по программе лояльности",
 }
 
-# Общемагазинные расходы
-STOREWIDE_EXPENSE_NAMES = {
-    "Штраф",
-    "Удержания",
-    "Разовое изменение срока перечисления денежных средств",
+RETURN_LIKE_OPERATIONS = {
+    "Возврат",
 }
 
-# Логистика
-DIRECT_LOGISTICS_HINTS = {
+DIRECT_LOGISTIC_HINTS = [
     "к клиенту при продаже",
-    "клиенту при продаже",
-}
-REVERSE_LOGISTICS_HINTS = {
-    "к клиенту при отмене",
+    "к клиенту",
+]
+
+REVERSE_LOGISTIC_HINTS = [
     "от клиента при отмене",
     "от клиента при возврате",
+    "к клиенту при отмене",
     "возврат товара",
-}
+    "возврат",
+    "от клиента",
+]
 
-# ============================================================
-# S3 STORAGE
-# ============================================================
+
+# =========================================================
+# LOGGING / UTILS
+# =========================================================
+
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def moscow_now():
+    return datetime.now(pytz.timezone(TIMEZONE))
+
+
+def safe_round(x, digits=6):
+    try:
+        if pd.isna(x):
+            return 0.0
+        return round(float(x), digits)
+    except Exception:
+        return 0.0
+
+
+def safe_div(a, b, digits=6):
+    try:
+        a = float(a)
+        b = float(b)
+        if b == 0:
+            return 0.0
+        return round(a / b, digits)
+    except Exception:
+        return 0.0
+
+
+def norm_text(x) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip().lower()
+
+
+def week_label(dt: datetime.date) -> str:
+    year, week_num, _ = dt.isocalendar()
+    return f"{year}-W{week_num:02d}"
+
+
+def get_last_full_week_range() -> Tuple[datetime.date, datetime.date]:
+    today = moscow_now().date()
+    current_week_monday = today - timedelta(days=today.weekday())
+    end_prev_week = current_week_monday - timedelta(days=1)
+    start_prev_week = end_prev_week - timedelta(days=6)
+    return start_prev_week, end_prev_week
+
+
+def get_weekly_finance_key(week_start: datetime.date) -> str:
+    return f"{FINANCE_PREFIX}Финансовые показатели_{week_label(week_start)}.xlsx"
+
+
+def get_weekly_stocks_key(week_start: datetime.date) -> str:
+    return f"{STOCKS_PREFIX}Остатки_{week_label(week_start)}.xlsx"
+
+
+def get_weekly_advert_key(week_start: datetime.date) -> str:
+    return f"{ADVERT_WEEKLY_PREFIX}Реклама_{week_label(week_start)}.xlsx"
+
+
+def to_date_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce").dt.date
+
+
+def to_datetime_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
+
+
+def ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return df
+
+
+def mode_or_last(series: pd.Series):
+    s = series.dropna().astype(str).str.strip()
+    if s.empty:
+        return ""
+    mode = s.mode()
+    if not mode.empty:
+        return mode.iloc[0]
+    return s.iloc[-1]
+
+
+def extract_vat_from_gross(revenue_with_vat: float, vat_rate: float) -> float:
+    return safe_round(revenue_with_vat * vat_rate / (100.0 + vat_rate), 6)
+
+
+def get_sign_for_row(doc_type_name: str, supplier_oper_name: str) -> int:
+    doc = norm_text(doc_type_name)
+    oper = norm_text(supplier_oper_name)
+
+    if supplier_oper_name in SALE_LIKE_OPERATIONS or doc == "продажа":
+        return 1
+    if supplier_oper_name in RETURN_LIKE_OPERATIONS or doc == "возврат":
+        return -1
+    if oper in {x.lower() for x in SALE_LIKE_OPERATIONS}:
+        return 1
+    if oper in {x.lower() for x in RETURN_LIKE_OPERATIONS}:
+        return -1
+    return 0
+
+
+def classify_logistics_row(row) -> str:
+    supplier_oper = norm_text(row.get("supplier_oper_name", ""))
+    bonus_type = norm_text(row.get("bonus_type_name", ""))
+    delivery_amount = float(row.get("delivery_amount", 0) or 0)
+    return_amount = float(row.get("return_amount", 0) or 0)
+
+    if supplier_oper != "логистика":
+        return "none"
+
+    for hint in REVERSE_LOGISTIC_HINTS:
+        if hint in bonus_type:
+            return "reverse"
+
+    for hint in DIRECT_LOGISTIC_HINTS:
+        if hint in bonus_type:
+            return "direct"
+
+    if return_amount > 0:
+        return "reverse"
+    if delivery_amount > 0:
+        return "direct"
+    return "direct"
+
+
+def build_week_list(last_week_start: datetime.date, lookback_weeks: int) -> List[datetime.date]:
+    weeks = []
+    current = last_week_start
+    for _ in range(lookback_weeks):
+        weeks.append(current)
+        current = current - timedelta(days=7)
+    return sorted(weeks)
+
+
+# =========================================================
+# S3 / YANDEX OBJECT STORAGE
+# =========================================================
 
 class S3Storage:
     def __init__(self, access_key: str, secret_key: str, bucket_name: str):
@@ -100,1012 +236,1076 @@ class S3Storage:
             return False
 
     def list_files(self, prefix: str) -> List[str]:
-        try:
-            resp = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
-            if "Contents" not in resp:
-                return []
-            return [x["Key"] for x in resp["Contents"]]
-        except Exception:
-            return []
+        out = []
+        token = None
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = self.s3.list_objects_v2(**kwargs)
+            for obj in resp.get("Contents", []):
+                out.append(obj["Key"])
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+            else:
+                break
+        return out
 
-    def read_excel(self, key: str, sheet_name=0) -> pd.DataFrame:
-        try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            data = obj["Body"].read()
-            return pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                return pd.DataFrame()
-            raise
-        except Exception:
-            print(f"Ошибка чтения Excel: {key}")
-            traceback.print_exc()
-            return pd.DataFrame()
+    def read_excel(self, key: str, sheet_name=0):
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        data = obj["Body"].read()
+        return pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
 
     def read_excel_all_sheets(self, key: str) -> Dict[str, pd.DataFrame]:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        data = obj["Body"].read()
+        return pd.read_excel(io.BytesIO(data), sheet_name=None)
+
+    def write_excel_sheets(self, key: str, sheets: Dict[str, pd.DataFrame]):
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp_path = tmp.name
         try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            data = obj["Body"].read()
-            return pd.read_excel(io.BytesIO(data), sheet_name=None)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                return {}
-            raise
-        except Exception:
-            print(f"Ошибка чтения всех листов Excel: {key}")
-            traceback.print_exc()
-            return {}
-
-    def write_excel_sheets(self, key: str, sheets: Dict[str, pd.DataFrame]) -> None:
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            for sheet_name, df in sheets.items():
-                safe_name = str(sheet_name)[:31] if sheet_name else "Sheet1"
-                if df is None:
-                    df = pd.DataFrame()
-                df.to_excel(writer, index=False, sheet_name=safe_name)
-        out.seek(0)
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=out.getvalue())
+            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+                for sheet_name, df in sheets.items():
+                    safe_sheet = str(sheet_name)[:31]
+                    if df is None:
+                        df = pd.DataFrame()
+                    df.to_excel(writer, index=False, sheet_name=safe_sheet)
+            self.s3.upload_file(tmp_path, self.bucket, key)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
+# =========================================================
+# COSTS NORMALIZATION
+# =========================================================
 
-def log(msg: str):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}", flush=True)
-
-
-def week_id_from_date(d: date) -> str:
-    y, w, _ = d.isocalendar()
-    return f"{y}-W{w:02d}"
-
-
-def week_start_from_week_id(week_id: str) -> date:
-    year, week = week_id.split("-W")
-    return date.fromisocalendar(int(year), int(week), 1)
-
-
-def week_end_from_week_id(week_id: str) -> date:
-    year, week = week_id.split("-W")
-    return date.fromisocalendar(int(year), int(week), 7)
-
-
-def get_last_complete_week_id() -> str:
-    tz = pytz.timezone(TIMEZONE)
-    today = datetime.now(tz).date()
-    last_sunday = today - timedelta(days=today.weekday() + 1)
-    return week_id_from_date(last_sunday)
-
-
-def get_previous_week_id(week_id: str) -> str:
-    start = week_start_from_week_id(week_id)
-    prev = start - timedelta(days=7)
-    return week_id_from_date(prev)
-
-
-def get_last_n_week_ids(anchor_week_id: str, n: int) -> List[str]:
-    start = week_start_from_week_id(anchor_week_id)
-    result = []
-    for i in range(n):
-        d = start - timedelta(days=7 * i)
-        result.append(week_id_from_date(d))
-    return result
-
-
-def retention_filter(df: pd.DataFrame, week_col: str = "Неделя", keep_weeks: int = RETENTION_WEEKS) -> pd.DataFrame:
-    if df.empty or week_col not in df.columns:
-        return df
-    unique_weeks = sorted(df[week_col].dropna().astype(str).unique())
-    keep = unique_weeks[-keep_weeks:]
-    return df[df[week_col].astype(str).isin(keep)].copy()
-
-
-def to_float(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(0.0)
-
-
-def to_int(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(0).astype(int)
-
-
-def safe_div(a, b):
-    try:
-        if b in (0, None) or pd.isna(b):
-            return 0.0
-        return float(a) / float(b)
-    except Exception:
-        return 0.0
-
-
-def safe_round(x, n=2):
-    try:
-        if pd.isna(x):
-            return 0
-        return round(float(x), n)
-    except Exception:
-        return 0
-
-
-def normalize_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def normalize_lower(x) -> str:
-    return normalize_text(x).lower()
-
-
-def first_non_empty(*values):
-    for v in values:
-        if pd.notna(v) and str(v).strip() != "":
-            return v
-    return None
-
-
-def cols_exist(df: pd.DataFrame, cols: List[str]) -> bool:
-    return all(c in df.columns for c in cols)
-
-
-def ensure_columns(df: pd.DataFrame, cols: List[str]):
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
-
-
-def pick_first_existing(columns: List[str], candidates: List[str]) -> Optional[str]:
-    low_map = {str(c).strip().lower(): c for c in columns}
-    for c in candidates:
-        if c.strip().lower() in low_map:
-            return low_map[c.strip().lower()]
-    return None
-
-
-# ============================================================
-# НОРМАЛИЗАЦИЯ СЕБЕСТОИМОСТИ
-# ============================================================
-
-def load_costs(s3: S3Storage) -> pd.DataFrame:
-    df = s3.read_excel(COST_KEY, sheet_name=0)
-    if df.empty:
-        log("⚠️ Файл себестоимости пуст или не найден.")
+def normalize_cost_dataframe(cost_df: pd.DataFrame) -> pd.DataFrame:
+    if cost_df.empty:
         return pd.DataFrame(columns=["nm_id", "cost_price"])
 
-    normalized = {col: str(col).strip().lower().replace("ё", "е") for col in df.columns}
+    df = cost_df.copy()
+    original_columns = list(df.columns)
+
+    normalized = {}
+    for col in df.columns:
+        norm = str(col).strip().lower().replace("ё", "е")
+        normalized[col] = norm
+
     nm_col = None
     cost_col = None
 
+    nm_priority = [
+        "nm_id",
+        "nmid",
+        "артикул wb",
+        "артикул вб",
+        "wb article",
+        "wb id",
+        "код wb",
+    ]
+
     for col, norm in normalized.items():
-        if norm in {"nm_id", "nmid", "артикул wb", "артикул", "id товара"} or "артикул wb" in norm:
+        if norm in nm_priority:
             nm_col = col
             break
 
+    if nm_col is None:
+        for col, norm in normalized.items():
+            if "артикул wb" in norm or "артикул вб" in norm:
+                nm_col = col
+                break
+
+    cost_priority = [
+        "cost_price",
+        "себестоимость",
+        "стоимость",
+        "cost",
+        "cost price",
+        "закупочная цена",
+    ]
+
     for col, norm in normalized.items():
-        if norm in {"cost_price", "себестоимость", "закупочная цена", "cost"} or "себестоим" in norm:
+        if norm in cost_priority:
             cost_col = col
             break
 
+    if cost_col is None:
+        for col, norm in normalized.items():
+            if "себестоим" in norm or "стоимость" in norm or norm.startswith("cost"):
+                cost_col = col
+                break
+
+    if nm_col is None:
+        for col in original_columns:
+            if "вб" in str(col).lower():
+                nm_col = col
+                break
+
+    if cost_col is None and len(original_columns) >= 4:
+        cost_col = original_columns[-1]
+
     if nm_col is None or cost_col is None:
-        log(f"⚠️ Не удалось определить колонки в Себестоимости. Колонки: {list(df.columns)}")
+        log(f"⚠️ Не удалось определить колонки в Себестоимости. Колонки: {original_columns}")
         return pd.DataFrame(columns=["nm_id", "cost_price"])
 
-    out = df.rename(columns={nm_col: "nm_id", cost_col: "cost_price"}).copy()
-    out["nm_id"] = pd.to_numeric(out["nm_id"], errors="coerce")
-    out["cost_price"] = pd.to_numeric(out["cost_price"], errors="coerce").fillna(0.0)
-    out = out.dropna(subset=["nm_id"])
-    out["nm_id"] = out["nm_id"].astype("int64")
-    out = out[["nm_id", "cost_price"]].drop_duplicates(subset=["nm_id"], keep="last")
-    return out
-
-
-# ============================================================
-# ЗАГРУЗКА ФИНАНСОВ
-# ============================================================
-
-def load_finance_week(s3: S3Storage, week_id: str) -> pd.DataFrame:
-    key = f"{FINANCE_FOLDER}/Финансовые показатели_{week_id}.xlsx"
-    df = s3.read_excel(key, sheet_name=0)
-    if df.empty:
-        log(f"⚠️ Не найден финансовый файл: {key}")
-        return pd.DataFrame()
-
-    # обязательные поля
-    must_cols = [
-        "rr_dt", "nm_id", "sa_name", "subject_name", "brand_name",
-        "doc_type_name", "supplier_oper_name", "quantity", "retail_amount",
-        "retail_price_withdisc_rub", "commission_percent", "acquiring_fee",
-        "acquiring_percent", "delivery_amount", "return_amount", "delivery_rub",
-        "bonus_type_name", "penalty", "additional_payment", "rebill_logistic_cost",
-        "storage_fee", "deduction", "acceptance", "ppvz_for_pay", "ppvz_vw",
-        "ppvz_vw_nds", "ppvz_spp_prc", "office_name", "dlv_prc",
-    ]
-    ensure_columns(df, must_cols)
-
-    # типы
-    numeric_cols = [
-        "nm_id", "quantity", "retail_amount", "retail_price_withdisc_rub",
-        "commission_percent", "acquiring_fee", "acquiring_percent", "delivery_amount",
-        "return_amount", "delivery_rub", "penalty", "additional_payment",
-        "rebill_logistic_cost", "storage_fee", "deduction", "acceptance",
-        "ppvz_for_pay", "ppvz_vw", "ppvz_vw_nds", "ppvz_spp_prc", "dlv_prc",
-    ]
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-    df["rr_dt"] = pd.to_datetime(df["rr_dt"], errors="coerce").dt.date
-    df["sale_dt"] = pd.to_datetime(df.get("sale_dt"), errors="coerce")
-    df["order_dt"] = pd.to_datetime(df.get("order_dt"), errors="coerce")
-
-    # строковые
-    for c in ["doc_type_name", "supplier_oper_name", "bonus_type_name", "office_name", "sa_name", "subject_name", "brand_name"]:
-        df[c] = df[c].astype(str).fillna("").str.strip()
-
+    df = df.rename(columns={nm_col: "nm_id", cost_col: "cost_price"})
     df["nm_id"] = pd.to_numeric(df["nm_id"], errors="coerce")
-    return df
+    df["cost_price"] = pd.to_numeric(df["cost_price"], errors="coerce")
+
+    df = df[["nm_id", "cost_price"]].dropna(subset=["nm_id"])
+    df["nm_id"] = df["nm_id"].astype("int64")
+    df["cost_price"] = df["cost_price"].fillna(0.0)
+
+    return df.drop_duplicates(subset="nm_id", keep="last")
 
 
-# ============================================================
-# ЗАГРУЗКА ОСТАТКОВ
-# ============================================================
+# =========================================================
+# READ INPUTS
+# =========================================================
 
-def load_stocks_week(s3: S3Storage, week_id: str) -> pd.DataFrame:
-    key = f"{STOCKS_FOLDER}/Остатки_{week_id}.xlsx"
-    df = s3.read_excel(key, sheet_name=0)
-    if df.empty:
-        log(f"⚠️ Файл остатков не найден: {key}")
+def read_finance_week(s3: S3Storage, week_start: datetime.date) -> pd.DataFrame:
+    key = get_weekly_finance_key(week_start)
+    if not s3.file_exists(key):
+        log(f"⚠️ Не найден фин. отчёт: {key}")
         return pd.DataFrame()
 
-    ensure_columns(df, ["Дата сбора", "Дата запроса", "Артикул WB", "Доступно для продажи", "Склад"])
-    if "Дата сбора" in df.columns:
-        df["Дата сбора"] = pd.to_datetime(df["Дата сбора"], errors="coerce")
-    if "Дата запроса" in df.columns:
-        df["Дата запроса"] = pd.to_datetime(df["Дата запроса"], errors="coerce")
-    df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-    df["Доступно для продажи"] = pd.to_numeric(df["Доступно для продажи"], errors="coerce").fillna(0)
-    return df
-
-
-def get_stock_snapshot_for_week(stocks_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Берём первую доступную дату внутри файла.
-    Сначала пытаемся 'Дата сбора', если пусто — 'Дата запроса'.
-    """
-    if stocks_df.empty:
-        return pd.DataFrame(columns=["nm_id", "stock_units"])
-
-    date_col = None
-    if "Дата сбора" in stocks_df.columns and stocks_df["Дата сбора"].notna().any():
-        date_col = "Дата сбора"
-    elif "Дата запроса" in stocks_df.columns and stocks_df["Дата запроса"].notna().any():
-        date_col = "Дата запроса"
-
-    if date_col is None:
-        log("⚠️ В остатках нет валидных дат.")
-        return pd.DataFrame(columns=["nm_id", "stock_units"])
-
-    first_dt = stocks_df[date_col].dropna().min()
-    snap = stocks_df[stocks_df[date_col] == first_dt].copy()
-    snap["nm_id"] = pd.to_numeric(snap["Артикул WB"], errors="coerce")
-    snap["stock_units"] = pd.to_numeric(snap["Доступно для продажи"], errors="coerce").fillna(0)
-    snap = snap.dropna(subset=["nm_id"])
-
-    out = snap.groupby("nm_id", as_index=False)["stock_units"].sum()
-    out["nm_id"] = out["nm_id"].astype("int64")
-    return out
-
-
-# ============================================================
-# ЗАГРУЗКА РЕКЛАМЫ
-# ============================================================
-
-def load_advert_spend_week(s3: S3Storage, week_id: str) -> pd.DataFrame:
-    sheets = s3.read_excel_all_sheets(ADVERT_ANALYTICS_KEY)
-    if not sheets:
-        log(f"⚠️ Не найден файл рекламы: {ADVERT_ANALYTICS_KEY}")
-        return pd.DataFrame(columns=["nm_id", "advert_spend_week"])
-
-    # основной лист
-    if "Статистика_Ежедневно" in sheets:
-        df = sheets["Статистика_Ежедневно"].copy()
-    else:
-        # fallback - первый лист
-        first_sheet = next(iter(sheets.keys()))
-        df = sheets[first_sheet].copy()
-
-    if df.empty:
-        return pd.DataFrame(columns=["nm_id", "advert_spend_week"])
-
-    ensure_columns(df, ["Дата", "Артикул WB", "Расход"])
-    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce").dt.date
-    df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-    df["Расход"] = pd.to_numeric(df["Расход"], errors="coerce").fillna(0)
-
-    start = week_start_from_week_id(week_id)
-    end = week_end_from_week_id(week_id)
-    df = df[(df["Дата"] >= start) & (df["Дата"] <= end)].copy()
-
-    if df.empty:
-        return pd.DataFrame(columns=["nm_id", "advert_spend_week"])
-
-    out = df.groupby("Артикул WB", as_index=False)["Расход"].sum()
-    out.columns = ["nm_id", "advert_spend_week"]
-    out["nm_id"] = out["nm_id"].astype("int64")
-    return out
-
-
-# ============================================================
-# КЛАССИФИКАЦИЯ СТРОК ФИНОТЧЁТА
-# ============================================================
-
-def classify_finance_rows(df: pd.DataFrame) -> pd.DataFrame:
+    df = s3.read_excel(key, sheet_name=0)
     if df.empty:
         return df
 
-    out = df.copy()
+    numeric_cols = [
+        "nm_id", "quantity", "retail_price", "retail_amount",
+        "retail_price_withdisc_rub", "commission_percent", "ppvz_for_pay",
+        "acquiring_fee", "acquiring_percent", "delivery_rub", "delivery_amount",
+        "return_amount", "penalty", "additional_payment", "rebill_logistic_cost",
+        "storage_fee", "deduction", "acceptance", "ppvz_spp_prc", "dlv_prc"
+    ]
+    df = ensure_numeric(df, numeric_cols)
 
-    out["is_sale"] = (
-        (out["doc_type_name"].str.lower() == "продажа") &
-        (~out["supplier_oper_name"].isin(POSITIVE_COMPENSATION_OPS))
-    )
+    if "rr_dt" in df.columns:
+        df["rr_dt"] = to_date_series(df["rr_dt"])
+    if "sale_dt" in df.columns:
+        df["sale_dt"] = to_datetime_series(df["sale_dt"])
+    if "order_dt" in df.columns:
+        df["order_dt"] = to_datetime_series(df["order_dt"])
+    if "nm_id" in df.columns:
+        df["nm_id"] = pd.to_numeric(df["nm_id"], errors="coerce")
 
-    out["is_return"] = (
-        (out["doc_type_name"].str.lower() == "возврат") &
-        (~out["supplier_oper_name"].isin(NEGATIVE_COMPENSATION_OPS))
-    )
-
-    out["is_positive_compensation"] = (
-        out["supplier_oper_name"].isin(POSITIVE_COMPENSATION_OPS) &
-        (out["doc_type_name"].str.lower() == "продажа")
-    )
-
-    out["is_negative_compensation"] = (
-        out["supplier_oper_name"].isin(NEGATIVE_COMPENSATION_OPS) &
-        (out["doc_type_name"].str.lower() == "возврат")
-    )
-
-    out["is_storage"] = out["supplier_oper_name"].str.lower().eq("хранение")
-    out["is_acceptance"] = (
-        out["supplier_oper_name"].str.lower().isin({"обработка товара", "операции на приемке", "операции при приемке"})
-        | (to_float(out["acceptance"]) != 0)
-    )
-    out["is_penalty"] = (out["supplier_oper_name"].str.lower().eq("штраф")) | (to_float(out["penalty"]) != 0)
-    out["is_deduction"] = (out["supplier_oper_name"].str.lower().eq("удержания")) | (to_float(out["deduction"]) != 0)
-
-    # классификация логистики
-    bonus_lower = out["bonus_type_name"].astype(str).str.lower().fillna("")
-    oper_lower = out["supplier_oper_name"].astype(str).str.lower().fillna("")
-
-    out["is_logistics"] = (
-        oper_lower.eq("логистика")
-        | oper_lower.eq("возмещение издержек по перевозке/по складским операциям с товаром")
-        | (to_float(out["delivery_rub"]) != 0)
-        | (to_float(out["rebill_logistic_cost"]) != 0)
-    )
-
-    out["is_direct_logistics"] = (
-        out["is_logistics"] &
-        (
-            bonus_lower.apply(lambda x: any(h in x for h in DIRECT_LOGISTICS_HINTS))
-            | ((to_float(out["delivery_amount"]) > 0) & (to_float(out["return_amount"]) <= 0))
-        )
-    )
-
-    out["is_reverse_logistics"] = (
-        out["is_logistics"] &
-        (
-            bonus_lower.apply(lambda x: any(h in x for h in REVERSE_LOGISTICS_HINTS))
-            | (to_float(out["return_amount"]) > 0)
-        )
-    )
-
-    out["is_storewide_expense"] = (
-        out["supplier_oper_name"].isin(STOREWIDE_EXPENSE_NAMES)
-        | out["is_penalty"]
-        | out["is_deduction"]
-    )
-
-    return out
+    return df
 
 
-# ============================================================
-# РАСЧЁТ СТРОКОВОЙ КОМИССИИ
-# ============================================================
+def read_stocks_week(s3: S3Storage, week_start: datetime.date) -> pd.DataFrame:
+    key = get_weekly_stocks_key(week_start)
+    if not s3.file_exists(key):
+        log(f"⚠️ Не найден отчёт остатков: {key}")
+        return pd.DataFrame()
 
-def calculate_commission_rub(row: pd.Series) -> float:
-    """
-    Приоритет:
-    1) ppvz_vw + ppvz_vw_nds — явное вознаграждение WB
-    2) fallback: retail_price_withdisc_rub - ppvz_for_pay - acquiring_fee
-    """
-    ppvz_vw = float(row.get("ppvz_vw", 0) or 0)
-    ppvz_vw_nds = float(row.get("ppvz_vw_nds", 0) or 0)
-    explicit = ppvz_vw + ppvz_vw_nds
-    if explicit != 0:
-        return explicit
+    df = s3.read_excel(key, sheet_name=0)
+    if df.empty:
+        return df
 
-    retail = float(row.get("retail_price_withdisc_rub", 0) or 0)
-    pay = float(row.get("ppvz_for_pay", 0) or 0)
-    acquiring = float(row.get("acquiring_fee", 0) or 0)
-    fallback = retail - pay - acquiring
-    return max(fallback, 0.0)
+    if "Дата сбора" in df.columns:
+        df["Дата сбора"] = to_date_series(df["Дата сбора"])
+    elif "Дата запроса" in df.columns:
+        df["Дата сбора"] = to_date_series(df["Дата запроса"])
+
+    df = ensure_numeric(df, ["Артикул WB", "Доступно для продажи", "Полное количество"])
+    if "Артикул WB" in df.columns:
+        df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
+
+    return df
 
 
-# ============================================================
-# АГРЕГАЦИЯ ФИНАНСОВ ПО SKU
-# ============================================================
+def read_advert_week(s3: S3Storage, week_start: datetime.date, week_end: datetime.date) -> pd.DataFrame:
+    try:
+        sheets = s3.read_excel_all_sheets(ADVERT_ANALYTICS_KEY)
+        if "Статистика_Ежедневно" in sheets:
+            df = sheets["Статистика_Ежедневно"].copy()
+        else:
+            df = next(iter(sheets.values())).copy()
 
-def build_weekly_fact_by_sku(fin_df: pd.DataFrame, cost_df: pd.DataFrame, advert_df: pd.DataFrame, stock_snapshot_df: pd.DataFrame, week_id: str) -> pd.DataFrame:
+        if not df.empty and "Дата" in df.columns:
+            df["Дата"] = to_date_series(df["Дата"])
+            df = ensure_numeric(df, ["Артикул WB", "Расход", "Сумма заказов", "Показы", "Клики", "Заказы"])
+            df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
+            df = df[(df["Дата"] >= week_start) & (df["Дата"] <= week_end)]
+            return df
+    except Exception as e:
+        log(f"⚠️ Не удалось прочитать Анализ рекламы.xlsx: {e}")
+
+    weekly_key = get_weekly_advert_key(week_start)
+    if not s3.file_exists(weekly_key):
+        log(f"⚠️ Не найден weekly-рекламный файл: {weekly_key}")
+        return pd.DataFrame()
+
+    try:
+        sheets = s3.read_excel_all_sheets(weekly_key)
+        if "Статистика_Ежедневно" in sheets:
+            df = sheets["Статистика_Ежедневно"].copy()
+        else:
+            df = next(iter(sheets.values())).copy()
+
+        if not df.empty and "Дата" in df.columns:
+            df["Дата"] = to_date_series(df["Дата"])
+            df = ensure_numeric(df, ["Артикул WB", "Расход", "Сумма заказов", "Показы", "Клики", "Заказы"])
+            df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
+            df = df[(df["Дата"] >= week_start) & (df["Дата"] <= week_end)]
+            return df
+    except Exception as e:
+        log(f"⚠️ Не удалось прочитать weekly рекламу: {e}")
+
+    return pd.DataFrame()
+
+
+def read_costs(s3: S3Storage) -> pd.DataFrame:
+    if not s3.file_exists(COST_KEY):
+        log(f"⚠️ Не найден файл себестоимости: {COST_KEY}")
+        return pd.DataFrame(columns=["nm_id", "cost_price"])
+
+    raw = s3.read_excel(COST_KEY, sheet_name=0)
+    if raw.empty:
+        return pd.DataFrame(columns=["nm_id", "cost_price"])
+
+    return normalize_cost_dataframe(raw)
+
+
+# =========================================================
+# PREP FINANCE
+# =========================================================
+
+def build_finance_rows(fin_df: pd.DataFrame) -> pd.DataFrame:
     if fin_df.empty:
         return pd.DataFrame()
 
-    fin_df = classify_finance_rows(fin_df).copy()
-    fin_df["commission_rub_row"] = fin_df.apply(calculate_commission_rub, axis=1)
+    df = fin_df.copy()
 
-    # База SKU — всё, где есть nm_id
-    sku_df = fin_df[fin_df["nm_id"].notna() & (fin_df["nm_id"] != 0)].copy()
-    if sku_df.empty:
-        return pd.DataFrame()
+    df["supplier_oper_name_norm"] = df.get("supplier_oper_name", "").astype(str).str.strip()
+    df["doc_type_name_norm"] = df.get("doc_type_name", "").astype(str).str.strip()
+    df["subject_name"] = df.get("subject_name", "").astype(str)
+    df["brand_name"] = df.get("brand_name", "").astype(str)
+    df["sa_name"] = df.get("sa_name", "").astype(str)
+    df["office_name"] = df.get("office_name", "").astype(str)
+    df["bonus_type_name"] = df.get("bonus_type_name", "").astype(str)
 
-    sku_df["nm_id"] = sku_df["nm_id"].astype("int64")
-
-    # Продажи / возвраты / компенсации
-    sold = sku_df[sku_df["is_sale"]].groupby("nm_id").agg(
-        sold_units=("quantity", "sum"),
-        revenue_sale=("retail_amount", "sum"),
-        retail_price_withdisc_sale=("retail_price_withdisc_rub", "sum"),
-        avg_spp_sale=("ppvz_spp_prc", "mean"),
-        commission_rub_sale=("commission_rub_row", "sum"),
-        acquiring_fee_sale=("acquiring_fee", "sum"),
-        avg_commission_percent=("commission_percent", "mean"),
-        avg_acquiring_percent=("acquiring_percent", "mean"),
-    ).reset_index()
-
-    returned = sku_df[sku_df["is_return"]].groupby("nm_id").agg(
-        returned_units=("quantity", "sum"),
-        revenue_return=("retail_amount", "sum"),
-        retail_price_withdisc_return=("retail_price_withdisc_rub", "sum"),
-        commission_rub_return=("commission_rub_row", "sum"),
-        acquiring_fee_return=("acquiring_fee", "sum"),
-    ).reset_index()
-
-    pos_comp = sku_df[sku_df["is_positive_compensation"]].groupby("nm_id").agg(
-        positive_comp_units=("quantity", "sum"),
-        revenue_positive_comp=("retail_amount", "sum"),
-    ).reset_index()
-
-    neg_comp = sku_df[sku_df["is_negative_compensation"]].groupby("nm_id").agg(
-        negative_comp_units=("quantity", "sum"),
-        revenue_negative_comp=("retail_amount", "sum"),
-    ).reset_index()
-
-    # Прямая и обратная логистика
-    direct_log = sku_df[sku_df["is_direct_logistics"]].copy()
-    direct_log["direct_log_rub_row"] = to_float(direct_log["delivery_rub"]) + to_float(direct_log["rebill_logistic_cost"])
-    direct_log_agg = direct_log.groupby("nm_id").agg(
-        direct_logistics=("direct_log_rub_row", "sum"),
-        direct_logistics_rows=("direct_log_rub_row", "count"),
-    ).reset_index()
-
-    reverse_log = sku_df[sku_df["is_reverse_logistics"]].copy()
-    reverse_log["reverse_log_rub_row"] = to_float(reverse_log["delivery_rub"]) + to_float(reverse_log["rebill_logistic_cost"])
-    reverse_log_agg = reverse_log.groupby("nm_id").agg(
-        reverse_logistics=("reverse_log_rub_row", "sum"),
-        reverse_logistics_rows=("reverse_log_rub_row", "count"),
-    ).reset_index()
-
-    # Справочник SKU
-    info = sku_df.groupby("nm_id").agg(
-        Артикул_продавца=("sa_name", lambda x: next((i for i in x if str(i).strip()), "")),
-        Предмет=("subject_name", lambda x: next((i for i in x if str(i).strip()), "")),
-        Бренд=("brand_name", lambda x: next((i for i in x if str(i).strip()), "")),
-        last_sale_dt=("sale_dt", "max"),
-    ).reset_index()
-
-    # Последняя комиссия по SKU — по последним продажам недели
-    sale_rows = sku_df[sku_df["is_sale"]].copy()
-    sale_rows = sale_rows.sort_values(["nm_id", "sale_dt", "rr_dt"])
-    last_commission = sale_rows.groupby("nm_id").tail(1)[["nm_id", "commission_percent", "acquiring_percent"]].copy()
-    last_commission.columns = ["nm_id", "commission_percent_last", "acquiring_percent_last"]
-
-    # Собираем базу
-    base = info.copy()
-    for part in [sold, returned, pos_comp, neg_comp, direct_log_agg, reverse_log_agg, advert_df, stock_snapshot_df, cost_df, last_commission]:
-        if part is not None and not part.empty:
-            base = base.merge(part, on="nm_id", how="left")
-
-    # fillna
-    numeric_cols = [
-        "sold_units", "revenue_sale", "retail_price_withdisc_sale", "avg_spp_sale",
-        "commission_rub_sale", "acquiring_fee_sale", "avg_commission_percent",
-        "avg_acquiring_percent", "returned_units", "revenue_return", "retail_price_withdisc_return",
-        "commission_rub_return", "acquiring_fee_return", "positive_comp_units",
-        "revenue_positive_comp", "negative_comp_units", "revenue_negative_comp",
-        "direct_logistics", "reverse_logistics", "advert_spend_week", "stock_units",
-        "cost_price", "commission_percent_last", "acquiring_percent_last",
-    ]
-    for c in numeric_cols:
-        if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0.0)
-
-    # NET UNITS и REVENUE
-    base["sold_units"] = base.get("sold_units", 0)
-    base["returned_units"] = base.get("returned_units", 0)
-    base["positive_comp_units"] = base.get("positive_comp_units", 0)
-    base["negative_comp_units"] = base.get("negative_comp_units", 0)
-
-    base["Net units"] = (
-        base["sold_units"]
-        - base["returned_units"]
-        + base["positive_comp_units"]
-        - base["negative_comp_units"]
-    )
-
-    base["Валовая выручка"] = (
-        base.get("revenue_sale", 0)
-        - base.get("revenue_return", 0)
-        + base.get("revenue_positive_comp", 0)
-        - base.get("revenue_negative_comp", 0)
-    )
-
-    # Комиссия и эквайринг
-    base["Комиссия WB"] = base.get("commission_rub_sale", 0) - base.get("commission_rub_return", 0)
-    base["Эквайринг"] = base.get("acquiring_fee_sale", 0) - base.get("acquiring_fee_return", 0)
-
-    # Себестоимость
-    base["Себестоимость"] = base["Net units"] * base.get("cost_price", 0)
-
-    # Средние цены
-    retail_price_net = base.get("retail_price_withdisc_sale", 0) - base.get("retail_price_withdisc_return", 0)
-    base["Средняя retail_amount"] = base.apply(lambda r: safe_div(r["Валовая выручка"], r["Net units"]), axis=1)
-    base["Средняя retail_price_withdisc_rub"] = base.apply(lambda r: safe_div(retail_price_net.loc[r.name], r["Net units"]), axis=1)
-    base["Средняя СПП"] = base.get("avg_spp_sale", 0).fillna(0)
-
-    # Buyout rate proxy:
-    # Берём sold_units / (sold_units + reverse logistics rows)
-    base["Buyout rate"] = base.apply(
-        lambda r: safe_div(r["sold_units"], (r["sold_units"] + r.get("reverse_logistics_rows", 0))),
+    df["sign"] = df.apply(
+        lambda r: get_sign_for_row(r.get("doc_type_name_norm", ""), r.get("supplier_oper_name_norm", "")),
         axis=1
     )
 
-    # НДС
-    base["НДС"] = base["Валовая выручка"] * VAT_RATE / (100.0 + VAT_RATE)
+    df["signed_quantity"] = df["quantity"] * df["sign"]
+    df["signed_retail_amount"] = df["retail_amount"] * df["sign"]
+    df["signed_retail_price_withdisc_rub"] = df["retail_price_withdisc_rub"] * df["sign"]
 
-    # Пока без хранения/приёмки/штрафов — добавим дальше
-    base["Хранение"] = 0.0
-    base["Приёмка"] = 0.0
-    base["Штрафы"] = 0.0
-    base["Удержания"] = 0.0
-    base["Логистика прямая"] = base.get("direct_logistics", 0)
-    base["Логистика обратная"] = base.get("reverse_logistics", 0)
-    base["Реклама"] = base.get("advert_spend_week", 0)
+    commission_raw = (df["retail_price_withdisc_rub"] - df["ppvz_for_pay"] - df["acquiring_fee"]).fillna(0)
+    df["signed_commission"] = commission_raw.abs() * df["sign"]
+    df["signed_acquiring"] = df["acquiring_fee"].abs() * df["sign"]
 
-    # Week
-    base["Неделя"] = week_id
-
-    # Оставим нужное
-    out = base[
-        [
-            "Неделя", "nm_id", "Артикул_продавца", "Предмет", "Бренд",
-            "sold_units", "returned_units", "positive_comp_units", "negative_comp_units",
-            "Net units", "Buyout rate", "Средняя retail_amount", "Средняя retail_price_withdisc_rub",
-            "Средняя СПП", "commission_percent_last", "acquiring_percent_last",
-            "Валовая выручка", "Себестоимость", "Комиссия WB", "Эквайринг",
-            "Логистика прямая", "Логистика обратная", "Хранение", "Приёмка",
-            "Штрафы", "Удержания", "Реклама", "cost_price", "stock_units"
-        ]
-    ].copy()
-
-    # Переименуем чуть аккуратнее
-    out = out.rename(columns={
-        "sold_units": "Продажи, шт",
-        "returned_units": "Возвраты, шт",
-        "positive_comp_units": "Компенсации+, шт",
-        "negative_comp_units": "Компенсации-, шт",
-        "commission_percent_last": "Комиссия WB, % актуальная",
-        "acquiring_percent_last": "Эквайринг, % актуальный",
-        "cost_price": "Себестоимость, руб/ед",
-        "stock_units": "Остаток, шт"
-    })
-
-    return out
+    return df
 
 
-# ============================================================
-# ОБЩЕМАГАЗИННЫЕ РАСХОДЫ
-# ============================================================
+# =========================================================
+# STORAGE / WAREHOUSES
+# =========================================================
 
-def calculate_storewide_expenses(fin_df: pd.DataFrame) -> Dict[str, float]:
-    fin_df = classify_finance_rows(fin_df).copy()
-    result = {
-        "total_storage_week": 0.0,
-        "total_acceptance_week": 0.0,
-        "total_penalties_week": 0.0,
-        "total_deductions_week": 0.0,
-    }
+def calc_storage_allocation(
+    stocks_df: pd.DataFrame,
+    total_storage_week: float,
+    week_start: datetime.date,
+    week_end: datetime.date
+) -> pd.DataFrame:
+    if stocks_df.empty or "Дата сбора" not in stocks_df.columns or "Артикул WB" not in stocks_df.columns:
+        return pd.DataFrame(columns=["nm_id", "Хранение"])
 
-    # Хранение
-    storage_rows = fin_df[fin_df["is_storage"]].copy()
-    if not storage_rows.empty:
-        result["total_storage_week"] = float(to_float(storage_rows["storage_fee"]).sum())
+    df = stocks_df.copy()
+    df = df[df["Дата сбора"].notna()].copy()
 
-    # Приёмка
-    acceptance_rows = fin_df[fin_df["is_acceptance"]].copy()
-    if not acceptance_rows.empty:
-        result["total_acceptance_week"] = float(to_float(acceptance_rows["acceptance"]).sum())
+    if df.empty:
+        return pd.DataFrame(columns=["nm_id", "Хранение"])
 
-    # Штрафы
-    penalty_rows = fin_df[fin_df["is_penalty"]].copy()
-    if not penalty_rows.empty:
-        result["total_penalties_week"] = float(to_float(penalty_rows["penalty"]).sum())
+    in_week = df[(df["Дата сбора"] >= week_start) & (df["Дата сбора"] <= week_end)].copy()
+    if in_week.empty:
+        target_date = df["Дата сбора"].min()
+        in_week = df[df["Дата сбора"] == target_date].copy()
+    else:
+        target_date = in_week["Дата сбора"].min()
+        in_week = in_week[in_week["Дата сбора"] == target_date].copy()
 
-    # Удержания
-    deduction_rows = fin_df[fin_df["is_deduction"]].copy()
-    if not deduction_rows.empty:
-        result["total_deductions_week"] = float(to_float(deduction_rows["deduction"]).sum())
+    qty_col = "Доступно для продажи" if "Доступно для продажи" in in_week.columns else "Полное количество"
+    in_week[qty_col] = pd.to_numeric(in_week[qty_col], errors="coerce").fillna(0)
+    in_week["Артикул WB"] = pd.to_numeric(in_week["Артикул WB"], errors="coerce")
+    in_week = in_week.dropna(subset=["Артикул WB"]).copy()
+    in_week["Артикул WB"] = in_week["Артикул WB"].astype("int64")
 
-    return result
-
-
-def allocate_storage_by_stock(fact_df: pd.DataFrame, total_storage_week: float) -> pd.DataFrame:
-    out = fact_df.copy()
-    total_stock = to_float(out["Остаток, шт"]).sum()
-    if total_stock <= 0 or total_storage_week == 0:
-        out["Хранение"] = 0.0
-        return out
-    out["Хранение"] = out["Остаток, шт"].apply(lambda x: total_storage_week * safe_div(x, total_stock))
-    return out
-
-
-def allocate_storewide_cost_by_sales_units(fact_df: pd.DataFrame, value: float, target_col: str) -> pd.DataFrame:
-    out = fact_df.copy()
-    total_units = to_float(out["Продажи, шт"]).sum()
-    if total_units <= 0 or value == 0:
-        out[target_col] = 0.0
-        return out
-    out[target_col] = out["Продажи, шт"].apply(lambda x: value * safe_div(x, total_units))
-    return out
-
-
-# ============================================================
-# ПРИЁМКА ЗА 9 НЕДЕЛЬ
-# ============================================================
-
-def calculate_acceptance_per_unit_9w(s3: S3Storage, anchor_week_id: str) -> float:
-    week_ids = get_last_n_week_ids(anchor_week_id, ACCEPTANCE_LOOKBACK_WEEKS)
-    total_acceptance = 0.0
-    total_sold_units = 0.0
-
-    for w in week_ids:
-        fin_df = load_finance_week(s3, w)
-        if fin_df.empty:
-            continue
-        fin_df = classify_finance_rows(fin_df)
-        total_acceptance += float(to_float(fin_df["acceptance"]).sum())
-
-        sold_units = fin_df[fin_df["doc_type_name"].str.lower().eq("продажа")]["quantity"]
-        total_sold_units += float(to_float(sold_units).sum())
-
-    return safe_div(total_acceptance, total_sold_units)
-
-
-def apply_acceptance_norm_to_fact(fact_df: pd.DataFrame, acceptance_per_unit_9w: float) -> pd.DataFrame:
-    out = fact_df.copy()
-    out["Приёмка"] = out["Продажи, шт"] * acceptance_per_unit_9w
-    return out
-
-
-# ============================================================
-# ПРИБЫЛЬ
-# ============================================================
-
-def calculate_profit_columns(fact_df: pd.DataFrame) -> pd.DataFrame:
-    out = fact_df.copy()
-
-    # Валовая прибыль — до налогов
-    out["Валовая прибыль"] = (
-        out["Валовая выручка"]
-        - out["Себестоимость"]
-        - out["Комиссия WB"]
-        - out["Эквайринг"]
-        - out["Логистика прямая"]
-        - out["Логистика обратная"]
-        - out["Хранение"]
-        - out["Приёмка"]
-        - out["Штрафы"]
-        - out["Удержания"]
-        - out["Реклама"]
+    agg = (
+        in_week.groupby("Артикул WB", as_index=False)[qty_col]
+        .sum()
+        .rename(columns={"Артикул WB": "nm_id", qty_col: "stock_units"})
     )
 
-    out["Прибыль до налога"] = out["Валовая прибыль"] - out["НДС"]
-    out["Налог на прибыль"] = out["Прибыль до налога"].apply(lambda x: max(float(x), 0.0) * PROFIT_TAX_RATE / 100.0)
-    out["Чистая прибыль"] = out["Прибыль до налога"] - out["Налог на прибыль"]
+    total_stock_units = agg["stock_units"].sum()
+    if total_stock_units <= 0:
+        agg["Хранение"] = 0.0
+        return agg[["nm_id", "Хранение"]]
 
-    return out
+    agg["Хранение"] = agg["stock_units"] * total_storage_week / total_stock_units
+    return agg[["nm_id", "Хранение"]]
 
 
-def build_unit_economics(fact_df: pd.DataFrame, acceptance_per_unit_9w: float) -> pd.DataFrame:
-    out = fact_df.copy()
+def calc_warehouse_analysis(logistic_rows: pd.DataFrame, week_start: datetime.date) -> pd.DataFrame:
+    if logistic_rows.empty:
+        return pd.DataFrame(columns=[
+            "Неделя", "Склад", "Средний коэффициент", "Количество продаж",
+            "Логистика факт", "Логистика при cap=1.4", "Переплата", "Переплата на единицу"
+        ])
 
-    out["Комиссия WB, руб/ед"] = out.apply(lambda r: safe_div(r["Комиссия WB"], r["Net units"]), axis=1)
-    out["Эквайринг, руб/ед"] = out.apply(lambda r: safe_div(r["Эквайринг"], r["Net units"]), axis=1)
-    out["Прямая логистика, руб/ед"] = out.apply(lambda r: safe_div(r["Логистика прямая"], r["Net units"]), axis=1)
-    out["Обратная логистика, руб/ед"] = out.apply(lambda r: safe_div(r["Логистика обратная"], r["Net units"]), axis=1)
-    out["Хранение, руб/ед"] = out.apply(lambda r: safe_div(r["Хранение"], r["Net units"]), axis=1)
-    out["Приёмка, руб/ед (9 недель)"] = acceptance_per_unit_9w
-    out["Штрафы и удержания, руб/ед"] = out.apply(lambda r: safe_div(r["Штрафы"] + r["Удержания"], r["Net units"]), axis=1)
-    out["Реклама, руб/ед"] = out.apply(lambda r: safe_div(r["Реклама"], r["Net units"]), axis=1)
-    out["Валовая прибыль, руб/ед"] = out.apply(lambda r: safe_div(r["Валовая прибыль"], r["Net units"]), axis=1)
-    out["Чистая прибыль, руб/ед"] = out.apply(lambda r: safe_div(r["Чистая прибыль"], r["Net units"]), axis=1)
-    out["Валовая маржа, %"] = out.apply(lambda r: safe_div(r["Валовая прибыль"], r["Валовая выручка"]) * 100, axis=1)
-    out["Чистая маржа, %"] = out.apply(lambda r: safe_div(r["Чистая прибыль"], r["Валовая выручка"]) * 100, axis=1)
+    df = logistic_rows.copy()
+    df["dlv_prc"] = pd.to_numeric(df["dlv_prc"], errors="coerce")
+    df["delivery_rub"] = pd.to_numeric(df["delivery_rub"], errors="coerce").fillna(0)
+    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
 
-    cols = [
-        "Неделя", "nm_id", "Артикул_продавца", "Предмет", "Бренд",
+    df["log_type"] = df.apply(classify_logistics_row, axis=1)
+    df = df[df["log_type"] == "direct"].copy()
+    df = df[df["dlv_prc"].notna()].copy()
+    df = df[df["dlv_prc"] >= MIN_DLV_PRC].copy()
+
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Неделя", "Склад", "Средний коэффициент", "Количество продаж",
+            "Логистика факт", "Логистика при cap=1.4", "Переплата", "Переплата на единицу"
+        ])
+
+    def recalc_row(row):
+        actual = abs(float(row["delivery_rub"]))
+        coeff = float(row["dlv_prc"])
+        if coeff <= 0:
+            return actual, actual, 0.0
+        if coeff > EXPENSIVE_WAREHOUSE_THRESHOLD:
+            base = actual / coeff
+            recalc = base * TARGET_DLV_PRC_CAP
+            overpay = max(0.0, actual - recalc)
+            return actual, recalc, overpay
+        return actual, actual, 0.0
+
+    tmp = df.apply(lambda r: pd.Series(recalc_row(r), index=["actual_delivery", "recalc_delivery", "overpay"]), axis=1)
+    df = pd.concat([df, tmp], axis=1)
+
+    out = (
+        df.groupby("office_name", as_index=False)
+        .agg(
+            **{
+                "Средний коэффициент": ("dlv_prc", "mean"),
+                "Количество продаж": ("quantity", "sum"),
+                "Логистика факт": ("actual_delivery", "sum"),
+                "Логистика при cap=1.4": ("recalc_delivery", "sum"),
+                "Переплата": ("overpay", "sum"),
+            }
+        )
+        .rename(columns={"office_name": "Склад"})
+    )
+
+    out["Переплата на единицу"] = out.apply(
+        lambda r: safe_div(r["Переплата"], r["Количество продаж"], 6), axis=1
+    )
+    out["Неделя"] = week_label(week_start)
+
+    out = out[[
+        "Неделя", "Склад", "Средний коэффициент", "Количество продаж",
+        "Логистика факт", "Логистика при cap=1.4", "Переплата", "Переплата на единицу"
+    ]].copy()
+
+    return out.sort_values("Переплата", ascending=False)
+
+
+# =========================================================
+# WEEKLY FACT / UNIT ECONOMICS
+# =========================================================
+
+def calc_weekly_facts(
+    fin_df: pd.DataFrame,
+    advert_df: pd.DataFrame,
+    cost_df: pd.DataFrame,
+    stocks_df: pd.DataFrame,
+    week_start: datetime.date,
+    week_end: datetime.date,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if fin_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df = build_finance_rows(fin_df)
+
+    product_rows = df[df["nm_id"].notna()].copy()
+    product_rows["nm_id"] = product_rows["nm_id"].astype("int64")
+
+    meta_agg = (
+        product_rows.groupby("nm_id", as_index=False)
+        .agg(
+            subject_name=("subject_name", lambda x: mode_or_last(x)),
+            brand_name=("brand_name", lambda x: mode_or_last(x)),
+            sa_name=("sa_name", lambda x: mode_or_last(x)),
+        )
+    )
+
+    signed_rows = product_rows[product_rows["sign"] != 0].copy()
+
+    sold_units = (
+        signed_rows[signed_rows["sign"] == 1]
+        .groupby("nm_id")["quantity"]
+        .sum()
+        .rename("Продажи, шт")
+    )
+    return_units = (
+        signed_rows[signed_rows["sign"] == -1]
+        .groupby("nm_id")["quantity"]
+        .sum()
+        .rename("Возвраты, шт")
+    )
+    net_units = (
+        signed_rows.groupby("nm_id")["signed_quantity"]
+        .sum()
+        .rename("Net units")
+    )
+    revenue = (
+        signed_rows.groupby("nm_id")["signed_retail_amount"]
+        .sum()
+        .rename("Валовая выручка")
+    )
+    retail_price_withdisc_total = (
+        signed_rows.groupby("nm_id")["signed_retail_price_withdisc_rub"]
+        .sum()
+        .rename("Сумма retail_price_withdisc_rub")
+    )
+    commission_total = (
+        signed_rows.groupby("nm_id")["signed_commission"]
+        .sum()
+        .rename("Комиссия WB")
+    )
+    acquiring_total = (
+        signed_rows.groupby("nm_id")["signed_acquiring"]
+        .sum()
+        .rename("Эквайринг")
+    )
+    avg_retail_amount = (
+        revenue / net_units.replace(0, pd.NA)
+    ).rename("Средняя retail_amount")
+    avg_retail_price_withdisc = (
+        retail_price_withdisc_total / net_units.replace(0, pd.NA)
+    ).rename("Средняя retail_price_withdisc_rub")
+
+    sale_like = product_rows[
+        product_rows.apply(
+            lambda r: get_sign_for_row(r.get("doc_type_name_norm", ""), r.get("supplier_oper_name_norm", "")) == 1,
+            axis=1
+        )
+    ].copy()
+
+    sale_like = sale_like.sort_values(["nm_id", "sale_dt", "rr_dt"], ascending=[True, False, False])
+
+    last_commission_pct = (
+        sale_like.groupby("nm_id")["commission_percent"]
+        .first()
+        .rename("Комиссия WB, % актуальная")
+    )
+
+    avg_spp = (
+        sale_like.groupby("nm_id")["ppvz_spp_prc"]
+        .mean()
+        .rename("Средняя СПП")
+    )
+
+    avg_acquiring_pct = (
+        sale_like.groupby("nm_id")["acquiring_percent"]
+        .mean()
+        .rename("Эквайринг, % средний")
+    )
+
+    logistic_rows = product_rows[product_rows["supplier_oper_name_norm"].str.lower() == "логистика"].copy()
+    if not logistic_rows.empty:
+        logistic_rows["log_type"] = logistic_rows.apply(classify_logistics_row, axis=1)
+    else:
+        logistic_rows["log_type"] = []
+
+    direct_logistics = (
+        logistic_rows[logistic_rows["log_type"] == "direct"]
+        .groupby("nm_id")["delivery_rub"]
+        .sum()
+        .abs()
+        .rename("Логистика прямая")
+    )
+
+    reverse_logistics = (
+        logistic_rows[logistic_rows["log_type"] == "reverse"]
+        .groupby("nm_id")["delivery_rub"]
+        .sum()
+        .abs()
+        .rename("Логистика обратная")
+    )
+
+    reverse_events = (
+        logistic_rows[logistic_rows["log_type"] == "reverse"]
+        .groupby("nm_id")["return_amount"]
+        .sum()
+        .rename("_reverse_events")
+    )
+
+    storage_total_store = abs(pd.to_numeric(df.get("storage_fee", 0), errors="coerce").fillna(0).sum())
+    acceptance_total_store = abs(pd.to_numeric(df.get("acceptance", 0), errors="coerce").fillna(0).sum())
+    penalty_total_store = abs(pd.to_numeric(df.get("penalty", 0), errors="coerce").fillna(0).sum())
+    deduction_total_store = abs(pd.to_numeric(df.get("deduction", 0), errors="coerce").fillna(0).sum())
+
+    if not advert_df.empty and "Артикул WB" in advert_df.columns:
+        advert_agg = (
+            advert_df.groupby("Артикул WB", as_index=False)
+            .agg(
+                Реклама=("Расход", "sum"),
+                Рекламные_заказы=("Заказы", "sum"),
+                Рекламная_выручка=("Сумма заказов", "sum"),
+                Рекламные_показы=("Показы", "sum"),
+                Рекламные_клики=("Клики", "sum"),
+            )
+        )
+        advert_agg["Артикул WB"] = pd.to_numeric(advert_agg["Артикул WB"], errors="coerce").fillna(0).astype("int64")
+        advert_agg = advert_agg.rename(columns={"Артикул WB": "nm_id"})
+    else:
+        advert_agg = pd.DataFrame(columns=["nm_id", "Реклама", "Рекламные_заказы", "Рекламная_выручка", "Рекламные_показы", "Рекламные_клики"])
+
+    if cost_df.empty:
+        cost_df = pd.DataFrame(columns=["nm_id", "cost_price"])
+
+    fact = meta_agg.copy()
+    series_list = [
+        sold_units, return_units, net_units, revenue, retail_price_withdisc_total,
+        commission_total, acquiring_total, avg_retail_amount, avg_retail_price_withdisc,
+        last_commission_pct, avg_spp, avg_acquiring_pct,
+        direct_logistics, reverse_logistics, reverse_events
+    ]
+
+    for s in series_list:
+        fact = fact.merge(s.reset_index(), on="nm_id", how="left")
+
+    fact = fact.merge(cost_df, on="nm_id", how="left")
+    fact = fact.merge(advert_agg, on="nm_id", how="left")
+
+    if "cost_price" not in fact.columns:
+        fact["cost_price"] = 0.0
+
+    num_fill_cols = [
+        "Продажи, шт", "Возвраты, шт", "Net units", "Валовая выручка",
+        "Сумма retail_price_withdisc_rub", "Комиссия WB", "Эквайринг",
+        "Средняя retail_amount", "Средняя retail_price_withdisc_rub",
+        "Комиссия WB, % актуальная", "Средняя СПП", "Эквайринг, % средний",
+        "Логистика прямая", "Логистика обратная", "_reverse_events",
+        "cost_price", "Реклама", "Рекламные_заказы", "Рекламная_выручка",
+        "Рекламные_показы", "Рекламные_клики"
+    ]
+    for c in num_fill_cols:
+        if c in fact.columns:
+            fact[c] = pd.to_numeric(fact[c], errors="coerce").fillna(0)
+
+    fact["Оценка заказанных, шт"] = fact["Продажи, шт"] + fact["_reverse_events"]
+    fact["Buyout rate"] = fact.apply(
+        lambda r: safe_round(safe_div(r["Продажи, шт"], r["Оценка заказанных, шт"], 6), 6)
+        if r["Оценка заказанных, шт"] > 0 else 0.0,
+        axis=1
+    )
+
+    fact["Себестоимость"] = fact["Net units"] * fact["cost_price"]
+
+    storage_alloc = calc_storage_allocation(stocks_df, storage_total_store, week_start, week_end)
+    fact = fact.merge(storage_alloc, on="nm_id", how="left")
+    if "Хранение" not in fact.columns:
+        fact["Хранение"] = 0.0
+    fact["Хранение"] = pd.to_numeric(fact["Хранение"], errors="coerce").fillna(0)
+
+    total_units_sold_store = fact["Продажи, шт"].sum()
+    acceptance_per_unit = safe_div(acceptance_total_store, total_units_sold_store, 6)
+    penalty_per_unit = safe_div(penalty_total_store, total_units_sold_store, 6)
+    deduction_per_unit = safe_div(deduction_total_store, total_units_sold_store, 6)
+
+    fact["Приёмка"] = fact["Продажи, шт"] * acceptance_per_unit
+    fact["Штрафы"] = fact["Продажи, шт"] * penalty_per_unit
+    fact["Удержания"] = fact["Продажи, шт"] * deduction_per_unit
+
+    fact["НДС"] = fact["Валовая выручка"].apply(lambda x: extract_vat_from_gross(x, VAT_RATE))
+
+    fact["Валовая прибыль"] = (
+        fact["Валовая выручка"]
+        - fact["Себестоимость"]
+        - fact["Комиссия WB"]
+        - fact["Эквайринг"]
+        - fact["Логистика прямая"]
+        - fact["Логистика обратная"]
+        - fact["Хранение"]
+        - fact["Приёмка"]
+        - fact["Штрафы"]
+        - fact["Удержания"]
+        - fact["Реклама"]
+    )
+
+    fact["Прибыль до налога"] = fact["Валовая прибыль"] - fact["НДС"]
+    fact["Налог на прибыль"] = fact["Прибыль до налога"].apply(
+        lambda x: max(0.0, x) * PROFIT_TAX_RATE / 100.0
+    )
+    fact["Чистая прибыль"] = fact["Прибыль до налога"] - fact["Налог на прибыль"]
+
+    fact["Валовая маржа, %"] = fact.apply(
+        lambda r: safe_round(safe_div(r["Валовая прибыль"] * 100.0, r["Валовая выручка"], 6), 6)
+        if r["Валовая выручка"] else 0.0,
+        axis=1
+    )
+    fact["Чистая маржа, %"] = fact.apply(
+        lambda r: safe_round(safe_div(r["Чистая прибыль"] * 100.0, r["Валовая выручка"], 6), 6)
+        if r["Валовая выручка"] else 0.0,
+        axis=1
+    )
+
+    unit = fact.copy()
+    unit["Неделя"] = week_label(week_start)
+    unit["Комиссия WB, руб/ед"] = unit.apply(lambda r: safe_div(r["Комиссия WB"], r["Net units"], 6), axis=1)
+    unit["Эквайринг, руб/ед"] = unit.apply(lambda r: safe_div(r["Эквайринг"], r["Net units"], 6), axis=1)
+    unit["Прямая логистика, руб/ед"] = unit.apply(lambda r: safe_div(r["Логистика прямая"], r["Net units"], 6), axis=1)
+    unit["Обратная логистика, руб/ед"] = unit.apply(lambda r: safe_div(r["Логистика обратная"], r["Net units"], 6), axis=1)
+    unit["Хранение, руб/ед"] = unit.apply(lambda r: safe_div(r["Хранение"], r["Net units"], 6), axis=1)
+    unit["Приёмка, руб/ед"] = unit.apply(lambda r: safe_div(r["Приёмка"], r["Net units"], 6), axis=1)
+    unit["Штрафы и удержания, руб/ед"] = unit.apply(lambda r: safe_div(r["Штрафы"] + r["Удержания"], r["Net units"], 6), axis=1)
+    unit["Реклама, руб/ед"] = unit.apply(lambda r: safe_div(r["Реклама"], r["Net units"], 6), axis=1)
+    unit["Себестоимость, руб/ед"] = unit["cost_price"]
+    unit["Валовая прибыль, руб/ед"] = unit.apply(lambda r: safe_div(r["Валовая прибыль"], r["Net units"], 6), axis=1)
+    unit["Чистая прибыль, руб/ед"] = unit.apply(lambda r: safe_div(r["Чистая прибыль"], r["Net units"], 6), axis=1)
+
+    unit = unit[[
+        "Неделя", "nm_id", "sa_name", "subject_name", "brand_name",
         "Продажи, шт", "Возвраты, шт", "Net units", "Buyout rate",
         "Средняя retail_amount", "Средняя retail_price_withdisc_rub", "Средняя СПП",
-        "Комиссия WB, % актуальная", "Комиссия WB, руб/ед",
-        "Эквайринг, % актуальный", "Эквайринг, руб/ед",
+        "Комиссия WB, % актуальная", "Эквайринг, % средний",
+        "Комиссия WB, руб/ед", "Эквайринг, руб/ед",
         "Прямая логистика, руб/ед", "Обратная логистика, руб/ед",
-        "Хранение, руб/ед", "Приёмка, руб/ед (9 недель)",
+        "Хранение, руб/ед", "Приёмка, руб/ед",
         "Штрафы и удержания, руб/ед", "Реклама, руб/ед",
-        "Себестоимость, руб/ед", "Валовая прибыль, руб/ед",
-        "Чистая прибыль, руб/ед", "Валовая маржа, %", "Чистая маржа, %",
-        "Остаток, шт"
-    ]
-    return out[cols].copy()
+        "Себестоимость, руб/ед",
+        "Валовая прибыль, руб/ед", "Чистая прибыль, руб/ед",
+        "Валовая маржа, %", "Чистая маржа, %"
+    ]].copy()
+
+    fact["Неделя"] = week_label(week_start)
+    fact["VAT_RATE"] = VAT_RATE
+    fact["PROFIT_TAX_RATE"] = PROFIT_TAX_RATE
+
+    fact = fact[[
+        "Неделя", "nm_id", "sa_name", "subject_name", "brand_name",
+        "Продажи, шт", "Возвраты, шт", "Net units", "Buyout rate",
+        "Валовая выручка", "Средняя retail_amount", "Средняя retail_price_withdisc_rub", "Средняя СПП",
+        "Комиссия WB", "Комиссия WB, % актуальная",
+        "Эквайринг", "Эквайринг, % средний",
+        "Логистика прямая", "Логистика обратная",
+        "Хранение", "Приёмка", "Штрафы", "Удержания",
+        "Реклама", "Рекламные_заказы", "Рекламная_выручка", "Рекламные_показы", "Рекламные_клики",
+        "cost_price", "Себестоимость",
+        "Валовая прибыль", "НДС", "Прибыль до налога", "Налог на прибыль", "Чистая прибыль",
+        "Валовая маржа, %", "Чистая маржа, %", "VAT_RATE", "PROFIT_TAX_RATE"
+    ]].copy()
+
+    warehouse_df = calc_warehouse_analysis(logistic_rows, week_start)
+    return fact, unit, warehouse_df
 
 
-# ============================================================
-# АНАЛИЗ НЕДЕЛЯ К НЕДЕЛЕ
-# ============================================================
+# =========================================================
+# ACCEPTANCE NORM 9W
+# =========================================================
 
-def explain_change(row: pd.Series) -> str:
+def calc_acceptance_per_unit_9w(s3: S3Storage, last_week_start: datetime.date) -> float:
+    weeks = build_week_list(last_week_start, ACCEPTANCE_LOOKBACK_WEEKS)
+    total_acceptance = 0.0
+    total_units_sold = 0.0
+
+    for ws in weeks:
+        df = read_finance_week(s3, ws)
+        if df.empty:
+            continue
+
+        df = build_finance_rows(df)
+        signed_rows = df[df["sign"] != 0].copy()
+        sales = signed_rows[signed_rows["sign"] == 1]
+        units = pd.to_numeric(sales["quantity"], errors="coerce").fillna(0).sum()
+
+        total_units_sold += units
+        total_acceptance += abs(pd.to_numeric(df.get("acceptance", 0), errors="coerce").fillna(0).sum())
+
+    return safe_div(total_acceptance, total_units_sold, 6)
+
+
+def apply_acceptance_norm_to_unit(unit_df: pd.DataFrame, acceptance_per_unit_9w: float) -> pd.DataFrame:
+    if unit_df.empty:
+        return unit_df
+
+    df = unit_df.copy()
+    old_acceptance = df["Приёмка, руб/ед"].copy()
+    df["Приёмка, руб/ед"] = acceptance_per_unit_9w
+
+    delta = df["Приёмка, руб/ед"] - old_acceptance
+    df["Валовая прибыль, руб/ед"] = df["Валовая прибыль, руб/ед"] - delta
+    df["Чистая прибыль, руб/ед"] = df["Чистая прибыль, руб/ед"] - delta
+    return df
+
+
+# =========================================================
+# ANALYSIS
+# =========================================================
+
+def explain_store_change(cur_store: Dict[str, float], prev_store: Dict[str, float]) -> str:
+    deltas = {
+        "выручка": cur_store["Валовая выручка"] - prev_store["Валовая выручка"],
+        "реклама": cur_store["Реклама"] - prev_store["Реклама"],
+        "комиссия": cur_store["Комиссия WB"] - prev_store["Комиссия WB"],
+        "логистика": (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) -
+                     (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]),
+        "себестоимость": cur_store["Себестоимость"] - prev_store["Себестоимость"],
+        "хранение": cur_store["Хранение"] - prev_store["Хранение"],
+        "приёмка": cur_store["Приёмка"] - prev_store["Приёмка"],
+    }
+
+    top_negative = max(deltas, key=lambda k: abs(deltas[k]))
+    if deltas["выручка"] > 0 and cur_store["Чистая прибыль"] > prev_store["Чистая прибыль"]:
+        return f"Прибыль выросла. Основной драйвер — выручка. Крупнейшее изменение среди статей: {top_negative} ({safe_round(deltas[top_negative], 2)})."
+    if deltas["выручка"] < 0 and cur_store["Чистая прибыль"] < prev_store["Чистая прибыль"]:
+        return f"Прибыль снизилась вместе с выручкой. Крупнейшее изменение среди статей: {top_negative} ({safe_round(deltas[top_negative], 2)})."
+    if cur_store["Реклама"] > prev_store["Реклама"] and cur_store["Валовая выручка"] <= prev_store["Валовая выручка"]:
+        return "Прибыль снизилась: рекламные расходы выросли быстрее выручки."
+    if (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) > (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]):
+        return "Прибыль снизилась: выросли логистические расходы."
+    return f"Изменение прибыли смешанное. Наиболее сильное влияние оказала статья: {top_negative}."
+
+
+def explain_sku_change(row) -> str:
+    delta_profit = row["Δ Чистая прибыль"]
+    delta_revenue = row["Δ Валовая выручка"]
+    delta_ads = row["Δ Реклама"]
+    delta_comm = row["Δ Комиссия WB"]
+    delta_log = row["Δ Логистика"]
+    delta_spp = row["Δ СПП"]
+    delta_price = row["Δ вашей цены"]
+
     reasons = []
 
-    delta_net = row.get("ΔЧистая прибыль", 0)
-    delta_rev = row.get("ΔВаловая выручка", 0)
-    delta_adv = row.get("ΔРеклама", 0)
-    delta_comm = row.get("ΔКомиссия WB", 0)
-    delta_log = row.get("ΔЛогистика итого", 0)
-    delta_price = row.get("ΔСредняя retail_price_withdisc_rub", 0)
-    delta_amount = row.get("ΔСредняя retail_amount", 0)
-    delta_spp = row.get("ΔСредняя СПП", 0)
-    delta_units = row.get("ΔПродажи, шт", 0)
-
-    if delta_units > 0 and delta_rev > 0:
-        reasons.append("рост объёма продаж")
-    elif delta_units < 0 and delta_rev < 0:
-        reasons.append("снижение объёма продаж")
-
+    if delta_revenue > 0 and delta_profit > 0:
+        reasons.append("рост выручки")
+    if delta_revenue < 0 and delta_profit < 0:
+        reasons.append("снижение выручки")
+    if delta_ads > 0 and delta_profit < 0:
+        reasons.append("рост рекламных расходов")
+    if delta_comm > 0 and delta_profit < 0:
+        reasons.append("рост комиссии WB")
+    if delta_log > 0 and delta_profit < 0:
+        reasons.append("рост логистики")
     if delta_price > 0:
-        reasons.append("выросла ваша цена")
-    elif delta_price < 0:
-        reasons.append("снизилась ваша цена")
-
-    if abs(delta_amount) > 0 and abs(delta_price) < abs(delta_amount) * 0.3:
-        if delta_amount < 0 and delta_spp > 0:
-            reasons.append("снизилась цена покупателя из-за роста СПП WB")
-        elif delta_amount > 0 and delta_spp < 0:
-            reasons.append("цена покупателя выросла за счёт снижения СПП WB")
-
-    if delta_adv > 0 and delta_rev <= 0:
-        reasons.append("рекламные расходы выросли без роста выручки")
-    elif delta_adv < 0 and delta_net > 0:
-        reasons.append("снизились рекламные расходы")
-
-    if delta_comm > 0:
-        reasons.append("выросла комиссия WB")
-
-    if delta_log > 0:
-        reasons.append("выросли логистические расходы")
+        reasons.append("рост вашей цены")
+    if delta_price < 0:
+        reasons.append("снижение вашей цены")
+    if delta_spp > 0:
+        reasons.append("рост СПП WB")
+    if delta_spp < 0:
+        reasons.append("снижение СПП WB")
 
     if not reasons:
-        if delta_net > 0:
-            reasons.append("смешанный положительный эффект")
-        elif delta_net < 0:
-            reasons.append("смешанный отрицательный эффект")
-        else:
-            reasons.append("без существенных изменений")
+        if delta_profit >= 0:
+            return "Положительная динамика без явного одного драйвера."
+        return "Негативная динамика без явного одного драйвера."
 
-    return "; ".join(reasons)
+    return "; ".join(reasons[:3])
 
 
-def build_wow_analysis(current_fact: pd.DataFrame, previous_fact: pd.DataFrame, week_id: str) -> pd.DataFrame:
+def build_week_to_week_analysis(current_fact: pd.DataFrame, prev_fact: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
     if current_fact.empty:
         return pd.DataFrame()
 
-    if previous_fact.empty:
-        out = current_fact.copy()
-        out["Предыдущая неделя"] = ""
-        out["ΔЧистая прибыль"] = 0.0
-        out["Комментарий"] = "предыдущая неделя отсутствует"
-        return out[["Неделя", "nm_id", "Артикул_продавца", "Предмет", "Бренд", "Комментарий"]].copy()
-
     cur = current_fact.copy()
-    prev = previous_fact.copy()
+    prev = prev_fact.copy() if prev_fact is not None else pd.DataFrame()
+    current_week = cur["Неделя"].iloc[0]
 
-    cur["Логистика итого"] = cur["Логистика прямая"] + cur["Логистика обратная"]
-    prev["Логистика итого"] = prev["Логистика прямая"] + prev["Логистика обратная"]
+    summary_cols = [
+        "Валовая выручка", "Комиссия WB", "Эквайринг", "Логистика прямая",
+        "Логистика обратная", "Хранение", "Приёмка", "Штрафы", "Удержания",
+        "Реклама", "Себестоимость", "Валовая прибыль", "НДС", "Налог на прибыль", "Чистая прибыль"
+    ]
+
+    cur_store = {c: cur[c].sum() for c in summary_cols}
+    if not prev.empty:
+        prev_store = {c: prev[c].sum() for c in summary_cols}
+    else:
+        prev_store = {c: 0.0 for c in summary_cols}
+
+    store_delta_profit = cur_store["Чистая прибыль"] - prev_store["Чистая прибыль"]
+    store_reason = explain_store_change(cur_store, prev_store)
+
+    rows.append({
+        "section": "summary_store",
+        "Неделя": current_week,
+        "nm_id": "",
+        "Артикул продавца": "",
+        "Предмет": "",
+        "Показатель": "Итог по магазину",
+        "Чистая прибыль_тек": safe_round(cur_store["Чистая прибыль"], 6),
+        "Чистая прибыль_пред": safe_round(prev_store["Чистая прибыль"], 6),
+        "Δ Чистая прибыль": safe_round(store_delta_profit, 6),
+        "Валовая выручка_тек": safe_round(cur_store["Валовая выручка"], 6),
+        "Валовая выручка_пред": safe_round(prev_store["Валовая выручка"], 6),
+        "Δ Реклама": safe_round(cur_store["Реклама"] - prev_store["Реклама"], 6),
+        "Δ Комиссия WB": safe_round(cur_store["Комиссия WB"] - prev_store["Комиссия WB"], 6),
+        "Δ Логистика": safe_round(
+            (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) -
+            (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]), 6
+        ),
+        "Δ СПП": "",
+        "Δ вашей цены": "",
+        "Комментарий": store_reason
+    })
+
+    if prev.empty:
+        return pd.DataFrame(rows)
 
     merge_cols = [
-        "nm_id", "Артикул_продавца", "Предмет", "Бренд",
-        "Продажи, шт", "Возвраты, шт", "Net units",
-        "Средняя retail_amount", "Средняя retail_price_withdisc_rub", "Средняя СПП",
-        "Валовая выручка", "Комиссия WB", "Эквайринг", "Логистика итого",
-        "Хранение", "Приёмка", "Штрафы", "Удержания", "Реклама",
-        "Валовая прибыль", "НДС", "Налог на прибыль", "Чистая прибыль"
+        "nm_id", "sa_name", "subject_name",
+        "Чистая прибыль", "Валовая прибыль", "Валовая выручка", "Реклама", "Комиссия WB",
+        "Логистика прямая", "Логистика обратная", "Средняя СПП", "Средняя retail_price_withdisc_rub",
+        "Средняя retail_amount", "Продажи, шт", "Buyout rate"
     ]
-    cur = cur[merge_cols].copy()
-    prev = prev[merge_cols].copy()
 
-    merged = cur.merge(prev, on="nm_id", how="outer", suffixes=("_cur", "_prev"))
+    left = cur[merge_cols].copy()
+    right = prev[merge_cols].copy()
+    merged = left.merge(right, on="nm_id", how="outer", suffixes=("_cur", "_prev")).fillna(0)
 
-    text_cols = ["Артикул_продавца", "Предмет", "Бренд"]
-    for c in text_cols:
-        merged[c] = merged[f"{c}_cur"].combine_first(merged[f"{c}_prev"])
-
-    num_base = [
-        "Продажи, шт", "Возвраты, шт", "Net units",
-        "Средняя retail_amount", "Средняя retail_price_withdisc_rub", "Средняя СПП",
-        "Валовая выручка", "Комиссия WB", "Эквайринг", "Логистика итого",
-        "Хранение", "Приёмка", "Штрафы", "Удержания", "Реклама",
-        "Валовая прибыль", "НДС", "Налог на прибыль", "Чистая прибыль"
-    ]
-    for c in num_base:
-        merged[f"{c}_cur"] = pd.to_numeric(merged.get(f"{c}_cur"), errors="coerce").fillna(0)
-        merged[f"{c}_prev"] = pd.to_numeric(merged.get(f"{c}_prev"), errors="coerce").fillna(0)
-        merged[f"Δ{c}"] = merged[f"{c}_cur"] - merged[f"{c}_prev"]
-
-    merged["Неделя"] = week_id
-    merged["Предыдущая неделя"] = get_previous_week_id(week_id)
-    merged["Комментарий"] = merged.apply(explain_change, axis=1)
-
-    cols = [
-        "Неделя", "Предыдущая неделя", "nm_id", "Артикул_продавца", "Предмет", "Бренд",
-        "ΔЧистая прибыль", "ΔВаловая прибыль", "ΔВаловая выручка", "ΔПродажи, шт",
-        "ΔСредняя retail_amount", "ΔСредняя retail_price_withdisc_rub", "ΔСредняя СПП",
-        "ΔРеклама", "ΔКомиссия WB", "ΔЭквайринг", "ΔЛогистика итого", "ΔХранение",
-        "ΔПриёмка", "ΔШтрафы", "ΔУдержания", "Комментарий"
-    ]
-    out = merged[cols].copy()
-    out = out.sort_values("ΔЧистая прибыль", ascending=False).reset_index(drop=True)
-    return out
-
-
-# ============================================================
-# СКЛАДЫ И КОЭФФИЦИЕНТЫ
-# ============================================================
-
-def build_warehouse_analysis(fin_df: pd.DataFrame, week_id: str) -> pd.DataFrame:
-    if fin_df.empty:
-        return pd.DataFrame()
-
-    df = classify_finance_rows(fin_df).copy()
-    df = df[df["is_direct_logistics"]].copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    df["dlv_prc"] = pd.to_numeric(df["dlv_prc"], errors="coerce")
-    df["delivery_rub"] = pd.to_numeric(df["delivery_rub"], errors="coerce").fillna(0)
-    df["rebill_logistic_cost"] = pd.to_numeric(df["rebill_logistic_cost"], errors="coerce").fillna(0)
-    df["nm_id"] = pd.to_numeric(df["nm_id"], errors="coerce")
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-
-    df = df[df["dlv_prc"].notna()]
-    df = df[df["dlv_prc"] > 0]
-    df = df[df["dlv_prc"] >= MIN_DLV_PRC]
-
-    if df.empty:
-        return pd.DataFrame()
-
-    df["actual_direct_log"] = df["delivery_rub"] + df["rebill_logistic_cost"]
-
-    # Переплата только для дорогих складов
-    def calc_overpay(row):
-        coeff = float(row["dlv_prc"])
-        actual = float(row["actual_direct_log"])
-        if coeff <= EXPENSIVE_WAREHOUSE_THRESHOLD or coeff <= 0:
-            return 0.0
-        base = actual / coeff
-        recalc = base * TARGET_DLV_PRC_CAP
-        return max(actual - recalc, 0.0)
-
-    df["overpay"] = df.apply(calc_overpay, axis=1)
-
-    # Пересчёт логистики при cap
-    def calc_capped_log(row):
-        coeff = float(row["dlv_prc"])
-        actual = float(row["actual_direct_log"])
-        if coeff <= 0:
-            return actual
-        if coeff <= EXPENSIVE_WAREHOUSE_THRESHOLD:
-            return actual
-        base = actual / coeff
-        return base * TARGET_DLV_PRC_CAP
-
-    df["capped_logistics"] = df.apply(calc_capped_log, axis=1)
-
-    wh = df.groupby("office_name", as_index=False).agg(
-        **{
-            "Средний коэффициент": ("dlv_prc", "mean"),
-            "Количество продаж": ("quantity", "sum"),
-            "Логистика факт": ("actual_direct_log", "sum"),
-            "Логистика при cap = 1.4": ("capped_logistics", "sum"),
-            "Переплата": ("overpay", "sum"),
-        }
+    merged["Δ Чистая прибыль"] = merged["Чистая прибыль_cur"] - merged["Чистая прибыль_prev"]
+    merged["Δ Валовая выручка"] = merged["Валовая выручка_cur"] - merged["Валовая выручка_prev"]
+    merged["Δ Реклама"] = merged["Реклама_cur"] - merged["Реклама_prev"]
+    merged["Δ Комиссия WB"] = merged["Комиссия WB_cur"] - merged["Комиссия WB_prev"]
+    merged["Δ Логистика"] = (
+        (merged["Логистика прямая_cur"] + merged["Логистика обратная_cur"]) -
+        (merged["Логистика прямая_prev"] + merged["Логистика обратная_prev"])
     )
-    wh["Переплата на единицу"] = wh.apply(lambda r: safe_div(r["Переплата"], r["Количество продаж"]), axis=1)
-    wh["Неделя"] = week_id
+    merged["Δ СПП"] = merged["Средняя СПП_cur"] - merged["Средняя СПП_prev"]
+    merged["Δ вашей цены"] = merged["Средняя retail_price_withdisc_rub_cur"] - merged["Средняя retail_price_withdisc_rub_prev"]
+    merged["Комментарий"] = merged.apply(explain_sku_change, axis=1)
 
-    wh = wh[
-        ["Неделя", "office_name", "Средний коэффициент", "Количество продаж",
-         "Логистика факт", "Логистика при cap = 1.4", "Переплата", "Переплата на единицу"]
-    ].rename(columns={"office_name": "Склад"})
+    gainers = merged.sort_values("Δ Чистая прибыль", ascending=False).head(20)
+    losers = merged.sort_values("Δ Чистая прибыль", ascending=True).head(20)
 
-    wh = wh.sort_values("Переплата", ascending=False).reset_index(drop=True)
-    return wh
+    for _, r in gainers.iterrows():
+        rows.append({
+            "section": "top_gainers",
+            "Неделя": current_week,
+            "nm_id": int(r["nm_id"]) if pd.notna(r["nm_id"]) else "",
+            "Артикул продавца": r.get("sa_name_cur") or r.get("sa_name_prev") or "",
+            "Предмет": r.get("subject_name_cur") or r.get("subject_name_prev") or "",
+            "Показатель": "Рост прибыли",
+            "Чистая прибыль_тек": safe_round(r["Чистая прибыль_cur"], 6),
+            "Чистая прибыль_пред": safe_round(r["Чистая прибыль_prev"], 6),
+            "Δ Чистая прибыль": safe_round(r["Δ Чистая прибыль"], 6),
+            "Валовая выручка_тек": safe_round(r["Валовая выручка_cur"], 6),
+            "Валовая выручка_пред": safe_round(r["Валовая выручка_prev"], 6),
+            "Δ Реклама": safe_round(r["Δ Реклама"], 6),
+            "Δ Комиссия WB": safe_round(r["Δ Комиссия WB"], 6),
+            "Δ Логистика": safe_round(r["Δ Логистика"], 6),
+            "Δ СПП": safe_round(r["Δ СПП"], 6),
+            "Δ вашей цены": safe_round(r["Δ вашей цены"], 6),
+            "Комментарий": r["Комментарий"]
+        })
+
+    for _, r in losers.iterrows():
+        rows.append({
+            "section": "top_losers",
+            "Неделя": current_week,
+            "nm_id": int(r["nm_id"]) if pd.notna(r["nm_id"]) else "",
+            "Артикул продавца": r.get("sa_name_cur") or r.get("sa_name_prev") or "",
+            "Предмет": r.get("subject_name_cur") or r.get("subject_name_prev") or "",
+            "Показатель": "Падение прибыли",
+            "Чистая прибыль_тек": safe_round(r["Чистая прибыль_cur"], 6),
+            "Чистая прибыль_пред": safe_round(r["Чистая прибыль_prev"], 6),
+            "Δ Чистая прибыль": safe_round(r["Δ Чистая прибыль"], 6),
+            "Валовая выручка_тек": safe_round(r["Валовая выручка_cur"], 6),
+            "Валовая выручка_пред": safe_round(r["Валовая выручка_prev"], 6),
+            "Δ Реклама": safe_round(r["Δ Реклама"], 6),
+            "Δ Комиссия WB": safe_round(r["Δ Комиссия WB"], 6),
+            "Δ Логистика": safe_round(r["Δ Логистика"], 6),
+            "Δ СПП": safe_round(r["Δ СПП"], 6),
+            "Δ вашей цены": safe_round(r["Δ вашей цены"], 6),
+            "Комментарий": r["Комментарий"]
+        })
+
+    return pd.DataFrame(rows)
 
 
-# ============================================================
-# ИТОГ ПО МАГАЗИНУ
-# ============================================================
+# =========================================================
+# HISTORY / RETENTION
+# =========================================================
 
-def build_store_total_row(fact_df: pd.DataFrame) -> pd.DataFrame:
-    if fact_df.empty:
-        return pd.DataFrame()
+def append_with_retention(
+    existing_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    key_cols: List[str],
+    retention_weeks: int = RETENTION_WEEKS
+) -> pd.DataFrame:
+    if new_df is None or new_df.empty:
+        return existing_df if existing_df is not None else pd.DataFrame()
 
-    total_numeric = [
-        "Продажи, шт", "Возвраты, шт", "Компенсации+, шт", "Компенсации-, шт", "Net units",
-        "Валовая выручка", "Себестоимость", "Комиссия WB", "Эквайринг",
-        "Логистика прямая", "Логистика обратная", "Хранение", "Приёмка",
-        "Штрафы", "Удержания", "Реклама", "Валовая прибыль",
-        "НДС", "Прибыль до налога", "Налог на прибыль", "Чистая прибыль",
-        "Остаток, шт"
-    ]
-    row = {}
-    for c in total_numeric:
-        if c in fact_df.columns:
-            row[c] = pd.to_numeric(fact_df[c], errors="coerce").fillna(0).sum()
-
-    row["Неделя"] = fact_df["Неделя"].iloc[0]
-    row["nm_id"] = "ИТОГО"
-    row["Артикул_продавца"] = ""
-    row["Предмет"] = "ИТОГО ПО МАГАЗИНУ"
-    row["Бренд"] = ""
-    row["Buyout rate"] = safe_div(row.get("Продажи, шт", 0), row.get("Продажи, шт", 0) + 0)
-    row["Средняя retail_amount"] = safe_div(row.get("Валовая выручка", 0), row.get("Net units", 0))
-    row["Средняя retail_price_withdisc_rub"] = np.nan
-    row["Средняя СПП"] = np.nan
-    row["Комиссия WB, % актуальная"] = np.nan
-    row["Эквайринг, % актуальный"] = np.nan
-    row["Себестоимость, руб/ед"] = safe_div(row.get("Себестоимость", 0), row.get("Net units", 0))
-    return pd.DataFrame([row])
-
-
-# ============================================================
-# ОБНОВЛЕНИЕ ИСТОРИИ В OUTPUT
-# ============================================================
-
-def upsert_history(existing: pd.DataFrame, new_rows: pd.DataFrame, key_cols: List[str]) -> pd.DataFrame:
-    if existing is None or existing.empty:
-        out = new_rows.copy()
-    elif new_rows is None or new_rows.empty:
-        out = existing.copy()
+    if existing_df is None or existing_df.empty:
+        combined = new_df.copy()
     else:
-        out = pd.concat([existing, new_rows], ignore_index=True)
-        existing_keys = [c for c in key_cols if c in out.columns]
-        if existing_keys:
-            out = out.drop_duplicates(subset=existing_keys, keep="last")
-    if "Неделя" in out.columns:
-        out = retention_filter(out, "Неделя", RETENTION_WEEKS)
-    return out
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+
+    if "Неделя" in combined.columns:
+        combined = combined.drop_duplicates(subset=key_cols, keep="last")
+        weeks_sorted = sorted([w for w in combined["Неделя"].dropna().astype(str).unique()])
+        if len(weeks_sorted) > retention_weeks:
+            keep_weeks = set(weeks_sorted[-retention_weeks:])
+            combined = combined[combined["Неделя"].astype(str).isin(keep_weeks)].copy()
+
+    return combined.reset_index(drop=True)
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def load_existing_economics(s3: S3Storage) -> Dict[str, pd.DataFrame]:
+    if not s3.file_exists(ECONOMICS_KEY):
+        return {
+            WEEK_SHEET_UNIT: pd.DataFrame(),
+            WEEK_SHEET_FACT: pd.DataFrame(),
+            WEEK_SHEET_ANALYSIS: pd.DataFrame(),
+            WEEK_SHEET_WAREHOUSES: pd.DataFrame(),
+        }
+
+    try:
+        sheets = s3.read_excel_all_sheets(ECONOMICS_KEY)
+        return {
+            WEEK_SHEET_UNIT: sheets.get(WEEK_SHEET_UNIT, pd.DataFrame()),
+            WEEK_SHEET_FACT: sheets.get(WEEK_SHEET_FACT, pd.DataFrame()),
+            WEEK_SHEET_ANALYSIS: sheets.get(WEEK_SHEET_ANALYSIS, pd.DataFrame()),
+            WEEK_SHEET_WAREHOUSES: sheets.get(WEEK_SHEET_WAREHOUSES, pd.DataFrame()),
+        }
+    except Exception as e:
+        log(f"⚠️ Не удалось прочитать существующий Экономика.xlsx: {e}")
+        return {
+            WEEK_SHEET_UNIT: pd.DataFrame(),
+            WEEK_SHEET_FACT: pd.DataFrame(),
+            WEEK_SHEET_ANALYSIS: pd.DataFrame(),
+            WEEK_SHEET_WAREHOUSES: pd.DataFrame(),
+        }
+
+
+# =========================================================
+# MAIN CALCULATOR
+# =========================================================
+
+class WeeklyEconomicsCalculator:
+    def __init__(self, s3: S3Storage):
+        self.s3 = s3
+
+    def run(self):
+        week_start, week_end = get_last_full_week_range()
+        prev_week_start = week_start - timedelta(days=7)
+        prev_week_end = week_end - timedelta(days=7)
+
+        current_week_code = week_label(week_start)
+
+        log("=" * 80)
+        log(f"📌 Запуск weekly-экономики для магазина {STORE_NAME}")
+        log(f"📅 Целевая неделя: {current_week_code}")
+        log("=" * 80)
+
+        fin_df = read_finance_week(self.s3, week_start)
+        if fin_df.empty:
+            raise RuntimeError(f"Нет финансовых данных за неделю {current_week_code}")
+
+        stocks_df = read_stocks_week(self.s3, week_start)
+        advert_df = read_advert_week(self.s3, week_start, week_end)
+        cost_df = read_costs(self.s3)
+
+        fact_df, unit_df, warehouse_df = calc_weekly_facts(
+            fin_df=fin_df,
+            advert_df=advert_df,
+            cost_df=cost_df,
+            stocks_df=stocks_df,
+            week_start=week_start,
+            week_end=week_end,
+        )
+
+        if fact_df.empty:
+            raise RuntimeError("Не удалось сформировать weekly fact")
+
+        acceptance_norm = calc_acceptance_per_unit_9w(self.s3, week_start)
+        log(f"📦 Норматив приёмки за {ACCEPTANCE_LOOKBACK_WEEKS} недель: {acceptance_norm:.6f} руб/ед")
+
+        unit_df = apply_acceptance_norm_to_unit(unit_df, acceptance_norm)
+
+        prev_fin_df = read_finance_week(self.s3, prev_week_start)
+        if not prev_fin_df.empty:
+            prev_stocks_df = read_stocks_week(self.s3, prev_week_start)
+            prev_advert_df = read_advert_week(self.s3, prev_week_start, prev_week_end)
+            prev_fact_df, _, _ = calc_weekly_facts(
+                fin_df=prev_fin_df,
+                advert_df=prev_advert_df,
+                cost_df=cost_df,
+                stocks_df=prev_stocks_df,
+                week_start=prev_week_start,
+                week_end=prev_week_end,
+            )
+        else:
+            prev_fact_df = pd.DataFrame()
+
+        analysis_df = build_week_to_week_analysis(fact_df, prev_fact_df)
+
+        existing = load_existing_economics(self.s3)
+
+        unit_all = append_with_retention(
+            existing[WEEK_SHEET_UNIT],
+            unit_df,
+            key_cols=["Неделя", "nm_id"],
+            retention_weeks=RETENTION_WEEKS
+        )
+
+        fact_all = append_with_retention(
+            existing[WEEK_SHEET_FACT],
+            fact_df,
+            key_cols=["Неделя", "nm_id"],
+            retention_weeks=RETENTION_WEEKS
+        )
+
+        analysis_all = append_with_retention(
+            existing[WEEK_SHEET_ANALYSIS],
+            analysis_df,
+            key_cols=["Неделя", "section", "nm_id", "Показатель"],
+            retention_weeks=RETENTION_WEEKS
+        )
+
+        warehouses_all = append_with_retention(
+            existing[WEEK_SHEET_WAREHOUSES],
+            warehouse_df,
+            key_cols=["Неделя", "Склад"],
+            retention_weeks=RETENTION_WEEKS
+        )
+
+        sheets_to_write = {
+            WEEK_SHEET_UNIT: unit_all.sort_values(["Неделя", "Чистая прибыль, руб/ед"], ascending=[True, False]).reset_index(drop=True),
+            WEEK_SHEET_FACT: fact_all.sort_values(["Неделя", "Чистая прибыль"], ascending=[True, False]).reset_index(drop=True),
+            WEEK_SHEET_ANALYSIS: analysis_all.reset_index(drop=True),
+            WEEK_SHEET_WAREHOUSES: warehouses_all.sort_values(["Неделя", "Переплата"], ascending=[True, False]).reset_index(drop=True),
+        }
+
+        self.s3.write_excel_sheets(ECONOMICS_KEY, sheets_to_write)
+
+        total_revenue = fact_df["Валовая выручка"].sum()
+        total_gp = fact_df["Валовая прибыль"].sum()
+        total_net = fact_df["Чистая прибыль"].sum()
+
+        log(f"✅ Экономика сохранена: {ECONOMICS_KEY}")
+        log(f"📊 Выручка недели: {total_revenue:,.2f}")
+        log(f"📊 Валовая прибыль недели: {total_gp:,.2f}")
+        log(f"📊 Чистая прибыль недели: {total_net:,.2f}")
+
+
+# =========================================================
+# ENTRYPOINT
+# =========================================================
 
 def main():
     required_env = [
@@ -1113,9 +1313,9 @@ def main():
         "YC_SECRET_ACCESS_KEY",
         "YC_BUCKET_NAME",
     ]
-    missing = [x for x in required_env if not os.environ.get(x)]
+    missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
-        raise RuntimeError(f"Не заданы переменные окружения: {missing}")
+        raise RuntimeError(f"Отсутствуют переменные окружения: {missing}")
 
     s3 = S3Storage(
         access_key=os.environ["YC_ACCESS_KEY_ID"],
@@ -1123,129 +1323,14 @@ def main():
         bucket_name=os.environ["YC_BUCKET_NAME"],
     )
 
-    week_id = get_last_complete_week_id()
-    prev_week_id = get_previous_week_id(week_id)
-
-    log("=" * 80)
-    log(f"📌 Запуск weekly-экономики для магазина {STORE_NAME}")
-    log(f"📅 Целевая неделя: {week_id}")
-    log("=" * 80)
-
-    # 1. Загружаем данные
-    fin_df = load_finance_week(s3, week_id)
-    if fin_df.empty:
-        raise RuntimeError(f"Не удалось загрузить финансы за {week_id}")
-
-    prev_fin_df = load_finance_week(s3, prev_week_id)
-    stocks_df = load_stocks_week(s3, week_id)
-    stock_snapshot_df = get_stock_snapshot_for_week(stocks_df)
-    advert_df = load_advert_spend_week(s3, week_id)
-    cost_df = load_costs(s3)
-
-    # 2. Базовый факт по SKU
-    fact_df = build_weekly_fact_by_sku(
-        fin_df=fin_df,
-        cost_df=cost_df,
-        advert_df=advert_df,
-        stock_snapshot_df=stock_snapshot_df,
-        week_id=week_id
-    )
-    if fact_df.empty:
-        raise RuntimeError("Не удалось собрать weekly fact по SKU")
-
-    # 3. Общемагазинные расходы
-    storewide = calculate_storewide_expenses(fin_df)
-
-    fact_df = allocate_storage_by_stock(fact_df, storewide["total_storage_week"])
-    fact_df = allocate_storewide_cost_by_sales_units(fact_df, storewide["total_penalties_week"], "Штрафы")
-    fact_df = allocate_storewide_cost_by_sales_units(fact_df, storewide["total_deductions_week"], "Удержания")
-
-    acceptance_per_unit_9w = calculate_acceptance_per_unit_9w(s3, week_id)
-    fact_df = apply_acceptance_norm_to_fact(fact_df, acceptance_per_unit_9w)
-
-    # 4. Прибыль
-    fact_df = calculate_profit_columns(fact_df)
-
-    # 5. Добавляем итог магазина
-    total_row = build_store_total_row(fact_df)
-    fact_df_full = pd.concat([fact_df, total_row], ignore_index=True)
-
-    # 6. Юнит экономика
-    unit_df = build_unit_economics(fact_df, acceptance_per_unit_9w)
-
-    # 7. Анализ неделя к неделе
-    prev_fact_df = pd.DataFrame()
-    if not prev_fin_df.empty:
-        prev_stocks_df = load_stocks_week(s3, prev_week_id)
-        prev_stock_snapshot_df = get_stock_snapshot_for_week(prev_stocks_df)
-        prev_advert_df = load_advert_spend_week(s3, prev_week_id)
-        prev_fact_df = build_weekly_fact_by_sku(
-            fin_df=prev_fin_df,
-            cost_df=cost_df,
-            advert_df=prev_advert_df,
-            stock_snapshot_df=prev_stock_snapshot_df,
-            week_id=prev_week_id
-        )
-        prev_storewide = calculate_storewide_expenses(prev_fin_df)
-        prev_fact_df = allocate_storage_by_stock(prev_fact_df, prev_storewide["total_storage_week"])
-        prev_fact_df = allocate_storewide_cost_by_sales_units(prev_fact_df, prev_storewide["total_penalties_week"], "Штрафы")
-        prev_fact_df = allocate_storewide_cost_by_sales_units(prev_fact_df, prev_storewide["total_deductions_week"], "Удержания")
-        prev_acc_norm = calculate_acceptance_per_unit_9w(s3, prev_week_id)
-        prev_fact_df = apply_acceptance_norm_to_fact(prev_fact_df, prev_acc_norm)
-        prev_fact_df = calculate_profit_columns(prev_fact_df)
-
-    wow_df = build_wow_analysis(fact_df, prev_fact_df, week_id)
-
-    # 8. Склады и коэффициенты
-    warehouse_df = build_warehouse_analysis(fin_df, week_id)
-
-    # 9. Загружаем существующую историю output
-    existing_sheets = s3.read_excel_all_sheets(OUTPUT_KEY)
-
-    existing_unit = existing_sheets.get(SHEET_UNIT, pd.DataFrame())
-    existing_fact = existing_sheets.get(SHEET_FACT, pd.DataFrame())
-    existing_wow = existing_sheets.get(SHEET_WOW, pd.DataFrame())
-    existing_wh = existing_sheets.get(SHEET_WH, pd.DataFrame())
-
-    # 10. Upsert history
-    unit_hist = upsert_history(existing_unit, unit_df, ["Неделя", "nm_id"])
-    fact_hist = upsert_history(existing_fact, fact_df_full, ["Неделя", "nm_id"])
-    wow_hist = upsert_history(existing_wow, wow_df, ["Неделя", "nm_id"])
-    wh_hist = upsert_history(existing_wh, warehouse_df, ["Неделя", "Склад"])
-
-    # 11. Красивое округление
-    def round_df(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        out = df.copy()
-        for c in out.columns:
-            if pd.api.types.is_float_dtype(out[c]) or pd.api.types.is_numeric_dtype(out[c]):
-                out[c] = out[c].apply(lambda x: safe_round(x, 4) if abs(float(x)) < 1 else safe_round(x, 2))
-        return out
-
-    unit_hist = round_df(unit_hist)
-    fact_hist = round_df(fact_hist)
-    wow_hist = round_df(wow_hist)
-    wh_hist = round_df(wh_hist)
-
-    # 12. Сохраняем
-    s3.write_excel_sheets(
-        OUTPUT_KEY,
-        {
-            SHEET_UNIT: unit_hist,
-            SHEET_FACT: fact_hist,
-            SHEET_WOW: wow_hist,
-            SHEET_WH: wh_hist,
-        }
-    )
-
-    log(f"✅ Экономика сохранена: {OUTPUT_KEY}")
-    log(f"   - {SHEET_UNIT}: {len(unit_hist)} строк")
-    log(f"   - {SHEET_FACT}: {len(fact_hist)} строк")
-    log(f"   - {SHEET_WOW}: {len(wow_hist)} строк")
-    log(f"   - {SHEET_WH}: {len(wh_hist)} строк")
-    log("✅ Готово")
+    calc = WeeklyEconomicsCalculator(s3)
+    calc.run()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ Критическая ошибка: {e}")
+        traceback.print_exc()
+        raise
