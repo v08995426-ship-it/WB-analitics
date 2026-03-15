@@ -11,6 +11,7 @@
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
 Добавлено формирование единого объединённого отчёта (воронка + заказы + реклама).
+Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
 """
 
 import os
@@ -1039,7 +1040,7 @@ class WildberriesDailyUpdater:
         self.log("❌ Не удалось получить отчёт воронки")
         return False
 
-    # ---------- Реклама (получение данных напрямую из API, без файла База данных.xlsx) ----------
+    # ---------- Реклама (получение данных напрямую из API) ----------
     def update_adverts(self, store_name: str) -> bool:
         """
         Обновление данных по рекламным кампаниям понедельно.
@@ -1224,8 +1225,7 @@ class WildberriesDailyUpdater:
                 combined = week_df
             self._save_weekly_data(combined, store_name, 'adverts', week_start)
 
-        # 8. Дополнительно формируем отчёты по категориям и сохраняем в отдельный файл (по желанию)
-        # Для удобства можно создать файл "Анализ рекламы.xlsx" с дополнительными листами
+        # 8. Дополнительно формируем отчёты по категориям и сохраняем в отдельный файл
         if not daily_df.empty:
             # Отчёт по категориям за каждый день
             daily_cat = daily_df.groupby(['Дата', 'Название предмета']).agg({
@@ -1257,16 +1257,7 @@ class WildberriesDailyUpdater:
             summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
             summary_cat = summary_cat.sort_values('Расход', ascending=False)
 
-            # Сохраняем отчёты в отдельный файл (например, Анализ рекламы.xlsx) рядом с недельными файлами
             analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
-            # Загружаем существующий, если есть
-            existing_analytics = pd.DataFrame()
-            if self.s3.file_exists(analytics_key):
-                try:
-                    existing_analytics = self.s3.read_excel(analytics_key, sheet_name='Отчет_по_Категории')
-                except:
-                    pass
-            # Здесь можно реализовать мерж, но для простоты перезапишем
             with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
                 tmp_path = tmp.name
             with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
@@ -1279,7 +1270,7 @@ class WildberriesDailyUpdater:
         self.log("✅ Реклама успешно обновлена")
         return True
 
-    # ---------- Остатки из 1С ----------
+    # ---------- Остатки из 1С (отключено, метод оставлен для возможности возврата) ----------
     def update_1c_stocks(self, store_name: str = '1С') -> bool:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки из 1С для магазина {store_name}")
         config = self.reports_config['1c_stocks']
@@ -1313,7 +1304,7 @@ class WildberriesDailyUpdater:
         tmp_path = None
         try:
             self.log(f"📥 Скачивание файла из: {download_url}")
-            resp = requests.get(download_url, auth=auth, timeout=120, stream=True)
+            resp = requests.get(download_url, auth=auth, timeout=120, stream=True, allow_redirects=True)
             if resp.status_code != 200:
                 self.log(f"❌ Ошибка при скачивании: HTTP {resp.status_code}")
                 return False
@@ -1347,34 +1338,43 @@ class WildberriesDailyUpdater:
         Сохраняет результат в папку "Объединенный отчет".
         """
         self.log(f"\n📌 ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА для магазина {store_name}")
-
-        # 1. Определяем диапазон дат (последние 90 дней)
         start_date, end_date = self._get_date_range_90_days()
         self.log(f"📅 Период данных: {start_date} - {end_date}")
 
-        # 2. Загружаем воронку продаж (единый файл)
+        # 1. Воронка продаж
         funnel_key = f"Отчёты/{self.reports_config['funnel']['folder']}/{store_name}/{self.reports_config['funnel']['filename']}"
         self.log(f"📥 Загрузка воронки продаж: {funnel_key}")
         funnel_df = self.s3.read_excel(funnel_key, sheet_name=0)
         if funnel_df.empty:
             self.log("❌ Не удалось загрузить данные воронки продаж. Отчёт не будет создан.")
             return False
-        # Приводим дату и фильтруем по периоду
         funnel_df['dt'] = pd.to_datetime(funnel_df['dt'], errors='coerce')
         funnel_df = funnel_df[(funnel_df['dt'] >= pd.Timestamp(start_date)) & (funnel_df['dt'] <= pd.Timestamp(end_date))]
         self.log(f"📊 Воронка продаж: {len(funnel_df)} записей")
 
-        # 3. Загружаем заказы из всех недельных файлов
+        # 2. Заказы
         orders_prefix = f"Отчёты/{self.reports_config['orders']['folder']}/{store_name}/Недельные/"
         orders_files = self.s3.list_files(orders_prefix)
         orders_list = []
         for file_key in orders_files:
             self.log(f"📥 Загрузка заказов: {file_key}")
             df = self.s3.read_excel(file_key, sheet_name=0)
-            if not df.empty:
-                df['dt'] = pd.to_datetime(df['date'], errors='coerce')
-                df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
-                orders_list.append(df)
+            if df.empty:
+                continue
+            # Приводим названия колонок: nmId -> nmID, date -> dt
+            rename_map = {}
+            if 'nmId' in df.columns:
+                rename_map['nmId'] = 'nmID'
+            if 'date' in df.columns:
+                rename_map['date'] = 'dt'
+            if rename_map:
+                df = df.rename(columns=rename_map)
+            if 'nmID' not in df.columns or 'dt' not in df.columns:
+                self.log(f"⚠️ В файле {file_key} отсутствуют колонки nmID или dt, пропускаем")
+                continue
+            df['dt'] = pd.to_datetime(df['dt'], errors='coerce')
+            df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+            orders_list.append(df)
         if orders_list:
             orders_df = pd.concat(orders_list, ignore_index=True)
             self.log(f"📊 Заказы: {len(orders_df)} записей")
@@ -1382,17 +1382,29 @@ class WildberriesDailyUpdater:
             orders_df = pd.DataFrame()
             self.log("⚠️ Нет данных по заказам за период")
 
-        # 4. Загружаем рекламу из всех недельных файлов
+        # 3. Реклама
         adverts_prefix = f"Отчёты/{self.reports_config['adverts']['folder']}/{store_name}/Недельные/"
         adverts_files = self.s3.list_files(adverts_prefix)
         adverts_list = []
         for file_key in adverts_files:
             self.log(f"📥 Загрузка рекламы: {file_key}")
             df = self.s3.read_excel(file_key, sheet_name=0)
-            if not df.empty:
-                df['dt'] = pd.to_datetime(df['Дата'], errors='coerce')
-                df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
-                adverts_list.append(df)
+            if df.empty:
+                continue
+            # Приводим названия колонок: Артикул WB -> nmID, Дата -> dt
+            rename_map = {}
+            if 'Артикул WB' in df.columns:
+                rename_map['Артикул WB'] = 'nmID'
+            if 'Дата' in df.columns:
+                rename_map['Дата'] = 'dt'
+            if rename_map:
+                df = df.rename(columns=rename_map)
+            if 'nmID' not in df.columns or 'dt' not in df.columns:
+                self.log(f"⚠️ В файле {file_key} отсутствуют колонки nmID или dt, пропускаем")
+                continue
+            df['dt'] = pd.to_datetime(df['dt'], errors='coerce')
+            df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+            adverts_list.append(df)
         if adverts_list:
             adverts_df = pd.concat(adverts_list, ignore_index=True)
             self.log(f"📊 Реклама: {len(adverts_df)} записей")
@@ -1400,18 +1412,14 @@ class WildberriesDailyUpdater:
             adverts_df = pd.DataFrame()
             self.log("⚠️ Нет данных по рекламе за период")
 
-        # 5. Если нет данных ни одного из источников, выходим
+        # 4. Если нет данных ни одного из источников, выходим
         if funnel_df.empty and orders_df.empty and adverts_df.empty:
             self.log("❌ Нет данных для формирования отчёта")
             return False
 
-        # 6. Группировка и подготовка данных
-        # Воронка уже готова, оставляем как есть (там есть nmID, dt и другие поля)
-        funnel_df.rename(columns={'nmID': 'nmID'}, inplace=True)
-
-        # Заказы: группируем по nmID и dt
+        # 5. Группировка заказов
+        orders_grouped = pd.DataFrame()
         if not orders_df.empty:
-            # Определяем нужные колонки
             agg_dict = {}
             if 'priceWithDisc' in orders_df.columns:
                 agg_dict['priceWithDisc'] = 'sum'
@@ -1423,9 +1431,8 @@ class WildberriesDailyUpdater:
                 agg_dict['subject'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
             if 'supplierArticle' in orders_df.columns:
                 agg_dict['supplierArticle'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
-            # Локальные заказы – используем mapping из этапа 2
+            # Локальные заказы
             if 'warehouseName' in orders_df.columns and 'oblastOkrugName' in orders_df.columns:
-                # Функция определения локальности
                 local_mapping = {
                     'Екатеринбург - Перспективная 14': ['Уральский федеральный округ'],
                     'Котовск': ['Центральный федеральный округ'],
@@ -1457,8 +1464,7 @@ class WildberriesDailyUpdater:
                     except:
                         return 0
                 orders_df['is_local'] = orders_df.apply(is_local, axis=1)
-                agg_dict['is_local'] = 'mean'  # процент локальных
-            # Выполняем группировку
+                agg_dict['is_local'] = 'mean'
             orders_grouped = orders_df.groupby(['nmID', 'dt']).agg(agg_dict).reset_index()
             orders_grouped.rename(columns={
                 'priceWithDisc': 'total_priceWithDisc',
@@ -1467,41 +1473,37 @@ class WildberriesDailyUpdater:
                 'is_local': 'local_orders_percent'
             }, inplace=True)
             self.log(f"📊 Заказы сгруппированы: {len(orders_grouped)} записей")
-        else:
-            orders_grouped = pd.DataFrame()
 
-        # Реклама: группируем по nmID и dt (суммируем метрики)
+        # 6. Группировка рекламы
+        adverts_grouped = pd.DataFrame()
         if not adverts_df.empty:
-            # Приводим колонки к единому виду
-            rename_dict = {}
-            if 'Артикул WB' in adverts_df.columns:
-                rename_dict['Артикул WB'] = 'nmID'
-            if 'ID кампании' in adverts_df.columns:
-                rename_dict['ID кампании'] = 'campaign_id'
-            adverts_df.rename(columns=rename_dict, inplace=True)
-            # Выбираем нужные колонки
-            adverts_agg = adverts_df.groupby(['nmID', 'dt']).agg({
+            # Суммируем метрики по nmID и dt
+            agg_adv = {
                 'Расход': 'sum',
                 'Показы': 'sum',
                 'Клики': 'sum',
-                'CTR': 'mean',  # средний CTR? обычно сумма показов и кликов, CTR потом пересчитаем
+                'CTR': 'mean',
                 'CPC': 'mean',
                 'Заказы': 'sum',
                 'Сумма заказов': 'sum'
-            }).reset_index()
-            # Пересчитаем CTR и CPC (хотя они уже есть)
-            adverts_agg['CTR'] = (adverts_agg['Клики'] / adverts_agg['Показы'] * 100).round(2)
-            adverts_agg['CPC'] = (adverts_agg['Расход'] / adverts_agg['Клики']).round(2)
-            self.log(f"📊 Реклама сгруппирована: {len(adverts_agg)} записей")
-        else:
-            adverts_agg = pd.DataFrame()
+            }
+            # Убираем колонки, которых нет
+            cols_to_agg = {k: v for k, v in agg_adv.items() if k in adverts_df.columns}
+            if cols_to_agg:
+                adverts_grouped = adverts_df.groupby(['nmID', 'dt']).agg(cols_to_agg).reset_index()
+                # Пересчитываем CTR и CPC (на всякий случай)
+                if 'Клики' in adverts_grouped and 'Показы' in adverts_grouped:
+                    adverts_grouped['CTR'] = (adverts_grouped['Клики'] / adverts_grouped['Показы'] * 100).round(2)
+                if 'Расход' in adverts_grouped and 'Клики' in adverts_grouped:
+                    adverts_grouped['CPC'] = (adverts_grouped['Расход'] / adverts_grouped['Клики']).round(2)
+                self.log(f"📊 Реклама сгруппирована: {len(adverts_grouped)} записей")
 
-        # 7. Объединяем
+        # 7. Объединение
         merged = funnel_df.copy()
         if not orders_grouped.empty:
             merged = pd.merge(merged, orders_grouped, on=['nmID', 'dt'], how='left')
-        if not adverts_agg.empty:
-            merged = pd.merge(merged, adverts_agg, on=['nmID', 'dt'], how='left')
+        if not adverts_grouped.empty:
+            merged = pd.merge(merged, adverts_grouped, on=['nmID', 'dt'], how='left')
         # Заполняем NaN нулями для числовых колонок
         for col in merged.columns:
             if col not in ['nmID', 'dt', 'subject', 'supplierArticle']:
@@ -1509,7 +1511,7 @@ class WildberriesDailyUpdater:
 
         self.log(f"📊 Объединено записей: {len(merged)}")
 
-        # 8. Перевод названий колонок (как в этапе 2)
+        # 8. Перевод названий колонок
         column_translation = {
             'nmID': 'ID товара',
             'dt': 'Дата',
@@ -1545,10 +1547,9 @@ class WildberriesDailyUpdater:
             'Заказы': 'Заказы из рекламы',
             'Сумма заказов': 'Сумма заказов из рекламы'
         }
-        # Простое переименование совпадающих колонок
         merged.rename(columns=column_translation, inplace=True)
 
-        # 9. Сохраняем результат
+        # 9. Сохраняем
         output_folder = "Объединенный отчет"
         output_filename = "Объединенный_отчет.xlsx"
         output_key = f"Отчёты/{output_folder}/{store_name}/{output_filename}"
@@ -1568,7 +1569,8 @@ class WildberriesDailyUpdater:
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
-        all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', '1c_stocks', 'keywords']
+        # Исключаем 1c_stocks из списка по умолчанию (можно вернуть позже, добавив в список)
+        all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
         if reports is None:
             reports = all_reports
 
@@ -1591,14 +1593,12 @@ class WildberriesDailyUpdater:
                 self.log(f"⏳ Пауза 30 секунд перед следующим отчётом...")
                 time.sleep(30)
 
-        # После всех отчётов формируем единый отчёт
         self.log_section("ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА")
         self.create_unified_report(store_name)
 
         self.log("✅ Обновление завершено")
 
     def log_section(self, title: str):
-        """Вспомогательный метод для заголовка раздела"""
         self.log("")
         self.log("=" * 80)
         self.log(f"📌 {title}")
@@ -1620,8 +1620,9 @@ if __name__ == "__main__":
         print(f"❌ Отсутствуют переменные окружения: {missing}")
         exit(1)
 
-    if not os.environ.get('URL_1C_STOCKS'):
-        print("⚠️ Переменная URL_1C_STOCKS не задана. Отчёт '1c_stocks' будет пропущен.")
+    # Если хотите позже включить 1c_stocks, раскомментируйте строку ниже и добавьте '1c_stocks' в список reports
+    # if not os.environ.get('URL_1C_STOCKS'):
+    #     print("⚠️ Переменная URL_1C_STOCKS не задана. Отчёт '1c_stocks' будет пропущен.")
 
     s3 = S3Storage(
         access_key=os.environ['YC_ACCESS_KEY_ID'],
