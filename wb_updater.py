@@ -23,6 +23,7 @@ import zipfile
 import tempfile
 import traceback
 import re
+import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
 import warnings
@@ -1797,6 +1798,9 @@ def show_menu() -> int:
                 return choice
             else:
                 print("Ошибка: введите число от 1 до 4.")
+        except (EOFError, KeyboardInterrupt):
+            # В неинтерактивном режиме или при прерывании возвращаем 1 (полное обновление) или выход
+            return 1
         except ValueError:
             print("Ошибка: введите число.")
 
@@ -1823,6 +1827,8 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
                 return
             else:
                 print(f"Ошибка: введите число от 0 до {len(reports)}.")
+        except (EOFError, KeyboardInterrupt):
+            return
         except ValueError:
             print("Ошибка: введите число.")
 
@@ -1855,6 +1861,12 @@ def main():
 
     updater = WildberriesDailyUpdater(api_keys, s3)
     store = 'TOPFACE'
+
+    # Если запуск в неинтерактивном режиме (например, в CI/CD), выполняем полное обновление без меню
+    if not sys.stdin.isatty():
+        updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
+        updater.run_daily_update(store)
+        return
 
     while True:
         choice = show_menu()
