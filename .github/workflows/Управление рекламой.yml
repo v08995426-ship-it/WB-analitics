@@ -1,34 +1,103 @@
-name: Управление рекламой
+name: assistant-wb-ads-manager
 
 on:
   schedule:
-    - cron: '0 3 * * *'   # 06:00 Москва
+    # 06:00 по Москве = 03:00 UTC
+    - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска: dry-run или prod'
+        required: true
+        default: 'dry-run'
+      week:
+        description: 'Неделя в формате YYYY-Wxx, например 2026-W11. Пусто = автоопределение'
+        required: false
+        default: ''
+      strategy_id:
+        description: 'Опционально: установить стратегию перед запуском (1, 2, 3). Пусто = не менять'
+        required: false
+        default: ''
 
 jobs:
-  run:
-
+  run-assistant-wb-ads-manager:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install libs
+      - name: Install dependencies
         run: |
-          pip install pandas boto3 openpyxl requests
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl boto3 pytz requests
 
-      - name: Run assistant
+      - name: Validate script exists
+        run: |
+          test -f assistant_wb_ads_manager.py
+
+      - name: Optionally set strategy
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.strategy_id != '' }}
         env:
           YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
         run: |
-          python assistant_wb_github.py
+          python assistant_wb_ads_manager.py set-strategy ${{ github.event.inputs.strategy_id }}
+
+      - name: Scheduled run at 06:00 Moscow in dry-run mode
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_ads_manager.py run --dry-run
+
+      - name: Manual run dry-run
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week == '' }}
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_ads_manager.py run --dry-run
+
+      - name: Manual run dry-run for selected week
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week != '' }}
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}" --dry-run
+
+      - name: Manual run production
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'prod' && github.event.inputs.week == '' }}
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_ads_manager.py run
+
+      - name: Manual run production for selected week
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'prod' && github.event.inputs.week != '' }}
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}"
