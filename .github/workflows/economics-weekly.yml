@@ -1,0 +1,32 @@
+name: WB Economics Weekly
+
+on:
+  schedule:
+    - cron: '0 11 * * 1'   # Понедельник 14:00 МСК = 11:00 UTC
+  workflow_dispatch:
+
+jobs:
+  run-economics:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl boto3 botocore requests pytz
+
+      - name: Run economics script
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+        run: |
+          python economics_weekly.py
