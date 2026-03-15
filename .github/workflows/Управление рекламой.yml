@@ -1,4 +1,4 @@
-name: Assistant WB Daily
+name: Управление рекламой
 
 on:
   schedule:
