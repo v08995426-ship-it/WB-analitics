@@ -1,0 +1,34 @@
+name: Assistant WB Daily
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 06:00 Москва
+  workflow_dispatch:
+
+jobs:
+  run:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install libs
+        run: |
+          pip install pandas boto3 openpyxl requests
+
+      - name: Run assistant
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python assistant_wb_github.py
