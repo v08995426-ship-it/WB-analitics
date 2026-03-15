@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
