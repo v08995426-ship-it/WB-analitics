@@ -79,7 +79,37 @@ class S3Storage:
         with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            df.to_excel(tmp_path, index=False, sheet_name=sheet_name)
+            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+            self.upload_file(tmp_path, key)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def read_excel_all_sheets(self, key: str) -> Dict[str, pd.DataFrame]:
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            data = obj['Body'].read()
+            return pd.read_excel(io.BytesIO(data), sheet_name=None)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                return {}
+            else:
+                raise e
+        except Exception as e:
+            print(f"Ошибка чтения всех листов {key}: {e}")
+            return {}
+
+    def write_excel_sheets(self, key: str, sheets: Dict[str, pd.DataFrame]):
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+                for sheet_name, df in sheets.items():
+                    safe_sheet_name = str(sheet_name)[:31] if sheet_name else 'Sheet1'
+                    if df is None:
+                        df = pd.DataFrame()
+                    df.to_excel(writer, index=False, sheet_name=safe_sheet_name)
             self.upload_file(tmp_path, key)
         finally:
             if os.path.exists(tmp_path):
@@ -1041,19 +1071,166 @@ class WildberriesDailyUpdater:
         self.log("❌ Не удалось получить отчёт воронки")
         return False
 
+    def _safe_div(self, numerator: float, denominator: float, multiplier: float = 1.0, digits: int = 2) -> float:
+        try:
+            denominator = float(denominator)
+            if denominator == 0:
+                return 0.0
+            return round((float(numerator) / denominator) * multiplier, digits)
+        except Exception:
+            return 0.0
+
+    def _normalize_cost_dataframe(self, cost_df: pd.DataFrame) -> pd.DataFrame:
+        if cost_df.empty:
+            return pd.DataFrame(columns=['nm_id', 'cost_price'])
+        df = cost_df.copy()
+        original_columns = list(df.columns)
+        normalized = {col: str(col).strip().lower().replace('ё', 'е') for col in df.columns}
+        nm_col = None
+        cost_col = None
+        for col, norm in normalized.items():
+            if norm in ['nm_id', 'nmid', 'артикул wb', 'артикул', 'id товара'] or 'артикул wb' in norm:
+                nm_col = col
+                break
+        for col, norm in normalized.items():
+            if norm in ['cost_price', 'себестоимость', 'cost', 'cost price', 'закупочная цена'] or 'себестоим' in norm:
+                cost_col = col
+                break
+        if nm_col is None and len(original_columns) >= 3:
+            nm_col = original_columns[2]
+        if cost_col is None:
+            for col, norm in normalized.items():
+                if 'себестоим' in norm or norm.startswith('cost'):
+                    cost_col = col
+                    break
+        if nm_col is None or cost_col is None:
+            self.log(f"⚠️ Не удалось определить колонки себестоимости. Найдены колонки: {original_columns}")
+            return pd.DataFrame(columns=['nm_id', 'cost_price'])
+        df = df.rename(columns={nm_col: 'nm_id', cost_col: 'cost_price'})
+        df['nm_id'] = pd.to_numeric(df['nm_id'], errors='coerce')
+        df['cost_price'] = pd.to_numeric(df['cost_price'], errors='coerce')
+        df = df[['nm_id', 'cost_price']].dropna(subset=['nm_id'])
+        df['nm_id'] = df['nm_id'].astype('int64')
+        df['cost_price'] = df['cost_price'].fillna(0.0)
+        return df.drop_duplicates(subset='nm_id', keep='last')
+
+    def _build_campaigns_dataframe(self, adverts: List[Dict[str, Any]]) -> pd.DataFrame:
+        rows = []
+        current_date = datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y-%m-%d')
+        for advert in adverts:
+            settings = advert.get('settings', {}) or {}
+            timestamps = advert.get('timestamps', {}) or {}
+            placements = settings.get('placements', {}) or {}
+            nm_settings = advert.get('nm_settings', []) or []
+            first_nm = nm_settings[0] if nm_settings else {}
+            bids_kopecks = first_nm.get('bids_kopecks', {}) or {}
+            subject = first_nm.get('subject', {}) or {}
+            rows.append({
+                'ID': advert.get('id'),
+                'Название': settings.get('name', ''),
+                'Статус': 'Активна' if advert.get('status') == 9 else 'На паузе' if advert.get('status') == 11 else advert.get('status', ''),
+                'Тип оплаты': settings.get('payment_type', ''),
+                'Тип ставки': advert.get('bid_type', ''),
+                'Создана': timestamps.get('created', ''),
+                'Обновлена': timestamps.get('updated', ''),
+                'Запущена': timestamps.get('started', ''),
+                'Размещение в поиске': 'Да' if placements.get('search') is True else 'Нет',
+                'Размещение в рекомендациях': 'Да' if placements.get('recommendations') is True else 'Нет',
+                'Ставка в поиске (руб)': round((bids_kopecks.get('search', 0) or 0) / 100, 2),
+                'Ставка в рекомендациях (руб)': round((bids_kopecks.get('recommendations', 0) or 0) / 100, 2),
+                'ID предмета': subject.get('id', ''),
+                'Название предмета': subject.get('name', ''),
+                'Артикул WB': first_nm.get('nm_id', ''),
+                'Количество товаров': len(nm_settings),
+                'Первый артикул товара': first_nm.get('nm_id', ''),
+                'Дата_сбора': current_date
+            })
+        return pd.DataFrame(rows)
+
+    def _build_adverts_summary_dataframe(self, all_stats: List[Dict[str, Any]], campaign_info: Dict[int, Dict[str, Any]]) -> pd.DataFrame:
+        rows = []
+        for campaign in all_stats:
+            campaign_id = campaign.get('advertId')
+            info = campaign_info.get(campaign_id, {})
+            sum_price = campaign.get('sum_price', 0) or 0
+            spent = campaign.get('sum', 0) or 0
+            rows.append({
+                'ID кампании': campaign_id,
+                'Артикул WB': info.get('article', ''),
+                'Название предмета': info.get('subject', ''),
+                'Название': info.get('name', ''),
+                'Показы': campaign.get('views', 0),
+                'Клики': campaign.get('clicks', 0),
+                'CTR': campaign.get('ctr', 0),
+                'CPC': campaign.get('cpc', 0),
+                'Заказы': campaign.get('orders', 0),
+                'CR': campaign.get('cr', 0),
+                'Расход': spent,
+                'ATBS': campaign.get('atbs', 0),
+                'SHKS': campaign.get('shks', 0),
+                'Сумма заказов': sum_price,
+                'Отменено': campaign.get('canceled', 0),
+                'ДРР': self._safe_div(spent, sum_price * 0.88 if sum_price else 0, 100, 2)
+            })
+        return pd.DataFrame(rows)
+
+    def _build_category_reports(self, daily_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if daily_df.empty or 'Название предмета' not in daily_df.columns:
+            return pd.DataFrame(), pd.DataFrame()
+        daily_category = daily_df.groupby(['Дата', 'Название предмета'], dropna=False).agg({'Показы':'sum','Клики':'sum','Заказы':'sum','Расход':'sum','Сумма заказов':'sum'}).reset_index()
+        daily_category['CTR'] = daily_category.apply(lambda x: self._safe_div(x['Клики'], x['Показы'], 100, 2), axis=1)
+        daily_category['CPC'] = daily_category.apply(lambda x: self._safe_div(x['Расход'], x['Клики'], 1, 2), axis=1)
+        daily_category['CR'] = daily_category.apply(lambda x: self._safe_div(x['Заказы'], x['Клики'], 100, 2), axis=1)
+        daily_category['ROI'] = daily_category.apply(lambda x: self._safe_div(x['Сумма заказов'] - x['Расход'], x['Расход'], 100, 2), axis=1)
+        daily_category['ДРР'] = daily_category.apply(lambda x: self._safe_div(x['Расход'], x['Сумма заказов'] * 0.88 if x['Сумма заказов'] else 0, 100, 2), axis=1)
+        daily_category = daily_category[['Дата','Название предмета','Показы','Клики','CTR','CPC','Заказы','CR','Расход','Сумма заказов','ROI','ДРР']].sort_values(['Дата','Расход'], ascending=[True,False])
+        summary_category = daily_df.groupby('Название предмета', dropna=False).agg({'Показы':'sum','Клики':'sum','Заказы':'sum','Расход':'sum','Сумма заказов':'sum'}).reset_index()
+        summary_category['CTR'] = summary_category.apply(lambda x: self._safe_div(x['Клики'], x['Показы'], 100, 2), axis=1)
+        summary_category['CPC'] = summary_category.apply(lambda x: self._safe_div(x['Расход'], x['Клики'], 1, 2), axis=1)
+        summary_category['CR'] = summary_category.apply(lambda x: self._safe_div(x['Заказы'], x['Клики'], 100, 2), axis=1)
+        summary_category['ROI'] = summary_category.apply(lambda x: self._safe_div(x['Сумма заказов'] - x['Расход'], x['Расход'], 100, 2), axis=1)
+        summary_category['ДРР'] = summary_category.apply(lambda x: self._safe_div(x['Расход'], x['Сумма заказов'] * 0.88 if x['Сумма заказов'] else 0, 100, 2), axis=1)
+        summary_category = summary_category[['Название предмета','Показы','Клики','CTR','CPC','Заказы','CR','Расход','Сумма заказов','ROI','ДРР']].sort_values('Расход', ascending=False)
+        return daily_category, summary_category
+
+    def _update_adverts_history_14_days(self, store_name: str, daily_df: pd.DataFrame):
+        if daily_df.empty:
+            return
+        history_key = f"Отчёты/Реклама/{store_name}/Реклама_14_дней_история.xlsx"
+        history_df = self.s3.read_excel(history_key, sheet_name=0)
+        request_date = datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y-%m-%d')
+        start_14, end_14 = self._get_date_range_last_n_days(14)
+        part = daily_df.copy()
+        part['Дата'] = pd.to_datetime(part['Дата'], errors='coerce').dt.date
+        part = part[(part['Дата'] >= start_14) & (part['Дата'] <= end_14)].copy()
+        part['Дата'] = part['Дата'].astype(str)
+        part['Дата запроса'] = request_date
+        if history_df.empty:
+            combined = part
+        else:
+            if 'Дата' in history_df.columns:
+                history_df['Дата'] = pd.to_datetime(history_df['Дата'], errors='coerce').dt.date.astype(str)
+            combined = pd.concat([history_df, part], ignore_index=True)
+            dedupe_cols = [col for col in ['Дата запроса','ID кампании','Артикул WB','Дата'] if col in combined.columns]
+            if dedupe_cols:
+                combined = combined.drop_duplicates(subset=dedupe_cols, keep='last')
+        self.s3.write_excel(history_key, combined, sheet_name='История_14_дней')
+        self.log(f"📊 История рекламы за 14 дней сохранена: {history_key}, записей: {len(combined)}")
+
     # ---------- Реклама (получение данных напрямую из API) ----------
     def update_adverts(self, store_name: str) -> bool:
         """
-        Обновление данных по рекламным кампаниям понедельно.
-        Получает список кампаний напрямую из API Wildberries.
+        Обновление данных по рекламным кампаниям.
+        Формирует недельные файлы с листами:
+        Статистика_Ежедневно, Список_кампаний, Статистика_Итого,
+        Отчет_по_Категории, Отчет_по_Категории_Итог.
+        Также ведёт отдельную историю за последние 14 дней с датой запроса.
         """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
-
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
-        # 1. Получаем список всех кампаний (статусы 9 - активные, 11 - на паузе)
         self.log("📋 Запрос списка рекламных кампаний...")
         all_adverts = []
         for payment_type in ['cpm', 'cpc']:
@@ -1061,8 +1238,7 @@ class WildberriesDailyUpdater:
             try:
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    adverts = data.get('adverts', [])
+                    adverts = (resp.json() or {}).get('adverts', [])
                     all_adverts.extend(adverts)
                     self.log(f"✅ Получено кампаний для {payment_type}: {len(adverts)}")
                 else:
@@ -1077,113 +1253,84 @@ class WildberriesDailyUpdater:
             return False
 
         self.log(f"✅ Всего получено кампаний: {len(all_adverts)}")
+        campaigns_df = self._build_campaigns_dataframe(all_adverts)
 
-        # 2. Извлекаем информацию о кампаниях (ID, название, предмет, артикул)
         campaign_ids = []
-        campaign_info = {}  # id -> {'name': ..., 'subject': ..., 'article': ...}
-
+        campaign_info = {}
         for adv in all_adverts:
             adv_id = adv.get('id')
             if not adv_id:
                 continue
-            settings = adv.get('settings', {})
-            name = settings.get('name', '')
-            # Пытаемся получить предмет и артикул из nm_settings
-            subject = ''
-            article = ''
-            nm_settings = adv.get('nm_settings', [])
-            if nm_settings:
-                first_nm = nm_settings[0]
-                subject_obj = first_nm.get('subject', {})
-                if subject_obj:
-                    subject = subject_obj.get('name', '')
-                article = first_nm.get('nm_id', '')
-            campaign_info[adv_id] = {'name': name, 'subject': subject, 'article': article}
+            settings = adv.get('settings', {}) or {}
+            nm_settings = adv.get('nm_settings', []) or []
+            first_nm = nm_settings[0] if nm_settings else {}
+            subject_obj = first_nm.get('subject', {}) or {}
+            campaign_info[adv_id] = {'name': settings.get('name', ''), 'subject': subject_obj.get('name', ''), 'article': first_nm.get('nm_id', '')}
             campaign_ids.append(adv_id)
 
         self.log(f"📊 Получено {len(campaign_ids)} кампаний с информацией")
 
-        # 3. Определяем диапазон дат для статистики (последние 30 дней)
-        end_date = (datetime.now() - timedelta(days=1)).date()
-        start_date = end_date - timedelta(days=29)  # 30 дней включая end_date
+        end_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
+        start_date = end_date - timedelta(days=29)
         start_str = start_date.strftime('%Y-%m-%d')
         end_str = end_date.strftime('%Y-%m-%d')
         self.log(f"📅 Запрашиваем статистику за период: {start_str} - {end_str}")
 
-        # 4. Группируем ID по неделям для сохранения
         weeks = defaultdict(list)
         for d in [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]:
             week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
             weeks[week_start].append(d)
 
-        # 5. Загружаем статистику для всех кампаний
-        all_stats = []  # список ответов от API (каждый ответ содержит данные по группе кампаний)
+        all_stats = []
         stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
-        # Разбиваем ID на группы по 30
         for i in range(0, len(campaign_ids), 30):
             chunk = campaign_ids[i:i+30]
-            ids_param = ','.join(map(str, chunk))
-            params = {
-                'ids': ids_param,
-                'beginDate': start_str,
-                'endDate': end_str
-            }
+            params = {'ids': ','.join(map(str, chunk)), 'beginDate': start_str, 'endDate': end_str}
             retries = 0
-            success = False
-            while retries < 3 and not success:
+            while retries < 5:
                 try:
                     self.log(f"⏳ Запрос статистики для кампаний {i+1}-{min(i+30, len(campaign_ids))}...")
                     resp = requests.get(stats_url, headers=headers, params=params, timeout=60)
                     if resp.status_code == 200:
-                        data = resp.json()
-                        if data:
-                            all_stats.extend(data)
-                            self.log(f"✅ Получены данные для {len(data)} кампаний")
-                        else:
-                            self.log(f"ℹ️ Нет данных для этой группы")
-                        success = True
+                        data = resp.json() or []
+                        all_stats.extend(data)
+                        self.log(f"✅ Получены данные для {len(data)} кампаний")
+                        break
                     elif resp.status_code == 429:
                         retries += 1
                         wait = 60 * retries
-                        self.log(f"    ⚠️ Лимит, ждём {wait} сек...")
+                        self.log(f"⚠️ Лимит API, ожидание {wait} сек...")
                         time.sleep(wait)
                     else:
                         self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
                         break
                 except Exception as e:
-                    self.log(f"❌ Исключение: {e}")
-                    break
-            time.sleep(30)  # пауза между группами
+                    retries += 1
+                    self.log(f"❌ Ошибка запроса статистики: {e}")
+                    time.sleep(15)
+            time.sleep(30)
 
         if not all_stats:
             self.log("⚠️ Не получено статистических данных.")
             return False
 
-        self.log(f"📊 Получена статистика для {len(all_stats)} записей кампаний")
-
-        # 6. Преобразуем полученную статистику в DataFrame (ежедневная)
         daily_rows = []
         for camp in all_stats:
             camp_id = camp.get('advertId')
             if not camp_id:
                 continue
             info = campaign_info.get(camp_id, {})
-            subject = info.get('subject', '')
-            name = info.get('name', '')
-            article = info.get('article', '')
-            days = camp.get('days', [])
-            for day in days:
-                day_date = day.get('date', '').split('T')[0]
-                if not day_date:
+            for day in camp.get('days', []) or []:
+                day_date = str(day.get('date', '')).split('T')[0]
+                if not day_date or day_date < start_str or day_date > end_str:
                     continue
-                # Фильтруем по датам (на всякий случай)
-                if day_date < start_str or day_date > end_str:
-                    continue
-                row = {
+                spent = day.get('sum', 0) or 0
+                sum_price = day.get('sum_price', 0) or 0
+                daily_rows.append({
                     'ID кампании': camp_id,
-                    'Артикул WB': article,
-                    'Название': name,
-                    'Название предмета': subject,
+                    'Артикул WB': info.get('article', ''),
+                    'Название': info.get('name', ''),
+                    'Название предмета': info.get('subject', ''),
                     'Дата': day_date,
                     'Показы': day.get('views', 0),
                     'Клики': day.get('clicks', 0),
@@ -1191,83 +1338,62 @@ class WildberriesDailyUpdater:
                     'CPC': day.get('cpc', 0),
                     'Заказы': day.get('orders', 0),
                     'CR': day.get('cr', 0),
-                    'Расход': day.get('sum', 0),
+                    'Расход': spent,
                     'ATBS': day.get('atbs', 0),
                     'SHKS': day.get('shks', 0),
-                    'Сумма заказов': day.get('sum_price', 0),
+                    'Сумма заказов': sum_price,
                     'Отменено': day.get('canceled', 0),
-                }
-                if row['Сумма заказов'] > 0:
-                    row['ДРР'] = round(row['Расход'] / (row['Сумма заказов'] * 0.88) * 100, 2)
-                else:
-                    row['ДРР'] = 0
-                daily_rows.append(row)
+                    'ДРР': self._safe_div(spent, sum_price * 0.88 if sum_price else 0, 100, 2)
+                })
 
         if not daily_rows:
             self.log("⚠️ Нет ежедневных данных для сохранения.")
             return False
 
         daily_df = pd.DataFrame(daily_rows)
+        daily_df['Дата'] = pd.to_datetime(daily_df['Дата'], errors='coerce').dt.date.astype(str)
         self.log(f"📊 Сформировано {len(daily_df)} ежедневных записей")
 
-        # 7. Группируем по неделям и сохраняем
+        summary_df = self._build_adverts_summary_dataframe(all_stats, campaign_info)
+        category_daily_df, category_total_df = self._build_category_reports(daily_df)
+
         for week_start, dates in weeks.items():
             week_dates = [d.strftime('%Y-%m-%d') for d in dates]
-            week_df = daily_df[daily_df['Дата'].isin(week_dates)].copy()
-            if week_df.empty:
+            week_daily_df = daily_df[daily_df['Дата'].isin(week_dates)].copy()
+            if week_daily_df.empty:
                 continue
-            # Загружаем существующий недельный файл
-            existing_week_df = self._load_weekly_data(store_name, 'adverts', week_start)
-            if not existing_week_df.empty:
-                # Удаляем дубликаты (ID кампании, дата)
-                combined = pd.concat([existing_week_df, week_df], ignore_index=True)
-                combined = combined.drop_duplicates(subset=['ID кампании', 'Дата'], keep='last')
-            else:
-                combined = week_df
-            self._save_weekly_data(combined, store_name, 'adverts', week_start)
+            existing_key = self._get_weekly_key(store_name, 'adverts', week_start)
+            existing_sheets = self.s3.read_excel_all_sheets(existing_key) if self.s3.file_exists(existing_key) else {}
+            existing_daily_df = existing_sheets.get('Статистика_Ежедневно', pd.DataFrame())
+            if existing_daily_df.empty and existing_sheets:
+                existing_daily_df = existing_sheets.get(next(iter(existing_sheets.keys())), pd.DataFrame())
+            if not existing_daily_df.empty:
+                existing_daily_df['Дата'] = pd.to_datetime(existing_daily_df['Дата'], errors='coerce').dt.date.astype(str)
+                week_daily_df = pd.concat([existing_daily_df, week_daily_df], ignore_index=True)
+                week_daily_df = week_daily_df.drop_duplicates(subset=['ID кампании', 'Дата', 'Артикул WB'], keep='last')
+            week_summary_df = self._build_adverts_summary_dataframe([camp for camp in all_stats if camp.get('advertId') in set(week_daily_df['ID кампании'].unique())], campaign_info)
+            week_category_daily_df, week_category_total_df = self._build_category_reports(week_daily_df)
+            week_campaigns_df = campaigns_df[campaigns_df['ID'].isin(week_daily_df['ID кампании'].unique())].copy() if not campaigns_df.empty else pd.DataFrame()
+            sheets_to_write = {
+                'Статистика_Ежедневно': week_daily_df.sort_values(['Дата','ID кампании']).reset_index(drop=True),
+                'Список_кампаний': week_campaigns_df.reset_index(drop=True),
+                'Статистика_Итого': week_summary_df.reset_index(drop=True),
+                'Отчет_по_Категории': week_category_daily_df.reset_index(drop=True),
+                'Отчет_по_Категории_Итог': week_category_total_df.reset_index(drop=True)
+            }
+            self.s3.write_excel_sheets(existing_key, sheets_to_write)
+            self.log(f"✅ Недельный файл сохранён: {existing_key}, листов: {list(sheets_to_write.keys())}")
 
-        # 8. Дополнительно формируем отчёты по категориям и сохраняем в отдельный файл
-        if not daily_df.empty:
-            # Отчёт по категориям за каждый день
-            daily_cat = daily_df.groupby(['Дата', 'Название предмета']).agg({
-                'Показы': 'sum',
-                'Клики': 'sum',
-                'Заказы': 'sum',
-                'Расход': 'sum',
-                'Сумма заказов': 'sum'
-            }).reset_index()
-            daily_cat['CTR'] = (daily_cat['Клики'] / daily_cat['Показы'] * 100).round(2)
-            daily_cat['CPC'] = (daily_cat['Расход'] / daily_cat['Клики']).round(2)
-            daily_cat['CR'] = (daily_cat['Заказы'] / daily_cat['Клики'] * 100).round(2)
-            daily_cat['ROI'] = ((daily_cat['Сумма заказов'] - daily_cat['Расход']) / daily_cat['Расход'] * 100).round(2)
-            daily_cat['ДРР'] = (daily_cat['Расход'] / (daily_cat['Сумма заказов'] * 0.88) * 100).round(2)
-            daily_cat = daily_cat.sort_values(['Дата', 'Расход'], ascending=[True, False])
-
-            # Итоговый отчёт по категориям
-            summary_cat = daily_df.groupby('Название предмета').agg({
-                'Показы': 'sum',
-                'Клики': 'sum',
-                'Заказы': 'sum',
-                'Расход': 'sum',
-                'Сумма заказов': 'sum'
-            }).reset_index()
-            summary_cat['CTR'] = (summary_cat['Клики'] / summary_cat['Показы'] * 100).round(2)
-            summary_cat['CPC'] = (summary_cat['Расход'] / summary_cat['Клики']).round(2)
-            summary_cat['CR'] = (summary_cat['Заказы'] / summary_cat['Клики'] * 100).round(2)
-            summary_cat['ROI'] = ((summary_cat['Сумма заказов'] - summary_cat['Расход']) / summary_cat['Расход'] * 100).round(2)
-            summary_cat['ДРР'] = (summary_cat['Расход'] / (summary_cat['Сумма заказов'] * 0.88) * 100).round(2)
-            summary_cat = summary_cat.sort_values('Расход', ascending=False)
-
-            analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
-            with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-                tmp_path = tmp.name
-            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-                daily_cat.to_excel(writer, sheet_name='Отчет_по_Категории', index=False)
-                summary_cat.to_excel(writer, sheet_name='Отчет_по_Категории_Итог', index=False)
-            self.s3.upload_file(tmp_path, analytics_key)
-            os.remove(tmp_path)
-            self.log(f"📊 Аналитический отчёт сохранён: {analytics_key}")
-
+        analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
+        self.s3.write_excel_sheets(analytics_key, {
+            'Статистика_Ежедневно': daily_df,
+            'Список_кампаний': campaigns_df,
+            'Статистика_Итого': summary_df,
+            'Отчет_по_Категории': category_daily_df,
+            'Отчет_по_Категории_Итог': category_total_df
+        })
+        self.log(f"📊 Аналитический отчёт сохранён: {analytics_key}")
+        self._update_adverts_history_14_days(store_name, daily_df)
         self.log("✅ Реклама успешно обновлена")
         return True
 
@@ -1336,451 +1462,220 @@ class WildberriesDailyUpdater:
     def create_unified_report(self, store_name: str) -> bool:
         """
         Формирует единый отчёт из данных воронки продаж, заказов и рекламы за последние 90 дней.
-        Сохраняет результат в папку "Объединенный отчет".
+        Использует union дат/товаров по всем источникам, чтобы не терять дни, если один источник отстаёт.
         """
         self.log(f"\n📌 ФОРМИРОВАНИЕ ЕДИНОГО ОТЧЁТА для магазина {store_name}")
         start_date, end_date = self._get_date_range_90_days()
         self.log(f"📅 Период данных: {start_date} - {end_date}")
-
-        # 1. Воронка продаж
         funnel_key = f"Отчёты/{self.reports_config['funnel']['folder']}/{store_name}/{self.reports_config['funnel']['filename']}"
         self.log(f"📥 Загрузка воронки продаж: {funnel_key}")
         funnel_df = self.s3.read_excel(funnel_key, sheet_name=0)
         if funnel_df.empty:
-            self.log("❌ Не удалось загрузить данные воронки продаж. Отчёт не будет создан.")
-            return False
-        funnel_df['dt'] = pd.to_datetime(funnel_df['dt'], errors='coerce')
-        funnel_df = funnel_df[(funnel_df['dt'] >= pd.Timestamp(start_date)) & (funnel_df['dt'] <= pd.Timestamp(end_date))]
-        self.log(f"📊 Воронка продаж: {len(funnel_df)} записей")
+            self.log("⚠️ Воронка продаж не загружена. Продолжаем без неё.")
+            funnel_df = pd.DataFrame(columns=['nmID','dt'])
+        else:
+            funnel_df['dt'] = pd.to_datetime(funnel_df['dt'], errors='coerce').dt.date
+            funnel_df = funnel_df[(funnel_df['dt'] >= start_date) & (funnel_df['dt'] <= end_date)].copy()
+            self.log(f"📊 Воронка продаж: {len(funnel_df)} записей")
 
-        # 2. Заказы
-        orders_prefix = f"Отчёты/{self.reports_config['orders']['folder']}/{store_name}/Недельные/"
-        orders_files = self.s3.list_files(orders_prefix)
+        orders_files = self.s3.list_files(f"Отчёты/{self.reports_config['orders']['folder']}/{store_name}/Недельные/")
         orders_list = []
         for file_key in orders_files:
             self.log(f"📥 Загрузка заказов: {file_key}")
             df = self.s3.read_excel(file_key, sheet_name=0)
             if df.empty:
                 continue
-            # Приводим названия колонок: nmId -> nmID, date -> dt
-            rename_map = {}
-            if 'nmId' in df.columns:
-                rename_map['nmId'] = 'nmID'
-            if 'date' in df.columns:
-                rename_map['date'] = 'dt'
-            if rename_map:
-                df = df.rename(columns=rename_map)
+            df = df.rename(columns={'nmId':'nmID','date':'dt'})
             if 'nmID' not in df.columns or 'dt' not in df.columns:
-                self.log(f"⚠️ В файле {file_key} отсутствуют колонки nmID или dt, пропускаем")
                 continue
-            df['dt'] = pd.to_datetime(df['dt'], errors='coerce')
-            df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+            df['dt'] = pd.to_datetime(df['dt'], errors='coerce').dt.date
+            df = df[(df['dt'] >= start_date) & (df['dt'] <= end_date)].copy()
             orders_list.append(df)
-        if orders_list:
-            orders_df = pd.concat(orders_list, ignore_index=True)
+        orders_df = pd.concat(orders_list, ignore_index=True) if orders_list else pd.DataFrame()
+        if not orders_df.empty:
             self.log(f"📊 Заказы: {len(orders_df)} записей")
-        else:
-            orders_df = pd.DataFrame()
-            self.log("⚠️ Нет данных по заказам за период")
 
-        # 3. Реклама
-        adverts_prefix = f"Отчёты/{self.reports_config['adverts']['folder']}/{store_name}/Недельные/"
-        adverts_files = self.s3.list_files(adverts_prefix)
+        adverts_files = self.s3.list_files(f"Отчёты/{self.reports_config['adverts']['folder']}/{store_name}/Недельные/")
         adverts_list = []
         for file_key in adverts_files:
             self.log(f"📥 Загрузка рекламы: {file_key}")
-            df = self.s3.read_excel(file_key, sheet_name=0)
+            sheets = self.s3.read_excel_all_sheets(file_key)
+            df = sheets.get('Статистика_Ежедневно', pd.DataFrame()) if sheets else pd.DataFrame()
+            if df.empty:
+                df = self.s3.read_excel(file_key, sheet_name=0)
             if df.empty:
                 continue
-            # Приводим названия колонок: Артикул WB -> nmID, Дата -> dt
-            rename_map = {}
-            if 'Артикул WB' in df.columns:
-                rename_map['Артикул WB'] = 'nmID'
-            if 'Дата' in df.columns:
-                rename_map['Дата'] = 'dt'
-            if rename_map:
-                df = df.rename(columns=rename_map)
+            df = df.rename(columns={'Артикул WB':'nmID','Дата':'dt'})
             if 'nmID' not in df.columns or 'dt' not in df.columns:
-                self.log(f"⚠️ В файле {file_key} отсутствуют колонки nmID или dt, пропускаем")
                 continue
-            df['dt'] = pd.to_datetime(df['dt'], errors='coerce')
-            df = df[(df['dt'] >= pd.Timestamp(start_date)) & (df['dt'] <= pd.Timestamp(end_date))]
+            df['dt'] = pd.to_datetime(df['dt'], errors='coerce').dt.date
+            df = df[(df['dt'] >= start_date) & (df['dt'] <= end_date)].copy()
             adverts_list.append(df)
-        if adverts_list:
-            adverts_df = pd.concat(adverts_list, ignore_index=True)
+        adverts_df = pd.concat(adverts_list, ignore_index=True) if adverts_list else pd.DataFrame()
+        if not adverts_df.empty:
             self.log(f"📊 Реклама: {len(adverts_df)} записей")
-        else:
-            adverts_df = pd.DataFrame()
-            self.log("⚠️ Нет данных по рекламе за период")
 
-        # 4. Если нет данных ни одного из источников, выходим
         if funnel_df.empty and orders_df.empty and adverts_df.empty:
             self.log("❌ Нет данных для формирования отчёта")
             return False
 
-        # 5. Группировка заказов
-        orders_grouped = pd.DataFrame()
+        orders_grouped = pd.DataFrame(columns=['nmID','dt'])
         if not orders_df.empty:
-            agg_dict = {}
-            if 'priceWithDisc' in orders_df.columns:
-                agg_dict['priceWithDisc'] = 'sum'
-            if 'spp' in orders_df.columns:
-                agg_dict['spp'] = 'mean'
-            if 'finishedPrice' in orders_df.columns:
-                agg_dict['finishedPrice'] = 'mean'
-            if 'subject' in orders_df.columns:
-                agg_dict['subject'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
-            if 'supplierArticle' in orders_df.columns:
-                agg_dict['supplierArticle'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else None
-            # Локальные заказы
-            if 'warehouseName' in orders_df.columns and 'oblastOkrugName' in orders_df.columns:
-                local_mapping = {
-                    'Екатеринбург - Перспективная 14': ['Уральский федеральный округ'],
-                    'Котовск': ['Центральный федеральный округ'],
-                    'Коледино': ['Центральный федеральный округ'],
-                    'Краснодар': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
-                    'Владимир': ['Центральный федеральный округ'],
-                    'Рязань (Тюшевское)': ['Центральный федеральный округ'],
-                    'Невинномысск': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
-                    'Тула': ['Центральный федеральный округ'],
-                    'Белые Столбы': ['Центральный федеральный округ'],
-                    'Самара (Новосемейкино)': ['Приволжский федеральный округ'],
-                    'Электросталь': ['Центральный федеральный округ'],
-                    'Санкт-Петербург Уткина Заводь': ['Северо-Западный федеральный округ'],
-                    'Казань': ['Приволжский федеральный округ'],
-                    'Воронеж': ['Центральный федеральный округ'],
-                    'Пенза': ['Приволжский федеральный округ'],
-                    'Новосибирск': ['Сибирский федеральный округ', 'Дальневосточный федеральный округ'],
-                    'Волгоград': ['Южный федеральный округ', 'Северо-Кавказский федеральный округ'],
-                    'Сарапул': ['Приволжский федеральный округ']
-                }
-                def is_local(row):
-                    try:
-                        warehouse = str(row['warehouseName']).strip()
-                        oblast = str(row['oblastOkrugName']).strip()
-                        for key, values in local_mapping.items():
-                            if key in warehouse and oblast in values:
-                                return 1
-                        return 0
-                    except:
-                        return 0
-                orders_df['is_local'] = orders_df.apply(is_local, axis=1)
-                agg_dict['is_local'] = 'mean'
-            orders_grouped = orders_df.groupby(['nmID', 'dt']).agg(agg_dict).reset_index()
-            orders_grouped.rename(columns={
-                'priceWithDisc': 'total_priceWithDisc',
-                'spp': 'avg_spp',
-                'finishedPrice': 'avg_finishedPrice',
-                'is_local': 'local_orders_percent'
-            }, inplace=True)
-            self.log(f"📊 Заказы сгруппированы: {len(orders_grouped)} записей")
+            agg = {}
+            if 'priceWithDisc' in orders_df.columns: agg['priceWithDisc'] = 'sum'
+            if 'spp' in orders_df.columns: agg['spp'] = 'mean'
+            if 'finishedPrice' in orders_df.columns: agg['finishedPrice'] = 'mean'
+            if 'subject' in orders_df.columns: agg['subject'] = lambda x: x.mode().iloc[0] if not x.mode().empty else None
+            if 'supplierArticle' in orders_df.columns: agg['supplierArticle'] = lambda x: x.mode().iloc[0] if not x.mode().empty else None
+            if agg:
+                orders_grouped = orders_df.groupby(['nmID','dt']).agg(agg).reset_index().rename(columns={'priceWithDisc':'total_priceWithDisc','spp':'avg_spp','finishedPrice':'avg_finishedPrice'})
+                self.log(f"📊 Заказы сгруппированы: {len(orders_grouped)} записей")
 
-        # 6. Группировка рекламы
-        adverts_grouped = pd.DataFrame()
+        adverts_grouped = pd.DataFrame(columns=['nmID','dt'])
         if not adverts_df.empty:
-            # Суммируем метрики по nmID и dt
-            agg_adv = {
-                'Расход': 'sum',
-                'Показы': 'sum',
-                'Клики': 'sum',
-                'CTR': 'mean',
-                'CPC': 'mean',
-                'Заказы': 'sum',
-                'Сумма заказов': 'sum'
-            }
-            # Убираем колонки, которых нет
-            cols_to_agg = {k: v for k, v in agg_adv.items() if k in adverts_df.columns}
-            if cols_to_agg:
-                adverts_grouped = adverts_df.groupby(['nmID', 'dt']).agg(cols_to_agg).reset_index()
-                # Пересчитываем CTR и CPC (на всякий случай)
-                if 'Клики' in adverts_grouped and 'Показы' in adverts_grouped:
-                    adverts_grouped['CTR'] = (adverts_grouped['Клики'] / adverts_grouped['Показы'] * 100).round(2)
-                if 'Расход' in adverts_grouped and 'Клики' in adverts_grouped:
-                    adverts_grouped['CPC'] = (adverts_grouped['Расход'] / adverts_grouped['Клики']).round(2)
+            cols = {k:v for k,v in {'Расход':'sum','Показы':'sum','Клики':'sum','Заказы':'sum','Сумма заказов':'sum'}.items() if k in adverts_df.columns}
+            if cols:
+                adverts_grouped = adverts_df.groupby(['nmID','dt']).agg(cols).reset_index()
+                adverts_grouped['CTR РК'] = adverts_grouped.apply(lambda x: self._safe_div(x.get('Клики',0), x.get('Показы',0), 100, 2), axis=1)
+                adverts_grouped['CPC (цена клика)'] = adverts_grouped.apply(lambda x: self._safe_div(x.get('Расход',0), x.get('Клики',0), 1, 2), axis=1)
                 self.log(f"📊 Реклама сгруппирована: {len(adverts_grouped)} записей")
 
-        # 7. Объединение
-        merged = funnel_df.copy()
+        bases = []
+        for df in [funnel_df, orders_grouped, adverts_grouped]:
+            if not df.empty and 'nmID' in df.columns and 'dt' in df.columns:
+                bases.append(df[['nmID','dt']].drop_duplicates())
+        merged = pd.concat(bases, ignore_index=True).drop_duplicates() if bases else pd.DataFrame(columns=['nmID','dt'])
+        if not funnel_df.empty:
+            merged = merged.merge(funnel_df, on=['nmID','dt'], how='left')
         if not orders_grouped.empty:
-            merged = pd.merge(merged, orders_grouped, on=['nmID', 'dt'], how='left')
+            merged = merged.merge(orders_grouped, on=['nmID','dt'], how='left')
         if not adverts_grouped.empty:
-            merged = pd.merge(merged, adverts_grouped, on=['nmID', 'dt'], how='left')
-        # Заполняем NaN нулями для числовых колонок
+            merged = merged.merge(adverts_grouped, on=['nmID','dt'], how='left')
         for col in merged.columns:
-            if col not in ['nmID', 'dt', 'subject', 'supplierArticle']:
+            if col not in ['nmID','dt','subject','supplierArticle','brand']:
                 merged[col] = merged[col].fillna(0)
-
+        merged['dt'] = pd.to_datetime(merged['dt'], errors='coerce').dt.strftime('%Y-%m-%d')
+        merged = merged.sort_values(['dt','nmID']).reset_index(drop=True)
         self.log(f"📊 Объединено записей: {len(merged)}")
-
-        # 8. Перевод названий колонок
-        column_translation = {
-            'nmID': 'ID товара',
-            'dt': 'Дата',
-            'subject': 'Категория',
-            'supplierArticle': 'Артикул поставщика',
-            'brand': 'Бренд',
-            'openCardCount': 'Открытия карточки',
-            'addToCartCount': 'Добавления в корзину',
-            'ordersCount': 'Количество заказов',
-            'cartToOrderCount': 'Конверсия корзина-заказ',
-            'total_priceWithDisc': 'Сумма заказов (со скидкой)',
-            'avg_spp': 'Средняя себестоимость (СПП)',
-            'avg_finishedPrice': 'Средняя конечная цена',
-            'local_orders_percent': 'Доля локальных заказов (%)',
-            'priceWithDisc': 'Цена со скидкой',
-            'spp': 'Себестоимость (СПП)',
-            'finishedPrice': 'Конечная цена',
-            'warehouseName': 'Склад',
-            'oblastOkrugName': 'Федеральный округ',
-            'regionName': 'Регион',
-            'is_local': 'Локальный заказ',
-            'viewCount': 'Просмотры',
-            'clickCount': 'Клики',
-            'ctr': 'CTR',
-            'conversion': 'Конверсия',
-            'Расход': 'Расход на рекламу',
-            'Показы': 'Показы',
-            'Клики': 'Клики РК',
-            'CTR_x': 'CTR РК',
-            'CPC_x': 'CPC (цена клика)',
-            'CPA': 'CPA (цена заказа)',
-            'ROAS': 'ROAS',
-            'Заказы': 'Заказы из рекламы',
-            'Сумма заказов': 'Сумма заказов из рекламы'
-        }
-        merged.rename(columns=column_translation, inplace=True)
-
-        # 9. Сохраняем
-        output_folder = "Объединенный отчет"
-        output_filename = "Объединенный_отчет.xlsx"
-        output_key = f"Отчёты/{output_folder}/{store_name}/{output_filename}"
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            merged.to_excel(tmp_path, index=False, sheet_name='Объединенный отчет')
-            self.s3.upload_file(tmp_path, output_key)
-            self.log(f"✅ Единый отчёт сохранён: {output_key}")
-            return True
-        except Exception as e:
-            self.log(f"❌ Ошибка сохранения единого отчёта: {e}")
-            return False
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        merged = merged.rename(columns={
+            'nmID':'ID товара','dt':'Дата','subject':'Категория','supplierArticle':'Артикул поставщика','brand':'Бренд',
+            'openCardCount':'Открытия карточки','addToCartCount':'Добавления в корзину','ordersCount':'Количество заказов',
+            'cartToOrderCount':'Конверсия корзина-заказ','total_priceWithDisc':'Сумма заказов (со скидкой)',
+            'avg_spp':'Средняя СПП','avg_finishedPrice':'Средняя конечная цена','viewCount':'Просмотры','clickCount':'Клики',
+            'ctr':'CTR','conversion':'Конверсия','Расход':'Расход на рекламу','Показы':'Показы РК','Клики':'Клики РК',
+            'Заказы':'Заказы из рекламы','Сумма заказов':'Сумма заказов из рекламы'
+        })
+        output_key = f"Отчёты/Объединенный отчет/{store_name}/Объединенный_отчет.xlsx"
+        self.s3.write_excel(output_key, merged, sheet_name='Объединенный отчет')
+        self.log(f"✅ Единый отчёт сохранён: {output_key}")
+        return True
 
     # ====================== РАСЧЁТ ЭКОНОМИКИ ======================
     def calculate_economics(self, store_name: str):
         """
         Расчёт экономических показателей для последней полной недели.
-        Сохраняет результаты в файл Экономика.xlsx с двумя листами:
-        - Валовая прибыль (детальные суммы по артикулам)
-        - Юнит экономика (средние показатели на единицу)
+        Устойчив к плавающей структуре файла себестоимости.
         """
         self.log_section("РАСЧЁТ ЭКОНОМИКИ")
-
-        # 1. Определяем последнюю полную неделю
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
-        # Если сегодня воскресенье (6), то последняя полная неделя закончилась вчера.
-        # Вообще последняя полная неделя – это неделя, которая закончилась в последнее воскресенье.
-        # Вычисляем последнее воскресенье, которое <= вчера
         yesterday = today - timedelta(days=1)
-        days_since_sunday = (yesterday.weekday() + 1) % 7  # сколько дней прошло с воскресенья
+        days_since_sunday = (yesterday.weekday() + 1) % 7
         end_of_last_week = yesterday - timedelta(days=days_since_sunday)
         start_of_last_week = end_of_last_week - timedelta(days=6)
-
         week_number = f"{start_of_last_week.isocalendar()[0]}-W{start_of_last_week.isocalendar()[1]:02d}"
         self.log(f"📅 Неделя расчёта: {week_number} ({start_of_last_week} - {end_of_last_week})")
 
-        # 2. Загружаем финансовый отчёт за эту неделю
         finance_key = f"Отчёты/Финансовые показатели/{store_name}/Недельные/Финансовые показатели_{week_number}.xlsx"
         finance_df = self.s3.read_excel(finance_key, sheet_name=0)
         if finance_df.empty:
             self.log(f"❌ Финансовый отчёт за неделю {week_number} не найден. Расчёт отменён.")
             return
+        finance_df['nm_id'] = pd.to_numeric(finance_df.get('nm_id'), errors='coerce')
+        finance_df = finance_df.dropna(subset=['nm_id']).copy()
+        finance_df['nm_id'] = finance_df['nm_id'].astype('int64')
 
-        # 3. Загружаем остатки на начало недели
         stocks_key = f"Отчёты/Остатки/{store_name}/Недельные/Остатки_{week_number}.xlsx"
         stocks_df = self.s3.read_excel(stocks_key, sheet_name=0)
         if stocks_df.empty:
             self.log(f"⚠️ Остатки за неделю {week_number} не найдены. Хранение не будет распределено.")
             stocks_start = pd.DataFrame()
         else:
-            stocks_df['Дата запроса'] = pd.to_datetime(stocks_df['Дата запроса']).dt.date
+            stocks_df['Дата запроса'] = pd.to_datetime(stocks_df['Дата запроса'], errors='coerce').dt.date
             stocks_start = stocks_df[stocks_df['Дата запроса'] == start_of_last_week].copy()
             if stocks_start.empty:
                 self.log(f"⚠️ Нет остатков на дату {start_of_last_week}. Хранение не распределено.")
-                stocks_start = pd.DataFrame()
 
-        # 4. Загружаем себестоимость
-        cost_key = f"Отчёты/Себестоимость/Себестоимость.xlsx"
-        cost_df = self.s3.read_excel(cost_key, sheet_name=0)
+        raw_cost_df = self.s3.read_excel("Отчёты/Себестоимость/Себестоимость.xlsx", sheet_name=0)
+        cost_df = self._normalize_cost_dataframe(raw_cost_df) if not raw_cost_df.empty else pd.DataFrame(columns=['nm_id','cost_price'])
         if cost_df.empty:
-            self.log(f"❌ Файл себестоимости не найден. Расчёт отменён.")
-            return
-        # Предполагаем, что в файле есть колонки: "Артикул WB" (индекс 2) и "Себестоимость"
-        # Переименуем для удобства
-        cost_df.rename(columns={cost_df.columns[2]: 'nm_id', 'Себестоимость': 'cost_price'}, inplace=True)
-        # Оставляем только нужные колонки, удаляем дубликаты (берём последнее значение)
-        cost_df = cost_df[['nm_id', 'cost_price']].drop_duplicates(subset='nm_id', keep='last')
+            self.log("⚠️ Себестоимость не найдена или не распознана. Продолжаем с нулевой себестоимостью.")
 
-        # 5. Загружаем рекламные расходы за неделю
         advert_key = f"Отчёты/Реклама/{store_name}/Недельные/Реклама_{week_number}.xlsx"
-        advert_df = self.s3.read_excel(advert_key, sheet_name=0)
+        advert_sheets = self.s3.read_excel_all_sheets(advert_key)
+        advert_df = advert_sheets.get('Статистика_Ежедневно', pd.DataFrame()) if advert_sheets else pd.DataFrame()
+        if advert_df.empty:
+            advert_df = self.s3.read_excel(advert_key, sheet_name=0)
         if not advert_df.empty and 'Артикул WB' in advert_df.columns and 'Расход' in advert_df.columns:
-            advert_agg = advert_df.groupby('Артикул WB')['Расход'].sum().reset_index()
-            advert_agg.rename(columns={'Артикул WB': 'nm_id', 'Расход': 'advert_cost'}, inplace=True)
+            advert_df['Артикул WB'] = pd.to_numeric(advert_df['Артикул WB'], errors='coerce')
+            advert_agg = advert_df.dropna(subset=['Артикул WB']).groupby('Артикул WB')['Расход'].sum().reset_index().rename(columns={'Артикул WB':'nm_id','Расход':'advert_cost'})
+            advert_agg['nm_id'] = advert_agg['nm_id'].astype('int64')
         else:
             self.log(f"ℹ️ Нет данных по рекламе за неделю {week_number}.")
-            advert_agg = pd.DataFrame(columns=['nm_id', 'advert_cost'])
+            advert_agg = pd.DataFrame(columns=['nm_id','advert_cost'])
 
-        # 6. Определяем типы операций для агрегации
-        # Список возможных типов расходов (логистика, хранение, прочее)
-        expense_types = [
-            'Логистика',
-            'Возмещение издержек по перевозке/по складским операциям с товаром',
-            'Штрафы',
-            'Платная приёмка',
-            'Услуги WB Продвижения'
-        ]
-
-        # Группируем финансовый отчёт по nm_id и вычисляем агрегаты
+        expense_types = ['Логистика','Возмещение издержек по перевозке/по складским операциям с товаром','Штрафы','Платная приёмка','Услуги WB Продвижения']
         results = []
         for nm_id, group in finance_df.groupby('nm_id'):
-            # Продажи
             sales = group[group['doc_type_name'] == 'Продажа']
             returns = group[group['doc_type_name'] == 'Возврат']
             compensations = group[group['doc_type_name'] == 'Компенсация скидки по программе лояльности']
             expenses = group[group['doc_type_name'].isin(expense_types)]
-
-            # Количество
             qty_sold = sales['quantity'].sum() - returns['quantity'].sum()
             if qty_sold <= 0:
-                continue  # нет продаж – нет расчёта
-
-            # Выручка
+                continue
             revenue = sales['retail_amount'].sum() - returns['retail_amount'].sum()
-
-            # Денежный поток
-            cash_flow = (
-                sales['ppvz_for_pay'].sum()
-                - returns['ppvz_for_pay'].sum()  # в файле положительные, вычитаем
-                + compensations['ppvz_for_pay'].sum()
-                + expenses['ppvz_for_pay'].sum()  # они уже отрицательные
-            )
-
-            # Себестоимость
+            cash_flow = sales['ppvz_for_pay'].sum() - returns['ppvz_for_pay'].sum() + compensations['ppvz_for_pay'].sum() + expenses['ppvz_for_pay'].sum()
             cost_row = cost_df[cost_df['nm_id'] == nm_id]
-            if not cost_row.empty:
-                cost_price = cost_row.iloc[0]['cost_price']
-                total_cost = qty_sold * cost_price
-            else:
-                self.log(f"⚠️ Для артикула {nm_id} нет себестоимости. Прибыль будет завышена.")
-                total_cost = 0
-
-            # Реклама
+            cost_price = float(cost_row.iloc[0]['cost_price']) if not cost_row.empty else 0.0
+            total_cost = qty_sold * cost_price
+            if cost_row.empty:
+                self.log(f"⚠️ Для артикула {nm_id} нет себестоимости. Использую 0.")
             adv_row = advert_agg[advert_agg['nm_id'] == nm_id]
-            advert_cost = adv_row.iloc[0]['advert_cost'] if not adv_row.empty else 0
-
-            # Хранение (распределение)
-            if not stocks_start.empty:
-                # Общий остаток всех товаров на начало недели
-                total_stock_all = stocks_start['Доступно для продажи'].sum()
-                # Остаток данного артикула (сумма по складам)
-                sku_stock = stocks_start[stocks_start['Артикул WB'] == nm_id]['Доступно для продажи'].sum()
-                # Общая стоимость хранения за неделю – сумма по строкам expense с типом "Хранение"
-                # В наших данных пока нет отдельного типа, поэтому берём 0.
-                # Если появится, можно искать по вхождению слова "Хранение" в doc_type_name
-                storage_fee_rows = group[group['doc_type_name'].str.contains('Хранение', na=False)]
-                if not storage_fee_rows.empty:
-                    total_storage_cost = abs(storage_fee_rows['ppvz_for_pay'].sum())
-                else:
-                    total_storage_cost = 0
-                if total_stock_all > 0 and total_storage_cost > 0:
-                    storage_cost = (sku_stock / total_stock_all) * total_storage_cost
-                else:
-                    storage_cost = 0
+            advert_cost = float(adv_row.iloc[0]['advert_cost']) if not adv_row.empty else 0.0
+            if not stocks_start.empty and 'Артикул WB' in stocks_start.columns and 'Доступно для продажи' in stocks_start.columns:
+                stocks_start['Артикул WB'] = pd.to_numeric(stocks_start['Артикул WB'], errors='coerce')
+                total_stock_all = pd.to_numeric(stocks_start['Доступно для продажи'], errors='coerce').fillna(0).sum()
+                sku_stock = pd.to_numeric(stocks_start[stocks_start['Артикул WB'] == nm_id]['Доступно для продажи'], errors='coerce').fillna(0).sum()
+                storage_fee_rows = group[group['doc_type_name'].astype(str).str.contains('Хранение', na=False)]
+                total_storage_cost = abs(storage_fee_rows['ppvz_for_pay'].sum()) if not storage_fee_rows.empty else 0
+                storage_cost = (sku_stock / total_stock_all) * total_storage_cost if total_stock_all > 0 and total_storage_cost > 0 else 0
             else:
                 storage_cost = 0
-
-            # Налоги
             nds = revenue * 0.07
             profit_base = cash_flow - total_cost - storage_cost - advert_cost
             profit_tax = max(0, profit_base) * 0.15
-
-            # Валовая прибыль
             gross_profit = profit_base - nds - profit_tax
-
-            # Средние комиссии (берём из последней продажи)
             if not sales.empty:
                 sales_sorted = sales.sort_values('sale_dt', ascending=False)
-                last_commission = sales_sorted.iloc[0]['commission_percent']
-                last_acquiring = sales_sorted.iloc[0]['acquiring_percent']
+                last_commission = sales_sorted.iloc[0].get('commission_percent', 0)
+                last_acquiring = sales_sorted.iloc[0].get('acquiring_percent', 0)
                 avg_price = revenue / qty_sold
-                avg_logistics = abs(expenses[expenses['doc_type_name'].isin(['Логистика', 'Возмещение издержек по перевозке/по складским операциям с товаром'])]['ppvz_for_pay'].sum()) / qty_sold
+                avg_logistics = abs(expenses[expenses['doc_type_name'].isin(['Логистика','Возмещение издержек по перевозке/по складским операциям с товаром'])]['ppvz_for_pay'].sum()) / qty_sold
                 avg_storage = storage_cost / qty_sold
                 avg_advert = advert_cost / qty_sold
                 avg_tax = (nds + profit_tax) / qty_sold
                 avg_profit = gross_profit / qty_sold
             else:
-                last_commission = 0
-                last_acquiring = 0
-                avg_price = 0
-                avg_logistics = 0
-                avg_storage = 0
-                avg_advert = 0
-                avg_tax = 0
-                avg_profit = 0
-
-            results.append({
-                'nm_id': nm_id,
-                'week': week_number,
-                'revenue': round(revenue, 2),
-                'cash_flow': round(cash_flow, 2),
-                'total_cost': round(total_cost, 2),
-                'storage_cost': round(storage_cost, 2),
-                'advert_cost': round(advert_cost, 2),
-                'nds': round(nds, 2),
-                'profit_tax': round(profit_tax, 2),
-                'gross_profit': round(gross_profit, 2),
-                'qty_sold': qty_sold,
-                'avg_price': round(avg_price, 2),
-                'last_commission_percent': last_commission,
-                'last_acquiring_percent': last_acquiring,
-                'avg_logistics_per_unit': round(avg_logistics, 2),
-                'avg_storage_per_unit': round(avg_storage, 2),
-                'avg_advert_per_unit': round(avg_advert, 2),
-                'avg_tax_per_unit': round(avg_tax, 2),
-                'avg_profit_per_unit': round(avg_profit, 2),
-            })
-
+                last_commission = last_acquiring = avg_price = avg_logistics = avg_storage = avg_advert = avg_tax = avg_profit = 0
+            results.append({'nm_id':nm_id,'week':week_number,'revenue':round(revenue,2),'cash_flow':round(cash_flow,2),'total_cost':round(total_cost,2),'storage_cost':round(storage_cost,2),'advert_cost':round(advert_cost,2),'nds':round(nds,2),'profit_tax':round(profit_tax,2),'gross_profit':round(gross_profit,2),'qty_sold':qty_sold,'avg_price':round(avg_price,2),'last_commission_percent':last_commission,'last_acquiring_percent':last_acquiring,'avg_logistics_per_unit':round(avg_logistics,2),'avg_storage_per_unit':round(avg_storage,2),'avg_advert_per_unit':round(avg_advert,2),'avg_tax_per_unit':round(avg_tax,2),'avg_profit_per_unit':round(avg_profit,2)})
         if not results:
             self.log("❌ Нет данных для формирования отчёта.")
             return
-
-        # 7. Формируем итоговые DataFrame
-        gross_df = pd.DataFrame(results)[['nm_id', 'week', 'revenue', 'cash_flow', 'total_cost',
-                                          'storage_cost', 'advert_cost', 'nds', 'profit_tax', 'gross_profit']]
-        unit_df = pd.DataFrame(results)[['nm_id', 'week', 'avg_price', 'last_commission_percent',
-                                         'last_acquiring_percent', 'avg_logistics_per_unit',
-                                         'avg_storage_per_unit', 'avg_advert_per_unit',
-                                         'avg_tax_per_unit', 'avg_profit_per_unit']]
-
-        # 8. Сохраняем результат
+        gross_df = pd.DataFrame(results)[['nm_id','week','revenue','cash_flow','total_cost','storage_cost','advert_cost','nds','profit_tax','gross_profit']]
+        unit_df = pd.DataFrame(results)[['nm_id','week','avg_price','last_commission_percent','last_acquiring_percent','avg_logistics_per_unit','avg_storage_per_unit','avg_advert_per_unit','avg_tax_per_unit','avg_profit_per_unit']]
         output_key = f"Отчёты/Финансовые показатели/{store_name}/Экономика.xlsx"
-        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-                gross_df.to_excel(writer, sheet_name='Валовая прибыль', index=False)
-                unit_df.to_excel(writer, sheet_name='Юнит экономика', index=False)
-            self.s3.upload_file(tmp_path, output_key)
-            self.log(f"✅ Экономика сохранена: {output_key}")
-        except Exception as e:
-            self.log(f"❌ Ошибка сохранения экономики: {e}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
+        self.s3.write_excel_sheets(output_key, {'Валовая прибыль': gross_df, 'Юнит экономика': unit_df})
+        self.log(f"✅ Экономика сохранена: {output_key}")
         self.log("✅ Расчёт экономики завершён.")
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
