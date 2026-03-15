@@ -10,7 +10,7 @@ import math
 import argparse
 import tempfile
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -38,26 +38,31 @@ SERVICE_CONFIG_KEY = f"Служебные файлы/Ассистент WB/{STOR
 SERVICE_HISTORY_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/bid_history.xlsx"
 SERVICE_PREVIEW_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/preview_last_run.xlsx"
 SERVICE_LOG_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/last_run_summary.json"
+SERVICE_SCHEDULE_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/strategy_schedule.xlsx"
+SERVICE_EFFECTIVENESS_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/strategy_effectiveness.xlsx"
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 
 ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started"}
 
-# шаги ставок в копейках
-STEP_CPC_SOFT = 100
-STEP_CPC_HARD = 200
-STEP_CPM_SOFT = 500
-STEP_CPM_HARD = 1000
+# шаги ставок
+STEP_CPC_SMALL = 100
+STEP_CPC_MED = 200
+STEP_CPC_BIG = 300
+
+STEP_CPM_SMALL = 500
+STEP_CPM_MED = 1000
+STEP_CPM_BIG = 1500
 
 MIN_CPC_SEARCH = 400
-MIN_CPM_SEARCH = 4000
-MIN_CPM_SHELVES = 5000
-
 MAX_CPC_SEARCH = 15000
-MAX_CPM_SEARCH = 60000
-MAX_CPM_SHELVES = 100000
 
-# бизнес-пороги
+MIN_CPM_SEARCH = 4000
+MAX_CPM_SEARCH = 70000
+
+MIN_CPM_SHELVES = 5000
+MAX_CPM_SHELVES = 120000
+
 BAD_RATING_THRESHOLD = 4.6
 OK_RATING_THRESHOLD = 4.7
 GOOD_RATING_THRESHOLD = 4.8
@@ -65,24 +70,40 @@ GOOD_RATING_THRESHOLD = 4.8
 TOP10_BORDER = 10
 TOP20_BORDER = 20
 
-MIN_IMPRESSIONS_SHELVES = 5000
-MIN_CLICKS_SHELVES = 40
-MIN_CTR_SHELVES = 0.4   # %
-GOOD_CTR_SHELVES = 0.8  # %
-
 MIN_WEEK_SPEND = 300.0
 MIN_WEEK_ORDERS = 3
 
-# Порог DRR не как абсолютная цель бизнеса, а как защитный лимит
-TARGET_DRR_CPC = 12.0
-TARGET_DRR_CPM_SEARCH = 14.0
-TARGET_DRR_CPM_SHELVES = 10.0
+MIN_IMPRESSIONS_SHELVES = 5000
+MIN_CLICKS_SHELVES = 40
+MIN_CTR_SHELVES = 0.40
+GOOD_CTR_SHELVES = 0.80
 
-# Допустимая минимальная чистая прибыль на единицу
 MIN_NET_PROFIT_PER_UNIT = 0.0
-
-# если позиция низкая, но запрос почти не даёт заказов — не разгоняем
 MIN_KEYWORD_ORDERS_FOR_PUSH = 2
+
+DEFAULT_STRATEGY_SEQUENCE = [1, 2, 3, 4]
+
+STRATEGY_NAMES = {
+    1: "Максимизация прибыли",
+    2: "Удержание / рост позиции",
+    3: "Контроль ДРР",
+    4: "Доля трафика",
+}
+
+DEFAULT_CONFIG = {
+    "mode": "rotation",  # rotation / fixed
+    "active_strategy": 1,
+    "strategy_sequence": DEFAULT_STRATEGY_SEQUENCE,
+    "evaluation_lag_weeks": 1,
+    "final_evaluation_lag_weeks": 2,
+    "target_drr_cpc": 15.0,
+    "target_drr_cpm_search": 16.0,
+    "target_drr_cpm_shelves": 12.0,
+    "max_drr_cpc": 22.0,
+    "max_drr_cpm_search": 24.0,
+    "max_drr_cpm_shelves": 18.0,
+}
+
 
 # =========================================================
 # ЛОГ
@@ -93,7 +114,7 @@ def log(msg: str):
 
 
 # =========================================================
-# S3 / OBJECT STORAGE
+# S3
 # =========================================================
 
 class S3Storage:
@@ -152,22 +173,6 @@ class S3Storage:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    def list_files(self, prefix: str) -> List[str]:
-        out = []
-        token = None
-        while True:
-            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
-            if token:
-                kwargs["ContinuationToken"] = token
-            resp = self.s3.list_objects_v2(**kwargs)
-            for obj in resp.get("Contents", []):
-                out.append(obj["Key"])
-            if resp.get("IsTruncated"):
-                token = resp.get("NextContinuationToken")
-            else:
-                break
-        return out
-
 
 # =========================================================
 # УТИЛИТЫ
@@ -192,6 +197,14 @@ def safe_int(v, default=0) -> int:
     except Exception:
         return default
 
+def normalize_colname(name: str) -> str:
+    return str(name).strip().lower().replace("ё", "е")
+
+def percent(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return round((numerator / denominator) * 100.0, 2)
+
 def iso_week_label(d: date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
@@ -200,41 +213,29 @@ def week_start_from_label(label: str) -> date:
     m = re.match(r"^(\d{4})-W(\d{2})$", label)
     if not m:
         raise ValueError(f"Некорректная неделя: {label}")
-    y = int(m.group(1))
-    w = int(m.group(2))
-    return date.fromisocalendar(y, w, 1)
+    return date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
+
+def week_end_from_label(label: str) -> date:
+    return week_start_from_label(label) + timedelta(days=6)
+
+def previous_week_label(label: str, shift: int = 1) -> str:
+    start = week_start_from_label(label) - timedelta(days=7 * shift)
+    return iso_week_label(start)
 
 def target_week_range(explicit_week: Optional[str] = None) -> Tuple[str, date, date]:
     if explicit_week:
         start = week_start_from_label(explicit_week)
-        end = start + timedelta(days=6)
-        return explicit_week, start, end
+        return explicit_week, start, start + timedelta(days=6)
 
-    # по умолчанию: неделя, в которую попадает вчера
     yesterday = tz_now().date() - timedelta(days=1)
     start = yesterday - timedelta(days=yesterday.weekday())
-    end = start + timedelta(days=6)
-    return iso_week_label(start), start, end
-
-def keywords_weekly_key(week_label: str) -> str:
-    return f"{KEYWORDS_WEEKLY_PREFIX}Неделя {week_label}.xlsx"
+    return iso_week_label(start), start, start + timedelta(days=6)
 
 def ads_weekly_key(week_label: str) -> str:
     return f"{ADS_WEEKLY_PREFIX}Реклама_{week_label}.xlsx"
 
-def normalize_colname(name: str) -> str:
-    return str(name).strip().lower().replace("ё", "е")
-
-def round_money(v: float) -> float:
-    return round(safe_float(v), 2)
-
-def clamp(v: int, min_v: int, max_v: int) -> int:
-    return max(min_v, min(v, max_v))
-
-def percent(numerator: float, denominator: float) -> float:
-    if denominator == 0:
-        return 0.0
-    return round((numerator / denominator) * 100.0, 2)
+def keywords_weekly_key(week_label: str) -> str:
+    return f"{KEYWORDS_WEEKLY_PREFIX}Неделя {week_label}.xlsx"
 
 def read_json_or_default(s3: S3Storage, key: str, default: dict) -> dict:
     try:
@@ -243,6 +244,9 @@ def read_json_or_default(s3: S3Storage, key: str, default: dict) -> dict:
         return json.loads(s3.read_text(key))
     except Exception:
         return default
+
+def clamp(v: int, min_v: int, max_v: int) -> int:
+    return max(min_v, min(v, max_v))
 
 
 # =========================================================
@@ -276,7 +280,7 @@ def is_active_campaign(row: pd.Series) -> bool:
 
 
 # =========================================================
-# ЗАГРУЗКА ДАННЫХ ИЗ РЕКЛАМЫ
+# РЕКЛАМА
 # =========================================================
 
 def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
@@ -286,17 +290,12 @@ def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
     aliases = {
         "ID кампании": ["ID кампании", "ID", "Кампания ID", "advert_id"],
         "Артикул WB": ["Артикул WB", "Артикул", "nm_id"],
-        "Название предмета": ["Название предмета", "Предмет", "subject"],
         "Дата": ["Дата", "День", "date"],
         "Расход": ["Расход", "Затраты", "spent"],
         "Сумма заказов": ["Сумма заказов", "Выручка", "orders_sum"],
         "Показы": ["Показы", "Просмотры", "views"],
         "Клики": ["Клики", "clicks"],
         "Заказы": ["Заказы", "orders"],
-        "CTR": ["CTR", "ctr"],
-        "CPC": ["CPC", "cpc"],
-        "CR": ["CR", "cr"],
-        "ДРР": ["ДРР", "ДРР %", "drr"],
         "Название": ["Название", "Название кампании", "Кампания"],
     }
 
@@ -304,9 +303,8 @@ def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
     lower_cols = {normalize_colname(c): c for c in df.columns}
     for target, variants in aliases.items():
         for v in variants:
-            key = normalize_colname(v)
-            if key in lower_cols:
-                rename_map[lower_cols[key]] = target
+            if normalize_colname(v) in lower_cols:
+                rename_map[lower_cols[normalize_colname(v)]] = target
                 break
 
     df = df.rename(columns=rename_map)
@@ -315,14 +313,14 @@ def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
     if not all(col in df.columns for col in required):
         return pd.DataFrame()
 
-    for col in ["Показы", "Клики", "Заказы", "Сумма заказов", "CTR", "CPC", "CR", "ДРР"]:
+    for col in ["Показы", "Клики", "Заказы", "Сумма заказов"]:
         if col not in df.columns:
             df[col] = 0
 
     df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce").dt.date
     for col in ["ID кампании", "Артикул WB"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["Расход", "Показы", "Клики", "Заказы", "Сумма заказов", "CTR", "CPC", "CR", "ДРР"]:
+    for col in ["Расход", "Показы", "Клики", "Заказы", "Сумма заказов"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     df = df.dropna(subset=["ID кампании", "Артикул WB", "Дата"]).copy()
@@ -337,36 +335,29 @@ def prepare_campaigns_sheet(df: pd.DataFrame) -> pd.DataFrame:
 
     aliases = {
         "ID кампании": ["ID кампании", "ID", "Кампания ID", "advert_id"],
-        "Тип оплаты": ["Тип оплаты", "Тип", "payment_type"],
-        "Тип ставки": ["Тип ставки", "bid_type", "Тип ставки (ручной/единый)"],
-        "Ставка в поиске (руб)": ["Ставка в поиске (руб)", "Ставка", "current_bid", "bid"],
-        "Ставка в рекомендациях (руб)": ["Ставка в рекомендациях (руб)", "Ставка в рекомендациях", "recommendations bid"],
+        "Тип оплаты": ["Тип оплаты", "payment_type"],
+        "Тип ставки": ["Тип ставки", "bid_type"],
+        "Ставка в поиске (руб)": ["Ставка в поиске (руб)", "Ставка", "bid"],
+        "Ставка в рекомендациях (руб)": ["Ставка в рекомендациях (руб)", "Ставка в рекомендациях"],
         "Название": ["Название", "Название кампании", "Кампания"],
         "Статус": ["Статус", "status"],
         "Размещение в рекомендациях": ["Размещение в рекомендациях", "recommendations"],
-        "Артикул WB": ["Артикул WB", "Артикул", "nm_id"],
     }
 
     rename_map = {}
     lower_cols = {normalize_colname(c): c for c in df.columns}
     for target, variants in aliases.items():
         for v in variants:
-            key = normalize_colname(v)
-            if key in lower_cols:
-                rename_map[lower_cols[key]] = target
+            if normalize_colname(v) in lower_cols:
+                rename_map[lower_cols[normalize_colname(v)]] = target
                 break
 
     df = df.rename(columns=rename_map)
-
     required = ["ID кампании", "Тип оплаты", "Название"]
     if not all(col in df.columns for col in required):
         return pd.DataFrame()
 
-    for col in ["Ставка в поиске (руб)", "Ставка в рекомендациях (руб)"]:
-        if col not in df.columns:
-            df[col] = 0
-
-    for col in ["Статус", "Размещение в рекомендациях", "Тип ставки", "Артикул WB"]:
+    for col in ["Ставка в поиске (руб)", "Ставка в рекомендациях (руб)", "Статус", "Размещение в рекомендациях", "Тип ставки"]:
         if col not in df.columns:
             df[col] = ""
 
@@ -375,7 +366,7 @@ def prepare_campaigns_sheet(df: pd.DataFrame) -> pd.DataFrame:
     df["ID кампании"] = df["ID кампании"].astype("int64")
     df["Ставка в поиске (руб)"] = pd.to_numeric(df["Ставка в поиске (руб)"], errors="coerce").fillna(0)
     df["Ставка в рекомендациях (руб)"] = pd.to_numeric(df["Ставка в рекомендациях (руб)"], errors="coerce").fillna(0)
-    df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
+
     return df
 
 
@@ -411,7 +402,6 @@ def load_advertising_data(s3: S3Storage, week_label: str, week_start: date, week
                     campaigns_df = prepared
                     break
 
-    # fallback на недельный файл
     if stats_df.empty:
         wk_key = ads_weekly_key(week_label)
         if s3.file_exists(wk_key):
@@ -437,7 +427,6 @@ def load_advertising_data(s3: S3Storage, week_label: str, week_start: date, week
     stats_df = stats_df[(stats_df["Дата"] >= week_start) & (stats_df["Дата"] <= week_end)].copy()
     log(f"✅ Статистика рекламы за неделю: строк {len(stats_df)}")
     log(f"✅ Список кампаний: {len(campaigns_df)}")
-
     return stats_df, campaigns_df
 
 
@@ -457,15 +446,9 @@ def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("Лист 'Юнит экономика' пустой")
 
-    required = ["Неделя", "Артикул WB", "Чистая прибыль, руб/ед", "Валовая прибыль, руб/ед"]
-    for col in required:
-        if col not in df.columns:
-            raise RuntimeError(f"В 'Юнит экономика' нет колонки '{col}'")
-
     df["Неделя"] = df["Неделя"].astype(str)
     df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-    df = df[df["Неделя"] == week_label].copy()
-    df = df.dropna(subset=["Артикул WB"]).copy()
+    df = df[df["Неделя"] == week_label].dropna(subset=["Артикул WB"]).copy()
     df["Артикул WB"] = df["Артикул WB"].astype("int64")
 
     numeric_cols = [
@@ -486,7 +469,7 @@ def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
 
 
 # =========================================================
-# ПОИСКОВЫЕ ЗАПРОСЫ
+# КЛЮЧИ
 # =========================================================
 
 def load_keywords_weekly(s3: S3Storage, week_label: str) -> pd.DataFrame:
@@ -504,7 +487,7 @@ def load_keywords_weekly(s3: S3Storage, week_label: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    required = ["Артикул WB", "Рейтинг отзывов", "Частота запросов", "Частота за неделю", "Медианная позиция", "Переходы в карточку", "Заказы", "Поисковый запрос"]
+    required = ["Артикул WB", "Рейтинг отзывов", "Частота запросов", "Переходы в карточку", "Заказы", "Медианная позиция", "Поисковый запрос"]
     if not all(col in df.columns for col in required):
         log("ℹ️ В weekly keywords нет полного набора колонок, продолжаю без анализа ключей")
         return pd.DataFrame()
@@ -513,7 +496,7 @@ def load_keywords_weekly(s3: S3Storage, week_label: str) -> pd.DataFrame:
     df = df.dropna(subset=["Артикул WB"]).copy()
     df["Артикул WB"] = df["Артикул WB"].astype("int64")
 
-    for col in ["Рейтинг отзывов", "Частота запросов", "Частота за неделю", "Медианная позиция", "Переходы в карточку", "Заказы"]:
+    for col in ["Рейтинг отзывов", "Частота запросов", "Переходы в карточку", "Заказы", "Медианная позиция"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
     return df
@@ -557,37 +540,71 @@ def aggregate_keywords(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# ИСТОРИЯ СТАВОК
+# HISTORY / SCHEDULE / EFFECTIVENESS
 # =========================================================
 
 def load_bid_history(s3: S3Storage) -> pd.DataFrame:
+    cols = [
+        "Дата запуска", "Неделя", "ID кампании", "Артикул WB", "Тип кампании",
+        "Ставка поиск, коп", "Ставка рекомендации, коп", "Стратегия"
+    ]
     if not s3.file_exists(SERVICE_HISTORY_KEY):
-        return pd.DataFrame(columns=[
-            "Дата запуска", "Неделя", "ID кампании", "Артикул WB", "Тип кампании",
-            "Ставка поиск, коп", "Ставка рекомендации, коп", "Стратегия"
-        ])
-
+        return pd.DataFrame(columns=cols)
     try:
         df = s3.read_excel(SERVICE_HISTORY_KEY, sheet_name=0)
         if df.empty:
-            return pd.DataFrame(columns=[
-                "Дата запуска", "Неделя", "ID кампании", "Артикул WB", "Тип кампании",
-                "Ставка поиск, коп", "Ставка рекомендации, коп", "Стратегия"
-            ])
+            return pd.DataFrame(columns=cols)
         return df
     except Exception:
-        return pd.DataFrame(columns=[
-            "Дата запуска", "Неделя", "ID кампании", "Артикул WB", "Тип кампании",
-            "Ставка поиск, коп", "Ставка рекомендации, коп", "Стратегия"
-        ])
+        return pd.DataFrame(columns=cols)
 
 
 def save_bid_history(s3: S3Storage, history_df: pd.DataFrame):
     s3.write_excel_sheets(SERVICE_HISTORY_KEY, {"history": history_df})
 
 
+def load_schedule(s3: S3Storage) -> pd.DataFrame:
+    cols = ["Неделя", "Стратегия", "Название стратегии", "Статус", "Дата назначения"]
+    if not s3.file_exists(SERVICE_SCHEDULE_KEY):
+        return pd.DataFrame(columns=cols)
+    try:
+        df = s3.read_excel(SERVICE_SCHEDULE_KEY, sheet_name=0)
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+def save_schedule(s3: S3Storage, df: pd.DataFrame):
+    s3.write_excel_sheets(SERVICE_SCHEDULE_KEY, {"schedule": df})
+
+
+def load_effectiveness(s3: S3Storage) -> pd.DataFrame:
+    cols = [
+        "Неделя", "Стратегия", "Название стратегии", "Тип оценки",
+        "Расход за неделю", "Сумма заказов за неделю", "Заказы за неделю",
+        "ДРР, % факт", "CTR, % факт", "CR, % факт",
+        "Ожидаемая чистая прибыль рекламы, руб", "Средняя чистая прибыль, руб/ед",
+        "Средняя позиция", "Средняя доля трафика, %", "Средний рейтинг", "Вывод"
+    ]
+    if not s3.file_exists(SERVICE_EFFECTIVENESS_KEY):
+        return pd.DataFrame(columns=cols)
+    try:
+        df = s3.read_excel(SERVICE_EFFECTIVENESS_KEY, sheet_name=0)
+        if df.empty:
+            return pd.DataFrame(columns=cols)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+def save_effectiveness(s3: S3Storage, df: pd.DataFrame):
+    s3.write_excel_sheets(SERVICE_EFFECTIVENESS_KEY, {"effectiveness": df})
+
+
 # =========================================================
-# АГРЕГАЦИЯ НЕДЕЛЬНЫХ РЕКЛАМНЫХ МЕТРИК
+# METRICS
 # =========================================================
 
 def build_campaign_week_metrics(
@@ -612,29 +629,27 @@ def build_campaign_week_metrics(
     g["CTR, % факт"] = g.apply(lambda r: percent(r["Клики за неделю"], r["Показы за неделю"]), axis=1)
     g["CR, % факт"] = g.apply(lambda r: percent(r["Заказы за неделю"], r["Клики за неделю"]), axis=1)
     g["CPC, руб факт"] = g.apply(
-        lambda r: round(safe_float(r["Расход за неделю"]) / safe_float(r["Клики за неделю"]), 2) if r["Клики за неделю"] > 0 else 0.0,
+        lambda r: round(safe_float(r["Расход за неделю"]) / safe_float(r["Клики за неделю"]), 2)
+        if r["Клики за неделю"] > 0 else 0.0,
         axis=1
     )
     g["ДРР, % факт"] = g.apply(
-        lambda r: percent(r["Расход за неделю"], r["Сумма заказов за неделю"]) if r["Сумма заказов за неделю"] > 0 else 0.0,
+        lambda r: percent(r["Расход за неделю"], r["Сумма заказов за неделю"])
+        if r["Сумма заказов за неделю"] > 0 else 0.0,
         axis=1
     )
 
-    # из кампаний
     c = campaigns_df.copy()
     c["Тип кампании"] = c.apply(classify_campaign, axis=1)
     c["Активна"] = c.apply(is_active_campaign, axis=1)
-
-    merge_cols = [
+    c = c[[
         "ID кампании", "Название", "Тип оплаты", "Тип ставки", "Статус",
         "Размещение в рекомендациях", "Ставка в поиске (руб)", "Ставка в рекомендациях (руб)",
         "Тип кампании", "Активна"
-    ]
-    c = c[merge_cols].drop_duplicates(subset=["ID кампании"])
+    ]].drop_duplicates(subset=["ID кампании"])
 
     m = g.merge(c, on="ID кампании", how="left")
 
-    # из экономики
     econ_cols = [
         "Артикул WB", "Артикул продавца", "Предмет", "Бренд",
         "Средняя цена продажи", "Чистая прибыль, руб/ед", "Валовая прибыль, руб/ед",
@@ -644,20 +659,17 @@ def build_campaign_week_metrics(
     e = economics_df[econ_cols].drop_duplicates(subset=["Артикул WB"])
     m = m.merge(e, on="Артикул WB", how="left")
 
-    # из keywords
     if not keywords_agg_df.empty:
         m = m.merge(keywords_agg_df, on="Артикул WB", how="left")
     else:
-        for col in ["Рейтинг отзывов", "Частота запросов сумма", "Переходы в карточку сумма",
-                    "Заказы по ключам сумма", "Медианная позиция заказных ключей", "Доля трафика, %", "Флаг плохого рейтинга"]:
+        for col in [
+            "Рейтинг отзывов", "Частота запросов сумма", "Переходы в карточку сумма",
+            "Заказы по ключам сумма", "Медианная позиция заказных ключей", "Доля трафика, %", "Флаг плохого рейтинга"
+        ]:
             m[col] = 0 if "Флаг" not in col else "нет"
 
-    # derived business metrics
     m["Ожидаемая чистая прибыль рекламы, руб"] = (
         m["Заказы за неделю"].fillna(0) * m["Чистая прибыль, руб/ед"].fillna(0) - m["Расход за неделю"].fillna(0)
-    )
-    m["Ожидаемая валовая прибыль рекламы, руб"] = (
-        m["Заказы за неделю"].fillna(0) * m["Валовая прибыль, руб/ед"].fillna(0) - m["Расход за неделю"].fillna(0)
     )
     m["Профит на заказ после рекламы, руб"] = m.apply(
         lambda r: round(safe_float(r["Чистая прибыль, руб/ед"]) - safe_float(r["Расход за неделю"]) / safe_float(r["Заказы за неделю"]), 2)
@@ -673,12 +685,13 @@ def build_campaign_week_metrics(
 
 
 # =========================================================
-# СТРАТЕГИИ
+# STRATEGIES
 # =========================================================
 
 @dataclass
 class Decision:
     strategy_id: int
+    strategy_name: str
     id_campaign: int
     nm_id: int
     campaign_name: str
@@ -692,222 +705,365 @@ class Decision:
     week_label: str
 
 
-def decide_cpc_search(row: pd.Series, strategy_id: int, week_label: str) -> Optional[Decision]:
-    current_bid = safe_int(row.get("Текущая ставка поиск, коп"))
-    if current_bid <= 0:
-        return None
+def stop_factors(row: pd.Series) -> Optional[str]:
+    rating = safe_float(row.get("Рейтинг отзывов"))
+    profit_u = safe_float(row.get("Чистая прибыль, руб/ед"))
 
+    if rating and rating < BAD_RATING_THRESHOLD:
+        return f"Низкий рейтинг отзывов {rating:.2f}"
+    if profit_u <= MIN_NET_PROFIT_PER_UNIT:
+        return f"Чистая прибыль на единицу {profit_u:.2f} ≤ {MIN_NET_PROFIT_PER_UNIT:.2f}"
+    return None
+
+
+def decide_profit_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
+    ctype = str(row.get("Тип кампании"))
+    rating = safe_float(row.get("Рейтинг отзывов"))
+    pos = safe_float(row.get("Медианная позиция заказных ключей"))
+    ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
     drr = safe_float(row.get("ДРР, % факт"))
     profit_u = safe_float(row.get("Чистая прибыль, руб/ед"))
-    pos = safe_float(row.get("Медианная позиция заказных ключей"))
-    rating = safe_float(row.get("Рейтинг отзывов"))
     orders_kw = safe_float(row.get("Заказы по ключам сумма"))
-    ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
-    spend = safe_float(row.get("Расход за неделю"))
 
-    step_up = STEP_CPC_SOFT if strategy_id == 1 else STEP_CPC_HARD
-    step_down = STEP_CPC_SOFT if strategy_id == 1 else STEP_CPC_HARD
+    sf = stop_factors(row)
+    if sf:
+        action = "DOWN"
+        if ctype == "cpm_shelves":
+            current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+            new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new == current:
+                return None
+            return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, action, sf, 0, 0, current, new, week_label)
+        else:
+            current = safe_int(row.get("Текущая ставка поиск, коп"))
+            min_v = MIN_CPC_SEARCH if ctype == "cpc_search" else MIN_CPM_SEARCH
+            max_v = MAX_CPC_SEARCH if ctype == "cpc_search" else MAX_CPM_SEARCH
+            step = STEP_CPC_BIG if ctype == "cpc_search" else STEP_CPM_BIG
+            new = clamp(current - step, min_v, max_v)
+            if new == current:
+                return None
+            return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, action, sf, current, new, 0, 0, week_label)
 
-    new_bid = current_bid
-    action = "KEEP"
-    reason = "Без изменений"
+    if ctype == "cpm_shelves":
+        current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+        ctr = safe_float(row.get("CTR, % факт"))
+        if ad_profit < 0 or drr > config["target_drr_cpm_shelves"]:
+            new = clamp(current - STEP_CPM_MED, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN",
+                                f"Полки: прибыль рекламы {ad_profit:.2f}, ДРР {drr:.2f}%",
+                                0, 0, current, new, week_label)
+        elif ad_profit > 0 and ctr >= GOOD_CTR_SHELVES and profit_u > 0:
+            new = clamp(current + STEP_CPM_SMALL, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"Полки прибыльны, CTR {ctr:.2f}%",
+                                0, 0, current, new, week_label)
+        return None
 
-    if rating and rating < BAD_RATING_THRESHOLD:
-        new_bid = max(current_bid - step_down, MIN_CPC_SEARCH)
-        action = "DOWN"
-        reason = f"Низкий рейтинг отзывов {rating:.2f} (< {BAD_RATING_THRESHOLD})"
-    elif profit_u <= MIN_NET_PROFIT_PER_UNIT:
-        new_bid = max(current_bid - step_down, MIN_CPC_SEARCH)
-        action = "DOWN"
-        reason = f"Чистая прибыль на единицу {profit_u:.2f} ≤ {MIN_NET_PROFIT_PER_UNIT:.2f}"
-    elif spend >= MIN_WEEK_SPEND and ad_profit < 0:
-        new_bid = max(current_bid - step_down, MIN_CPC_SEARCH)
-        action = "DOWN"
-        reason = f"Реклама убыточна по неделе: {ad_profit:.2f} руб"
-    elif drr > TARGET_DRR_CPC:
-        new_bid = max(current_bid - step_down, MIN_CPC_SEARCH)
-        action = "DOWN"
-        reason = f"ДРР {drr:.2f}% > {TARGET_DRR_CPC:.2f}%"
-    elif pos > TOP20_BORDER and profit_u > 0 and rating >= OK_RATING_THRESHOLD and orders_kw >= MIN_KEYWORD_ORDERS_FOR_PUSH:
-        new_bid = min(current_bid + step_up, MAX_CPC_SEARCH)
-        action = "UP"
-        reason = f"Медианная позиция {pos:.1f} хуже TOP20, товар прибыльный"
-    elif strategy_id == 2 and pos > TOP10_BORDER and profit_u > 0 and rating >= GOOD_RATING_THRESHOLD and orders_kw >= MIN_KEYWORD_ORDERS_FOR_PUSH:
-        new_bid = min(current_bid + step_up, MAX_CPC_SEARCH)
-        action = "UP"
-        reason = f"Стратегия роста: позиция {pos:.1f} хуже TOP10, рейтинг {rating:.2f}"
+    current = safe_int(row.get("Текущая ставка поиск, коп"))
+    if ctype == "cpm_search":
+        step_up = STEP_CPM_SMALL
+        step_down = STEP_CPM_MED
+        min_v, max_v = MIN_CPM_SEARCH, MAX_CPM_SEARCH
+        drr_target = config["target_drr_cpm_search"]
+        drr_max = config["max_drr_cpm_search"]
     else:
-        return None
+        step_up = STEP_CPC_SMALL
+        step_down = STEP_CPC_MED
+        min_v, max_v = MIN_CPC_SEARCH, MAX_CPC_SEARCH
+        drr_target = config["target_drr_cpc"]
+        drr_max = config["max_drr_cpc"]
 
-    if new_bid == current_bid:
-        return None
+    if ad_profit < 0 or drr > drr_max:
+        new = clamp(current - step_down, min_v, max_v)
+        if new != current:
+            return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"Убыточно/перегрето: прибыль рекламы {ad_profit:.2f}, ДРР {drr:.2f}%",
+                            current, new, 0, 0, week_label)
 
-    return Decision(
-        strategy_id=strategy_id,
-        id_campaign=safe_int(row["ID кампании"]),
-        nm_id=safe_int(row["Артикул WB"]),
-        campaign_name=str(row.get("Название", "")),
-        campaign_type="cpc_search",
-        action=action,
-        reason=reason,
-        current_search_bid_kop=current_bid,
-        new_search_bid_kop=new_bid,
-        current_rec_bid_kop=0,
-        new_rec_bid_kop=0,
-        week_label=week_label,
-    )
+    if ad_profit > 0 and profit_u > 0 and rating >= OK_RATING_THRESHOLD:
+        if pos > TOP20_BORDER and orders_kw >= MIN_KEYWORD_ORDERS_FOR_PUSH:
+            new = clamp(current + step_up * 2, min_v, max_v)
+            if new != current:
+                return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"Нужно поднять видимость, позиция {pos:.1f}, реклама прибыльна",
+                                current, new, 0, 0, week_label)
+        if TOP10_BORDER < pos <= TOP20_BORDER and drr <= drr_target + 2:
+            new = clamp(current + step_up, min_v, max_v)
+            if new != current:
+                return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"Есть запас по прибыли, позиция {pos:.1f}",
+                                current, new, 0, 0, week_label)
+
+    return None
 
 
-def decide_cpm_search(row: pd.Series, strategy_id: int, week_label: str) -> Optional[Decision]:
-    current_bid = safe_int(row.get("Текущая ставка поиск, коп"))
-    if current_bid <= 0:
-        return None
-
+def decide_position_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
+    ctype = str(row.get("Тип кампании"))
+    pos = safe_float(row.get("Медианная позиция заказных ключей"))
+    rating = safe_float(row.get("Рейтинг отзывов"))
     drr = safe_float(row.get("ДРР, % факт"))
-    profit_u = safe_float(row.get("Чистая прибыль, руб/ед"))
+    ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
+
+    sf = stop_factors(row)
+    if sf:
+        if ctype == "cpm_shelves":
+            current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+            new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN", sf, 0, 0, current, new, week_label)
+            return None
+        current = safe_int(row.get("Текущая ставка поиск, коп"))
+        min_v = MIN_CPM_SEARCH if ctype == "cpm_search" else MIN_CPC_SEARCH
+        max_v = MAX_CPM_SEARCH if ctype == "cpm_search" else MAX_CPC_SEARCH
+        step = STEP_CPM_BIG if ctype == "cpm_search" else STEP_CPC_BIG
+        new = clamp(current - step, min_v, max_v)
+        if new != current:
+            return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN", sf, current, new, 0, 0, week_label)
+        return None
+
+    if ctype == "cpm_shelves":
+        current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+        ctr = safe_float(row.get("CTR, % факт"))
+        if ad_profit < 0 and ctr < MIN_CTR_SHELVES:
+            new = clamp(current - STEP_CPM_MED, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN",
+                                f"Полки не дают нужного эффекта: CTR {ctr:.2f}%, прибыль {ad_profit:.2f}",
+                                0, 0, current, new, week_label)
+        elif ad_profit > 0 and ctr >= GOOD_CTR_SHELVES and rating >= GOOD_RATING_THRESHOLD:
+            new = clamp(current + STEP_CPM_SMALL, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"Полки стабильны: CTR {ctr:.2f}%, рейтинг {rating:.2f}",
+                                0, 0, current, new, week_label)
+        return None
+
+    current = safe_int(row.get("Текущая ставка поиск, коп"))
+    if ctype == "cpm_search":
+        step_small, step_med, min_v, max_v = STEP_CPM_SMALL, STEP_CPM_MED, MIN_CPM_SEARCH, MAX_CPM_SEARCH
+    else:
+        step_small, step_med, min_v, max_v = STEP_CPC_SMALL, STEP_CPC_MED, MIN_CPC_SEARCH, MAX_CPC_SEARCH
+
+    if ad_profit < 0 or drr > (config["target_drr_cpc"] + 5):
+        new = clamp(current - step_small, min_v, max_v)
+        if new != current:
+            return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"Позиция не должна покупаться в убыток: прибыль {ad_profit:.2f}, ДРР {drr:.2f}%",
+                            current, new, 0, 0, week_label)
+
+    if pos > TOP20_BORDER and rating >= OK_RATING_THRESHOLD:
+        new = clamp(current + step_med, min_v, max_v)
+        if new != current:
+            return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "UP",
+                            f"Позиция {pos:.1f} хуже TOP20",
+                            current, new, 0, 0, week_label)
+
+    if TOP10_BORDER < pos <= TOP20_BORDER and rating >= GOOD_RATING_THRESHOLD:
+        new = clamp(current + step_small, min_v, max_v)
+        if new != current:
+            return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "UP",
+                            f"Позиция {pos:.1f} вне TOP10",
+                            current, new, 0, 0, week_label)
+
+    if pos < 5 and drr > config["target_drr_cpc"]:
+        new = clamp(current - step_small, min_v, max_v)
+        if new != current:
+            return Decision(2, STRATEGY_NAMES[2], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"Позиция {pos:.1f} уже очень высокая, можно экономить",
+                            current, new, 0, 0, week_label)
+
+    return None
+
+
+def decide_drr_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
+    ctype = str(row.get("Тип кампании"))
+    drr = safe_float(row.get("ДРР, % факт"))
+    sf = stop_factors(row)
+
+    if ctype == "cpm_shelves":
+        current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+        target = config["target_drr_cpm_shelves"]
+        max_drr = config["max_drr_cpm_shelves"]
+
+        if sf:
+            new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN", sf, 0, 0, current, new, week_label)
+
+        if drr > max_drr:
+            new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN",
+                                f"ДРР {drr:.2f}% > {max_drr:.2f}%",
+                                0, 0, current, new, week_label)
+        elif target < drr <= max_drr:
+            new = clamp(current - STEP_CPM_SMALL, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN",
+                                f"ДРР {drr:.2f}% выше цели {target:.2f}%",
+                                0, 0, current, new, week_label)
+        elif drr < target - 3 and safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб")) > 0:
+            new = clamp(current + STEP_CPM_SMALL, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"ДРР {drr:.2f}% заметно ниже цели",
+                                0, 0, current, new, week_label)
+        return None
+
+    current = safe_int(row.get("Текущая ставка поиск, коп"))
+    if ctype == "cpm_search":
+        target = config["target_drr_cpm_search"]
+        max_drr = config["max_drr_cpm_search"]
+        step_small, step_big, min_v, max_v = STEP_CPM_SMALL, STEP_CPM_BIG, MIN_CPM_SEARCH, MAX_CPM_SEARCH
+    else:
+        target = config["target_drr_cpc"]
+        max_drr = config["max_drr_cpc"]
+        step_small, step_big, min_v, max_v = STEP_CPC_SMALL, STEP_CPC_BIG, MIN_CPC_SEARCH, MAX_CPC_SEARCH
+
+    if sf:
+        new = clamp(current - step_big, min_v, max_v)
+        if new != current:
+            return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN", sf, current, new, 0, 0, week_label)
+
+    if drr > max_drr:
+        new = clamp(current - step_big, min_v, max_v)
+        if new != current:
+            return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"ДРР {drr:.2f}% > {max_drr:.2f}%",
+                            current, new, 0, 0, week_label)
+    elif target < drr <= max_drr:
+        new = clamp(current - step_small, min_v, max_v)
+        if new != current:
+            return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"ДРР {drr:.2f}% выше цели {target:.2f}%",
+                            current, new, 0, 0, week_label)
+    elif drr < target - 3 and safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб")) > 0:
+        new = clamp(current + step_small, min_v, max_v)
+        if new != current:
+            return Decision(3, STRATEGY_NAMES[3], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "UP",
+                            f"ДРР {drr:.2f}% ниже цели {target:.2f}%",
+                            current, new, 0, 0, week_label)
+
+    return None
+
+
+def decide_traffic_share_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
+    ctype = str(row.get("Тип кампании"))
+    traffic_share = safe_float(row.get("Доля трафика, %"))
     pos = safe_float(row.get("Медианная позиция заказных ключей"))
     rating = safe_float(row.get("Рейтинг отзывов"))
     ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
-    spend = safe_float(row.get("Расход за неделю"))
-
-    step_up = STEP_CPM_SOFT if strategy_id == 1 else STEP_CPM_HARD
-    step_down = STEP_CPM_SOFT if strategy_id == 1 else STEP_CPM_HARD
-
-    new_bid = current_bid
-    action = "KEEP"
-    reason = "Без изменений"
-
-    if rating and rating < BAD_RATING_THRESHOLD:
-        new_bid = max(current_bid - step_down, MIN_CPM_SEARCH)
-        action = "DOWN"
-        reason = f"Низкий рейтинг отзывов {rating:.2f}"
-    elif profit_u <= MIN_NET_PROFIT_PER_UNIT:
-        new_bid = max(current_bid - step_down, MIN_CPM_SEARCH)
-        action = "DOWN"
-        reason = f"Чистая прибыль на единицу {profit_u:.2f} ≤ {MIN_NET_PROFIT_PER_UNIT:.2f}"
-    elif spend >= MIN_WEEK_SPEND and ad_profit < 0:
-        new_bid = max(current_bid - step_down, MIN_CPM_SEARCH)
-        action = "DOWN"
-        reason = f"CPM-поиск убыточен по неделе: {ad_profit:.2f}"
-    elif drr > TARGET_DRR_CPM_SEARCH:
-        new_bid = max(current_bid - step_down, MIN_CPM_SEARCH)
-        action = "DOWN"
-        reason = f"ДРР {drr:.2f}% > {TARGET_DRR_CPM_SEARCH:.2f}%"
-    elif pos > TOP20_BORDER and profit_u > 0 and rating >= OK_RATING_THRESHOLD:
-        new_bid = min(current_bid + step_up, MAX_CPM_SEARCH)
-        action = "UP"
-        reason = f"CPM-поиск: позиция {pos:.1f} хуже TOP20 при положительной экономике"
-    elif strategy_id == 2 and pos > TOP10_BORDER and profit_u > 0 and rating >= GOOD_RATING_THRESHOLD:
-        new_bid = min(current_bid + step_up, MAX_CPM_SEARCH)
-        action = "UP"
-        reason = f"Стратегия роста CPM-поиска: позиция {pos:.1f} хуже TOP10"
-    else:
-        return None
-
-    if new_bid == current_bid:
-        return None
-
-    return Decision(
-        strategy_id=strategy_id,
-        id_campaign=safe_int(row["ID кампании"]),
-        nm_id=safe_int(row["Артикул WB"]),
-        campaign_name=str(row.get("Название", "")),
-        campaign_type="cpm_search",
-        action=action,
-        reason=reason,
-        current_search_bid_kop=current_bid,
-        new_search_bid_kop=new_bid,
-        current_rec_bid_kop=0,
-        new_rec_bid_kop=0,
-        week_label=week_label,
-    )
-
-
-def decide_cpm_shelves(row: pd.Series, strategy_id: int, week_label: str) -> Optional[Decision]:
-    current_bid = safe_int(row.get("Текущая ставка рекомендации, коп"))
-    if current_bid <= 0:
-        return None
-
-    ctr = safe_float(row.get("CTR, % факт"))
-    clicks = safe_float(row.get("Клики за неделю"))
-    views = safe_float(row.get("Показы за неделю"))
-    orders = safe_float(row.get("Заказы за неделю"))
     drr = safe_float(row.get("ДРР, % факт"))
-    profit_u = safe_float(row.get("Чистая прибыль, руб/ед"))
-    ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
-    rating = safe_float(row.get("Рейтинг отзывов"))
 
-    step_up = STEP_CPM_SOFT if strategy_id == 1 else STEP_CPM_HARD
-    step_down = STEP_CPM_SOFT if strategy_id == 1 else STEP_CPM_HARD
+    sf = stop_factors(row)
 
-    new_bid = current_bid
-    action = "KEEP"
-    reason = "Без изменений"
+    if ctype == "cpm_shelves":
+        current = safe_int(row.get("Текущая ставка рекомендации, коп"))
+        ctr = safe_float(row.get("CTR, % факт"))
+        if sf:
+            new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN", sf, 0, 0, current, new, week_label)
 
-    if rating and rating < BAD_RATING_THRESHOLD:
-        new_bid = max(current_bid - step_down, MIN_CPM_SHELVES)
-        action = "DOWN"
-        reason = f"Низкий рейтинг отзывов {rating:.2f}"
-    elif profit_u <= MIN_NET_PROFIT_PER_UNIT:
-        new_bid = max(current_bid - step_down, MIN_CPM_SHELVES)
-        action = "DOWN"
-        reason = f"Чистая прибыль на единицу {profit_u:.2f} ≤ {MIN_NET_PROFIT_PER_UNIT:.2f}"
-    elif views >= MIN_IMPRESSIONS_SHELVES and clicks >= MIN_CLICKS_SHELVES and ctr < MIN_CTR_SHELVES:
-        new_bid = max(current_bid - step_down, MIN_CPM_SHELVES)
-        action = "DOWN"
-        reason = f"Полки: низкий CTR {ctr:.2f}% при {views:.0f} показах"
-    elif ad_profit < 0 and drr > TARGET_DRR_CPM_SHELVES:
-        new_bid = max(current_bid - step_down, MIN_CPM_SHELVES)
-        action = "DOWN"
-        reason = f"Полки убыточны: ДРР {drr:.2f}% и прибыль рекламы {ad_profit:.2f}"
-    elif strategy_id == 2 and profit_u > 0 and ctr >= GOOD_CTR_SHELVES and orders >= MIN_WEEK_ORDERS:
-        new_bid = min(current_bid + step_up, MAX_CPM_SHELVES)
-        action = "UP"
-        reason = f"Полки: хороший CTR {ctr:.2f}% и положительная экономика"
-    elif strategy_id == 3 and profit_u > 0 and ctr >= MIN_CTR_SHELVES and ad_profit > 0:
-        new_bid = min(current_bid + step_up, MAX_CPM_SHELVES)
-        action = "UP"
-        reason = f"Агрессивный рост полок: реклама прибыльна, CTR {ctr:.2f}%"
+        if ad_profit < 0 or ctr < MIN_CTR_SHELVES:
+            new = clamp(current - STEP_CPM_MED, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "DOWN",
+                                f"Полки не увеличивают полезный трафик: CTR {ctr:.2f}%, прибыль {ad_profit:.2f}",
+                                0, 0, current, new, week_label)
+        elif ad_profit > 0 and ctr >= GOOD_CTR_SHELVES:
+            new = clamp(current + STEP_CPM_SMALL, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
+            if new != current:
+                return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                                str(row.get("Название", "")), ctype, "UP",
+                                f"Полки хорошо забирают трафик: CTR {ctr:.2f}%",
+                                0, 0, current, new, week_label)
+        return None
+
+    current = safe_int(row.get("Текущая ставка поиск, коп"))
+    if ctype == "cpm_search":
+        step_up, step_down, min_v, max_v = STEP_CPM_SMALL, STEP_CPM_MED, MIN_CPM_SEARCH, MAX_CPM_SEARCH
     else:
-        return None
+        step_up, step_down, min_v, max_v = STEP_CPC_SMALL, STEP_CPC_MED, MIN_CPC_SEARCH, MAX_CPC_SEARCH
 
-    if new_bid == current_bid:
-        return None
+    if sf:
+        new = clamp(current - step_down, min_v, max_v)
+        if new != current:
+            return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN", sf, current, new, 0, 0, week_label)
 
-    return Decision(
-        strategy_id=strategy_id,
-        id_campaign=safe_int(row["ID кампании"]),
-        nm_id=safe_int(row["Артикул WB"]),
-        campaign_name=str(row.get("Название", "")),
-        campaign_type="cpm_shelves",
-        action=action,
-        reason=reason,
-        current_search_bid_kop=0,
-        new_search_bid_kop=0,
-        current_rec_bid_kop=current_bid,
-        new_rec_bid_kop=new_bid,
-        week_label=week_label,
-    )
+    # если доля трафика низкая и позиция плохая — поднимаем
+    if traffic_share < 2.0 and pos > TOP20_BORDER and rating >= OK_RATING_THRESHOLD and ad_profit >= 0:
+        new = clamp(current + step_up * 2, min_v, max_v)
+        if new != current:
+            return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "UP",
+                            f"Низкая доля трафика {traffic_share:.2f}% и слабая позиция {pos:.1f}",
+                            current, new, 0, 0, week_label)
+
+    if 2.0 <= traffic_share < 4.0 and pos > TOP10_BORDER and ad_profit >= 0 and drr <= config["max_drr_cpc"]:
+        new = clamp(current + step_up, min_v, max_v)
+        if new != current:
+            return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "UP",
+                            f"Есть потенциал роста доли трафика: {traffic_share:.2f}%",
+                            current, new, 0, 0, week_label)
+
+    if traffic_share >= 6.0 and drr > config["target_drr_cpc"] + 2:
+        new = clamp(current - step_down, min_v, max_v)
+        if new != current:
+            return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
+                            str(row.get("Название", "")), ctype, "DOWN",
+                            f"Доля трафика уже высокая ({traffic_share:.2f}%), можно экономить",
+                            current, new, 0, 0, week_label)
+
+    return None
 
 
-def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, week_label: str) -> List[Decision]:
+def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, week_label: str) -> List[Decision]:
     decisions: List[Decision] = []
 
     for _, row in metrics_df.iterrows():
         ctype = str(row.get("Тип кампании", "unknown"))
-
-        if ctype == "manual_mixed" or ctype == "manual_search":
-            continue
-        if ctype == "unknown":
+        if ctype in {"manual_mixed", "manual_search", "unknown"}:
             continue
 
         decision = None
-        if ctype == "cpc_search":
-            decision = decide_cpc_search(row, strategy_id, week_label)
-        elif ctype == "cpm_search":
-            decision = decide_cpm_search(row, strategy_id, week_label)
-        elif ctype == "cpm_shelves":
-            decision = decide_cpm_shelves(row, strategy_id, week_label)
+        if strategy_id == 1:
+            decision = decide_profit_strategy(row, config, week_label)
+        elif strategy_id == 2:
+            decision = decide_position_strategy(row, config, week_label)
+        elif strategy_id == 3:
+            decision = decide_drr_strategy(row, config, week_label)
+        elif strategy_id == 4:
+            decision = decide_traffic_share_strategy(row, config, week_label)
 
         if decision:
             decisions.append(decision)
@@ -916,7 +1072,7 @@ def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, week_label: str)
 
 
 # =========================================================
-# ПОДГОТОВКА PAYLOAD ДЛЯ WB
+# PAYLOAD
 # =========================================================
 
 def decisions_to_payload(decisions: List[Decision]) -> List[Dict[str, Any]]:
@@ -924,16 +1080,10 @@ def decisions_to_payload(decisions: List[Decision]) -> List[Dict[str, Any]]:
 
     for d in decisions:
         if d.id_campaign not in grouped:
-            grouped[d.id_campaign] = {
-                "advert_id": d.id_campaign,
-                "nm_bids": []
-            }
+            grouped[d.id_campaign] = {"advert_id": d.id_campaign, "nm_bids": []}
 
-        nm_bid = {
-            "nm_id": d.nm_id
-        }
+        nm_bid = {"nm_id": d.nm_id}
 
-        # используем ту же логику полей search/recommendations, что была в старом скрипте
         if d.campaign_type in {"cpc_search", "cpm_search"}:
             nm_bid["search"] = d.new_search_bid_kop
         elif d.campaign_type == "cpm_shelves":
@@ -978,20 +1128,21 @@ def send_batches(payload: List[Dict[str, Any]], api_key: str, dry_run: bool = Tr
 
 
 # =========================================================
-# СОХРАНЕНИЕ PREVIEW / SUMMARY
+# PREVIEW / SUMMARY
 # =========================================================
 
 def decisions_to_df(decisions: List[Decision], metrics_df: pd.DataFrame) -> pd.DataFrame:
     if not decisions:
         return pd.DataFrame(columns=[
-            "Неделя", "ID кампании", "Название", "Артикул WB", "Тип кампании",
-            "Действие", "Причина",
+            "Неделя", "Стратегия", "Название стратегии", "ID кампании", "Название", "Артикул WB",
+            "Тип кампании", "Действие", "Причина",
             "Текущая ставка поиск, коп", "Новая ставка поиск, коп",
             "Текущая ставка рекомендации, коп", "Новая ставка рекомендации, коп"
         ])
 
-    ddf = pd.DataFrame([d.__dict__ for d in decisions]).rename(columns={
+    ddf = pd.DataFrame([asdict(d) for d in decisions]).rename(columns={
         "strategy_id": "Стратегия",
+        "strategy_name": "Название стратегии",
         "id_campaign": "ID кампании",
         "nm_id": "Артикул WB",
         "campaign_name": "Название",
@@ -1009,13 +1160,11 @@ def decisions_to_df(decisions: List[Decision], metrics_df: pd.DataFrame) -> pd.D
         "ID кампании", "Артикул WB", "Расход за неделю", "Сумма заказов за неделю", "Заказы за неделю",
         "Показы за неделю", "Клики за неделю", "CTR, % факт", "CR, % факт", "ДРР, % факт",
         "Ожидаемая чистая прибыль рекламы, руб", "Профит на заказ после рекламы, руб",
-        "Чистая прибыль, руб/ед", "Валовая прибыль, руб/ед", "Рейтинг отзывов",
-        "Медианная позиция заказных ключей", "Доля трафика, %"
+        "Чистая прибыль, руб/ед", "Рейтинг отзывов", "Медианная позиция заказных ключей", "Доля трафика, %"
     ]
     enrich = metrics_df[enrich_cols].drop_duplicates(subset=["ID кампании", "Артикул WB"])
 
-    out = ddf.merge(enrich, on=["ID кампании", "Артикул WB"], how="left")
-    return out
+    return ddf.merge(enrich, on=["ID кампании", "Артикул WB"], how="left")
 
 
 def save_preview_files(s3: S3Storage, decisions_df: pd.DataFrame, metrics_df: pd.DataFrame, week_label: str, strategy_id: int):
@@ -1029,6 +1178,7 @@ def save_preview_files(s3: S3Storage, decisions_df: pd.DataFrame, metrics_df: pd
         "generated_at": datetime.now().isoformat(),
         "week_label": week_label,
         "strategy_id": strategy_id,
+        "strategy_name": STRATEGY_NAMES.get(strategy_id, f"Стратегия {strategy_id}"),
         "recommendations_count": 0 if decisions_df is None else int(len(decisions_df)),
         "metrics_count": 0 if metrics_df is None else int(len(metrics_df)),
     }
@@ -1036,26 +1186,218 @@ def save_preview_files(s3: S3Storage, decisions_df: pd.DataFrame, metrics_df: pd
 
 
 # =========================================================
-# КОНФИГ СТРАТЕГИИ
+# CONFIG / ROTATION
 # =========================================================
 
 def load_strategy_config(s3: S3Storage) -> dict:
-    return read_json_or_default(s3, SERVICE_CONFIG_KEY, {"active_strategy": 1})
+    cfg = read_json_or_default(s3, SERVICE_CONFIG_KEY, DEFAULT_CONFIG.copy())
+    # добиваем defaults
+    for k, v in DEFAULT_CONFIG.items():
+        if k not in cfg:
+            cfg[k] = v
+    return cfg
 
 
-def save_strategy_config(s3: S3Storage, strategy_id: int):
-    data = {"active_strategy": int(strategy_id), "updated_at": datetime.now().isoformat()}
-    s3.write_text(SERVICE_CONFIG_KEY, json.dumps(data, ensure_ascii=False, indent=2))
+def save_strategy_config(s3: S3Storage, cfg: dict):
+    cfg = dict(cfg)
+    cfg["updated_at"] = datetime.now().isoformat()
+    s3.write_text(SERVICE_CONFIG_KEY, json.dumps(cfg, ensure_ascii=False, indent=2))
+
+
+def determine_strategy_for_week(s3: S3Storage, week_label: str, cfg: dict) -> int:
+    if cfg.get("mode") == "fixed":
+        return int(cfg.get("active_strategy", 1))
+
+    schedule_df = load_schedule(s3)
+    if not schedule_df.empty and "Неделя" in schedule_df.columns:
+        existing = schedule_df[schedule_df["Неделя"].astype(str) == week_label]
+        if not existing.empty:
+            return safe_int(existing.iloc[0]["Стратегия"], 1)
+
+    seq = cfg.get("strategy_sequence", DEFAULT_STRATEGY_SEQUENCE)
+    if not seq:
+        seq = DEFAULT_STRATEGY_SEQUENCE
+
+    prev_week = previous_week_label(week_label, 1)
+    prev_rows = schedule_df[schedule_df["Неделя"].astype(str) == prev_week] if not schedule_df.empty else pd.DataFrame()
+    if not prev_rows.empty:
+        prev_strategy = safe_int(prev_rows.iloc[0]["Стратегия"], seq[0])
+        if prev_strategy in seq:
+            idx = seq.index(prev_strategy)
+            strategy_id = seq[(idx + 1) % len(seq)]
+        else:
+            strategy_id = seq[0]
+    else:
+        strategy_id = seq[0]
+
+    new_row = pd.DataFrame([{
+        "Неделя": week_label,
+        "Стратегия": strategy_id,
+        "Название стратегии": STRATEGY_NAMES.get(strategy_id, str(strategy_id)),
+        "Статус": "назначена",
+        "Дата назначения": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }])
+    schedule_df = pd.concat([schedule_df, new_row], ignore_index=True)
+    schedule_df = schedule_df.drop_duplicates(subset=["Неделя"], keep="last")
+    save_schedule(s3, schedule_df)
+
+    return strategy_id
 
 
 # =========================================================
-# ОСНОВНОЙ PIPELINE
+# EFFECTIVENESS ANALYTICS
 # =========================================================
 
-def run_pipeline(s3: S3Storage, strategy_id: int, dry_run: bool, explicit_week: Optional[str]):
+def evaluate_strategy_week(metrics_df: pd.DataFrame, week_label: str, strategy_id: int, eval_type: str) -> Dict[str, Any]:
+    if metrics_df.empty:
+        return {
+            "Неделя": week_label,
+            "Стратегия": strategy_id,
+            "Название стратегии": STRATEGY_NAMES.get(strategy_id, str(strategy_id)),
+            "Тип оценки": eval_type,
+            "Расход за неделю": 0.0,
+            "Сумма заказов за неделю": 0.0,
+            "Заказы за неделю": 0.0,
+            "ДРР, % факт": 0.0,
+            "CTR, % факт": 0.0,
+            "CR, % факт": 0.0,
+            "Ожидаемая чистая прибыль рекламы, руб": 0.0,
+            "Средняя чистая прибыль, руб/ед": 0.0,
+            "Средняя позиция": 0.0,
+            "Средняя доля трафика, %": 0.0,
+            "Средний рейтинг": 0.0,
+            "Вывод": "Нет данных",
+        }
+
+    spend = round(safe_float(metrics_df["Расход за неделю"].sum()), 2)
+    revenue = round(safe_float(metrics_df["Сумма заказов за неделю"].sum()), 2)
+    orders = round(safe_float(metrics_df["Заказы за неделю"].sum()), 2)
+    clicks = safe_float(metrics_df["Клики за неделю"].sum())
+    views = safe_float(metrics_df["Показы за неделю"].sum())
+    ad_profit = round(safe_float(metrics_df["Ожидаемая чистая прибыль рекламы, руб"].sum()), 2)
+
+    drr = percent(spend, revenue) if revenue > 0 else 0.0
+    ctr = percent(clicks, views) if views > 0 else 0.0
+    cr = percent(orders, clicks) if clicks > 0 else 0.0
+
+    avg_net_u = round(safe_float(metrics_df["Чистая прибыль, руб/ед"].mean()), 2)
+    avg_pos = round(safe_float(metrics_df["Медианная позиция заказных ключей"].replace(0, pd.NA).mean()), 2)
+    avg_share = round(safe_float(metrics_df["Доля трафика, %"].replace(0, pd.NA).mean()), 2)
+    avg_rating = round(safe_float(metrics_df["Рейтинг отзывов"].replace(0, pd.NA).mean()), 2)
+
+    conclusion_parts = []
+    if ad_profit > 0:
+        conclusion_parts.append("стратегия дала положительную чистую прибыль рекламы")
+    else:
+        conclusion_parts.append("стратегия не дала положительную чистую прибыль рекламы")
+
+    if drr <= 15:
+        conclusion_parts.append("ДРР в хорошем диапазоне")
+    elif drr <= 20:
+        conclusion_parts.append("ДРР приемлемый")
+    else:
+        conclusion_parts.append("ДРР высокий")
+
+    if avg_pos and avg_pos <= TOP10_BORDER:
+        conclusion_parts.append("позиции сильные")
+    elif avg_pos and avg_pos <= TOP20_BORDER:
+        conclusion_parts.append("позиции средние")
+    elif avg_pos:
+        conclusion_parts.append("позиции слабые")
+
+    conclusion = "; ".join(conclusion_parts)
+
+    return {
+        "Неделя": week_label,
+        "Стратегия": strategy_id,
+        "Название стратегии": STRATEGY_NAMES.get(strategy_id, str(strategy_id)),
+        "Тип оценки": eval_type,
+        "Расход за неделю": spend,
+        "Сумма заказов за неделю": revenue,
+        "Заказы за неделю": orders,
+        "ДРР, % факт": drr,
+        "CTR, % факт": ctr,
+        "CR, % факт": cr,
+        "Ожидаемая чистая прибыль рекламы, руб": ad_profit,
+        "Средняя чистая прибыль, руб/ед": avg_net_u,
+        "Средняя позиция": avg_pos,
+        "Средняя доля трафика, %": avg_share,
+        "Средний рейтинг": avg_rating,
+        "Вывод": conclusion,
+    }
+
+
+def update_effectiveness_analytics(s3: S3Storage, cfg: dict):
+    schedule_df = load_schedule(s3)
+    if schedule_df.empty:
+        return
+
+    eff_df = load_effectiveness(s3)
+
+    eval_lag = safe_int(cfg.get("evaluation_lag_weeks", 1), 1)
+    final_lag = safe_int(cfg.get("final_evaluation_lag_weeks", 2), 2)
+
+    weeks_to_check = []
+
+    # предварительная оценка
+    target_pre = previous_week_label(iso_week_label(tz_now().date()), eval_lag)
+    weeks_to_check.append((target_pre, "предварительная"))
+
+    # финальная оценка
+    target_final = previous_week_label(iso_week_label(tz_now().date()), final_lag)
+    weeks_to_check.append((target_final, "финальная"))
+
+    for week_label, eval_type in weeks_to_check:
+        row_sched = schedule_df[schedule_df["Неделя"].astype(str) == week_label]
+        if row_sched.empty:
+            continue
+
+        strategy_id = safe_int(row_sched.iloc[0]["Стратегия"], 1)
+
+        # уже посчитано?
+        exists = eff_df[
+            (eff_df["Неделя"].astype(str) == week_label) &
+            (eff_df["Тип оценки"].astype(str) == eval_type)
+        ]
+        if not exists.empty:
+            continue
+
+        try:
+            week_start = week_start_from_label(week_label)
+            week_end = week_start + timedelta(days=6)
+
+            stats_df, campaigns_df = load_advertising_data(s3, week_label, week_start, week_end)
+            economics_df = load_unit_economics(s3, week_label)
+            keywords_df = load_keywords_weekly(s3, week_label)
+            keywords_agg_df = aggregate_keywords(keywords_df)
+            metrics_df = build_campaign_week_metrics(stats_df, campaigns_df, economics_df, keywords_agg_df)
+
+            row = evaluate_strategy_week(metrics_df, week_label, strategy_id, eval_type)
+            eff_df = pd.concat([eff_df, pd.DataFrame([row])], ignore_index=True)
+            log(f"✅ Добавлена {eval_type} оценка стратегии за {week_label}")
+        except Exception as e:
+            log(f"⚠️ Не удалось оценить стратегию за {week_label}: {e}")
+
+    if not eff_df.empty:
+        eff_df = eff_df.drop_duplicates(subset=["Неделя", "Тип оценки"], keep="last")
+        eff_df = eff_df.sort_values(["Неделя", "Тип оценки"], ascending=[False, True]).reset_index(drop=True)
+        save_effectiveness(s3, eff_df)
+
+
+# =========================================================
+# PIPELINE
+# =========================================================
+
+def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], forced_strategy_id: Optional[int] = None):
+    cfg = load_strategy_config(s3)
+
     week_label, week_start, week_end = target_week_range(explicit_week)
     log(f"🎯 Целевая неделя: {week_label} ({week_start} — {week_end})")
     log("📌 Важно: расходы рекламы считаются только внутри этой недели")
+
+    strategy_id = forced_strategy_id if forced_strategy_id else determine_strategy_for_week(s3, week_label, cfg)
+    strategy_name = STRATEGY_NAMES.get(strategy_id, f"Стратегия {strategy_id}")
+    log(f"🧠 Активная стратегия: {strategy_id} — {strategy_name}")
 
     stats_df, campaigns_df = load_advertising_data(s3, week_label, week_start, week_end)
     economics_df = load_unit_economics(s3, week_label)
@@ -1064,15 +1406,16 @@ def run_pipeline(s3: S3Storage, strategy_id: int, dry_run: bool, explicit_week: 
 
     metrics_df = build_campaign_week_metrics(stats_df, campaigns_df, economics_df, keywords_agg_df)
 
-    # оставляем только предметы, с которыми вы работаете
-    if "Предмет" in metrics_df.columns:
-        allowed = {"Кисти косметические", "Помады", "Косметические карандаши", "Блески"}
-        metrics_df = metrics_df[metrics_df["Предмет"].astype(str).isin(allowed)].copy()
-
-    decisions = build_decisions(metrics_df, strategy_id, week_label)
+    decisions = build_decisions(metrics_df, strategy_id, cfg, week_label)
     decisions_df = decisions_to_df(decisions, metrics_df)
 
-    # история ставок
+    # schedule status update
+    schedule_df = load_schedule(s3)
+    if not schedule_df.empty:
+        schedule_df.loc[schedule_df["Неделя"].astype(str) == week_label, "Статус"] = "в работе"
+        save_schedule(s3, schedule_df)
+
+    # bid history
     history_df = load_bid_history(s3)
     if decisions:
         hist_rows = []
@@ -1097,17 +1440,19 @@ def run_pipeline(s3: S3Storage, strategy_id: int, dry_run: bool, explicit_week: 
 
     if decisions_df is not None and not decisions_df.empty:
         show_cols = [
-            "Неделя", "ID кампании", "Название", "Артикул WB", "Тип кампании", "Действие",
-            "Текущая ставка поиск, коп", "Новая ставка поиск, коп",
+            "Неделя", "Стратегия", "Название стратегии", "ID кампании", "Название", "Артикул WB", "Тип кампании",
+            "Действие", "Текущая ставка поиск, коп", "Новая ставка поиск, коп",
             "Текущая ставка рекомендации, коп", "Новая ставка рекомендации, коп",
             "ДРР, % факт", "Ожидаемая чистая прибыль рекламы, руб",
-            "Чистая прибыль, руб/ед", "Рейтинг отзывов", "Медианная позиция заказных ключей", "Причина"
+            "Чистая прибыль, руб/ед", "Рейтинг отзывов", "Медианная позиция заказных ключей",
+            "Доля трафика, %", "Причина"
         ]
         show_cols = [c for c in show_cols if c in decisions_df.columns]
-        print(decisions_df[show_cols].head(50).to_string(index=False))
+        print(decisions_df[show_cols].head(80).to_string(index=False))
 
     if not decisions:
         log("ℹ️ Нет изменений ставок")
+        update_effectiveness_analytics(s3, cfg)
         return
 
     payload = decisions_to_payload(decisions)
@@ -1119,26 +1464,79 @@ def run_pipeline(s3: S3Storage, strategy_id: int, dry_run: bool, explicit_week: 
     log(f"✅ Успешно обработано кампаний: {success}")
     log(f"⚠️ Не обработано кампаний: {failed}")
 
+    update_effectiveness_analytics(s3, cfg)
+
 
 # =========================================================
-# ИНТЕРАКТИВНОЕ МЕНЮ
+# REPORTS
+# =========================================================
+
+def print_effectiveness_report(s3: S3Storage):
+    df = load_effectiveness(s3)
+    if df.empty:
+        print("Отчёт по эффективности стратегий пока пуст.")
+        return
+
+    print("\n==============================")
+    print("Эффективность стратегий")
+    print("==============================\n")
+
+    show_cols = [
+        "Неделя", "Стратегия", "Название стратегии", "Тип оценки",
+        "Расход за неделю", "Сумма заказов за неделю", "Заказы за неделю",
+        "ДРР, % факт", "CTR, % факт", "CR, % факт",
+        "Ожидаемая чистая прибыль рекламы, руб",
+        "Средняя позиция", "Средняя доля трафика, %", "Средний рейтинг", "Вывод"
+    ]
+    print(df[show_cols].to_string(index=False))
+
+    # агрегировано по стратегиям
+    agg = (
+        df.groupby(["Стратегия", "Название стратегии"], as_index=False)
+        .agg(
+            **{
+                "Недель в оценке": ("Неделя", "nunique"),
+                "Средняя чистая прибыль рекламы, руб": ("Ожидаемая чистая прибыль рекламы, руб", "mean"),
+                "Средний ДРР, %": ("ДРР, % факт", "mean"),
+                "Средний CTR, %": ("CTR, % факт", "mean"),
+                "Средний CR, %": ("CR, % факт", "mean"),
+                "Средняя позиция": ("Средняя позиция", "mean"),
+                "Средняя доля трафика, %": ("Средняя доля трафика, %", "mean"),
+            }
+        )
+        .sort_values(["Средняя чистая прибыль рекламы, руб", "Средний ДРР, %"], ascending=[False, True])
+    )
+
+    print("\n==============================")
+    print("Сводка по стратегиям")
+    print("==============================\n")
+    print(agg.to_string(index=False))
+
+
+# =========================================================
+# MENU
 # =========================================================
 
 def interactive_menu(s3: S3Storage):
     while True:
         cfg = load_strategy_config(s3)
         current = int(cfg.get("active_strategy", 1))
+        mode = cfg.get("mode", "rotation")
 
         print("\n==============================")
         print("Ассистент WB — управление рекламой")
         print("==============================")
-        print(f"Текущая активная стратегия: {current}")
-        print("1. Стратегия 1 — Защита прибыли")
-        print("2. Стратегия 2 — Рост с контролем прибыли")
-        print("3. Стратегия 3 — Полки / агрессивный рост")
-        print("4. Предпросмотр активной стратегии")
-        print("5. Запуск активной стратегии (dry-run)")
-        print("6. Запуск активной стратегии (боевой)")
+        print(f"Режим: {mode}")
+        print(f"Текущая активная стратегия: {current} — {STRATEGY_NAMES.get(current)}")
+        print("1. Зафиксировать стратегию 1 — Максимизация прибыли")
+        print("2. Зафиксировать стратегию 2 — Удержание / рост позиции")
+        print("3. Зафиксировать стратегию 3 — Контроль ДРР")
+        print("4. Зафиксировать стратегию 4 — Доля трафика")
+        print("5. Включить недельную ротацию стратегий")
+        print("6. Предпросмотр текущей недели")
+        print("7. Запуск текущей недели dry-run")
+        print("8. Запуск текущей недели боевой")
+        print("9. Показать отчёт по эффективности стратегий")
         print("0. Выход")
 
         choice = input("Выберите действие: ").strip()
@@ -1147,24 +1545,33 @@ def interactive_menu(s3: S3Storage):
             print("Выход.")
             return
 
-        if choice in {"1", "2", "3"}:
-            save_strategy_config(s3, int(choice))
-            print(f"Сохранена активная стратегия: {choice}")
-            continue
-
-        if choice == "4":
-            cfg = load_strategy_config(s3)
-            run_pipeline(s3, int(cfg.get("active_strategy", 1)), dry_run=True, explicit_week=None)
+        if choice in {"1", "2", "3", "4"}:
+            cfg["mode"] = "fixed"
+            cfg["active_strategy"] = int(choice)
+            save_strategy_config(s3, cfg)
+            print(f"Сохранена фиксированная стратегия: {choice}")
             continue
 
         if choice == "5":
-            cfg = load_strategy_config(s3)
-            run_pipeline(s3, int(cfg.get("active_strategy", 1)), dry_run=True, explicit_week=None)
+            cfg["mode"] = "rotation"
+            save_strategy_config(s3, cfg)
+            print("Включена недельная ротация стратегий.")
             continue
 
         if choice == "6":
-            cfg = load_strategy_config(s3)
-            run_pipeline(s3, int(cfg.get("active_strategy", 1)), dry_run=False, explicit_week=None)
+            run_pipeline(s3, dry_run=True, explicit_week=None)
+            continue
+
+        if choice == "7":
+            run_pipeline(s3, dry_run=True, explicit_week=None)
+            continue
+
+        if choice == "8":
+            run_pipeline(s3, dry_run=False, explicit_week=None)
+            continue
+
+        if choice == "9":
+            print_effectiveness_report(s3)
             continue
 
         print("Неизвестная команда.")
@@ -1175,18 +1582,23 @@ def interactive_menu(s3: S3Storage):
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Ассистент WB — управление рекламными ставками")
+    parser = argparse.ArgumentParser(description="Ассистент WB — управление рекламными ставками и тестом стратегий")
     sub = parser.add_subparsers(dest="command")
 
-    p_set = sub.add_parser("set-strategy", help="Сохранить активную стратегию")
-    p_set.add_argument("strategy_id", type=int, choices=[1, 2, 3])
+    p_set = sub.add_parser("set-strategy", help="Зафиксировать стратегию")
+    p_set.add_argument("strategy_id", type=int, choices=[1, 2, 3, 4])
 
-    p_preview = sub.add_parser("preview", help="Предпросмотр активной стратегии")
-    p_preview.add_argument("--week", type=str, default=None, help="Неделя вида 2026-W11")
+    sub.add_parser("enable-rotation", help="Включить недельную ротацию")
 
-    p_run = sub.add_parser("run", help="Запуск стратегии")
-    p_run.add_argument("--dry-run", action="store_true", help="Не отправлять ставки в WB")
-    p_run.add_argument("--week", type=str, default=None, help="Неделя вида 2026-W11")
+    p_preview = sub.add_parser("preview", help="Предпросмотр")
+    p_preview.add_argument("--week", type=str, default=None)
+
+    p_run = sub.add_parser("run", help="Запуск")
+    p_run.add_argument("--dry-run", action="store_true")
+    p_run.add_argument("--week", type=str, default=None)
+    p_run.add_argument("--strategy-id", type=int, choices=[1, 2, 3, 4], default=None)
+
+    sub.add_parser("report", help="Отчёт по эффективности стратегий")
 
     args = parser.parse_args()
 
@@ -1206,19 +1618,30 @@ def main():
         return
 
     if args.command == "set-strategy":
-        save_strategy_config(s3, args.strategy_id)
-        log(f"✅ Активная стратегия сохранена: {args.strategy_id}")
+        cfg = load_strategy_config(s3)
+        cfg["mode"] = "fixed"
+        cfg["active_strategy"] = int(args.strategy_id)
+        save_strategy_config(s3, cfg)
+        log(f"✅ Сохранена фиксированная стратегия: {args.strategy_id} — {STRATEGY_NAMES[args.strategy_id]}")
         return
 
-    cfg = load_strategy_config(s3)
-    strategy_id = int(cfg.get("active_strategy", 1))
+    if args.command == "enable-rotation":
+        cfg = load_strategy_config(s3)
+        cfg["mode"] = "rotation"
+        save_strategy_config(s3, cfg)
+        log("✅ Включена недельная ротация стратегий")
+        return
 
     if args.command == "preview":
-        run_pipeline(s3, strategy_id, dry_run=True, explicit_week=args.week)
+        run_pipeline(s3, dry_run=True, explicit_week=args.week)
         return
 
     if args.command == "run":
-        run_pipeline(s3, strategy_id, dry_run=bool(args.dry_run), explicit_week=args.week)
+        run_pipeline(s3, dry_run=bool(args.dry_run), explicit_week=args.week, forced_strategy_id=args.strategy_id)
+        return
+
+    if args.command == "report":
+        print_effectiveness_report(s3)
         return
 
 
