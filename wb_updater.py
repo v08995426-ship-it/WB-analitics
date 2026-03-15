@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
@@ -1080,20 +1083,41 @@ class WildberriesDailyUpdater:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
-        # Проверяем, не обновлялись ли данные сегодня (по файлу истории)
-        history_key = f"Отчёты/{config['folder']}/{store_name}/История_рекламы_14дней.xlsx"
-        if self.s3.file_exists(history_key):
+        # Проверяем актуальность и полноту аналитического файла
+        analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
+        required_sheets = ['Статистика_Ежедневно', 'Статистика_Итого', 'Список_кампаний', 'Отчет_по_Категории', 'Отчет_по_Категории_Итог']
+
+        if self.s3.file_exists(analytics_key):
             try:
-                df_history = self.s3.read_excel(history_key, sheet_name=0)
-                if not df_history.empty and 'Дата запроса' in df_history.columns:
-                    today_str = datetime.now().strftime('%Y-%m-%d')
-                    # Проверяем, есть ли записи с сегодняшней датой запроса
-                    today_records = df_history[df_history['Дата запроса'].str.startswith(today_str)]
-                    if not today_records.empty:
-                        self.log(f"✅ Данные рекламы за сегодня уже загружены ({len(today_records)} записей в истории). Пропускаем обновление.")
-                        return True
+                sheets_present = True
+                all_sheets_non_empty = True
+                latest_date_ok = False
+
+                for sheet in required_sheets:
+                    df = self.s3.read_excel(analytics_key, sheet_name=sheet)
+                    if df.empty:
+                        all_sheets_non_empty = False
+                        self.log(f"⚠️ Лист '{sheet}' в аналитическом файле пуст, требуется обновление")
+                        sheets_present = False
+                        break
+
+                if sheets_present and all_sheets_non_empty:
+                    daily_df = self.s3.read_excel(analytics_key, sheet_name='Статистика_Ежедневно')
+                    if 'Дата' in daily_df.columns:
+                        max_date = pd.to_datetime(daily_df['Дата']).max().date()
+                        yesterday = (datetime.now() - timedelta(days=1)).date()
+                        if max_date >= yesterday:
+                            latest_date_ok = True
+                        else:
+                            self.log(f"⚠️ Данные в аналитическом файле устарели: последняя дата {max_date}, требуется обновление до {yesterday}")
+
+                if sheets_present and all_sheets_non_empty and latest_date_ok:
+                    self.log("✅ Данные рекламы актуальны и полны. Пропускаем обновление.")
+                    return True
             except Exception as e:
-                self.log(f"⚠️ Ошибка при проверке истории рекламы: {e}, продолжаем обновление")
+                self.log(f"⚠️ Ошибка при проверке аналитического файла: {e}, продолжаем обновление")
+        else:
+            self.log("⚠️ Аналитический файл не найден, будет создан")
 
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
