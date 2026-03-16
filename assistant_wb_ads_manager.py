@@ -39,8 +39,10 @@ SERVICE_PREVIEW_KEY = f"Служебные файлы/Ассистент WB/{STO
 SERVICE_LOG_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/last_run_summary.json"
 SERVICE_SCHEDULE_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/strategy_schedule.xlsx"
 SERVICE_EFFECTIVENESS_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/strategy_effectiveness.xlsx"
+SERVICE_DECISIONS_ARCHIVE_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/decision_archive.xlsx"
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
+WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
 
 ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started", "4", "9", "11"}
 
@@ -58,7 +60,8 @@ MAX_CPC_SEARCH = 15000
 MIN_CPM_SEARCH = 4000
 MAX_CPM_SEARCH = 70000
 
-MIN_CPM_SHELVES = 5000
+# WB уже вернул минимум 8000 для combined/recommendations в твоих логах
+MIN_CPM_SHELVES = 8000
 MAX_CPM_SHELVES = 120000
 
 BAD_RATING_THRESHOLD = 4.6
@@ -68,11 +71,6 @@ GOOD_RATING_THRESHOLD = 4.8
 TOP10_BORDER = 10
 TOP20_BORDER = 20
 
-MIN_WEEK_SPEND = 300.0
-MIN_WEEK_ORDERS = 3
-
-MIN_IMPRESSIONS_SHELVES = 5000
-MIN_CLICKS_SHELVES = 40
 MIN_CTR_SHELVES = 0.40
 GOOD_CTR_SHELVES = 0.80
 
@@ -83,6 +81,9 @@ MICRO_SPEND_IGNORE = 10.0
 MICRO_AD_PROFIT_IGNORE = -5.0
 
 DEFAULT_STRATEGY_SEQUENCE = [1, 2, 3, 4]
+
+FALLBACK_BID_STEP_KOPECKS = 100
+MAX_RETRY_ROUNDS = 10
 
 STRATEGY_NAMES = {
     1: "Максимизация прибыли",
@@ -273,7 +274,7 @@ def is_micro_noise(row: pd.Series) -> bool:
 
 
 # =========================================================
-# КЛАССИФИКАЦИЯ КАМПАНИЙ
+# КАМПАНИИ
 # =========================================================
 
 def classify_campaign(row: pd.Series) -> str:
@@ -565,7 +566,7 @@ def aggregate_keywords(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# HISTORY / SCHEDULE / EFFECTIVENESS
+# HISTORY / SCHEDULE / EFFECTIVENESS / ARCHIVE
 # =========================================================
 
 def load_bid_history(s3: S3Storage) -> pd.DataFrame:
@@ -577,9 +578,7 @@ def load_bid_history(s3: S3Storage) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     try:
         df = s3.read_excel(SERVICE_HISTORY_KEY, sheet_name=0)
-        if df.empty:
-            return pd.DataFrame(columns=cols)
-        return df
+        return df if not df.empty else pd.DataFrame(columns=cols)
     except Exception:
         return pd.DataFrame(columns=cols)
 
@@ -594,9 +593,7 @@ def load_schedule(s3: S3Storage) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     try:
         df = s3.read_excel(SERVICE_SCHEDULE_KEY, sheet_name=0)
-        if df.empty:
-            return pd.DataFrame(columns=cols)
-        return df
+        return df if not df.empty else pd.DataFrame(columns=cols)
     except Exception:
         return pd.DataFrame(columns=cols)
 
@@ -617,15 +614,61 @@ def load_effectiveness(s3: S3Storage) -> pd.DataFrame:
         return pd.DataFrame(columns=cols)
     try:
         df = s3.read_excel(SERVICE_EFFECTIVENESS_KEY, sheet_name=0)
-        if df.empty:
-            return pd.DataFrame(columns=cols)
-        return df
+        return df if not df.empty else pd.DataFrame(columns=cols)
     except Exception:
         return pd.DataFrame(columns=cols)
 
 
 def save_effectiveness(s3: S3Storage, df: pd.DataFrame):
     s3.write_excel_sheets(SERVICE_EFFECTIVENESS_KEY, {"effectiveness": df})
+
+
+def load_decision_archive(s3: S3Storage) -> Dict[str, pd.DataFrame]:
+    if not s3.file_exists(SERVICE_DECISIONS_ARCHIVE_KEY):
+        return {
+            "Решения": pd.DataFrame(),
+            "Расчёт логики": pd.DataFrame(),
+            "Отправка WB": pd.DataFrame(),
+        }
+    try:
+        sheets = s3.read_excel_all_sheets(SERVICE_DECISIONS_ARCHIVE_KEY)
+        for name in ["Решения", "Расчёт логики", "Отправка WB"]:
+            if name not in sheets:
+                sheets[name] = pd.DataFrame()
+        return sheets
+    except Exception:
+        return {
+            "Решения": pd.DataFrame(),
+            "Расчёт логики": pd.DataFrame(),
+            "Отправка WB": pd.DataFrame(),
+        }
+
+
+def save_decision_archive(
+    s3: S3Storage,
+    decisions_df: pd.DataFrame,
+    logic_df: pd.DataFrame,
+    send_log_df: pd.DataFrame
+):
+    current = load_decision_archive(s3)
+
+    new_decisions = pd.concat([current["Решения"], decisions_df], ignore_index=True) if decisions_df is not None else current["Решения"]
+    new_logic = pd.concat([current["Расчёт логики"], logic_df], ignore_index=True) if logic_df is not None else current["Расчёт логики"]
+    new_send = pd.concat([current["Отправка WB"], send_log_df], ignore_index=True) if send_log_df is not None else current["Отправка WB"]
+
+    # Храним последние 50000 строк
+    if len(new_decisions) > 50000:
+        new_decisions = new_decisions.tail(50000).reset_index(drop=True)
+    if len(new_logic) > 50000:
+        new_logic = new_logic.tail(50000).reset_index(drop=True)
+    if len(new_send) > 50000:
+        new_send = new_send.tail(50000).reset_index(drop=True)
+
+    s3.write_excel_sheets(SERVICE_DECISIONS_ARCHIVE_KEY, {
+        "Решения": new_decisions,
+        "Расчёт логики": new_logic,
+        "Отправка WB": new_send,
+    })
 
 
 # =========================================================
@@ -722,7 +765,7 @@ def build_campaign_week_metrics(
 
 
 # =========================================================
-# СТРАТЕГИИ
+# STRATEGIES
 # =========================================================
 
 @dataclass
@@ -753,6 +796,32 @@ def stop_factors(row: pd.Series) -> Optional[str]:
     return None
 
 
+def make_logic_row(row: pd.Series, strategy_id: int, reason: str, action: str) -> Dict[str, Any]:
+    return {
+        "Дата расчёта": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Неделя": row.get("Неделя", ""),
+        "Стратегия": strategy_id,
+        "Название стратегии": STRATEGY_NAMES.get(strategy_id, ""),
+        "ID кампании": safe_int(row.get("ID кампании")),
+        "Название кампании": str(row.get("Название", "")),
+        "Артикул WB": safe_int(row.get("Артикул WB")),
+        "Тип кампании": str(row.get("Тип кампании", "")),
+        "Расход за неделю": safe_float(row.get("Расход за неделю")),
+        "Сумма заказов за неделю": safe_float(row.get("Сумма заказов за неделю")),
+        "Заказы за неделю": safe_float(row.get("Заказы за неделю")),
+        "CTR, % факт": safe_float(row.get("CTR, % факт")),
+        "CR, % факт": safe_float(row.get("CR, % факт")),
+        "ДРР, % факт": safe_float(row.get("ДРР, % факт")),
+        "Ожидаемая чистая прибыль рекламы, руб": safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб")),
+        "Чистая прибыль, руб/ед": safe_float(row.get("Чистая прибыль, руб/ед")),
+        "Рейтинг отзывов": safe_float(row.get("Рейтинг отзывов")),
+        "Медианная позиция заказных ключей": safe_float(row.get("Медианная позиция заказных ключей")),
+        "Доля трафика, %": safe_float(row.get("Доля трафика, %")),
+        "Действие": action,
+        "Причина": reason,
+    }
+
+
 def decide_profit_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
     ctype = str(row.get("Тип кампании"))
     rating = safe_float(row.get("Рейтинг отзывов"))
@@ -767,14 +836,13 @@ def decide_profit_strategy(row: pd.Series, config: dict, week_label: str) -> Opt
 
     sf = stop_factors(row)
     if sf:
-        action = "DOWN"
         if ctype == "cpm_shelves":
             current = safe_int(row.get("Текущая ставка рекомендации, коп"))
             new = clamp(current - STEP_CPM_BIG, MIN_CPM_SHELVES, MAX_CPM_SHELVES)
             if new == current:
                 return None
             return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
-                            str(row.get("Название", "")), ctype, action, sf, 0, 0, current, new, week_label)
+                            str(row.get("Название", "")), ctype, "DOWN", sf, 0, 0, current, new, week_label)
         else:
             current = safe_int(row.get("Текущая ставка поиск, коп"))
             min_v = MIN_CPC_SEARCH if ctype == "cpc_search" else MIN_CPM_SEARCH
@@ -784,7 +852,7 @@ def decide_profit_strategy(row: pd.Series, config: dict, week_label: str) -> Opt
             if new == current:
                 return None
             return Decision(1, STRATEGY_NAMES[1], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
-                            str(row.get("Название", "")), ctype, action, sf, current, new, 0, 0, week_label)
+                            str(row.get("Название", "")), ctype, "DOWN", sf, current, new, 0, 0, week_label)
 
     if ctype == "cpm_shelves":
         current = safe_int(row.get("Текущая ставка рекомендации, коп"))
@@ -1096,8 +1164,12 @@ def decide_traffic_share_strategy(row: pd.Series, config: dict, week_label: str)
     return None
 
 
-def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, week_label: str) -> List[Decision]:
+def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, week_label: str) -> Tuple[List[Decision], pd.DataFrame]:
     decisions: List[Decision] = []
+    logic_rows: List[Dict[str, Any]] = []
+
+    metrics_df = metrics_df.copy()
+    metrics_df["Неделя"] = week_label
 
     for _, row in metrics_df.iterrows():
         ctype = str(row.get("Тип кампании", "unknown"))
@@ -1116,20 +1188,17 @@ def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, we
 
         if decision:
             decisions.append(decision)
+            logic_rows.append(make_logic_row(row, strategy_id, decision.reason, decision.action))
 
-    return decisions
+    logic_df = pd.DataFrame(logic_rows)
+    return decisions, logic_df
 
 
 # =========================================================
-# WB API PAYLOAD
+# WB MIN BIDS / PAYLOAD
 # =========================================================
 
 def detect_wb_placement(row: pd.Series, decision: Decision) -> str:
-    """
-    WB:
-    - combined -> единая ставка
-    - search / recommendations -> ручная ставка
-    """
     bid_type = str(row.get("Тип ставки", "")).strip().lower()
     campaign_type = str(row.get("Тип кампании", "")).strip().lower()
 
@@ -1142,9 +1211,89 @@ def detect_wb_placement(row: pd.Series, decision: Decision) -> str:
     return "search"
 
 
+def placement_for_min_bids_api(placement: str) -> str:
+    if placement == "recommendations":
+        return "recommendation"
+    return placement
+
+
+def extract_payment_type_for_advert(metrics_df: pd.DataFrame, advert_id: int) -> str:
+    rows = metrics_df[metrics_df["ID кампании"] == advert_id]
+    if rows.empty:
+        return "cpm"
+
+    payment_type = str(rows.iloc[0].get("Тип оплаты", "")).strip().lower()
+    if payment_type in {"cpm", "cpc"}:
+        return payment_type
+
+    campaign_type = str(rows.iloc[0].get("Тип кампании", "")).strip().lower()
+    if campaign_type == "cpc_search":
+        return "cpc"
+    return "cpm"
+
+
+def fetch_min_bids_for_advert(
+    api_key: str,
+    advert_id: int,
+    nm_ids: List[int],
+    payment_type: str,
+    placements: List[str],
+) -> Dict[Tuple[int, str], int]:
+    headers = {
+        "Authorization": api_key.strip(),
+        "Content-Type": "application/json",
+    }
+
+    req_payload = {
+        "advert_id": int(advert_id),
+        "nm_ids": [int(x) for x in nm_ids],
+        "payment_type": payment_type,
+        "placement_types": [placement_for_min_bids_api(p) for p in placements],
+    }
+
+    resp = requests.post(WB_BIDS_MIN_URL, headers=headers, json=req_payload, timeout=120)
+    resp.raise_for_status()
+
+    data = resp.json()
+    result: Dict[Tuple[int, str], int] = {}
+
+    for item in data.get("bids", []):
+        nm_id = safe_int(item.get("nm_id"))
+        for bid_item in item.get("bids", []):
+            bid_type = str(bid_item.get("type", "")).strip().lower()
+            bid_val = safe_int(bid_item.get("value", 0))
+
+            if bid_type == "recommendation":
+                bid_type = "recommendations"
+
+            if nm_id > 0 and bid_type:
+                result[(nm_id, bid_type)] = bid_val
+
+    return result
+
+
+def normalize_bid_for_wb(
+    bid_value: int,
+    placement: str,
+    known_min_bid: Optional[int] = None,
+) -> int:
+    bid_value = int(bid_value)
+
+    if known_min_bid is not None and known_min_bid > 0:
+        return max(bid_value, int(known_min_bid))
+
+    if placement == "combined":
+        return max(bid_value, 8000)
+    if placement == "recommendations":
+        return max(bid_value, 8000)
+    if placement == "search":
+        return max(bid_value, 400)
+
+    return bid_value
+
+
 def decisions_to_payload(decisions: List[Decision], metrics_df: pd.DataFrame) -> Dict[str, Any]:
     metrics_lookup = metrics_df.set_index(["ID кампании", "Артикул WB"], drop=False)
-
     grouped: Dict[int, Dict[str, Any]] = {}
 
     for d in decisions:
@@ -1170,7 +1319,7 @@ def decisions_to_payload(decisions: List[Decision], metrics_df: pd.DataFrame) ->
 
         grouped[d.id_campaign]["nm_bids"].append({
             "nm_id": int(d.nm_id),
-            "bid_kopecks": int(bid_value),
+            "bid_kopecks": normalize_bid_for_wb(int(bid_value), placement),
             "placement": placement,
         })
 
@@ -1179,8 +1328,6 @@ def decisions_to_payload(decisions: List[Decision], metrics_df: pd.DataFrame) ->
         nm_bids = advert["nm_bids"]
         if not nm_bids:
             continue
-
-        # режем по 50 nm_bids на кампанию
         for i in range(0, len(nm_bids), 50):
             bids.append({
                 "advert_id": advert["advert_id"],
@@ -1190,10 +1337,163 @@ def decisions_to_payload(decisions: List[Decision], metrics_df: pd.DataFrame) ->
     return {"bids": bids}
 
 
-def send_batches(payload: Dict[str, Any], api_key: str, dry_run: bool = True) -> Tuple[int, int]:
+def enrich_payload_with_min_bids(
+    payload: Dict[str, Any],
+    metrics_df: pd.DataFrame,
+    api_key: str,
+) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    bids_list = payload.get("bids", [])
+    if not bids_list:
+        return payload, pd.DataFrame()
+
+    new_bids = []
+    log_rows = []
+
+    for advert_block in bids_list:
+        advert_id = safe_int(advert_block.get("advert_id"))
+        nm_bids = advert_block.get("nm_bids", [])
+
+        if not advert_id or not nm_bids:
+            continue
+
+        nm_ids = [safe_int(x.get("nm_id")) for x in nm_bids if safe_int(x.get("nm_id")) > 0]
+        placements = list(sorted(set(str(x.get("placement", "")).strip().lower() for x in nm_bids if x.get("placement"))))
+        payment_type = extract_payment_type_for_advert(metrics_df, advert_id)
+
+        min_map: Dict[Tuple[int, str], int] = {}
+        min_fetch_status = "ok"
+        try:
+            min_map = fetch_min_bids_for_advert(
+                api_key=api_key,
+                advert_id=advert_id,
+                nm_ids=nm_ids,
+                payment_type=payment_type,
+                placements=placements,
+            )
+        except Exception as e:
+            min_fetch_status = f"error: {e}"
+            log(f"⚠️ Не удалось получить min bids для advert_id={advert_id}: {e}")
+
+        adjusted_nm_bids = []
+        for nm_bid in nm_bids:
+            nm_id = safe_int(nm_bid.get("nm_id"))
+            placement = str(nm_bid.get("placement", "")).strip().lower()
+            old_bid = safe_int(nm_bid.get("bid_kopecks"))
+            known_min = min_map.get((nm_id, placement))
+            new_bid = normalize_bid_for_wb(old_bid, placement, known_min)
+
+            adjusted_nm_bids.append({
+                "nm_id": nm_id,
+                "bid_kopecks": new_bid,
+                "placement": placement,
+            })
+
+            log_rows.append({
+                "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ID кампании": advert_id,
+                "Артикул WB": nm_id,
+                "Placement": placement,
+                "Тип оплаты": payment_type,
+                "Исходная ставка, коп": old_bid,
+                "Минимальная ставка WB, коп": known_min if known_min is not None else "",
+                "Ставка после нормализации, коп": new_bid,
+                "Статус получения min": min_fetch_status,
+            })
+
+        new_bids.append({
+            "advert_id": advert_id,
+            "nm_bids": adjusted_nm_bids,
+        })
+
+    return {"bids": new_bids}, pd.DataFrame(log_rows)
+
+
+def bump_payload_bids(payload: Dict[str, Any], step_kopecks: int = FALLBACK_BID_STEP_KOPECKS) -> Dict[str, Any]:
+    new_bids = []
+
+    for advert_block in payload.get("bids", []):
+        adjusted_nm_bids = []
+
+        for nm_bid in advert_block.get("nm_bids", []):
+            bid_kopecks = safe_int(nm_bid.get("bid_kopecks"))
+            placement = str(nm_bid.get("placement", "")).strip().lower()
+
+            bumped = bid_kopecks + step_kopecks
+            bumped = normalize_bid_for_wb(bumped, placement=placement, known_min_bid=None)
+
+            adjusted_nm_bids.append({
+                "nm_id": safe_int(nm_bid.get("nm_id")),
+                "bid_kopecks": bumped,
+                "placement": placement,
+            })
+
+        new_bids.append({
+            "advert_id": safe_int(advert_block.get("advert_id")),
+            "nm_bids": adjusted_nm_bids,
+        })
+
+    return {"bids": new_bids}
+
+
+def is_wrong_bid_value_error(response_text: str) -> bool:
+    txt = str(response_text).lower()
+    return "wrong bid value" in txt
+
+
+def extract_min_bid_from_error(response_text: str) -> Optional[int]:
+    m = re.search(r"min:\s*(\d+)", str(response_text).lower())
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def apply_min_from_error_to_payload(payload: Dict[str, Any], min_bid: int) -> Dict[str, Any]:
+    new_bids = []
+
+    for advert_block in payload.get("bids", []):
+        adjusted_nm_bids = []
+        for nm_bid in advert_block.get("nm_bids", []):
+            placement = str(nm_bid.get("placement", "")).strip().lower()
+            bid_kopecks = safe_int(nm_bid.get("bid_kopecks"))
+
+            adjusted_nm_bids.append({
+                "nm_id": safe_int(nm_bid.get("nm_id")),
+                "bid_kopecks": normalize_bid_for_wb(bid_kopecks, placement=placement, known_min_bid=min_bid),
+                "placement": placement,
+            })
+
+        new_bids.append({
+            "advert_id": safe_int(advert_block.get("advert_id")),
+            "nm_bids": adjusted_nm_bids,
+        })
+
+    return {"bids": new_bids}
+
+
+# =========================================================
+# SEND WB
+# =========================================================
+
+def send_batches(
+    payload: Dict[str, Any],
+    api_key: str,
+    metrics_df: pd.DataFrame,
+    dry_run: bool = True
+) -> Tuple[int, int, pd.DataFrame]:
+    send_log_rows = []
+
     if dry_run:
         log("🧪 dry-run: отправка ставок отключена")
-        return len(payload.get("bids", [])), 0
+        for advert in payload.get("bids", []):
+            send_log_rows.append({
+                "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ID кампании": safe_int(advert.get("advert_id")),
+                "Попытка": 0,
+                "Статус": "dry-run",
+                "HTTP статус": "",
+                "Ответ WB": "",
+            })
+        return len(payload.get("bids", [])), 0, pd.DataFrame(send_log_rows)
 
     headers = {
         "Authorization": api_key.strip(),
@@ -1203,7 +1503,7 @@ def send_batches(payload: Dict[str, Any], api_key: str, dry_run: bool = True) ->
     all_bids = payload.get("bids", [])
     if not all_bids:
         log("ℹ️ Пустой payload, отправлять нечего")
-        return 0, 0
+        return 0, 0, pd.DataFrame(send_log_rows)
 
     success = 0
     failed = 0
@@ -1215,28 +1515,105 @@ def send_batches(payload: Dict[str, Any], api_key: str, dry_run: bool = True) ->
         batch_payload = {"bids": batch}
         log(f"📤 Отправка батча {idx}/{len(batches)}: кампаний {len(batch)}")
 
-        try:
-            resp = requests.patch(
-                WB_BIDS_URL,
-                headers=headers,
-                json=batch_payload,
-                timeout=120
-            )
+        attempt_payload, min_log_df = enrich_payload_with_min_bids(
+            payload=batch_payload,
+            metrics_df=metrics_df,
+            api_key=api_key,
+        )
+        if not min_log_df.empty:
+            for _, rr in min_log_df.iterrows():
+                send_log_rows.append({
+                    "Дата": rr["Дата"],
+                    "ID кампании": rr["ID кампании"],
+                    "Попытка": 0,
+                    "Статус": "min_bids_loaded",
+                    "HTTP статус": "",
+                    "Ответ WB": f"placement={rr['Placement']}; old={rr['Исходная ставка, коп']}; min={rr['Минимальная ставка WB, коп']}; new={rr['Ставка после нормализации, коп']}; status={rr['Статус получения min']}",
+                })
 
-            if resp.status_code == 200:
-                success += len(batch)
-                log(f"✅ Батч {idx} успешно применён")
-                time.sleep(0.25)
-            else:
-                failed += len(batch)
-                allow_header = resp.headers.get("Allow", "")
-                log(f"⚠️ Ошибка WB {resp.status_code}, Allow={allow_header}: {resp.text[:1000]}")
-                log(f"⚠️ Проблемный payload батча {idx}: {json.dumps(batch_payload, ensure_ascii=False)[:3000]}")
-        except Exception as e:
+        sent_ok = False
+
+        for attempt in range(1, MAX_RETRY_ROUNDS + 1):
+            try:
+                resp = requests.patch(
+                    WB_BIDS_URL,
+                    headers=headers,
+                    json=attempt_payload,
+                    timeout=120
+                )
+
+                if resp.status_code == 200:
+                    success += len(batch)
+                    log(f"✅ Батч {idx} успешно применён с попытки {attempt}")
+                    send_log_rows.append({
+                        "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                        "Попытка": attempt,
+                        "Статус": "success",
+                        "HTTP статус": 200,
+                        "Ответ WB": resp.text[:2000],
+                    })
+                    sent_ok = True
+                    time.sleep(0.25)
+                    break
+
+                response_text = resp.text[:3000]
+                log(f"⚠️ Ошибка WB {resp.status_code}: {response_text}")
+
+                send_log_rows.append({
+                    "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                    "Попытка": attempt,
+                    "Статус": "error",
+                    "HTTP статус": resp.status_code,
+                    "Ответ WB": response_text,
+                })
+
+                if resp.status_code == 400 and is_wrong_bid_value_error(response_text):
+                    min_bid = extract_min_bid_from_error(response_text)
+
+                    if min_bid is not None:
+                        log(f"🔁 WB вернул минимальную ставку {min_bid}, корректирую payload и пробую снова")
+                        attempt_payload = apply_min_from_error_to_payload(attempt_payload, min_bid)
+                    else:
+                        log(f"🔁 Минимум из ошибки не извлечён, повышаю ставки на +{FALLBACK_BID_STEP_KOPECKS} коп и пробую снова")
+                        attempt_payload = bump_payload_bids(attempt_payload, step_kopecks=FALLBACK_BID_STEP_KOPECKS)
+
+                    time.sleep(0.3)
+                    continue
+
+                break
+
+            except Exception as e:
+                log(f"⚠️ Исключение отправки батча {idx}, попытка {attempt}: {e}")
+                send_log_rows.append({
+                    "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                    "Попытка": attempt,
+                    "Статус": "exception",
+                    "HTTP статус": "",
+                    "Ответ WB": str(e),
+                })
+                if attempt < MAX_RETRY_ROUNDS:
+                    attempt_payload = bump_payload_bids(attempt_payload, step_kopecks=FALLBACK_BID_STEP_KOPECKS)
+                    time.sleep(0.5)
+                    continue
+                break
+
+        if not sent_ok:
             failed += len(batch)
-            log(f"⚠️ Исключение отправки: {e}")
+            log(f"⚠️ Батч {idx} не отправлен после {MAX_RETRY_ROUNDS} попыток")
+            log(f"⚠️ Финальный payload батча {idx}: {json.dumps(attempt_payload, ensure_ascii=False)[:4000]}")
+            send_log_rows.append({
+                "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                "Попытка": MAX_RETRY_ROUNDS,
+                "Статус": "final_failed",
+                "HTTP статус": "",
+                "Ответ WB": json.dumps(attempt_payload, ensure_ascii=False)[:4000],
+            })
 
-    return success, failed
+    return success, failed, pd.DataFrame(send_log_rows)
 
 
 # =========================================================
@@ -1396,27 +1773,25 @@ def evaluate_strategy_week(metrics_df: pd.DataFrame, week_label: str, strategy_i
     avg_share = round(safe_float(metrics_df["Доля трафика, %"].replace(0, pd.NA).mean()), 2)
     avg_rating = round(safe_float(metrics_df["Рейтинг отзывов"].replace(0, pd.NA).mean()), 2)
 
-    conclusion_parts = []
+    parts = []
     if ad_profit > 0:
-        conclusion_parts.append("стратегия дала положительную чистую прибыль рекламы")
+        parts.append("стратегия дала положительную чистую прибыль рекламы")
     else:
-        conclusion_parts.append("стратегия не дала положительную чистую прибыль рекламы")
+        parts.append("стратегия не дала положительную чистую прибыль рекламы")
 
     if drr <= 15:
-        conclusion_parts.append("ДРР в хорошем диапазоне")
+        parts.append("ДРР в хорошем диапазоне")
     elif drr <= 20:
-        conclusion_parts.append("ДРР приемлемый")
+        parts.append("ДРР приемлемый")
     else:
-        conclusion_parts.append("ДРР высокий")
+        parts.append("ДРР высокий")
 
     if avg_pos and avg_pos <= TOP10_BORDER:
-        conclusion_parts.append("позиции сильные")
+        parts.append("позиции сильные")
     elif avg_pos and avg_pos <= TOP20_BORDER:
-        conclusion_parts.append("позиции средние")
+        parts.append("позиции средние")
     elif avg_pos:
-        conclusion_parts.append("позиции слабые")
-
-    conclusion = "; ".join(conclusion_parts)
+        parts.append("позиции слабые")
 
     return {
         "Неделя": week_label,
@@ -1434,7 +1809,7 @@ def evaluate_strategy_week(metrics_df: pd.DataFrame, week_label: str, strategy_i
         "Средняя позиция": avg_pos,
         "Средняя доля трафика, %": avg_share,
         "Средний рейтинг": avg_rating,
-        "Вывод": conclusion,
+        "Вывод": "; ".join(parts),
     }
 
 
@@ -1511,7 +1886,7 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
 
     metrics_df = build_campaign_week_metrics(stats_df, campaigns_df, economics_df, keywords_agg_df)
 
-    decisions = build_decisions(metrics_df, strategy_id, cfg, week_label)
+    decisions, logic_df = build_decisions(metrics_df, strategy_id, cfg, week_label)
     decisions_df = decisions_to_df(decisions, metrics_df)
 
     schedule_df = load_schedule(s3)
@@ -1553,9 +1928,12 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
         show_cols = [c for c in show_cols if c in decisions_df.columns]
         print(decisions_df[show_cols].head(80).to_string(index=False))
 
+    send_log_df = pd.DataFrame()
+
     if not decisions:
         log("ℹ️ Нет изменений ставок")
         update_effectiveness_analytics(s3, cfg)
+        save_decision_archive(s3, decisions_df, logic_df, send_log_df)
         return
 
     payload = decisions_to_payload(decisions, metrics_df)
@@ -1563,10 +1941,11 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
     if not wb_key:
         raise RuntimeError("Не задан секрет WB_PROMO_KEY_TOPFACE")
 
-    success, failed = send_batches(payload, wb_key, dry_run=dry_run)
+    success, failed, send_log_df = send_batches(payload, wb_key, metrics_df, dry_run=dry_run)
     log(f"✅ Успешно обработано кампаний: {success}")
     log(f"⚠️ Не обработано кампаний: {failed}")
 
+    save_decision_archive(s3, decisions_df, logic_df, send_log_df)
     update_effectiveness_analytics(s3, cfg)
 
 
