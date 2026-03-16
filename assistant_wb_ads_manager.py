@@ -1201,8 +1201,14 @@ def enrich_payload_with_min_bids(payload: Dict[str, Any], metrics_df: pd.DataFra
 # =========================================================
 # SEND WB
 # =========================================================
-def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame, dry_run: bool = True) -> Tuple[int, int, pd.DataFrame]:
+def send_batches(
+    payload: Dict[str, Any],
+    api_key: str,
+    metrics_df: pd.DataFrame,
+    dry_run: bool = True
+) -> Tuple[int, int, pd.DataFrame]:
     send_log_rows = []
+
     if dry_run:
         log("🧪 dry-run: отправка ставок отключена")
         for advert in payload.get("bids", []):
@@ -1216,7 +1222,11 @@ def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame
             })
         return len(payload.get("bids", [])), 0, pd.DataFrame(send_log_rows)
 
-    headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
+    headers = {
+        "Authorization": api_key.strip(),
+        "Content-Type": "application/json",
+    }
+
     all_bids = payload.get("bids", [])
     if not all_bids:
         log("ℹ️ Пустой payload, отправлять нечего")
@@ -1224,14 +1234,26 @@ def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame
 
     success = 0
     failed = 0
-    batch_size = 50
-    batches = [all_bids[i:i+batch_size] for i in range(0, len(all_bids), batch_size)]
 
-    for idx, batch in enumerate(batches, start=1):
-        batch_payload = {"bids": batch}
-        log(f"📤 Отправка батча {idx}/{len(batches)}: кампаний {len(batch)}")
+    total = len(all_bids)
 
-        attempt_payload, min_log_df = enrich_payload_with_min_bids(payload=batch_payload, metrics_df=metrics_df, api_key=api_key)
+    for idx, advert in enumerate(all_bids, start=1):
+        advert_id = safe_int(advert.get("advert_id"))
+        advert_payload = {"bids": [advert]}
+
+        log(f"📤 Отправка кампании {idx}/{total}: advert_id={advert_id}")
+
+        try:
+            enriched_payload, min_log_df = enrich_payload_with_min_bids(
+                payload=advert_payload,
+                metrics_df=metrics_df,
+                api_key=api_key,
+            )
+        except Exception as e:
+            log(f"⚠️ Не удалось подготовить advert_id={advert_id}: {e}")
+            enriched_payload = advert_payload
+            min_log_df = pd.DataFrame()
+
         if not min_log_df.empty:
             for _, rr in min_log_df.iterrows():
                 send_log_rows.append({
@@ -1240,19 +1262,33 @@ def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame
                     "Попытка": 0,
                     "Статус": "min_bids_loaded",
                     "HTTP статус": "",
-                    "Ответ WB": f"placement={rr['Placement']}; old={rr['Исходная ставка, коп']}; min={rr['Минимальная ставка WB, коп']}; new={rr['Ставка после нормализации, коп']}; status={rr['Статус получения min']}",
+                    "Ответ WB": (
+                        f"placement={rr['Placement']}; "
+                        f"old={rr['Исходная ставка, коп']}; "
+                        f"min={rr['Минимальная ставка WB, коп']}; "
+                        f"new={rr['Ставка после нормализации, коп']}; "
+                        f"status={rr['Статус получения min']}"
+                    ),
                 })
 
         sent_ok = False
+        attempt_payload = enriched_payload
+
         for attempt in range(1, MAX_RETRY_ROUNDS + 1):
             try:
-                resp = requests.patch(WB_BIDS_URL, headers=headers, json=attempt_payload, timeout=120)
+                resp = requests.patch(
+                    WB_BIDS_URL,
+                    headers=headers,
+                    json=attempt_payload,
+                    timeout=120
+                )
+
                 if resp.status_code == 200:
-                    success += len(batch)
-                    log(f"✅ Батч {idx} успешно применён с попытки {attempt}")
+                    success += 1
+                    log(f"✅ advert_id={advert_id} успешно применён с попытки {attempt}")
                     send_log_rows.append({
                         "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                        "ID кампании": advert_id,
                         "Попытка": attempt,
                         "Статус": "success",
                         "HTTP статус": 200,
@@ -1263,53 +1299,98 @@ def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame
                     break
 
                 response_text = resp.text[:3000]
-                log(f"⚠️ Ошибка WB {resp.status_code}: {response_text}")
+                log(f"⚠️ Ошибка WB advert_id={advert_id} {resp.status_code}: {response_text}")
 
                 send_log_rows.append({
                     "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                    "ID кампании": advert_id,
                     "Попытка": attempt,
                     "Статус": "error",
                     "HTTP статус": resp.status_code,
                     "Ответ WB": response_text,
                 })
 
+                lowered = response_text.lower()
+
+                if resp.status_code == 400 and "nomenclature" in lowered and "not found in advert" in lowered:
+                    log(f"⛔ advert_id={advert_id}: nm_id не найден в кампании, пропускаю эту кампанию")
+                    break
+
                 if resp.status_code == 400 and is_wrong_bid_value_error(response_text):
-                    limits = extract_bid_limits_from_error(response_text)
-                    if limits:
-                        log(f"🔁 WB вернул лимиты: {limits}, корректирую payload")
-                        attempt_payload = apply_limits_to_payload(attempt_payload, limits)
+                    min_bid = extract_min_bid_from_error(response_text)
+                    max_match = re.search(r"max:\s*(\d+)", lowered)
+
+                    if max_match:
+                        max_bid = int(max_match.group(1))
+                        log(f"🔁 advert_id={advert_id}: WB вернул max={max_bid}, понижаю ставку и пробую снова")
+
+                        fixed_bids = []
+                        for advert_block in attempt_payload.get("bids", []):
+                            new_nm_bids = []
+                            for nm_bid in advert_block.get("nm_bids", []):
+                                placement = str(nm_bid.get("placement", "")).strip().lower()
+                                bid_kopecks = safe_int(nm_bid.get("bid_kopecks"))
+                                bid_kopecks = min(bid_kopecks, max_bid)
+                                bid_kopecks = normalize_bid_for_wb(
+                                    bid_value=bid_kopecks,
+                                    placement=placement,
+                                    known_min_bid=None,
+                                )
+                                new_nm_bids.append({
+                                    "nm_id": safe_int(nm_bid.get("nm_id")),
+                                    "bid_kopecks": bid_kopecks,
+                                    "placement": placement,
+                                })
+
+                            fixed_bids.append({
+                                "advert_id": safe_int(advert_block.get("advert_id")),
+                                "nm_bids": new_nm_bids,
+                            })
+
+                        attempt_payload = {"bids": fixed_bids}
+                        time.sleep(0.3)
+                        continue
+
+                    if min_bid is not None:
+                        log(f"🔁 advert_id={advert_id}: WB вернул min={min_bid}, корректирую payload и пробую снова")
+                        attempt_payload = apply_min_from_error_to_payload(attempt_payload, min_bid)
                     else:
-                        log(f"🔁 Не удалось извлечь лимиты, повышаю ставки на +{FALLBACK_BID_STEP_KOPECKS} коп")
+                        log(f"🔁 advert_id={advert_id}: минимум не извлечён, повышаю ставки на +{FALLBACK_BID_STEP_KOPECKS} коп")
                         attempt_payload = bump_payload_bids(attempt_payload, step_kopecks=FALLBACK_BID_STEP_KOPECKS)
+
                     time.sleep(0.3)
                     continue
 
-                break  # другая ошибка – выходим
+                if resp.status_code == 429:
+                    wait_s = min(1 + attempt, 10)
+                    log(f"⚠️ 429 Too Many Requests для advert_id={advert_id}, повтор через {wait_s}с (попытка {attempt}/{MAX_RETRY_ROUNDS})")
+                    time.sleep(wait_s)
+                    continue
+
+                break
 
             except Exception as e:
-                log(f"⚠️ Исключение отправки батча {idx}, попытка {attempt}: {e}")
+                log(f"⚠️ Исключение отправки advert_id={advert_id}, попытка {attempt}: {e}")
                 send_log_rows.append({
                     "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                    "ID кампании": advert_id,
                     "Попытка": attempt,
                     "Статус": "exception",
                     "HTTP статус": "",
                     "Ответ WB": str(e),
                 })
                 if attempt < MAX_RETRY_ROUNDS:
-                    attempt_payload = bump_payload_bids(attempt_payload, step_kopecks=FALLBACK_BID_STEP_KOPECKS)
-                    time.sleep(0.5)
+                    time.sleep(min(1 + attempt, 10))
                     continue
                 break
 
         if not sent_ok:
-            failed += len(batch)
-            log(f"⚠️ Батч {idx} не отправлен после {MAX_RETRY_ROUNDS} попыток")
-            log(f"⚠️ Финальный payload батча {idx}: {json.dumps(attempt_payload, ensure_ascii=False)[:4000]}")
+            failed += 1
+            log(f"⚠️ advert_id={advert_id} не применён")
+            log(f"⚠️ Финальный payload advert_id={advert_id}: {json.dumps(attempt_payload, ensure_ascii=False)[:4000]}")
             send_log_rows.append({
                 "Дата": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "ID кампании": ",".join(str(x.get("advert_id")) for x in batch),
+                "ID кампании": advert_id,
                 "Попытка": MAX_RETRY_ROUNDS,
                 "Статус": "final_failed",
                 "HTTP статус": "",
@@ -1317,7 +1398,6 @@ def send_batches(payload: Dict[str, Any], api_key: str, metrics_df: pd.DataFrame
             })
 
     return success, failed, pd.DataFrame(send_log_rows)
-
 # =========================================================
 # PREVIEW / SUMMARY
 # =========================================================
