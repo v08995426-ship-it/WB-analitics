@@ -46,7 +46,7 @@ jobs:
         run: |
           test -f assistant_wb_ads_manager.py
 
-      - name: Scheduled run at 06:00 Moscow in dry-run mode
+      - name: Scheduled production run at 06:00 Moscow
         if: ${{ github.event_name == 'schedule' }}
         env:
           YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
@@ -54,7 +54,7 @@ jobs:
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
         run: |
-          python assistant_wb_ads_manager.py run --dry-run
+          python assistant_wb_ads_manager.py run
 
       - name: Manual set fixed strategy
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'set-strategy' && github.event.inputs.strategy_id != '' }}
