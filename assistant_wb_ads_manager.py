@@ -395,8 +395,10 @@ def load_advertising_data(s3: S3Storage, week_label: str, week_start: date, week
     return stats_df, campaigns_df
 
 # =========================================================
-# ЭКОНОМИКА
+# ЭКОНОМИКА (с фильтрацией по категориям)
 # =========================================================
+TARGET_PRODUCT_CATEGORIES = ["кисти косметические", "блески", "помады", "косметические карандаши"]
+
 def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
     if not s3.file_exists(ECONOMICS_KEY):
         raise RuntimeError(f"Не найден файл экономики: {ECONOMICS_KEY}")
@@ -410,6 +412,16 @@ def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
     df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
     df = df[df["Неделя"] == week_label].dropna(subset=["Артикул WB"]).copy()
     df["Артикул WB"] = df["Артикул WB"].astype("int64")
+
+    # Фильтрация по целевым категориям товаров
+    if "Предмет" in df.columns:
+        df["Предмет_clean"] = df["Предмет"].astype(str).str.lower().str.strip()
+        mask = df["Предмет_clean"].apply(lambda x: any(cat in x for cat in TARGET_PRODUCT_CATEGORIES))
+        df = df[mask].drop(columns=["Предмет_clean"])
+        log(f"✅ После фильтрации по категориям осталось SKU: {len(df)}")
+    else:
+        log("⚠️ Колонка 'Предмет' не найдена, фильтрация не применяется")
+
     numeric_cols = [
         "Продажи, шт", "Возвраты, шт", "Чистые продажи, шт", "Процент выкупа",
         "Средняя цена продажи", "Средняя цена покупателя", "СПП, %",
