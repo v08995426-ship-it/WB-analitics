@@ -42,7 +42,7 @@ SERVICE_EFFECTIVENESS_KEY = f"Служебные файлы/Ассистент W
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 
-ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started"}
+ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started", "4", "9", "11"}
 
 STEP_CPC_SMALL = 100
 STEP_CPC_MED = 200
@@ -182,6 +182,7 @@ class S3Storage:
 def tz_now() -> datetime:
     return datetime.now(pytz.timezone(TIMEZONE))
 
+
 def safe_float(v, default=0.0) -> float:
     try:
         if pd.isna(v):
@@ -189,6 +190,7 @@ def safe_float(v, default=0.0) -> float:
         return float(v)
     except Exception:
         return default
+
 
 def safe_int(v, default=0) -> int:
     try:
@@ -198,17 +200,21 @@ def safe_int(v, default=0) -> int:
     except Exception:
         return default
 
+
 def normalize_colname(name: str) -> str:
     return str(name).strip().lower().replace("ё", "е")
+
 
 def percent(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return round((numerator / denominator) * 100.0, 2)
 
+
 def iso_week_label(d: date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
+
 
 def week_start_from_label(label: str) -> date:
     m = re.match(r"^(\d{4})-W(\d{2})$", label)
@@ -216,9 +222,11 @@ def week_start_from_label(label: str) -> date:
         raise ValueError(f"Некорректная неделя: {label}")
     return date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
 
+
 def previous_week_label(label: str, shift: int = 1) -> str:
     start = week_start_from_label(label) - timedelta(days=7 * shift)
     return iso_week_label(start)
+
 
 def target_week_range(explicit_week: Optional[str] = None) -> Tuple[str, date, date]:
     if explicit_week:
@@ -229,11 +237,14 @@ def target_week_range(explicit_week: Optional[str] = None) -> Tuple[str, date, d
     start = yesterday - timedelta(days=yesterday.weekday())
     return iso_week_label(start), start, start + timedelta(days=6)
 
+
 def ads_weekly_key(week_label: str) -> str:
     return f"{ADS_WEEKLY_PREFIX}Реклама_{week_label}.xlsx"
 
+
 def keywords_weekly_key(week_label: str) -> str:
     return f"{KEYWORDS_WEEKLY_PREFIX}Неделя {week_label}.xlsx"
+
 
 def read_json_or_default(s3: S3Storage, key: str, default: dict) -> dict:
     try:
@@ -243,8 +254,10 @@ def read_json_or_default(s3: S3Storage, key: str, default: dict) -> dict:
     except Exception:
         return default
 
+
 def clamp(v: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(v, max_v))
+
 
 def is_micro_noise(row: pd.Series) -> bool:
     spend = safe_float(row.get("Расход за неделю"))
@@ -290,7 +303,7 @@ def is_active_campaign(row: pd.Series) -> bool:
 
 
 # =========================================================
-# РЕКЛАМА
+# ЧТЕНИЕ РЕКЛАМЫ
 # =========================================================
 
 def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
@@ -313,8 +326,9 @@ def prepare_daily_stats_sheet(df: pd.DataFrame) -> pd.DataFrame:
     lower_cols = {normalize_colname(c): c for c in df.columns}
     for target, variants in aliases.items():
         for v in variants:
-            if normalize_colname(v) in lower_cols:
-                rename_map[lower_cols[normalize_colname(v)]] = target
+            key = normalize_colname(v)
+            if key in lower_cols:
+                rename_map[lower_cols[key]] = target
                 break
 
     df = df.rename(columns=rename_map)
@@ -358,8 +372,9 @@ def prepare_campaigns_sheet(df: pd.DataFrame) -> pd.DataFrame:
     lower_cols = {normalize_colname(c): c for c in df.columns}
     for target, variants in aliases.items():
         for v in variants:
-            if normalize_colname(v) in lower_cols:
-                rename_map[lower_cols[normalize_colname(v)]] = target
+            key = normalize_colname(v)
+            if key in lower_cols:
+                rename_map[lower_cols[key]] = target
                 break
 
     df = df.rename(columns=rename_map)
@@ -479,7 +494,7 @@ def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
 
 
 # =========================================================
-# КЛЮЧИ
+# ПОИСКОВЫЕ ЗАПРОСЫ
 # =========================================================
 
 def load_keywords_weekly(s3: S3Storage, week_label: str) -> pd.DataFrame:
@@ -652,11 +667,20 @@ def build_campaign_week_metrics(
     c = campaigns_df.copy()
     c["Тип кампании"] = c.apply(classify_campaign, axis=1)
     c["Активна"] = c.apply(is_active_campaign, axis=1)
-    c = c[[
-        "ID кампании", "Название", "Тип оплаты", "Тип ставки", "Статус",
-        "Размещение в рекомендациях", "Ставка в поиске (руб)", "Ставка в рекомендациях (руб)",
-        "Тип кампании", "Активна"
-    ]].drop_duplicates(subset=["ID кампании"])
+
+    keep_cols = [
+        "ID кампании",
+        "Название",
+        "Тип оплаты",
+        "Тип ставки",
+        "Статус",
+        "Размещение в рекомендациях",
+        "Ставка в поиске (руб)",
+        "Ставка в рекомендациях (руб)",
+        "Тип кампании",
+        "Активна",
+    ]
+    c = c[keep_cols].drop_duplicates(subset=["ID кампании"])
 
     m = g.merge(c, on="ID кампании", how="left")
 
@@ -682,10 +706,13 @@ def build_campaign_week_metrics(
         m["Заказы за неделю"].fillna(0) * m["Чистая прибыль, руб/ед"].fillna(0) - m["Расход за неделю"].fillna(0)
     )
     m["Профит на заказ после рекламы, руб"] = m.apply(
-        lambda r: round(safe_float(r["Чистая прибыль, руб/ед"]) - safe_float(r["Расход за неделю"]) / safe_float(r["Заказы за неделю"]), 2)
-        if r["Заказы за неделю"] > 0 else round(-safe_float(r["Расход за неделю"]), 2),
+        lambda r: round(
+            safe_float(r["Чистая прибыль, руб/ед"]) - safe_float(r["Расход за неделю"]) / safe_float(r["Заказы за неделю"]),
+            2
+        ) if r["Заказы за неделю"] > 0 else round(-safe_float(r["Расход за неделю"]), 2),
         axis=1
     )
+
     m["Текущая ставка поиск, коп"] = (m["Ставка в поиске (руб)"].fillna(0) * 100).round().astype(int)
     m["Текущая ставка рекомендации, коп"] = (m["Ставка в рекомендациях (руб)"].fillna(0) * 100).round().astype(int)
 
@@ -695,7 +722,7 @@ def build_campaign_week_metrics(
 
 
 # =========================================================
-# STRATEGIES
+# СТРАТЕГИИ
 # =========================================================
 
 @dataclass
@@ -1094,57 +1121,117 @@ def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, we
 
 
 # =========================================================
-# PAYLOAD / WB API
+# WB API PAYLOAD
 # =========================================================
 
-def decisions_to_payload(decisions: List[Decision]) -> List[Dict[str, Any]]:
+def detect_wb_placement(row: pd.Series, decision: Decision) -> str:
+    """
+    WB:
+    - combined -> единая ставка
+    - search / recommendations -> ручная ставка
+    """
+    bid_type = str(row.get("Тип ставки", "")).strip().lower()
+    campaign_type = str(row.get("Тип кампании", "")).strip().lower()
+
+    if bid_type == "unified":
+        return "combined"
+
+    if campaign_type == "cpm_shelves":
+        return "recommendations"
+
+    return "search"
+
+
+def decisions_to_payload(decisions: List[Decision], metrics_df: pd.DataFrame) -> Dict[str, Any]:
+    metrics_lookup = metrics_df.set_index(["ID кампании", "Артикул WB"], drop=False)
+
     grouped: Dict[int, Dict[str, Any]] = {}
 
     for d in decisions:
+        key = (d.id_campaign, d.nm_id)
+        if key not in metrics_lookup.index:
+            continue
+
+        row = metrics_lookup.loc[key]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+
+        placement = detect_wb_placement(row, d)
+
         if d.id_campaign not in grouped:
-            grouped[d.id_campaign] = {"advert_id": d.id_campaign, "nm_bids": []}
+            grouped[d.id_campaign] = {
+                "advert_id": int(d.id_campaign),
+                "nm_bids": []
+            }
 
-        nm_bid = {"nm_id": d.nm_id}
+        bid_value = d.new_rec_bid_kop if d.campaign_type == "cpm_shelves" else d.new_search_bid_kop
+        if bid_value <= 0:
+            continue
 
-        if d.campaign_type in {"cpc_search", "cpm_search"}:
-            nm_bid["search"] = d.new_search_bid_kop
-        elif d.campaign_type == "cpm_shelves":
-            nm_bid["recommendations"] = d.new_rec_bid_kop
+        grouped[d.id_campaign]["nm_bids"].append({
+            "nm_id": int(d.nm_id),
+            "bid_kopecks": int(bid_value),
+            "placement": placement,
+        })
 
-        grouped[d.id_campaign]["nm_bids"].append(nm_bid)
+    bids = []
+    for advert in grouped.values():
+        nm_bids = advert["nm_bids"]
+        if not nm_bids:
+            continue
 
-    return list(grouped.values())
+        # режем по 50 nm_bids на кампанию
+        for i in range(0, len(nm_bids), 50):
+            bids.append({
+                "advert_id": advert["advert_id"],
+                "nm_bids": nm_bids[i:i + 50]
+            })
+
+    return {"bids": bids}
 
 
-def send_batches(payload: List[Dict[str, Any]], api_key: str, dry_run: bool = True) -> Tuple[int, int]:
+def send_batches(payload: Dict[str, Any], api_key: str, dry_run: bool = True) -> Tuple[int, int]:
     if dry_run:
         log("🧪 dry-run: отправка ставок отключена")
-        return len(payload), 0
+        return len(payload.get("bids", [])), 0
 
     headers = {
         "Authorization": api_key.strip(),
         "Content-Type": "application/json",
     }
 
+    all_bids = payload.get("bids", [])
+    if not all_bids:
+        log("ℹ️ Пустой payload, отправлять нечего")
+        return 0, 0
+
     success = 0
     failed = 0
 
     batch_size = 50
-    batches = [payload[i:i + batch_size] for i in range(0, len(payload), batch_size)]
+    batches = [all_bids[i:i + batch_size] for i in range(0, len(all_bids), batch_size)]
 
     for idx, batch in enumerate(batches, start=1):
+        batch_payload = {"bids": batch}
         log(f"📤 Отправка батча {idx}/{len(batches)}: кампаний {len(batch)}")
+
         try:
-            resp = requests.patch(WB_BIDS_URL, headers=headers, json=batch, timeout=120)
+            resp = requests.patch(
+                WB_BIDS_URL,
+                headers=headers,
+                json=batch_payload,
+                timeout=120
+            )
 
             if resp.status_code == 200:
                 success += len(batch)
                 log(f"✅ Батч {idx} успешно применён")
-                time.sleep(0.2)
+                time.sleep(0.25)
             else:
                 failed += len(batch)
                 allow_header = resp.headers.get("Allow", "")
-                log(f"⚠️ Ошибка WB {resp.status_code}, Allow={allow_header}: {resp.text[:800]}")
+                log(f"⚠️ Ошибка WB {resp.status_code}, Allow={allow_header}: {resp.text[:1000]}")
+                log(f"⚠️ Проблемный payload батча {idx}: {json.dumps(batch_payload, ensure_ascii=False)[:3000]}")
         except Exception as e:
             failed += len(batch)
             log(f"⚠️ Исключение отправки: {e}")
@@ -1269,7 +1356,7 @@ def determine_strategy_for_week(s3: S3Storage, week_label: str, cfg: dict) -> in
 
 
 # =========================================================
-# EFFECTIVENESS ANALYTICS
+# EFFECTIVENESS
 # =========================================================
 
 def evaluate_strategy_week(metrics_df: pd.DataFrame, week_label: str, strategy_id: int, eval_type: str) -> Dict[str, Any]:
@@ -1471,7 +1558,7 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
         update_effectiveness_analytics(s3, cfg)
         return
 
-    payload = decisions_to_payload(decisions)
+    payload = decisions_to_payload(decisions, metrics_df)
     wb_key = os.environ.get("WB_PROMO_KEY_TOPFACE", "").strip()
     if not wb_key:
         raise RuntimeError("Не задан секрет WB_PROMO_KEY_TOPFACE")
