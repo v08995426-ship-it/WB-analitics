@@ -6,7 +6,6 @@ import io
 import re
 import json
 import time
-import math
 import argparse
 import tempfile
 import traceback
@@ -45,7 +44,6 @@ WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 
 ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started"}
 
-# шаги ставок
 STEP_CPC_SMALL = 100
 STEP_CPC_MED = 200
 STEP_CPC_BIG = 300
@@ -81,6 +79,9 @@ GOOD_CTR_SHELVES = 0.80
 MIN_NET_PROFIT_PER_UNIT = 0.0
 MIN_KEYWORD_ORDERS_FOR_PUSH = 2
 
+MICRO_SPEND_IGNORE = 10.0
+MICRO_AD_PROFIT_IGNORE = -5.0
+
 DEFAULT_STRATEGY_SEQUENCE = [1, 2, 3, 4]
 
 STRATEGY_NAMES = {
@@ -91,7 +92,7 @@ STRATEGY_NAMES = {
 }
 
 DEFAULT_CONFIG = {
-    "mode": "rotation",  # rotation / fixed
+    "mode": "rotation",
     "active_strategy": 1,
     "strategy_sequence": DEFAULT_STRATEGY_SEQUENCE,
     "evaluation_lag_weeks": 1,
@@ -215,9 +216,6 @@ def week_start_from_label(label: str) -> date:
         raise ValueError(f"Некорректная неделя: {label}")
     return date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
 
-def week_end_from_label(label: str) -> date:
-    return week_start_from_label(label) + timedelta(days=6)
-
 def previous_week_label(label: str, shift: int = 1) -> str:
     start = week_start_from_label(label) - timedelta(days=7 * shift)
     return iso_week_label(start)
@@ -247,6 +245,18 @@ def read_json_or_default(s3: S3Storage, key: str, default: dict) -> dict:
 
 def clamp(v: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(v, max_v))
+
+def is_micro_noise(row: pd.Series) -> bool:
+    spend = safe_float(row.get("Расход за неделю"))
+    ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
+    orders = safe_float(row.get("Заказы за неделю"))
+    drr = safe_float(row.get("ДРР, % факт"))
+
+    if spend < MICRO_SPEND_IGNORE and ad_profit > MICRO_AD_PROFIT_IGNORE:
+        return True
+    if spend < MICRO_SPEND_IGNORE and orders <= 0 and drr == 0:
+        return True
+    return False
 
 
 # =========================================================
@@ -725,6 +735,9 @@ def decide_profit_strategy(row: pd.Series, config: dict, week_label: str) -> Opt
     profit_u = safe_float(row.get("Чистая прибыль, руб/ед"))
     orders_kw = safe_float(row.get("Заказы по ключам сумма"))
 
+    if is_micro_noise(row):
+        return None
+
     sf = stop_factors(row)
     if sf:
         action = "DOWN"
@@ -813,6 +826,9 @@ def decide_position_strategy(row: pd.Series, config: dict, week_label: str) -> O
     drr = safe_float(row.get("ДРР, % факт"))
     ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
 
+    if is_micro_noise(row):
+        return None
+
     sf = stop_factors(row)
     if sf:
         if ctype == "cpm_shelves":
@@ -895,6 +911,10 @@ def decide_position_strategy(row: pd.Series, config: dict, week_label: str) -> O
 def decide_drr_strategy(row: pd.Series, config: dict, week_label: str) -> Optional[Decision]:
     ctype = str(row.get("Тип кампании"))
     drr = safe_float(row.get("ДРР, % факт"))
+
+    if is_micro_noise(row):
+        return None
+
     sf = stop_factors(row)
 
     if ctype == "cpm_shelves":
@@ -980,6 +1000,9 @@ def decide_traffic_share_strategy(row: pd.Series, config: dict, week_label: str)
     ad_profit = safe_float(row.get("Ожидаемая чистая прибыль рекламы, руб"))
     drr = safe_float(row.get("ДРР, % факт"))
 
+    if is_micro_noise(row):
+        return None
+
     sf = stop_factors(row)
 
     if ctype == "cpm_shelves":
@@ -1019,7 +1042,6 @@ def decide_traffic_share_strategy(row: pd.Series, config: dict, week_label: str)
             return Decision(4, STRATEGY_NAMES[4], safe_int(row["ID кампании"]), safe_int(row["Артикул WB"]),
                             str(row.get("Название", "")), ctype, "DOWN", sf, current, new, 0, 0, week_label)
 
-    # если доля трафика низкая и позиция плохая — поднимаем
     if traffic_share < 2.0 and pos > TOP20_BORDER and rating >= OK_RATING_THRESHOLD and ad_profit >= 0:
         new = clamp(current + step_up * 2, min_v, max_v)
         if new != current:
@@ -1072,7 +1094,7 @@ def build_decisions(metrics_df: pd.DataFrame, strategy_id: int, config: dict, we
 
 
 # =========================================================
-# PAYLOAD
+# PAYLOAD / WB API
 # =========================================================
 
 def decisions_to_payload(decisions: List[Decision]) -> List[Dict[str, Any]]:
@@ -1113,13 +1135,16 @@ def send_batches(payload: List[Dict[str, Any]], api_key: str, dry_run: bool = Tr
     for idx, batch in enumerate(batches, start=1):
         log(f"📤 Отправка батча {idx}/{len(batches)}: кампаний {len(batch)}")
         try:
-            resp = requests.post(WB_BIDS_URL, headers=headers, json=batch, timeout=120)
+            resp = requests.patch(WB_BIDS_URL, headers=headers, json=batch, timeout=120)
+
             if resp.status_code == 200:
                 success += len(batch)
+                log(f"✅ Батч {idx} успешно применён")
                 time.sleep(0.2)
             else:
                 failed += len(batch)
-                log(f"⚠️ Ошибка WB {resp.status_code}: {resp.text[:500]}")
+                allow_header = resp.headers.get("Allow", "")
+                log(f"⚠️ Ошибка WB {resp.status_code}, Allow={allow_header}: {resp.text[:800]}")
         except Exception as e:
             failed += len(batch)
             log(f"⚠️ Исключение отправки: {e}")
@@ -1191,7 +1216,6 @@ def save_preview_files(s3: S3Storage, decisions_df: pd.DataFrame, metrics_df: pd
 
 def load_strategy_config(s3: S3Storage) -> dict:
     cfg = read_json_or_default(s3, SERVICE_CONFIG_KEY, DEFAULT_CONFIG.copy())
-    # добиваем defaults
     for k, v in DEFAULT_CONFIG.items():
         if k not in cfg:
             cfg[k] = v
@@ -1338,12 +1362,8 @@ def update_effectiveness_analytics(s3: S3Storage, cfg: dict):
     final_lag = safe_int(cfg.get("final_evaluation_lag_weeks", 2), 2)
 
     weeks_to_check = []
-
-    # предварительная оценка
     target_pre = previous_week_label(iso_week_label(tz_now().date()), eval_lag)
     weeks_to_check.append((target_pre, "предварительная"))
-
-    # финальная оценка
     target_final = previous_week_label(iso_week_label(tz_now().date()), final_lag)
     weeks_to_check.append((target_final, "финальная"))
 
@@ -1353,8 +1373,6 @@ def update_effectiveness_analytics(s3: S3Storage, cfg: dict):
             continue
 
         strategy_id = safe_int(row_sched.iloc[0]["Стратегия"], 1)
-
-        # уже посчитано?
         exists = eff_df[
             (eff_df["Неделя"].astype(str) == week_label) &
             (eff_df["Тип оценки"].astype(str) == eval_type)
@@ -1409,13 +1427,11 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
     decisions = build_decisions(metrics_df, strategy_id, cfg, week_label)
     decisions_df = decisions_to_df(decisions, metrics_df)
 
-    # schedule status update
     schedule_df = load_schedule(s3)
     if not schedule_df.empty:
         schedule_df.loc[schedule_df["Неделя"].astype(str) == week_label, "Статус"] = "в работе"
         save_schedule(s3, schedule_df)
 
-    # bid history
     history_df = load_bid_history(s3)
     if decisions:
         hist_rows = []
@@ -1468,7 +1484,7 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
 
 
 # =========================================================
-# REPORTS
+# REPORT
 # =========================================================
 
 def print_effectiveness_report(s3: S3Storage):
@@ -1490,7 +1506,6 @@ def print_effectiveness_report(s3: S3Storage):
     ]
     print(df[show_cols].to_string(index=False))
 
-    # агрегировано по стратегиям
     agg = (
         df.groupby(["Стратегия", "Название стратегии"], as_index=False)
         .agg(
