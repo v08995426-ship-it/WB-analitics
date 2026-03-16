@@ -23,12 +23,16 @@ DOC_PAGE_CANDIDATES = [
     "https://docs.ozon.ru/global/en/api/seller/",
 ]
 
-USER_AGENT = "Mozilla/5.0 (compatible; OzonDocsMonitor/1.0; +https://github.com/)"
+USER_AGENT = "Mozilla/5.0 (compatible; OzonDocsMonitor/1.1; +https://github.com/)"
 REQUEST_TIMEOUT = 40
 RETRY_COUNT = 3
 STATE_DIRNAME = ".ozon-docs-monitor"
 STATE_FILENAME = "state.json"
 RUN_REPORT_FILENAME = "last_report.json"
+
+# Практический лимит Telegram для sendMessage около 4096 символов.
+# Берем безопасный запас.
+TELEGRAM_MESSAGE_LIMIT = 3800
 
 ALERT_PATTERNS = [
     re.compile(r"метод\s+устарева", re.IGNORECASE),
@@ -77,7 +81,10 @@ def sha256_text(text: str) -> str:
 def read_json(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MonitorError(f"Файл JSON поврежден или некорректен: {path}. Ошибка: {exc}") from exc
 
 
 def write_json(path: Path, payload) -> None:
@@ -116,33 +123,45 @@ def clean_html_to_text(raw_html: str) -> str:
     text = text.replace("\xa0", " ")
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
     return "\n".join(lines)
 
 
 def normalize_endpoint(endpoint: str) -> str:
-    return endpoint.strip()
+    return str(endpoint).strip()
 
 
 def extract_context(text: str, endpoint: str, radius: int = 6000) -> Optional[str]:
     idx = text.find(endpoint)
     if idx == -1:
         return None
+
     start = max(0, idx - radius)
     end = min(len(text), idx + radius)
     snippet = text[start:end]
-    # Cut to nearby paragraph-ish chunk around endpoint to keep state smaller.
+
     parts = snippet.split("\n")
-    important = [line for line in parts if endpoint in line or any(p.search(line) for p in ALERT_PATTERNS) or "deprecated" in line.lower() or "устар" in line.lower() or "отключ" in line.lower() or re.search(r"/v\d+/", line)]
+    important = [
+        line
+        for line in parts
+        if endpoint in line
+        or any(p.search(line) for p in ALERT_PATTERNS)
+        or "deprecated" in line.lower()
+        or "устар" in line.lower()
+        or "отключ" in line.lower()
+        or re.search(r"/v\d+/", line)
+    ]
+
     if important:
-        # add some surrounding lines around endpoint match
         context_lines = []
         for i, line in enumerate(parts):
             if endpoint in line or any(p.search(line) for p in ALERT_PATTERNS):
                 lo = max(0, i - 5)
                 hi = min(len(parts), i + 6)
                 context_lines.extend(parts[lo:hi])
+
         deduped = []
         seen = set()
         for line in context_lines:
@@ -150,12 +169,14 @@ def extract_context(text: str, endpoint: str, radius: int = 6000) -> Optional[st
                 seen.add(line)
                 deduped.append(line)
         return "\n".join(deduped)
+
     return snippet[: min(len(snippet), 5000)]
 
 
 def find_endpoint_context(endpoint: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     endpoint = normalize_endpoint(endpoint)
     errors = []
+
     for url in DOC_PAGE_CANDIDATES:
         try:
             raw_html = fetch_url(url)
@@ -166,6 +187,7 @@ def find_endpoint_context(endpoint: str) -> Tuple[Optional[str], Optional[str], 
             errors.append(f"{url}: endpoint not found")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{url}: {exc}")
+
     return None, None, "; ".join(errors)
 
 
@@ -178,10 +200,13 @@ def detect_warnings(context: str) -> Tuple[List[str], List[str], List[str]]:
         line_clean = line.strip()
         if not line_clean:
             continue
+
         if any(p.search(line_clean) for p in ALERT_PATTERNS):
             warnings.append(line_clean)
+
         for m in re.finditer(r"/v\d+/[\w\-/]+", line_clean):
             replacements.append(m.group(0))
+
         for dp in DATE_PATTERNS:
             for m in dp.finditer(line_clean):
                 dates.append(m.group(0))
@@ -192,6 +217,7 @@ def detect_warnings(context: str) -> Tuple[List[str], List[str], List[str]]:
 def make_diff(old: str, new: str, max_lines: int = 120) -> Optional[str]:
     if old == new:
         return None
+
     diff = list(
         difflib.unified_diff(
             old.splitlines(),
@@ -203,6 +229,7 @@ def make_diff(old: str, new: str, max_lines: int = 120) -> Optional[str]:
     )
     if not diff:
         return None
+
     return "\n".join(diff[:max_lines])
 
 
@@ -216,9 +243,17 @@ def classify(changed: bool, warnings: List[str], replacements: List[str], error:
     return "info"
 
 
-def summarize(endpoint: str, changed: bool, warnings: List[str], replacements: List[str], dates: List[str], error: Optional[str]) -> str:
+def summarize(
+    endpoint: str,
+    changed: bool,
+    warnings: List[str],
+    replacements: List[str],
+    dates: List[str],
+    error: Optional[str],
+) -> str:
     if error:
         return f"{endpoint}: ошибка проверки документации"
+
     if warnings:
         parts = [f"{endpoint}: найдено предупреждение в документации"]
         if dates:
@@ -226,8 +261,10 @@ def summarize(endpoint: str, changed: bool, warnings: List[str], replacements: L
         if replacements:
             parts.append(f"замена: {', '.join(replacements)}")
         return "; ".join(parts)
+
     if changed:
         return f"{endpoint}: страница метода изменилась, но явного deprecation-предупреждения не найдено"
+
     return f"{endpoint}: изменений не обнаружено"
 
 
@@ -235,14 +272,18 @@ def load_tracked_methods(path: Path) -> List[str]:
     payload = read_json(path, None)
     if payload is None:
         raise MonitorError(f"Не найден файл со списком методов: {path}")
+
     if isinstance(payload, dict):
         methods = payload.get("methods", [])
     else:
         methods = payload
-    methods = [normalize_endpoint(x) for x in methods if str(x).strip()]
+
+    methods = [normalize_endpoint(x) for x in methods if normalize_endpoint(x)]
     methods = sorted(set(methods))
+
     if not methods:
         raise MonitorError("Список отслеживаемых методов пуст")
+
     return methods
 
 
@@ -252,6 +293,7 @@ def build_results(methods: List[str], previous_state: Dict[str, dict]) -> Tuple[
 
     for endpoint in methods:
         doc_url, context, error = find_endpoint_context(endpoint)
+
         if error and context is None:
             res = MethodResult(
                 endpoint=endpoint,
@@ -297,6 +339,7 @@ def build_results(methods: List[str], previous_state: Dict[str, dict]) -> Tuple[
             error=None,
         )
         results.append(res)
+
         new_state[endpoint] = {
             "endpoint": endpoint,
             "doc_url": doc_url,
@@ -320,6 +363,7 @@ def build_report(results: List[MethodResult]) -> dict:
         "error": sum(1 for r in results if r.severity == "error"),
     }
     has_actionable = any(r.severity in {"critical", "important", "error"} for r in results)
+
     return {
         "generated_at": now_iso(),
         "counts": counts,
@@ -328,10 +372,11 @@ def build_report(results: List[MethodResult]) -> dict:
     }
 
 
-def escape_markdown(text: str) -> str:
-    for ch in r"_[]()~`>#+-=|{}.!":
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def trim_line(text: str, limit: int = 300) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def build_telegram_message(report: dict, only_alerts: bool = True) -> str:
@@ -342,11 +387,10 @@ def build_telegram_message(report: dict, only_alerts: bool = True) -> str:
         selected = results
 
     lines = [
-        "*Ozon API monitor*",
-        f"Проверка: {escape_markdown(report['generated_at'])}",
+        "Ozon API monitor",
+        f"Проверка: {report['generated_at']}",
         (
-            "Итог: "
-            f"critical={report['counts']['critical']}, "
+            f"Итог: critical={report['counts']['critical']}, "
             f"important={report['counts']['important']}, "
             f"error={report['counts']['error']}"
         ),
@@ -355,24 +399,50 @@ def build_telegram_message(report: dict, only_alerts: bool = True) -> str:
 
     if not selected:
         lines.append("Изменений по отслеживаемым методам нет.")
-        return "\n".join(lines)
+        message = "\n".join(lines).strip()
+        return message[:TELEGRAM_MESSAGE_LIMIT]
+
+    truncated = False
+    shown_count = 0
 
     for item in selected[:20]:
-        lines.append(f"• `{item['endpoint']}` — {escape_markdown(item['severity'])}")
-        lines.append(escape_markdown(item["summary"]))
-        if item.get("warnings"):
-            first_warning = item["warnings"][0]
-            lines.append(f"warning: {escape_markdown(first_warning[:300])}")
-        if item.get("doc_url"):
-            lines.append(escape_markdown(item["doc_url"]))
-        lines.append("")
+        block = [
+            f"• {item['endpoint']} — {item['severity']}",
+            trim_line(item["summary"], 500),
+        ]
 
-    return "\n".join(lines).strip()
+        if item.get("warnings"):
+            first_warning = trim_line(item["warnings"][0], 300)
+            block.append(f"warning: {first_warning}")
+
+        if item.get("doc_url"):
+            block.append(trim_line(item["doc_url"], 400))
+
+        block.append("")
+        block_text = "\n".join(block)
+
+        candidate = "\n".join(lines + [block_text]).strip()
+        if len(candidate) > TELEGRAM_MESSAGE_LIMIT:
+            truncated = True
+            break
+
+        lines.append(block_text)
+        shown_count += 1
+
+    total_selected = min(len(selected), 20)
+    hidden = total_selected - shown_count
+
+    if truncated or hidden > 0:
+        lines.append(f"... сообщение сокращено. Показано: {shown_count} из {total_selected}")
+
+    message = "\n".join(lines).strip()
+    return message[:TELEGRAM_MESSAGE_LIMIT]
 
 
 def send_telegram(message: str) -> None:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
     if not bot_token or not chat_id:
         raise MonitorError("Не заданы TELEGRAM_BOT_TOKEN и/или TELEGRAM_CHAT_ID")
 
@@ -381,15 +451,22 @@ def send_telegram(message: str) -> None:
         {
             "chat_id": chat_id,
             "text": message,
-            "parse_mode": "MarkdownV2",
             "disable_web_page_preview": "true",
         }
     ).encode("utf-8")
+
     req = urllib.request.Request(url, data=payload, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-        if resp.status != 200:
-            raise MonitorError(f"Telegram вернул HTTP {resp.status}: {body}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            if resp.status != 200:
+                raise MonitorError(f"Telegram вернул HTTP {resp.status}: {body}")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise MonitorError(f"Telegram HTTP {exc.code}: {error_body}") from exc
+    except urllib.error.URLError as exc:
+        raise MonitorError(f"Ошибка соединения с Telegram: {exc}") from exc
 
 
 def main() -> int:
@@ -403,6 +480,7 @@ def main() -> int:
     methods_file = Path(args.methods_file)
     state_dir = Path(args.state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
+
     state_path = state_dir / STATE_FILENAME
     report_path = state_dir / RUN_REPORT_FILENAME
 
