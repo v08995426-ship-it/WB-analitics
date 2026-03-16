@@ -1,20 +1,24 @@
-name: WB Ads Manager
+name: Assistant WB Ads Manager
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */3 * * *'
+    # Каждый день в 08:00, 11:00, 14:00, 17:00, 20:00 по UTC
+    # При необходимости поменяешь
+    - cron: '0 8,11,14,17,20 * * *'
 
 jobs:
   run-assistant-wb-ads-manager:
     runs-on: ubuntu-latest
 
     env:
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -28,5 +32,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 pytz requests
 
-      - name: Run WB ads manager
+      - name: Check script exists
+        run: test -f assistant_wb_ads_manager.py
+
+      - name: Run assistant_wb_ads_manager
         run: python assistant_wb_ads_manager.py run
