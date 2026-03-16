@@ -728,6 +728,7 @@ def build_campaign_week_metrics(
         "Себестоимость, руб", "Реклама, руб/ед", "Комиссия WB, %", "Эквайринг, %",
         "Логистика прямая, руб/ед", "Логистика обратная, руб/ед"
     ]
+    econ_cols = [c for c in econ_cols if c in economics_df.columns]
     e = economics_df[econ_cols].drop_duplicates(subset=["Артикул WB"])
     m = m.merge(e, on="Артикул WB", how="left")
 
@@ -739,6 +740,9 @@ def build_campaign_week_metrics(
             "Заказы по ключам сумма", "Медианная позиция заказных ключей", "Доля трафика, %", "Флаг плохого рейтинга"
         ]:
             m[col] = 0 if "Флаг" not in col else "нет"
+
+    if "Чистая прибыль, руб/ед" not in m.columns:
+        m["Чистая прибыль, руб/ед"] = 0.0
 
     m["Ожидаемая чистая прибыль рекламы, руб"] = (
         m["Заказы за неделю"].fillna(0) * m["Чистая прибыль, руб/ед"].fillna(0) - m["Расход за неделю"].fillna(0)
@@ -1759,6 +1763,7 @@ def decisions_to_df(decisions: List[Decision], metrics_df: pd.DataFrame) -> pd.D
         "Ожидаемая чистая прибыль рекламы, руб", "Профит на заказ после рекламы, руб",
         "Чистая прибыль, руб/ед", "Рейтинг отзывов", "Медианная позиция заказных ключей", "Доля трафика, %"
     ]
+    enrich_cols = [c for c in enrich_cols if c in metrics_df.columns]
     enrich = metrics_df[enrich_cols].drop_duplicates(subset=["ID кампании", "Артикул WB"])
 
     return ddf.merge(enrich, on=["ID кампании", "Артикул WB"], how="left")
@@ -1865,21 +1870,21 @@ def evaluate_strategy_week(metrics_df: pd.DataFrame, week_label: str, strategy_i
             "Вывод": "Нет данных",
         }
 
-    spend = round(safe_float(metrics_df["Расход за неделю"].sum()), 2)
-    revenue = round(safe_float(metrics_df["Сумма заказов за неделю"].sum()), 2)
-    orders = round(safe_float(metrics_df["Заказы за неделю"].sum()), 2)
-    clicks = safe_float(metrics_df["Клики за неделю"].sum())
-    views = safe_float(metrics_df["Показы за неделю"].sum())
-    ad_profit = round(safe_float(metrics_df["Ожидаемая чистая прибыль рекламы, руб"].sum()), 2)
+    spend = round(safe_float(metrics_df["Расход за неделю"].sum()), 2) if "Расход за неделю" in metrics_df.columns else 0.0
+    revenue = round(safe_float(metrics_df["Сумма заказов за неделю"].sum()), 2) if "Сумма заказов за неделю" in metrics_df.columns else 0.0
+    orders = round(safe_float(metrics_df["Заказы за неделю"].sum()), 2) if "Заказы за неделю" in metrics_df.columns else 0.0
+    clicks = safe_float(metrics_df["Клики за неделю"].sum()) if "Клики за неделю" in metrics_df.columns else 0.0
+    views = safe_float(metrics_df["Показы за неделю"].sum()) if "Показы за неделю" in metrics_df.columns else 0.0
+    ad_profit = round(safe_float(metrics_df["Ожидаемая чистая прибыль рекламы, руб"].sum()), 2) if "Ожидаемая чистая прибыль рекламы, руб" in metrics_df.columns else 0.0
 
     drr = percent(spend, revenue) if revenue > 0 else 0.0
     ctr = percent(clicks, views) if views > 0 else 0.0
     cr = percent(orders, clicks) if clicks > 0 else 0.0
 
-    avg_net_u = round(safe_float(metrics_df["Чистая прибыль, руб/ед"].mean()), 2)
-    avg_pos = round(safe_float(metrics_df["Медианная позиция заказных ключей"].replace(0, pd.NA).mean()), 2)
-    avg_share = round(safe_float(metrics_df["Доля трафика, %"].replace(0, pd.NA).mean()), 2)
-    avg_rating = round(safe_float(metrics_df["Рейтинг отзывов"].replace(0, pd.NA).mean()), 2)
+    avg_net_u = round(safe_float(metrics_df["Чистая прибыль, руб/ед"].mean()), 2) if "Чистая прибыль, руб/ед" in metrics_df.columns else 0.0
+    avg_pos = round(safe_float(metrics_df["Медианная позиция заказных ключей"].replace(0, pd.NA).mean()), 2) if "Медианная позиция заказных ключей" in metrics_df.columns else 0.0
+    avg_share = round(safe_float(metrics_df["Доля трафика, %"].replace(0, pd.NA).mean()), 2) if "Доля трафика, %" in metrics_df.columns else 0.0
+    avg_rating = round(safe_float(metrics_df["Рейтинг отзывов"].replace(0, pd.NA).mean()), 2) if "Рейтинг отзывов" in metrics_df.columns else 0.0
 
     parts = []
     if ad_profit > 0:
@@ -2019,73 +2024,4 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
         history_df = pd.concat([history_df, pd.DataFrame(hist_rows)], ignore_index=True)
         save_bid_history(s3, history_df)
 
-    save_preview_files(s3, decisions_df, metrics_df, week_label, strategy_id)
-
-    log(f"📊 Кампаний/артикулов в расчёте: {len(metrics_df)}")
-    log(f"📌 Рекомендаций: {len(decisions)}")
-
-    if decisions_df is not None and not decisions_df.empty:
-        show_cols = [
-            "Неделя", "Стратегия", "Название стратегии", "ID кампании", "Название", "Артикул WB", "Тип кампании",
-            "Действие", "Текущая ставка поиск, коп", "Новая ставка поиск, коп",
-            "Текущая ставка рекомендации, коп", "Новая ставка рекомендации, коп",
-            "ДРР, % факт", "Ожидаемая чистая прибыль рекламы, руб",
-            "Чистая прибыль, руб/ед", "Рейтинг отзывов", "Медианная позиция заказных ключей",
-            "Доля трафика, %", "Причина"
-        ]
-        show_cols = [c for c in show_cols if c in decisions_df.columns]
-        print(decisions_df[show_cols].head(80).to_string(index=False))
-
-    send_log_df = pd.DataFrame()
-
-    if not decisions:
-        log("ℹ️ Нет изменений ставок")
-        update_effectiveness_analytics(s3, cfg)
-        save_decision_archive(s3, decisions_df, logic_df, send_log_df)
-        return
-
-    wb_key = os.environ.get("WB_PROMO_KEY_TOPFACE", "").strip()
-    if not wb_key:
-        raise RuntimeError("Не задан секрет WB_PROMO_KEY_TOPFACE")
-
-    payload_sender = WBBidSender(
-        api_key=wb_key,
-        metrics_df=metrics_df,
-        fallback_bid_step_kopecks=FALLBACK_BID_STEP_KOPECKS,
-        max_retry_rounds=MAX_RETRY_ROUNDS,
-    )
-
-    payload = payload_sender.decisions_to_payload(decisions)
-
-    success, failed, send_log_df = payload_sender.send_all(
-        payload=payload,
-        dry_run=dry_run,
-    )
-
-    log(f"✅ Успешно обработано кампаний: {success}")
-    log(f"⚠️ Не обработано кампаний: {failed}")
-
-    save_decision_archive(s3, decisions_df, logic_df, send_log_df)
-    update_effectiveness_analytics(s3, cfg)
-
-
-# =========================================================
-# REPORT
-# =========================================================
-
-def print_effectiveness_report(s3: S3Storage):
-    df = load_effectiveness(s3)
-    if df.empty:
-        print("Отчёт по эффективности стратегий пока пуст.")
-        return
-
-    print("\n==============================")
-    print("Эффективность стратегий")
-    print("==============================\n")
-
-    show_cols = [
-        "Неделя", "Стратегия", "Название стратегии", "Тип оценки",
-        "Расход за неделю", "Сумма заказов за неделю", "Заказы за неделю",
-        "ДРР, % факт", "CTR, % факт", "CR, % факт",
-        "Ожидаемая чистая прибыль рекламы, руб",
-        "Средняя позиция
+    save_preview_files(s3, decisions_df, metrics_df
