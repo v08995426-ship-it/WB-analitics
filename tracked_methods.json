@@ -1,0 +1,25 @@
+{
+  "methods": [
+    "/v1/analytics/stocks",
+    "/v1/cargoes/create",
+    "/v1/cluster/list",
+    "/v1/draft/crossdock/create",
+    "/v1/draft/direct/create",
+    "/v1/draft/multi-cluster/create",
+    "/v1/draft/supply/create/info",
+    "/v1/supply-order/bundle",
+    "/v1/supply-order/content/update",
+    "/v1/supply-order/content/update/status",
+    "/v1/supply-order/pass/create",
+    "/v1/supply/{supply_id}/act/get",
+    "/v1/warehouse/fbo/list",
+    "/v1/warehouse/list",
+    "/v2/cargoes/create/info",
+    "/v2/draft/supply/create",
+    "/v2/draft/timeslot/info",
+    "/v3/product/info/list",
+    "/v3/product/list",
+    "/v3/supply-order/get",
+    "/v3/supply-order/list"
+  ]
+}
