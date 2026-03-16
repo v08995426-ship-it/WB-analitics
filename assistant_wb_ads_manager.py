@@ -582,7 +582,7 @@ def save_decision_archive(s3: S3Storage, decisions_df: pd.DataFrame, logic_df: p
     })
 
 # =========================================================
-# METRICS
+# METRICS (с фильтрацией по наличию данных экономики)
 # =========================================================
 def build_campaign_week_metrics(stats_df: pd.DataFrame, campaigns_df: pd.DataFrame, economics_df: pd.DataFrame, keywords_agg_df: pd.DataFrame) -> pd.DataFrame:
     g = stats_df.groupby(["ID кампании", "Артикул WB"], as_index=False).agg(
@@ -598,24 +598,34 @@ def build_campaign_week_metrics(stats_df: pd.DataFrame, campaigns_df: pd.DataFra
     g["CR, % факт"] = g.apply(lambda r: percent(r["Заказы за неделю"], r["Клики за неделю"]), axis=1)
     g["CPC, руб факт"] = g.apply(lambda r: round(safe_float(r["Расход за неделю"]) / safe_float(r["Клики за неделю"]), 2) if r["Клики за неделю"] > 0 else 0.0, axis=1)
     g["ДРР, % факт"] = g.apply(lambda r: percent(r["Расход за неделю"], r["Сумма заказов за неделю"]) if r["Сумма заказов за неделю"] > 0 else 0.0, axis=1)
+
     c = campaigns_df.copy()
     c["Тип кампании"] = c.apply(classify_campaign, axis=1)
     c["Активна"] = c.apply(is_active_campaign, axis=1)
     keep_cols = ["ID кампании", "Название", "Тип оплаты", "Тип ставки", "Статус", "Размещение в рекомендациях", "Ставка в поиске (руб)", "Ставка в рекомендациях (руб)", "Тип кампании", "Активна"]
     c = c[keep_cols].drop_duplicates(subset=["ID кампании"])
+
     m = g.merge(c, on="ID кампании", how="left")
+
+    # Экономика (только нужные категории)
     econ_cols = ["Артикул WB", "Артикул продавца", "Предмет", "Бренд", "Средняя цена продажи", "Чистая прибыль, руб/ед", "Валовая прибыль, руб/ед", "Себестоимость, руб", "Реклама, руб/ед", "Комиссия WB, %", "Эквайринг, %", "Логистика прямая, руб/ед", "Логистика обратная, руб/ед"]
     e = economics_df[econ_cols].drop_duplicates(subset=["Артикул WB"])
     m = m.merge(e, on="Артикул WB", how="left")
+
+    # !!! КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: удаляем строки, для которых нет данных экономики (чистая прибыль отсутствует)
+    m = m.dropna(subset=["Чистая прибыль, руб/ед"]).copy()
+
     if not keywords_agg_df.empty:
         m = m.merge(keywords_agg_df, on="Артикул WB", how="left")
     else:
         for col in ["Рейтинг отзывов", "Частота запросов сумма", "Переходы в карточку сумма", "Заказы по ключам сумма", "Медианная позиция заказных ключей", "Доля трафика, %", "Флаг плохого рейтинга"]:
             m[col] = 0 if "Флаг" not in col else "нет"
+
     m["Ожидаемая чистая прибыль рекламы, руб"] = m["Заказы за неделю"].fillna(0) * m["Чистая прибыль, руб/ед"].fillna(0) - m["Расход за неделю"].fillna(0)
     m["Профит на заказ после рекламы, руб"] = m.apply(lambda r: round(safe_float(r["Чистая прибыль, руб/ед"]) - safe_float(r["Расход за неделю"]) / safe_float(r["Заказы за неделю"]), 2) if r["Заказы за неделю"] > 0 else round(-safe_float(r["Расход за неделю"]), 2), axis=1)
     m["Текущая ставка поиск, коп"] = (m["Ставка в поиске (руб)"].fillna(0) * 100).round().astype(int)
     m["Текущая ставка рекомендации, коп"] = (m["Ставка в рекомендациях (руб)"].fillna(0) * 100).round().astype(int)
+
     m = m[m["Активна"] == True].copy()
     m = m.sort_values(["Расход за неделю", "Заказы за неделю"], ascending=[False, False]).reset_index(drop=True)
     return m
