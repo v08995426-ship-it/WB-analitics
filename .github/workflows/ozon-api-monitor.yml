@@ -22,12 +22,18 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Ensure state directory exists
+        run: mkdir -p .ozon-docs-monitor
+
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python ozon_docs_monitor.py --methods-file tracked_methods.json --state-dir .ozon-docs-monitor --fail-on-error
+          python ozon_docs_monitor.py \
+            --methods-file tracked_methods.json \
+            --state-dir .ozon-docs-monitor \
+            --fail-on-fetch-error
 
       - name: Upload report artifact
         uses: actions/upload-artifact@v4
@@ -35,14 +41,21 @@ jobs:
         with:
           name: ozon-api-monitor-report
           path: .ozon-docs-monitor/
+          if-no-files-found: warn
 
       - name: Commit updated state
         if: always()
         run: |
+          if [ ! -d ".ozon-docs-monitor" ]; then
+            echo "State directory does not exist"
+            exit 0
+          fi
+
           if git diff --quiet -- .ozon-docs-monitor; then
             echo "No state changes to commit"
             exit 0
           fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .ozon-docs-monitor
