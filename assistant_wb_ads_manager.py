@@ -535,59 +535,31 @@ def save_effectiveness(s3: S3Storage, df: pd.DataFrame):
 
 def load_decision_archive(s3: S3Storage) -> Dict[str, pd.DataFrame]:
     if not s3.file_exists(SERVICE_DECISIONS_ARCHIVE_KEY):
-        return {
-            "Решения": pd.DataFrame(),
-            "Расчёт логики": pd.DataFrame(),
-            "Отправка WB": pd.DataFrame(),
-            "Изменение ставок": pd.DataFrame(),
-        }
+        return {"Решения": pd.DataFrame(), "Расчёт логики": pd.DataFrame(), "Отправка WB": pd.DataFrame()}
     try:
         sheets = s3.read_excel_all_sheets(SERVICE_DECISIONS_ARCHIVE_KEY)
-        for name in ["Решения", "Расчёт логики", "Отправка WB", "Изменение ставок"]:
+        for name in ["Решения", "Расчёт логики", "Отправка WB"]:
             if name not in sheets:
                 sheets[name] = pd.DataFrame()
         return sheets
     except Exception:
-        return {
-            "Решения": pd.DataFrame(),
-            "Расчёт логики": pd.DataFrame(),
-            "Отправка WB": pd.DataFrame(),
-            "Изменение ставок": pd.DataFrame(),
-        }
+        return {"Решения": pd.DataFrame(), "Расчёт логики": pd.DataFrame(), "Отправка WB": pd.DataFrame()}
 
-def save_decision_archive(
-    s3: S3Storage,
-    decisions_df: pd.DataFrame,
-    logic_df: pd.DataFrame,
-    send_log_df: pd.DataFrame,
-    bid_changes_df: Optional[pd.DataFrame] = None,
-):
+def save_decision_archive(s3: S3Storage, decisions_df: pd.DataFrame, logic_df: pd.DataFrame, send_log_df: pd.DataFrame):
     current = load_decision_archive(s3)
-
     new_decisions = pd.concat([current["Решения"], decisions_df], ignore_index=True) if decisions_df is not None else current["Решения"]
     new_logic = pd.concat([current["Расчёт логики"], logic_df], ignore_index=True) if logic_df is not None else current["Расчёт логики"]
     new_send = pd.concat([current["Отправка WB"], send_log_df], ignore_index=True) if send_log_df is not None else current["Отправка WB"]
-
-    current_bid_changes = current.get("Изменение ставок", pd.DataFrame())
-    if bid_changes_df is not None:
-        new_bid_changes = pd.concat([current_bid_changes, bid_changes_df], ignore_index=True)
-    else:
-        new_bid_changes = current_bid_changes
-
     if len(new_decisions) > 50000:
         new_decisions = new_decisions.tail(50000).reset_index(drop=True)
     if len(new_logic) > 50000:
         new_logic = new_logic.tail(50000).reset_index(drop=True)
     if len(new_send) > 50000:
         new_send = new_send.tail(50000).reset_index(drop=True)
-    if len(new_bid_changes) > 50000:
-        new_bid_changes = new_bid_changes.tail(50000).reset_index(drop=True)
-
     s3.write_excel_sheets(SERVICE_DECISIONS_ARCHIVE_KEY, {
         "Решения": new_decisions,
         "Расчёт логики": new_logic,
         "Отправка WB": new_send,
-        "Изменение ставок": new_bid_changes,
     })
 
 # =========================================================
@@ -1476,85 +1448,7 @@ def save_preview_files(s3: S3Storage, decisions_df: pd.DataFrame, metrics_df: pd
         "metrics_count": 0 if metrics_df is None else int(len(metrics_df)),
     }
     s3.write_text(SERVICE_LOG_KEY, json.dumps(summary, ensure_ascii=False, indent=2))
-def build_bid_changes_df(
-    decisions: List[Decision],
-    metrics_df: pd.DataFrame,
-    strategy_id: int,
-    week_label: str,
-) -> pd.DataFrame:
-    if not decisions:
-        return pd.DataFrame(columns=[
-            "Дата изменения",
-            "Неделя",
-            "Стратегия",
-            "Название стратегии",
-            "ID кампании",
-            "Название кампании",
-            "Артикул WB",
-            "Тип кампании",
-            "Placement",
-            "Действие",
-            "Ставка было, коп",
-            "Ставка стало, коп",
-            "Изменение, коп",
-            "ДРР, % факт",
-            "CTR, % факт",
-            "CR, % факт",
-            "Ожидаемая чистая прибыль рекламы, руб",
-            "Чистая прибыль, руб/ед",
-            "Рейтинг отзывов",
-            "Медианная позиция заказных ключей",
-            "Доля трафика, %",
-            "Причина",
-        ])
 
-    metrics_lookup = metrics_df.set_index(["ID кампании", "Артикул WB"], drop=False)
-    rows = []
-
-    for d in decisions:
-        key = (d.id_campaign, d.nm_id)
-        row_metrics = None
-
-        if key in metrics_lookup.index:
-            row_metrics = metrics_lookup.loc[key]
-            if isinstance(row_metrics, pd.DataFrame):
-                row_metrics = row_metrics.iloc[0]
-
-        if d.campaign_type == "cpm_shelves":
-            old_bid = safe_int(d.current_rec_bid_kop)
-            new_bid = safe_int(d.new_rec_bid_kop)
-            placement = "recommendations"
-        else:
-            old_bid = safe_int(d.current_search_bid_kop)
-            new_bid = safe_int(d.new_search_bid_kop)
-            placement = "search"
-
-        rows.append({
-            "Дата изменения": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Неделя": week_label,
-            "Стратегия": strategy_id,
-            "Название стратегии": STRATEGY_NAMES.get(strategy_id, ""),
-            "ID кампании": d.id_campaign,
-            "Название кампании": d.campaign_name,
-            "Артикул WB": d.nm_id,
-            "Тип кампании": d.campaign_type,
-            "Placement": placement,
-            "Действие": d.action,
-            "Ставка было, коп": old_bid,
-            "Ставка стало, коп": new_bid,
-            "Изменение, коп": new_bid - old_bid,
-            "ДРР, % факт": safe_float(row_metrics.get("ДРР, % факт")) if row_metrics is not None else 0.0,
-            "CTR, % факт": safe_float(row_metrics.get("CTR, % факт")) if row_metrics is not None else 0.0,
-            "CR, % факт": safe_float(row_metrics.get("CR, % факт")) if row_metrics is not None else 0.0,
-            "Ожидаемая чистая прибыль рекламы, руб": safe_float(row_metrics.get("Ожидаемая чистая прибыль рекламы, руб")) if row_metrics is not None else 0.0,
-            "Чистая прибыль, руб/ед": safe_float(row_metrics.get("Чистая прибыль, руб/ед")) if row_metrics is not None else 0.0,
-            "Рейтинг отзывов": safe_float(row_metrics.get("Рейтинг отзывов")) if row_metrics is not None else 0.0,
-            "Медианная позиция заказных ключей": safe_float(row_metrics.get("Медианная позиция заказных ключей")) if row_metrics is not None else 0.0,
-            "Доля трафика, %": safe_float(row_metrics.get("Доля трафика, %")) if row_metrics is not None else 0.0,
-            "Причина": d.reason,
-        })
-
-    return pd.DataFrame(rows)
 # =========================================================
 # CONFIG / ROTATION
 # =========================================================
@@ -1731,8 +1625,7 @@ def run_pipeline(s3: S3Storage, dry_run: bool, explicit_week: Optional[str], for
     keywords_agg_df = aggregate_keywords(keywords_df)
     metrics_df = build_campaign_week_metrics(stats_df, campaigns_df, economics_df, keywords_agg_df)
     decisions, logic_df = build_decisions(metrics_df, strategy_id, cfg, week_label)
-decisions_df = decisions_to_df(decisions, metrics_df)
-bid_changes_df = build_bid_changes_df(decisions, metrics_df, strategy_id, week_label)
+    decisions_df = decisions_to_df(decisions, metrics_df)
     schedule_df = load_schedule(s3)
     if not schedule_df.empty:
         schedule_df.loc[schedule_df["Неделя"].astype(str) == week_label, "Статус"] = "в работе"
@@ -1771,7 +1664,7 @@ bid_changes_df = build_bid_changes_df(decisions, metrics_df, strategy_id, week_l
     if not decisions:
         log("ℹ️ Нет изменений ставок")
         update_effectiveness_analytics(s3, cfg)
-        save_decision_archive(s3, decisions_df, logic_df, send_log_df, bid_changes_df)
+        save_decision_archive(s3, decisions_df, logic_df, send_log_df)
         return
     payload = decisions_to_payload(decisions, metrics_df)
     wb_key = os.environ.get("WB_PROMO_KEY_TOPFACE", "").strip()
@@ -1780,7 +1673,7 @@ bid_changes_df = build_bid_changes_df(decisions, metrics_df, strategy_id, week_l
     success, failed, send_log_df = send_batches(payload, wb_key, metrics_df, dry_run=dry_run)
     log(f"✅ Успешно обработано кампаний: {success}")
     log(f"⚠️ Не обработано кампаний: {failed}")
-    save_decision_archive(s3, decisions_df, logic_df, send_log_df, bid_changes_df)
+    save_decision_archive(s3, decisions_df, logic_df, send_log_df)
     update_effectiveness_analytics(s3, cfg)
 
 # =========================================================
