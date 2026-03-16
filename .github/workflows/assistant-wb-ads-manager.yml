@@ -1,38 +1,24 @@
-name: assistant-wb-ads-manager
+name: WB Ads Manager
 
 on:
-  schedule:
-    # 06:00 по Москве = 03:00 UTC
-    - cron: '0 3 * * *'
   workflow_dispatch:
-    inputs:
-      action:
-        description: 'Что сделать: run / preview / report / set-strategy / enable-rotation'
-        required: true
-        default: 'preview'
-      mode:
-        description: 'Режим запуска для action=run: dry-run или prod'
-        required: false
-        default: 'dry-run'
-      week:
-        description: 'Неделя в формате YYYY-Wxx, например 2026-W11. Пусто = автоопределение'
-        required: false
-        default: ''
-      strategy_id:
-        description: 'ID стратегии (1, 2, 3, 4). Используется для set-strategy или run с принудительной стратегией'
-        required: false
-        default: ''
+  schedule:
+    - cron: '0 */3 * * *'
 
 jobs:
   run-assistant-wb-ads-manager:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
+    env:
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
-      - name: Checkout repository
+
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -42,146 +28,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 pytz requests
 
-      - name: Validate script exists
-        run: |
-          test -f assistant_wb_ads_manager.py
-
-      - name: Scheduled production run at 06:00 Moscow
-        if: ${{ github.event_name == 'schedule' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run
-
-      - name: Manual set fixed strategy
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'set-strategy' && github.event.inputs.strategy_id != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py set-strategy ${{ github.event.inputs.strategy_id }}
-
-      - name: Manual enable rotation
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'enable-rotation' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py enable-rotation
-
-      - name: Manual preview current week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'preview' && github.event.inputs.week == '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py preview
-
-      - name: Manual preview selected week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'preview' && github.event.inputs.week != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py preview --week "${{ github.event.inputs.week }}"
-
-      - name: Manual run dry-run current week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week == '' && github.event.inputs.strategy_id == '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --dry-run
-
-      - name: Manual run dry-run selected week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week != '' && github.event.inputs.strategy_id == '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}" --dry-run
-
-      - name: Manual run dry-run with forced strategy current week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week == '' && github.event.inputs.strategy_id != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --dry-run --strategy-id ${{ github.event.inputs.strategy_id }}
-
-      - name: Manual run dry-run with forced strategy selected week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'dry-run' && github.event.inputs.week != '' && github.event.inputs.strategy_id != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}" --dry-run --strategy-id ${{ github.event.inputs.strategy_id }}
-
-      - name: Manual production run current week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'prod' && github.event.inputs.week == '' && github.event.inputs.strategy_id == '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run
-
-      - name: Manual production run selected week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'prod' && github.event.inputs.week != '' && github.event.inputs.strategy_id == '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}"
-
-      - name: Manual production run with forced strategy current week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'prod' && github.event.inputs.week == '' && github.event.inputs.strategy_id != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --strategy-id ${{ github.event.inputs.strategy_id }}
-
-      - name: Manual production run with forced strategy selected week
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run' && github.event.inputs.mode == 'prod' && github.event.inputs.week != '' && github.event.inputs.strategy_id != '' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py run --week "${{ github.event.inputs.week }}" --strategy-id ${{ github.event.inputs.strategy_id }}
-
-      - name: Manual strategy effectiveness report
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'report' }}
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-        run: |
-          python assistant_wb_ads_manager.py report
+      - name: Run WB ads manager
+        run: python assistant_wb_ads_manager.py run
