@@ -23,10 +23,6 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -104,11 +100,6 @@ class AppConfig:
 
 CONFIG = AppConfig()
 
-
-# ============================================================
-# СПРАВОЧНИКИ
-# ============================================================
-
 WAREHOUSE_ALIASES: Dict[str, str] = {
     "Коледино/Электросталь (Москва)": "MOSCOW_CLUSTER",
     "Новосемейкино": "Самара (Новосемейкино)",
@@ -116,7 +107,7 @@ WAREHOUSE_ALIASES: Dict[str, str] = {
     "Екатеринбург - Перспективный 12": "Екатеринбург - Перспективная 14",
     "Екатеринбург Перспективная 14": "Екатеринбург - Перспективная 14",
     "Санкт Петербург Уткина Заводь": "Санкт-Петербург Уткина Заводь",
-    "Москва": "Коледино",  # для МТ-шаблона, если встретится
+    "Москва": "Коледино",
 }
 
 TEMPLATE_WAREHOUSE_ALIASES: Dict[str, str] = {
@@ -138,7 +129,11 @@ TEMPLATE_WAREHOUSE_ALIASES: Dict[str, str] = {
     "Владимир": "Владимир",
     "Котовск": "Котовск",
     "Воронеж": "Воронеж",
-    "Москва": "Коледино",  # в МТ-шаблоне
+    "Москва": "Коледино",
+    "СПб Уткина Заводь": "Санкт-Петербург Уткина Заводь",
+    "СПБ Уткина Заводь": "Санкт-Петербург Уткина Заводь",
+    "Санкт-Петербург Уткина Заводь": "Санкт-Петербург Уткина Заводь",
+    "Новосибирск": "Новосибирск",
 }
 
 ECONOMY_REPLACEMENT_MAP: Dict[str, str] = {
@@ -168,6 +163,7 @@ WAREHOUSE_TO_DISTRICT: Dict[str, str] = {
     "Сарапул": "Приволжский федеральный округ",
     "Екатеринбург - Перспективная 14": "Уральский федеральный округ",
     "Новосибирск": "Сибирский федеральный округ",
+    "Санкт-Петербург Уткина Заводь": "Северо-Западный федеральный округ",
 }
 
 ALL_TARGET_WAREHOUSES: List[str] = list(WAREHOUSE_TO_DISTRICT.keys())
@@ -190,60 +186,41 @@ def build_region_to_group() -> Dict[str, str]:
             mapping[region] = group
 
     add("MOSCOW_CLUSTER", ["Москва", "Московская область"])
-
-    add(
-        "Краснодар",
-        [
-            "Краснодарский край", "Ростовская область", "Республика Крым", "Севастополь",
-            "Республика Адыгея", "Ереван", "Котайкская область", "Лорийская область",
-            "Гехаркуникская область", "Ширакская область", "федеральная территория Сириус",
-            "Тавушская область", "Республика Каракалпакстан", "Вайоцдзорская область",
-        ],
-    )
-
+    add("Краснодар", [
+        "Краснодарский край", "Ростовская область", "Республика Крым", "Севастополь",
+        "Республика Адыгея", "Ереван", "Котайкская область", "Лорийская область",
+        "Гехаркуникская область", "Ширакская область", "федеральная территория Сириус",
+        "Тавушская область", "Республика Каракалпакстан", "Вайоцдзорская область",
+    ])
     add("Санкт-Петербург Уткина Заводь", ["Санкт-Петербург", "Ленинградская область", "Новгородская область", "Республика Карелия"])
-
-    add(
-        "Невинномысск",
-        [
-            "Ставропольский край", "Республика Дагестан", "Чеченская Республика",
-            "Республика Северная Осетия — Алания", "Кабардино-Балкарская Республика",
-            "Карачаево-Черкесская Республика", "Республика Ингушетия", "Республика Калмыкия",
-            "Армавирская область", "Араратская область", "Сюникская область", "Арагацотнская область",
-        ],
-    )
-
+    add("Невинномысск", [
+        "Ставропольский край", "Республика Дагестан", "Чеченская Республика",
+        "Республика Северная Осетия — Алания", "Кабардино-Балкарская Республика",
+        "Карачаево-Черкесская Республика", "Республика Ингушетия", "Республика Калмыкия",
+        "Армавирская область", "Араратская область", "Сюникская область", "Арагацотнская область",
+    ])
     add("Казань", ["Республика Татарстан", "Ульяновская область", "Кировская область", "Чувашская Республика", "Республика Коми", "Республика Марий Эл"])
     add("Владимир", ["Нижегородская область", "Владимирская область", "Ярославская область", "Ивановская область", "Костромская область", "Бухарская область"])
-
-    add(
-        "Екатеринбург - Перспективная 14",
-        [
-            "Свердловская область", "Иркутская область", "Красноярский край", "Челябинская область",
-            "Новосибирская область", "Кемеровская область", "Ханты-Мансийский автономный округ",
-            "Тюменская область", "Алтайский край", "Омская область", "Томская область",
-            "Республика Саха (Якутия)", "Республика Бурятия", "Забайкальский край", "Амурская область",
-            "Ямало-Ненецкий автономный округ", "Курганская область", "Республика Алтай", "Алматы",
-            "Карагандинская область", "Костанайская область", "Восточно-Казахстанская область",
-            "город республиканского значения Астана", "Астана", "Павлодарская область",
-            "город республиканского подчинения Бишкек", "Акмолинская область", "Северо-Казахстанская область",
-            "город Бишкек", "Алматинская область", "область Абай", "область Жетысу",
-            "Джалал-Абадская область", "область Улытау", "Абайская область",
-            "город республиканского подчинения Ош", "Ошская область", "Иссык-Кульская область",
-            "Улутауская область", "Нарынская область", "город республиканского значения Нур-Султан",
-        ],
-    )
-
-    add(
-        "Самара (Новосемейкино)",
-        [
-            "Самарская область", "Оренбургская область", "Западно-Казахстанская область",
-            "Актюбинская область", "Чуйская область", "Жамбылская область", "Шымкент",
-            "Туркестанская область", "город республиканского значения Байконур",
-            "Баткенская область", "Кызылординская область", "город Ош",
-        ],
-    )
-
+    add("Екатеринбург - Перспективная 14", [
+        "Свердловская область", "Иркутская область", "Красноярский край", "Челябинская область",
+        "Новосибирская область", "Кемеровская область", "Ханты-Мансийский автономный округ",
+        "Тюменская область", "Алтайский край", "Омская область", "Томская область",
+        "Республика Саха (Якутия)", "Республика Бурятия", "Забайкальский край", "Амурская область",
+        "Ямало-Ненецкий автономный округ", "Курганская область", "Республика Алтай", "Алматы",
+        "Карагандинская область", "Костанайская область", "Восточно-Казахстанская область",
+        "город республиканского значения Астана", "Астана", "Павлодарская область",
+        "город республиканского подчинения Бишкек", "Акмолинская область", "Северо-Казахстанская область",
+        "город Бишкек", "Алматинская область", "область Абай", "область Жетысу",
+        "Джалал-Абадская область", "область Улытау", "Абайская область",
+        "город республиканского подчинения Ош", "Ошская область", "Иссык-Кульская область",
+        "Улутауская область", "Нарынская область", "город республиканского значения Нур-Султан",
+    ])
+    add("Самара (Новосемейкино)", [
+        "Самарская область", "Оренбургская область", "Западно-Казахстанская область",
+        "Актюбинская область", "Чуйская область", "Жамбылская область", "Шымкент",
+        "Туркестанская область", "город республиканского значения Байконур",
+        "Баткенская область", "Кызылординская область", "город Ош",
+    ])
     add("Сарапул", ["Республика Башкортостан", "Пермский край", "Удмуртская Республика", "Республика Хакасия"])
     add("Воронеж", ["Воронежская область", "Хатлонская область"])
     add("Тула", ["Тульская область", "Белгородская область", "Курская область", "Брянская область", "Орловская область", "Гомельская область", "Могилёвская область", "Витебская область"])
@@ -251,31 +228,22 @@ def build_region_to_group() -> Dict[str, str]:
     add("Котовск", ["Липецкая область", "Пензенская область", "Тамбовская область", "Республика Мордовия", "Сурхандарьинская область"])
     add("Рязань (Тюшевское)", ["Рязанская область", "Навоийская область"])
     add("Новосибирск", ["Республика Тыва", "Ташкентская область"])
-
-    add(
-        "MOSCOW_CLUSTER",
-        [
-            "Приморский край", "Калужская область", "Вологодская область", "Архангельская область",
-            "Минск", "Тверская область", "Мурманская область", "Смоленская область",
-            "Калининградская область", "Хабаровский край", "Сахалинская область", "Псковская область",
-            "Минская область", "Гродненская область", "Брестская область", "Камчатский край",
-            "Магаданская область", "Ташкент", "Еврейская автономная область", "Тбилиси",
-            "Ненецкий автономный округ", "Душанбе", "Квемо Картли", "Чукотский автономный округ",
-            "Аджарская Автономная Республика", "Самаркандская область", "Хорезмская область",
-            "муниципалитет Тбилиси", "Районы республиканского подчинения", "Самцхе-Джавахети",
-            "Ферганская область", "Согдийская область", "Горно-Бадахшанская автономная область", "Имеретия",
-        ],
-    )
-
+    add("MOSCOW_CLUSTER", [
+        "Приморский край", "Калужская область", "Вологодская область", "Архангельская область",
+        "Минск", "Тверская область", "Мурманская область", "Смоленская область",
+        "Калининградская область", "Хабаровский край", "Сахалинская область", "Псковская область",
+        "Минская область", "Гродненская область", "Брестская область", "Камчатский край",
+        "Магаданская область", "Ташкент", "Еврейская автономная область", "Тбилиси",
+        "Ненецкий автономный округ", "Душанбе", "Квемо Картли", "Чукотский автономный округ",
+        "Аджарская Автономная Республика", "Самаркандская область", "Хорезмская область",
+        "муниципалитет Тбилиси", "Районы республиканского подчинения", "Самцхе-Джавахети",
+        "Ферганская область", "Согдийская область", "Горно-Бадахшанская автономная область", "Имеретия",
+    ])
     return mapping
 
 
 REGION_TO_GROUP: Dict[str, str] = build_region_to_group()
 
-
-# ============================================================
-# ВСПОМОГАТЕЛЬНОЕ
-# ============================================================
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -361,10 +329,6 @@ def largest_remainder_allocation(total: int, weights: Dict[str, float], minimum_
     return out
 
 
-# ============================================================
-# S3
-# ============================================================
-
 class S3Storage:
     def __init__(self, cfg: AppConfig):
         if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
@@ -414,10 +378,6 @@ class S3Storage:
         self.s3.upload_file(local_path, self.bucket, key)
 
 
-# ============================================================
-# ЗАГРУЗКА ДАННЫХ
-# ============================================================
-
 def load_weekly_window(storage: S3Storage, prefix: str, run_date: datetime, lookback_days: int, expected_sheet: Optional[str] = None) -> pd.DataFrame:
     keys = storage.list_keys(prefix)
     if not keys:
@@ -448,7 +408,6 @@ def load_weekly_window(storage: S3Storage, prefix: str, run_date: datetime, look
 
 def load_orders(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df = load_weekly_window(storage, cfg.orders_prefix_tpl.format(store=cfg.store_name), cfg.run_date, cfg.lookback_days, expected_sheet="Заказы")
-
     required = ["date", "warehouseName", "oblastOkrugName", "regionName", "supplierArticle", "nmId", "subject", "finishedPrice"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -473,13 +432,11 @@ def load_orders(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     before = len(df)
     df = df[~df["subject"].isin(cfg.excluded_subjects)].copy()
     log(f"Исключено строк заказов по запрещённым категориям: {before - len(df)}")
-
     return df
 
 
 def load_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df = load_weekly_window(storage, cfg.stocks_prefix_tpl.format(store=cfg.store_name), cfg.run_date, cfg.lookback_days, expected_sheet="Остатки")
-
     required = ["Склад", "Артикул WB", "Полное количество"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -499,7 +456,6 @@ def load_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     before = len(df)
     df = df[~df["subject"].isin(cfg.excluded_subjects)].copy()
     log(f"Исключено строк остатков по запрещённым категориям: {before - len(df)}")
-
     return df
 
 
@@ -530,10 +486,6 @@ def load_1c_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df.columns = [normalize_text(c) for c in df.columns]
     return df
 
-
-# ============================================================
-# РАСЧЁТ
-# ============================================================
 
 def prepare_daily_orders(orders: pd.DataFrame) -> pd.DataFrame:
     df = orders.copy()
@@ -888,10 +840,6 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
     return plan[plan["to_supply"] > 0].copy()
 
 
-# ============================================================
-# 1С
-# ============================================================
-
 def prepare_1c_stocks_map(df_1c_stocks: pd.DataFrame) -> pd.DataFrame:
     df = df_1c_stocks.copy()
     if "Артикул" not in df.columns:
@@ -904,10 +852,6 @@ def prepare_1c_stocks_map(df_1c_stocks: pd.DataFrame) -> pd.DataFrame:
     df["Артикул"] = df["Артикул"].map(normalize_text)
     return df[["Артикул"] + ONE_C_STOCK_COLUMNS].drop_duplicates(subset=["Артикул"])
 
-
-# ============================================================
-# ШАБЛОН
-# ============================================================
 
 def resolve_template(storage: S3Storage, cfg: AppConfig, workdir: str) -> str:
     target = Path(workdir) / "Согласование поставки WB.xlsm"
@@ -933,17 +877,33 @@ def build_template_dataset(plan_df: pd.DataFrame, stocks_1c_map: pd.DataFrame) -
         fill_value=0,
     ).reset_index()
 
-    warehouse_cols = [c for c in wide.columns if c not in ["supplierArticle", "Артикул 1С", "nmId", "subject"]]
-    wide["Общий итог"] = wide[warehouse_cols].sum(axis=1) if warehouse_cols else 0
+    warehouse_cols = [
+        c for c in wide.columns
+        if c not in ["supplierArticle", "Артикул 1С", "nmId", "subject"]
+    ]
+
+    if warehouse_cols:
+        wide["Общий итог"] = wide[warehouse_cols].sum(axis=1)
+    else:
+        wide["Общий итог"] = 0
 
     stocks_1c_map = stocks_1c_map.rename(columns={"Артикул": "Артикул 1С"})
     out = wide.merge(stocks_1c_map, on="Артикул 1С", how="left")
-    out["missing_1c_article"] = out["Артикул 1С"].eq("") | out[ONE_C_STOCK_COLUMNS].isna().all(axis=1)
+
+    out["missing_1c_article"] = (
+        out["Артикул 1С"].astype(str).str.strip().eq("")
+        | out[ONE_C_STOCK_COLUMNS].isna().all(axis=1)
+    )
 
     for col in ONE_C_STOCK_COLUMNS:
         out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
 
     out = out[out["Артикул 1С"].astype(str).str.strip() != ""].copy()
+
+    if warehouse_cols:
+        out["Общий итог"] = out[warehouse_cols].sum(axis=1)
+        out = out[out["Общий итог"] > 0].copy()
+
     return out
 
 
@@ -952,32 +912,126 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     ws = wb[pick_sheet_name(cfg.store_name)]
 
     header_row = 1
-    header_map = {
-        normalize_template_header(ws.cell(header_row, col).value): col
-        for col in range(1, ws.max_column + 1)
-        if normalize_template_header(ws.cell(header_row, col).value)
-    }
+
+    def get_header_map() -> Dict[str, int]:
+        return {
+            normalize_template_header(ws.cell(header_row, col).value): col
+            for col in range(1, ws.max_column + 1)
+            if normalize_template_header(ws.cell(header_row, col).value)
+        }
+
+    header_map = get_header_map()
 
     article_1c_col = header_map.get("Артикул 1С") or header_map.get("Артикул 1с")
     if article_1c_col is None:
         raise KeyError(f"Не найдена колонка 'Артикул 1С'. Заголовки шаблона: {list(header_map.keys())}")
 
-    warehouse_write_map: Dict[str, int] = {}
-    for header, col_idx in header_map.items():
-        if header in TEMPLATE_WAREHOUSE_ALIASES:
-            warehouse_write_map[TEMPLATE_WAREHOUSE_ALIASES[header]] = col_idx
-
-    one_c_col_map = {col_name: header_map[col_name] for col_name in ONE_C_STOCK_COLUMNS if col_name in header_map}
     total_col = header_map.get("Общий итог")
+    if total_col is None:
+        raise KeyError(f"Не найдена колонка 'Общий итог'. Заголовки шаблона: {list(header_map.keys())}")
 
-    # очищаем старые данные, но не трогаем формулы в R/W/X...
-    clear_cols = set([article_1c_col])
+    technical_cols = {"supplierArticle", "Артикул 1С", "nmId", "subject", "Общий итог", "missing_1c_article"}
+    source_warehouse_cols = [
+        c for c in data_df.columns
+        if c not in technical_cols and c not in ONE_C_STOCK_COLUMNS
+    ]
+
+    preferred_order = [
+        "Коледино",
+        "Тула",
+        "Электросталь",
+        "Казань",
+        "Самара (Новосемейкино)",
+        "Краснодар",
+        "Невинномысск",
+        "Волгоград",
+        "Рязань (Тюшевское)",
+        "Сарапул",
+        "Екатеринбург - Перспективная 14",
+        "Владимир",
+        "Котовск",
+        "Воронеж",
+        "Санкт-Петербург Уткина Заводь",
+        "Новосибирск",
+    ]
+
+    ordered_warehouses = [w for w in preferred_order if w in source_warehouse_cols]
+    ordered_warehouses += [w for w in source_warehouse_cols if w not in ordered_warehouses]
+
+    current_header_map = get_header_map()
+    current_warehouse_headers: List[str] = []
+    for col in range(article_1c_col + 1, total_col):
+        val = normalize_template_header(ws.cell(header_row, col).value)
+        if val:
+            current_warehouse_headers.append(val)
+
+    current_internal_warehouses: List[str] = []
+    for header in current_warehouse_headers:
+        current_internal_warehouses.append(TEMPLATE_WAREHOUSE_ALIASES.get(header, header))
+
+    missing_warehouses = [w for w in ordered_warehouses if w not in current_internal_warehouses]
+
+    if missing_warehouses:
+        insert_at = total_col
+        ws.insert_cols(insert_at, amount=len(missing_warehouses))
+
+        reverse_template_names = {
+            "Самара (Новосемейкино)": "Новосемейкино",
+            "Рязань (Тюшевское)": "Рязань",
+            "Екатеринбург - Перспективная 14": "Екатеринбург",
+            "Санкт-Петербург Уткина Заводь": "СПб Уткина Заводь",
+        }
+
+        style_source_col = max(article_1c_col + 1, insert_at - 1)
+
+        for i, wh in enumerate(missing_warehouses):
+            col_idx = insert_at + i
+            header_value = reverse_template_names.get(wh, wh)
+            ws.cell(header_row, col_idx, header_value)
+            try:
+                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = ws.column_dimensions[
+                    ws.cell(1, style_source_col).column_letter
+                ].width
+            except Exception:
+                pass
+
+        header_map = get_header_map()
+        total_col = header_map.get("Общий итог")
+
+    header_map = get_header_map()
+    total_col = header_map.get("Общий итог")
+    article_1c_col = header_map.get("Артикул 1С") or header_map.get("Артикул 1с")
+
+    warehouse_write_map: Dict[str, int] = {}
+    for col in range(article_1c_col + 1, total_col):
+        header = normalize_template_header(ws.cell(header_row, col).value)
+        if not header:
+            continue
+        internal_name = TEMPLATE_WAREHOUSE_ALIASES.get(header, header)
+        warehouse_write_map[internal_name] = col
+
+    one_c_col_map = {
+        col_name: header_map[col_name]
+        for col_name in ONE_C_STOCK_COLUMNS
+        if col_name in header_map
+    }
+
+    template_warehouse_cols = [c for c in warehouse_write_map.keys() if c in data_df.columns]
+    if template_warehouse_cols:
+        data_df = data_df.copy()
+        data_df["template_total"] = data_df[template_warehouse_cols].sum(axis=1)
+        data_df = data_df[data_df["template_total"] > 0].copy()
+
+    clear_cols = {article_1c_col, total_col}
     clear_cols.update(warehouse_write_map.values())
     clear_cols.update(one_c_col_map.values())
 
     for row_idx in range(2, ws.max_row + 1):
         for col_idx in clear_cols:
             ws.cell(row_idx, col_idx).value = None
+            ws.cell(row_idx, col_idx).fill = PatternFill(fill_type=None)
+
+    log(f"Строк после фильтрации под шаблон: {len(data_df)}")
 
     if len(data_df) > ws.max_row - 1:
         raise ValueError(
@@ -989,16 +1043,16 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     for i, (_, row) in enumerate(data_df.iterrows(), start=2):
         ws.cell(i, article_1c_col, row["Артикул 1С"])
 
-        for internal_wh, col_idx in warehouse_write_map.items():
-            value = row.get(internal_wh, 0)
-            ws.cell(i, col_idx, floor_int(value))
+        row_total = 0
+        for warehouse, col_idx in warehouse_write_map.items():
+            value = floor_int(row.get(warehouse, 0))
+            ws.cell(i, col_idx, value)
+            row_total += value
+
+        ws.cell(i, total_col, row_total)
 
         for col_name, col_idx in one_c_col_map.items():
             ws.cell(i, col_idx, floor_int(row.get(col_name, 0)))
-
-        # если общий итог есть как обычная колонка без формулы, пишем число
-        if total_col and ws.cell(i, total_col).data_type != "f" and total_col in clear_cols:
-            ws.cell(i, total_col, floor_int(row.get("Общий итог", 0)))
 
         if bool(row.get("missing_1c_article", False)):
             for col_idx in range(1, ws.max_column + 1):
@@ -1008,10 +1062,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     wb.close()
     return output_path
 
-
-# ============================================================
-# TELEGRAM
-# ============================================================
 
 def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str = "") -> None:
     if not bot_token or not chat_id:
@@ -1038,10 +1088,6 @@ def send_results_to_telegram(cfg: AppConfig, files: List[str]) -> None:
         log(f"Файл отправлен в Telegram: {file_path}")
 
 
-# ============================================================
-# DEBUG
-# ============================================================
-
 def save_debug_files(output_dir: str, sku_df: pd.DataFrame, region_metrics: pd.DataFrame, shares_df: pd.DataFrame, plan_df: pd.DataFrame, filled_template_path: str) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1055,10 +1101,6 @@ def save_debug_files(output_dir: str, sku_df: pd.DataFrame, region_metrics: pd.D
     log(f"Сохранён debug-файл: {debug_path}")
     log(f"Сохранён шаблон: {filled_template_path}")
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main(cfg: AppConfig = CONFIG) -> str:
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
