@@ -60,6 +60,8 @@ class AppConfig:
     low_turnover_sales_threshold: int = 100
     low_turnover_network_stock: int = 50
 
+    min_review_rating: float = float(os.getenv("WB_MIN_REVIEW_RATING", "4.6"))
+
     output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
     upload_result_to_s3: bool = env_bool("WB_UPLOAD_RESULT_TO_S3", False)
 
@@ -72,6 +74,15 @@ class AppConfig:
     stocks_1c_key: str = "Отчёты/Остатки/1С/Остатки 1С.xlsx"
     article_map_1c_key: str = "Отчёты/Остатки/1С/Артикулы 1с.xlsx"
     template_key: str = os.getenv("WB_TEMPLATE_KEY", "Служебные файлы/Согласование поставки WB.xlsm")
+
+    # можно задать точный ключ через secret/env
+    ratings_key: str = os.getenv("WB_RATINGS_KEY", "").strip()
+    ratings_prefix_candidates: Tuple[str, ...] = (
+        "Отчёты/Позиции по ключам/{store}/Недельные/",
+        "Отчёты/Ключи/{store}/Недельные/",
+        "Отчёты/SEO/{store}/Недельные/",
+        "Отчёты/Поисковые запросы/{store}/Недельные/",
+    )
 
     excluded_subjects: Tuple[str, ...] = ("Лаки для ногтей",)
     economy_subjects: Tuple[str, ...] = (
@@ -403,6 +414,72 @@ def load_weekly_window(storage: S3Storage, prefix: str, run_date: datetime, look
         raise ValueError(f"Не удалось прочитать ни одного файла по префиксу {prefix}")
 
     return pd.concat(parts, ignore_index=True)
+
+
+def resolve_ratings_key(storage: S3Storage, cfg: AppConfig) -> Optional[str]:
+    if cfg.ratings_key:
+        return cfg.ratings_key
+
+    week_str = cfg.run_date.strftime("%Y-W%V")
+    patterns = [
+        f"Неделя {week_str}.xlsx",
+        f"Неделя_{week_str}.xlsx",
+    ]
+
+    for prefix_tpl in cfg.ratings_prefix_candidates:
+        prefix = prefix_tpl.format(store=cfg.store_name)
+        try:
+            keys = storage.list_keys(prefix)
+        except Exception:
+            continue
+        for key in keys:
+            filename = key.split("/")[-1]
+            if any(p == filename for p in patterns):
+                return key
+        # fallback: взять самый свежий файл "Неделя"
+        week_keys = [k for k in keys if "Неделя" in k.split("/")[-1]]
+        if week_keys:
+            return sorted(week_keys)[-1]
+
+    return None
+
+
+def load_ratings_map(storage: S3Storage, cfg: AppConfig) -> Dict[str, float]:
+    key = resolve_ratings_key(storage, cfg)
+    if not key:
+        log("⚠️ Файл с рейтингами не найден. Фильтр по рейтингу не будет применён.")
+        return {}
+
+    df = storage.read_excel(key)
+    if isinstance(df, dict):
+        df = next(iter(df.values()))
+
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    nm_col = None
+    rating_col = None
+
+    for k, original in cols.items():
+        if "артикул wb" in k or k == "nmid" or k == "nmid":
+            nm_col = original
+        if "рейтинг отзывов" in k:
+            rating_col = original
+
+    if nm_col is None or rating_col is None:
+        log(f"⚠️ В файле рейтингов не найдены нужные колонки. Колонки: {list(df.columns)}")
+        return {}
+
+    tmp = df[[nm_col, rating_col]].copy()
+    tmp["nmId"] = tmp[nm_col].map(normalize_nmid)
+    tmp["review_rating"] = pd.to_numeric(tmp[rating_col], errors="coerce")
+    tmp = tmp.dropna(subset=["nmId", "review_rating"])
+
+    ratings = (
+        tmp.groupby("nmId", as_index=False)
+        .agg(review_rating=("review_rating", "max"))
+    )
+
+    log(f"Загружены рейтинги отзывов: {len(ratings):,} SKU из {key}")
+    return dict(zip(ratings["nmId"], ratings["review_rating"]))
 
 
 def load_orders(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
@@ -765,7 +842,13 @@ def apply_strategy(shares_df: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
 
 
 def current_stock_by_warehouse(current_wh: pd.DataFrame) -> pd.DataFrame:
-    return current_wh.groupby(["nmId", "warehouse"], as_index=False).agg(current_stock_full=("qty_full", "sum"))
+    return (
+        current_wh.groupby(["nmId", "warehouse"], as_index=False)
+        .agg(
+            current_stock_full=("qty_full", "sum"),
+            current_stock_available=("qty_available", "sum"),
+        )
+    )
 
 
 def allocate_low_turnover(shares_sku: pd.DataFrame, cfg: AppConfig) -> Dict[str, int]:
@@ -795,6 +878,18 @@ def calculate_supply_plan(
         else {}
     )
 
+    network_stock_map = (
+        current_stock_df.groupby("nmId", as_index=False)
+        .agg(
+            network_stock_full=("current_stock_full", "sum"),
+            network_stock_available=("current_stock_available", "sum"),
+        )
+        .set_index("nmId")
+        .to_dict("index")
+        if not current_stock_df.empty
+        else {}
+    )
+
     rows: List[Dict[str, object]] = []
 
     for _, sku in sku_df.iterrows():
@@ -804,12 +899,30 @@ def calculate_supply_plan(
             continue
 
         article_1c = article_1c_map.get(nmid, "")
+        network_available = float(network_stock_map.get(nmid, {}).get("network_stock_available", 0.0))
 
         if int(sku["sales_90_total"]) < cfg.low_turnover_sales_threshold:
+            target_network_stock = float(cfg.low_turnover_network_stock)
+            net_need = max(0.0, target_network_stock - network_available)
+
+            if net_need <= 0:
+                continue
+
             allocations = allocate_low_turnover(sku_shares, cfg)
-            for warehouse, target_qty in allocations.items():
-                current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
-                to_supply = max(0, int(target_qty - current_stock))
+            total_alloc = sum(allocations.values())
+            if total_alloc <= 0:
+                continue
+
+            for warehouse, alloc_value in allocations.items():
+                share_weight = alloc_value / total_alloc
+                warehouse_need = int(math.ceil(net_need * share_weight))
+
+                wh_row = current_lookup.get((nmid, warehouse), {})
+                current_full = float(wh_row.get("current_stock_full", 0))
+                current_available = float(wh_row.get("current_stock_available", 0))
+
+                if warehouse_need <= 0:
+                    continue
 
                 rows.append(
                     {
@@ -822,20 +935,43 @@ def calculate_supply_plan(
                             sku_shares.loc[sku_shares["warehouse"] == warehouse, "warehouse_share"].sum()
                         ) if warehouse in sku_shares["warehouse"].values else 0.0,
                         "daily_demand_final": float(sku["daily_demand_final"]),
-                        "target_stock": float(target_qty),
-                        "current_stock_full": float(current_stock),
-                        "to_supply": float(to_supply),
+                        "target_stock": target_network_stock,
+                        "network_stock_available": network_available,
+                        "current_stock_full": current_full,
+                        "current_stock_available": current_available,
+                        "to_supply": float(warehouse_need),
                         "calc_mode": "low_turnover",
                     }
                 )
             continue
 
+        sku_shares = sku_shares.copy()
+        sku_shares["target_stock_wh"] = (
+            float(sku["daily_demand_final"]) * sku_shares["warehouse_share"].astype(float) * cfg.target_days
+        )
+
+        network_target = float(sku_shares["target_stock_wh"].sum())
+        net_need = max(0.0, network_target - network_available)
+
+        if net_need <= 0:
+            continue
+
+        total_target = float(sku_shares["target_stock_wh"].sum())
+        if total_target <= 0:
+            continue
+
         for _, share_row in sku_shares.iterrows():
             warehouse = share_row["warehouse"]
-            share = float(share_row["warehouse_share"])
-            target_stock = float(sku["daily_demand_final"]) * share * cfg.target_days
-            current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
-            to_supply = max(0, ceil_int(target_stock - current_stock))
+            warehouse_target = float(share_row["target_stock_wh"])
+            warehouse_share = warehouse_target / total_target if total_target > 0 else 0.0
+            warehouse_need = int(math.ceil(net_need * warehouse_share))
+
+            wh_row = current_lookup.get((nmid, warehouse), {})
+            current_full = float(wh_row.get("current_stock_full", 0))
+            current_available = float(wh_row.get("current_stock_available", 0))
+
+            if warehouse_need <= 0:
+                continue
 
             rows.append(
                 {
@@ -844,11 +980,13 @@ def calculate_supply_plan(
                     "subject": sku["subject"],
                     "Артикул 1С": article_1c,
                     "warehouse": warehouse,
-                    "warehouse_share": share,
+                    "warehouse_share": float(share_row["warehouse_share"]),
                     "daily_demand_final": float(sku["daily_demand_final"]),
-                    "target_stock": float(target_stock),
-                    "current_stock_full": float(current_stock),
-                    "to_supply": float(to_supply),
+                    "target_stock": warehouse_target,
+                    "network_stock_available": network_available,
+                    "current_stock_full": current_full,
+                    "current_stock_available": current_available,
+                    "to_supply": float(warehouse_need),
                     "calc_mode": "regular",
                 }
             )
@@ -866,7 +1004,9 @@ def calculate_supply_plan(
             warehouse_share=("warehouse_share", "sum"),
             daily_demand_final=("daily_demand_final", "first"),
             target_stock=("target_stock", "sum"),
+            network_stock_available=("network_stock_available", "first"),
             current_stock_full=("current_stock_full", "sum"),
+            current_stock_available=("current_stock_available", "sum"),
             to_supply=("to_supply", "sum"),
         )
     )
@@ -970,7 +1110,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         for col_name in ONE_C_STOCK_COLUMNS
         if col_name in header_map
     }
-    sobrat_col = header_map.get("Собрать всего")
 
     technical_cols = {"supplierArticle", "Артикул 1С", "nmId", "subject", "Общий итог", "missing_1c_article"}
     source_warehouse_cols = [
@@ -999,8 +1138,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     ordered_warehouses = [w for w in preferred_order if w in source_warehouse_cols]
     ordered_warehouses += [w for w in source_warehouse_cols if w not in ordered_warehouses]
 
-    # Полностью перестраиваем складскую зону:
-    # удаляем все колонки между A и "Общий итог", затем вставляем нужное число складских колонок с B
     if total_col > article_1c_col + 1:
         ws.delete_cols(article_1c_col + 1, total_col - article_1c_col - 1)
 
@@ -1022,7 +1159,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     for i, wh in enumerate(ordered_warehouses, start=article_1c_col + 1):
         ws.cell(header_row, i, reverse_template_names.get(wh, wh))
 
-    # после вставки пересчитываем карту заголовков
     header_map = get_header_map()
     total_col = header_map.get("Общий итог")
     article_1c_col = header_map.get("Артикул 1С") or header_map.get("Артикул 1с")
@@ -1031,7 +1167,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         for col_name in ONE_C_STOCK_COLUMNS
         if col_name in header_map
     }
-    sobrat_col = header_map.get("Собрать всего")
 
     warehouse_write_map: Dict[str, int] = {}
     for col in range(article_1c_col + 1, total_col):
@@ -1047,11 +1182,9 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         data_df["template_total"] = data_df[template_warehouse_cols].sum(axis=1)
         data_df = data_df[data_df["template_total"] > 0].copy()
 
-    # очищаем только нужные области
     clear_cols = {article_1c_col, total_col}
     clear_cols.update(warehouse_write_map.values())
     clear_cols.update(one_c_col_map.values())
-    # Собрать всего НЕ трогаем
 
     for row_idx in range(2, ws.max_row + 1):
         for col_idx in clear_cols:
@@ -1080,8 +1213,6 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
 
         for col_name, col_idx in one_c_col_map.items():
             ws.cell(i, col_idx, floor_int(row.get(col_name, 0)))
-
-        # Собрать всего не заполняем
 
         if bool(row.get("missing_1c_article", False)):
             for col_idx in range(1, ws.max_column + 1):
@@ -1153,6 +1284,28 @@ def main(cfg: AppConfig = CONFIG) -> str:
     article_1c_map = load_article_map_1c(storage, cfg)
     stocks_1c_raw = load_1c_stocks(storage, cfg)
     stocks_1c_map = prepare_1c_stocks_map(stocks_1c_raw)
+    ratings_map = load_ratings_map(storage, cfg)
+
+    # фильтр по рейтингу отзывов
+    if ratings_map:
+        sku_df_tmp = orders[["nmId"]].drop_duplicates().copy()
+        sku_df_tmp["review_rating"] = sku_df_tmp["nmId"].map(ratings_map)
+        bad_skus = set(
+            sku_df_tmp.loc[
+                sku_df_tmp["review_rating"].notna() & (sku_df_tmp["review_rating"] < cfg.min_review_rating),
+                "nmId",
+            ].astype(str)
+        )
+        if bad_skus:
+            orders_before = len(orders)
+            stocks_before = len(stocks)
+            orders = orders[~orders["nmId"].isin(bad_skus)].copy()
+            stocks = stocks[~stocks["nmId"].isin(bad_skus)].copy()
+            log(f"Исключено SKU по рейтингу отзывов < {cfg.min_review_rating}: {len(bad_skus)}")
+            log(f"Удалено строк из заказов по рейтингу: {orders_before - len(orders)}")
+            log(f"Удалено строк из остатков по рейтингу: {stocks_before - len(stocks)}")
+        else:
+            log(f"SKU с рейтингом отзывов < {cfg.min_review_rating} не найдено")
 
     stocks_1c_local = str(Path(cfg.output_dir) / "Остатки 1С.xlsx")
     storage.download_file(cfg.stocks_1c_key, stocks_1c_local)
@@ -1166,7 +1319,8 @@ def main(cfg: AppConfig = CONFIG) -> str:
 
     current_stock = current_stock_by_warehouse(current_stock_df)
     log(f"Текущих остатков по складам в расчёте: {len(current_stock):,} строк")
-    log(f"Сумма текущих остатков по складам: {current_stock['current_stock_full'].sum():,.0f}")
+    log(f"Сумма текущих остатков по складам (full): {current_stock['current_stock_full'].sum():,.0f}")
+    log(f"Сумма текущих остатков по складам (available): {current_stock['current_stock_available'].sum():,.0f}")
 
     grid = attach_presence_flags(grid, per_wh, per_district, history_dates)
     log(f"GRID SIZE: {len(grid):,}")
@@ -1178,6 +1332,10 @@ def main(cfg: AppConfig = CONFIG) -> str:
     sku_df = choose_final_daily_demand(region_metrics, cfg)
     shares_df = build_warehouse_shares(region_metrics)
     shares_df = apply_strategy(shares_df, cfg)
+
+    # рейтинг в debug
+    if ratings_map:
+        sku_df["review_rating"] = sku_df["nmId"].map(ratings_map)
 
     plan_df = calculate_supply_plan(sku_df, shares_df, current_stock, article_1c_map, cfg)
     if plan_df.empty:
