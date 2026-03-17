@@ -408,27 +408,26 @@ def load_unit_economics(s3: S3Storage, week_label: str) -> pd.DataFrame:
     df = sheets["Юнит экономика"].copy()
     if df.empty:
         raise RuntimeError("Лист 'Юнит экономика' пустой")
-    
-    # Приводим колонку "Неделя" к строке и фильтруем по нужной неделе
+
     df["Неделя"] = df["Неделя"].astype(str)
     df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
     df = df[df["Неделя"] == week_label].dropna(subset=["Артикул WB"]).copy()
     df["Артикул WB"] = df["Артикул WB"].astype("int64")
 
-    # Фильтрация по целевым категориям товаров (колонка "Предмет")
+    # Фильтрация по целевым категориям
     if "Предмет" in df.columns:
-        # Преобразуем все значения в строки, NaN станут "nan"
         df["Предмет_str"] = df["Предмет"].astype(str).str.lower().str.strip()
-        # Фильтруем только те строки, где строка содержит хотя бы одну из целевых категорий
         mask = df["Предмет_str"].apply(
             lambda x: any(cat in x for cat in TARGET_PRODUCT_CATEGORIES) if isinstance(x, str) else False
         )
-        df = df[mask].drop(columns=["Предмет_str"])
+        df = df[mask].copy()
+        # Удаляем временную колонку, если она существует
+        if "Предмет_str" in df.columns:
+            df = df.drop(columns=["Предмет_str"])
         log(f"✅ После фильтрации по категориям осталось SKU: {len(df)}")
     else:
         log("⚠️ Колонка 'Предмет' не найдена, фильтрация не применяется")
 
-    # Приводим числовые колонки к float и заполняем пропуски нулями
     numeric_cols = [
         "Продажи, шт", "Возвраты, шт", "Чистые продажи, шт", "Процент выкупа",
         "Средняя цена продажи", "Средняя цена покупателя", "СПП, %",
