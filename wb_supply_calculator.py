@@ -59,8 +59,8 @@ class AppConfig:
     low_turnover_network_stock: int = 50
 
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-send_telegram: bool = os.getenv("WB_SEND_TELEGRAM", "1") == "1"
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    send_telegram: bool = os.getenv("WB_SEND_TELEGRAM", "1") == "1"
 
     output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
     upload_result_to_s3: bool = os.getenv("WB_UPLOAD_RESULT_TO_S3", "0") == "1"
