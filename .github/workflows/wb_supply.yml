@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       store_name:
-        description: "Магазин"
+        description: "Магазин: TOPFACE или MISS_TAIS"
         required: true
         default: "TOPFACE"
         type: string
@@ -25,7 +25,7 @@ on:
           - economy
 
       run_date:
-        description: "Дата расчёта YYYY-MM-DD"
+        description: "Дата расчёта YYYY-MM-DD. Если пусто — берётся сегодняшняя дата"
         required: false
         default: ""
         type: string
@@ -41,18 +41,18 @@ jobs:
       WB_S3_ENDPOINT: ${{ secrets.WB_S3_ENDPOINT }}
       WB_S3_REGION: ${{ secrets.WB_S3_REGION }}
 
+      WB_TEMPLATE_KEY: ${{ secrets.WB_TEMPLATE_KEY }}
+
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      WB_TEMPLATE_KEY: ${{ secrets.WB_TEMPLATE_KEY }}
-WB_SEND_TELEGRAM: "1"
       WB_UPLOAD_RESULT_TO_S3: "1"
       WB_OUTPUT_DIR: "output"
       WB_SEND_TELEGRAM: "1"
 
-      WB_STORE: ${{ inputs.store_name }}
-      WB_SEASON_COEFF: ${{ inputs.season_coeff }}
-      WB_STRATEGY_MODE: ${{ inputs.strategy_mode }}
+      WB_STORE: ${{ github.event.inputs.store_name }}
+      WB_SEASON_COEFF: ${{ github.event.inputs.season_coeff }}
+      WB_STRATEGY_MODE: ${{ github.event.inputs.strategy_mode }}
 
     steps:
       - name: Checkout repository
@@ -61,11 +61,19 @@ WB_SEND_TELEGRAM: "1"
       - name: Set run date
         shell: bash
         run: |
-          if [ -n "${{ inputs.run_date }}" ]; then
-            echo "WB_RUN_DATE=${{ inputs.run_date }}" >> $GITHUB_ENV
+          if [ -n "${{ github.event.inputs.run_date }}" ]; then
+            echo "WB_RUN_DATE=${{ github.event.inputs.run_date }}" >> $GITHUB_ENV
           else
             echo "WB_RUN_DATE=$(date +%F)" >> $GITHUB_ENV
           fi
+
+      - name: Show input params
+        shell: bash
+        run: |
+          echo "WB_STORE=$WB_STORE"
+          echo "WB_SEASON_COEFF=$WB_SEASON_COEFF"
+          echo "WB_STRATEGY_MODE=$WB_STRATEGY_MODE"
+          echo "WB_RUN_DATE=$WB_RUN_DATE"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -73,17 +81,19 @@ WB_SEND_TELEGRAM: "1"
           python-version: "3.11"
 
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run WB supply calculation
+        shell: bash
         run: |
           python wb_supply_calculator.py
 
-      - name: Upload GitHub artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wb-supply-${{ inputs.store_name }}
+          name: wb-supply-${{ github.event.inputs.store_name }}
           path: output/*
           if-no-files-found: error
