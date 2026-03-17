@@ -8,15 +8,14 @@ import math
 import os
 import re
 import shutil
-import smtplib
+import requests
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from email.message import EmailMessage
+
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
-
 import boto3
 import numpy as np
 import pandas as pd
@@ -59,15 +58,9 @@ class AppConfig:
     low_turnover_sales_threshold: int = 100
     low_turnover_network_stock: int = 50
 
-    send_email: bool = os.getenv("WB_SEND_EMAIL", "0") == "1"
-    smtp_host: str = os.getenv("WB_SMTP_HOST", "")
-    smtp_port: int = int(os.getenv("WB_SMTP_PORT", "587"))
-    smtp_user: str = os.getenv("WB_SMTP_USER", "")
-    smtp_password: str = os.getenv("WB_SMTP_PASSWORD", "")
-    smtp_sender: str = os.getenv("WB_SMTP_SENDER", "")
-    smtp_to: str = os.getenv("WB_SMTP_TO", "")
-    smtp_cc: str = os.getenv("WB_SMTP_CC", "")
-    smtp_subject_prefix: str = os.getenv("WB_SMTP_SUBJECT_PREFIX", "Согласование поставки WB")
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+send_telegram: bool = os.getenv("WB_SEND_TELEGRAM", "1") == "1"
 
     output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
     upload_result_to_s3: bool = os.getenv("WB_UPLOAD_RESULT_TO_S3", "0") == "1"
@@ -1085,30 +1078,38 @@ def fill_template_file(
     return output_path
 
 
-def send_email_with_attachment(cfg: AppConfig, attachment_path: str) -> None:
-    if not cfg.send_email:
+def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str = "") -> None:
+    if not bot_token or not chat_id:
+        raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+
+    with open(file_path, "rb") as f:
+        files = {"document": (Path(file_path).name, f)}
+        data = {
+            "chat_id": chat_id,
+            "caption": caption[:1024],
+        }
+        response = requests.post(url, data=data, files=files, timeout=300)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Ошибка отправки в Telegram: {response.status_code} {response.text}")
+
+
+def send_results_to_telegram(cfg: AppConfig, files: List[str]) -> None:
+    if not cfg.send_telegram:
+        log("Отправка в Telegram отключена.")
         return
 
-    msg = EmailMessage()
-    msg["From"] = cfg.smtp_sender
-    msg["To"] = cfg.smtp_to
-    if cfg.smtp_cc:
-        msg["Cc"] = cfg.smtp_cc
-    msg["Subject"] = f"{cfg.smtp_subject_prefix}_{cfg.store_name}"
-    msg.set_content(f"Во вложении файл согласования поставки WB по магазину {cfg.store_name}.")
-
-    msg.add_attachment(
-        Path(attachment_path).read_bytes(),
-        maintype="application",
-        subtype="vnd.ms-excel.sheet.macroEnabled.12",
-        filename=Path(attachment_path).name
-    )
-
-    with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as server:
-        server.starttls()
-        server.login(cfg.smtp_user, cfg.smtp_password)
-        server.send_message(msg)
-
+    for file_path in files:
+        caption = f"{cfg.store_name} | {cfg.run_date:%Y-%m-%d} | {Path(file_path).name}"
+        send_telegram_document(
+            bot_token=cfg.telegram_bot_token,
+            chat_id=cfg.telegram_chat_id,
+            file_path=file_path,
+            caption=caption,
+        )
+        log(f"Файл отправлен в Telegram: {file_path}")
 
 def save_debug_files(
     output_dir: str,
@@ -1140,7 +1141,8 @@ def main(cfg: AppConfig = CONFIG) -> str:
     stocks = load_stocks(storage, cfg)
     article_1c_map = load_article_map_1c(storage, cfg)
     stocks_1c_map = prepare_1c_stocks_map(load_1c_stocks(storage, cfg))
-
+stocks_1c_local = str(Path(cfg.output_dir) / "Остатки 1С.xlsx")
+storage.download_file(cfg.stocks_1c_key, stocks_1c_local)
     daily_orders = prepare_daily_orders(orders)
     grid = build_daily_grid(daily_orders, cfg)
 
@@ -1181,7 +1183,12 @@ def main(cfg: AppConfig = CONFIG) -> str:
         )
         log("Результат загружен в Object Storage")
 
-    send_email_with_attachment(cfg, output_path)
+    files_to_send = [
+    output_path,
+    str(Path(cfg.output_dir) / "wb_supply_debug.xlsx"),
+    stocks_1c_local,
+]
+send_results_to_telegram(cfg, files_to_send)
     log("Готово")
     return output_path
 
