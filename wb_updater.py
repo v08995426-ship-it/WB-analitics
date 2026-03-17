@@ -502,76 +502,136 @@ class WildberriesDailyUpdater:
                 self.log(f"ℹ️ Нет новых данных за неделю")
         return True
 
-    # ---------- Остатки ----------
+    # ---------- Остатки (исправленная версия с пагинацией) ----------
     def update_stocks(self, store_name: str) -> bool:
+        """Обновление остатков (ежедневный срез) с поддержкой пагинации."""
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         config = self.reports_config['stocks']
+
+        # Целевая дата — вчера
         target_date = (datetime.now() - timedelta(days=1)).date()
         week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
+        target_date_str = target_date.strftime('%Y-%m-%d')
+
+        # Загружаем существующий недельный файл
         weekly_df = self._load_weekly_data(store_name, 'stocks', week_start)
-        if not weekly_df.empty:
-            existing_dates = set(pd.to_datetime(weekly_df['Дата запроса']).dt.date.unique()) if 'Дата запроса' in weekly_df.columns else set()
+        if not weekly_df.empty and 'Дата запроса' in weekly_df.columns:
+            existing_dates = set(pd.to_datetime(weekly_df['Дата запроса']).dt.date.unique())
         else:
             existing_dates = set()
 
         if target_date in existing_dates:
-            self.log(f"✅ Данные за {target_date} уже есть в недельном файле, пропускаем")
+            self.log(f"✅ Данные за {target_date_str} уже есть в недельном файле, пропускаем")
             return True
 
-        self.log(f"📅 Загрузка остатков за {target_date}...")
+        self.log(f"📅 Загрузка остатков за {target_date_str}...")
+
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": api_key.strip()}
-        try:
-            params = {"dateFrom": target_date.strftime('%Y-%m-%d')}
-            resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data:
-                    df_day = pd.DataFrame(data)
-                    df_day['Дата запроса'] = target_date.strftime('%Y-%m-%d')
-                    df_day['Магазин'] = store_name
-                    df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    rename_map = {
-                        'lastChangeDate': 'Дата последнего изменения',
-                        'warehouseName': 'Склад',
-                        'supplierArticle': 'Артикул продавца',
-                        'nmId': 'Артикул WB',
-                        'barcode': 'Баркод',
-                        'quantity': 'Доступно для продажи',
-                        'inWayToClient': 'В пути к клиенту',
-                        'inWayFromClient': 'В пути от клиента',
-                        'quantityFull': 'Полное количество',
-                        'category': 'Категория',
-                        'subject': 'Предмет',
-                        'brand': 'Бренд',
-                        'techSize': 'Размер',
-                        'Price': 'Цена',
-                        'Discount': 'Скидка',
-                        'isSupply': 'Договор поставки',
-                        'isRealization': 'Договор реализации',
-                        'SCCode': 'Код контракта'
-                    }
-                    df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
 
-                    if weekly_df.empty:
-                        weekly_df = df_day
-                    else:
-                        weekly_df = pd.concat([weekly_df, df_day], ignore_index=True)
+        # Параметры для пагинации: начинаем с очень ранней даты
+        date_from = "2000-01-01T00:00:00"
+        all_data = []
+        page = 1
+        max_pages = 50  # предохранитель
 
-                    self._save_weekly_data(weekly_df, store_name, 'stocks', week_start)
-                    self.log(f"✅ Данные за {target_date} добавлены в недельный файл")
+        while page <= max_pages:
+            params = {"dateFrom": date_from}
+            self.log(f"  Страница {page}, dateFrom={date_from}")
+
+            try:
+                resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if not data:  # пустой массив – все данные получены
+                        self.log(f"  ✅ Завершено: получено пустых данных")
+                        break
+
+                    all_data.extend(data)
+                    self.log(f"  ➕ Добавлено {len(data)} записей, всего {len(all_data)}")
+
+                    # Берём lastChangeDate последней записи для следующего запроса
+                    last_item = data[-1]
+                    date_from = last_item.get("lastChangeDate")
+                    if not date_from:
+                        self.log("  ⚠️ В последней записи нет lastChangeDate, прерываем пагинацию")
+                        break
+
+                    # Лимит 1 запрос в минуту, ждём 65 сек перед следующим
+                    time.sleep(self.delays['stocks'])
+                    page += 1
+
+                elif resp.status_code == 429:
+                    self.log(f"  ⚠️ Лимит запросов (429), ждём 65 сек...")
+                    time.sleep(65)
+                    # повторяем запрос с теми же параметрами
+                    continue
                 else:
-                    self.log(f"ℹ️ Нет данных за {target_date}")
-            elif resp.status_code == 429:
-                self.log(f"⚠️ Лимит запросов, ждём 65 сек...")
-                time.sleep(65)
+                    self.log(f"  ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                    return False
+            except Exception as e:
+                self.log(f"  ❌ Исключение при запросе: {e}")
                 return False
-            else:
-                self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
-                return False
-        except Exception as e:
-            self.log(f"❌ Исключение при запросе: {e}")
-            return False
+
+        if not all_data:
+            self.log(f"ℹ️ Нет данных за {target_date_str}")
+            return True
+
+        # Создаём DataFrame и добавляем служебные колонки
+        df_day = pd.DataFrame(all_data)
+        df_day['Дата запроса'] = target_date_str
+        df_day['Магазин'] = store_name
+        df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Переименование колонок
+        rename_map = {
+            'lastChangeDate': 'Дата последнего изменения',
+            'warehouseName': 'Склад',
+            'supplierArticle': 'Артикул продавца',
+            'nmId': 'Артикул WB',
+            'barcode': 'Баркод',
+            'quantity': 'Доступно для продажи',
+            'inWayToClient': 'В пути к клиенту',
+            'inWayFromClient': 'В пути от клиента',
+            'quantityFull': 'Полное количество',
+            'category': 'Категория',
+            'subject': 'Предмет',
+            'brand': 'Бренд',
+            'techSize': 'Размер',
+            'Price': 'Цена',
+            'Discount': 'Скидка',
+            'isSupply': 'Договор поставки',
+            'isRealization': 'Договор реализации',
+            'SCCode': 'Код контракта'
+        }
+        df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
+
+        # Дедупликация по уникальному набору полей (дата + артикул WB + склад)
+        dedup_cols = ['Дата запроса', 'Артикул WB', 'Склад']
+        existing_cols = [c for c in dedup_cols if c in df_day.columns]
+        if existing_cols:
+            before = len(df_day)
+            df_day = df_day.drop_duplicates(subset=existing_cols, keep='last')
+            after = len(df_day)
+            if before > after:
+                self.log(f"🔍 Удалено дубликатов в дневных данных: {before - after}")
+
+        # Объединяем с недельным файлом
+        if weekly_df.empty:
+            weekly_df = df_day
+        else:
+            weekly_df = pd.concat([weekly_df, df_day], ignore_index=True)
+            # Дедупликация во всём недельном файле
+            if existing_cols:
+                before_week = len(weekly_df)
+                weekly_df = weekly_df.drop_duplicates(subset=existing_cols, keep='last')
+                after_week = len(weekly_df)
+                if before_week > after_week:
+                    self.log(f"🔍 Удалено дубликатов в недельном файле: {before_week - after_week}")
+
+        # Сохраняем
+        self._save_weekly_data(weekly_df, store_name, 'stocks', week_start)
+        self.log(f"✅ Данные за {target_date_str} добавлены в недельный файл")
         return True
 
     # ---------- Финансовые показатели ----------
