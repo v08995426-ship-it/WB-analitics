@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       store_name:
-        description: "Магазин (например TOPFACE или MISS_TAIS)"
+        description: "Магазин"
         required: true
         default: "TOPFACE"
         type: string
@@ -16,7 +16,7 @@ on:
         type: string
 
       strategy_mode:
-        description: "Режим расчёта: default или economy"
+        description: "Режим расчёта"
         required: true
         default: "default"
         type: choice
@@ -30,12 +30,6 @@ on:
         default: ""
         type: string
 
-      send_email:
-        description: "Отправлять письмо"
-        required: true
-        default: false
-        type: boolean
-
 jobs:
   wb-supply:
     runs-on: ubuntu-latest
@@ -47,23 +41,18 @@ jobs:
       WB_S3_ENDPOINT: ${{ secrets.WB_S3_ENDPOINT }}
       WB_S3_REGION: ${{ secrets.WB_S3_REGION }}
 
-      WB_SMTP_HOST: ${{ secrets.WB_SMTP_HOST }}
-      WB_SMTP_PORT: ${{ secrets.WB_SMTP_PORT }}
-      WB_SMTP_USER: ${{ secrets.WB_SMTP_USER }}
-      WB_SMTP_PASSWORD: ${{ secrets.WB_SMTP_PASSWORD }}
-      WB_SMTP_SENDER: ${{ secrets.WB_SMTP_SENDER }}
-      WB_SMTP_TO: ${{ secrets.WB_SMTP_TO }}
-      WB_SMTP_CC: ${{ secrets.WB_SMTP_CC }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       WB_TEMPLATE_KEY: ${{ secrets.WB_TEMPLATE_KEY }}
 
       WB_UPLOAD_RESULT_TO_S3: "1"
       WB_OUTPUT_DIR: "output"
+      WB_SEND_TELEGRAM: "1"
 
       WB_STORE: ${{ inputs.store_name }}
       WB_SEASON_COEFF: ${{ inputs.season_coeff }}
       WB_STRATEGY_MODE: ${{ inputs.strategy_mode }}
-      WB_SEND_EMAIL: ${{ inputs.send_email }}
 
     steps:
       - name: Checkout repository
@@ -92,7 +81,7 @@ jobs:
         run: |
           python wb_supply_calculator.py
 
-      - name: Upload artifacts
+      - name: Upload GitHub artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wb-supply-${{ inputs.store_name }}
