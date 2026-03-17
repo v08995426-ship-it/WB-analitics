@@ -8,17 +8,17 @@ import math
 import os
 import re
 import shutil
-import requests
 import tempfile
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+
 import boto3
 import numpy as np
 import pandas as pd
+import requests
 from botocore.client import Config as BotoConfig
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -27,6 +27,13 @@ from openpyxl.styles import PatternFill
 # ============================================================
 # CONFIG
 # ============================================================
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 @dataclass
 class AppConfig:
@@ -39,7 +46,7 @@ class AppConfig:
     store_name: str = os.getenv("WB_STORE", "TOPFACE").strip()
     run_date: datetime = datetime.strptime(
         os.getenv("WB_RUN_DATE", datetime.now().strftime("%Y-%m-%d")),
-        "%Y-%m-%d"
+        "%Y-%m-%d",
     )
     season_coeff: float = float(os.getenv("WB_SEASON_COEFF", "1.0"))
 
@@ -58,12 +65,12 @@ class AppConfig:
     low_turnover_sales_threshold: int = 100
     low_turnover_network_stock: int = 50
 
+    output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
+    upload_result_to_s3: bool = env_bool("WB_UPLOAD_RESULT_TO_S3", False)
+
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
-    send_telegram: bool = os.getenv("WB_SEND_TELEGRAM", "1") == "1"
-
-    output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
-    upload_result_to_s3: bool = os.getenv("WB_UPLOAD_RESULT_TO_S3", "0") == "1"
+    send_telegram: bool = env_bool("WB_SEND_TELEGRAM", True)
 
     orders_prefix_tpl: str = "Отчёты/Заказы/{store}/Недельные/"
     stocks_prefix_tpl: str = "Отчёты/Остатки/{store}/Недельные/"
@@ -71,7 +78,7 @@ class AppConfig:
     article_map_1c_key: str = "Отчёты/Остатки/1С/Артикулы 1с.xlsx"
     template_key: str = os.getenv(
         "WB_TEMPLATE_KEY",
-        "Отчёты/Шаблоны/Согласование поставки WB.xlsm"
+        "Отчёты/Шаблоны/Согласование поставки WB.xlsm",
     )
 
     excluded_subjects: Tuple[str, ...] = ("Лаки для ногтей",)
@@ -83,10 +90,10 @@ class AppConfig:
     )
     strategy_mode: str = os.getenv("WB_STRATEGY_MODE", "default").strip().lower()
 
-    district_primary_warehouse: Dict[str, str] = None
+    district_primary_warehouse: Dict[str, str] = field(default_factory=dict)
 
-    def __post_init__(self):
-        if self.district_primary_warehouse is None:
+    def __post_init__(self) -> None:
+        if not self.district_primary_warehouse:
             self.district_primary_warehouse = {
                 "Центральный федеральный округ": "Коледино",
                 "Северо-Западный федеральный округ": "Санкт-Петербург Уткина Заводь",
@@ -103,71 +110,10 @@ CONFIG = AppConfig()
 
 
 # ============================================================
-# S3
+# НОРМАЛИЗАЦИЯ / СПРАВОЧНИКИ
 # ============================================================
 
-class S3Storage:
-    def __init__(self, cfg: AppConfig):
-        if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
-            raise ValueError(
-                "Не заданы параметры Object Storage. "
-                "Нужны env: WB_S3_BUCKET, WB_S3_ACCESS_KEY, WB_S3_SECRET_KEY."
-            )
-
-        self.bucket = cfg.bucket_name
-        self.s3 = boto3.client(
-            "s3",
-            endpoint_url=cfg.endpoint_url,
-            aws_access_key_id=cfg.access_key,
-            aws_secret_access_key=cfg.secret_key,
-            region_name=cfg.region_name,
-            config=BotoConfig(
-                signature_version="s3v4",
-                read_timeout=300,
-                connect_timeout=60
-            ),
-        )
-
-    def list_keys(self, prefix: str) -> List[str]:
-        keys: List[str] = []
-        continuation_token = None
-
-        while True:
-            kwargs = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
-            if continuation_token:
-                kwargs["ContinuationToken"] = continuation_token
-
-            resp = self.s3.list_objects_v2(**kwargs)
-            keys.extend([obj["Key"] for obj in resp.get("Contents", [])])
-
-            if not resp.get("IsTruncated"):
-                break
-
-            continuation_token = resp.get("NextContinuationToken")
-
-        return keys
-
-    def read_bytes(self, key: str) -> bytes:
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return obj["Body"].read()
-
-    def read_excel(self, key: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-        return pd.read_excel(io.BytesIO(self.read_bytes(key)), sheet_name=sheet_name)
-
-    def download_file(self, key: str, local_path: str) -> str:
-        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(local_path).write_bytes(self.read_bytes(key))
-        return local_path
-
-    def upload_file(self, local_path: str, key: str) -> None:
-        self.s3.upload_file(local_path, self.bucket, key)
-
-
-# ============================================================
-# СПРАВОЧНИКИ
-# ============================================================
-
-WAREHOUSE_ALIASES = {
+WAREHOUSE_ALIASES: Dict[str, str] = {
     "Коледино/Электросталь (Москва)": "MOSCOW_CLUSTER",
     "Новосемейкино": "Самара (Новосемейкино)",
     "Самара Новосемейкино": "Самара (Новосемейкино)",
@@ -176,14 +122,14 @@ WAREHOUSE_ALIASES = {
     "Санкт Петербург Уткина Заводь": "Санкт-Петербург Уткина Заводь",
 }
 
-TEMPLATE_WAREHOUSE_ALIASES = {
+TEMPLATE_WAREHOUSE_ALIASES: Dict[str, str] = {
     "Новосемейкино": "Самара (Новосемейкино)",
     "Екатеринбург": "Екатеринбург - Перспективная 14",
     "СПб Уткина Заводь": "Санкт-Петербург Уткина Заводь",
     "СПБ Уткина Заводь": "Санкт-Петербург Уткина Заводь",
 }
 
-ECONOMY_REPLACEMENT_MAP = {
+ECONOMY_REPLACEMENT_MAP: Dict[str, str] = {
     "Коледино": "Рязань (Тюшевское)",
     "Электросталь": "Владимир",
     "Краснодар": "Невинномысск",
@@ -191,7 +137,7 @@ ECONOMY_REPLACEMENT_MAP = {
     "Тула": "Котовск",
 }
 
-WAREHOUSE_TO_DISTRICT = {
+WAREHOUSE_TO_DISTRICT: Dict[str, str] = {
     "Коледино": "Центральный федеральный округ",
     "Электросталь": "Центральный федеральный округ",
     "Белые Столбы": "Центральный федеральный округ",
@@ -212,12 +158,12 @@ WAREHOUSE_TO_DISTRICT = {
     "Новосибирск": "Сибирский федеральный округ",
 }
 
-ALL_TARGET_WAREHOUSES = list(WAREHOUSE_TO_DISTRICT.keys())
+ALL_TARGET_WAREHOUSES: List[str] = list(WAREHOUSE_TO_DISTRICT.keys())
 
-MOSCOW_CLUSTER = ["Коледино", "Электросталь", "Белые Столбы", "Подольск"]
-MOSCOW_SPLIT_TARGET = {"Коледино": 0.5, "Электросталь": 0.5}
+MOSCOW_CLUSTER: List[str] = ["Коледино", "Электросталь", "Белые Столбы", "Подольск"]
+MOSCOW_SPLIT_TARGET: Dict[str, float] = {"Коледино": 0.5, "Электросталь": 0.5}
 
-ONE_C_STOCK_COLUMNS = [
+ONE_C_STOCK_COLUMNS: List[str] = [
     'Адресный склад',
     'Оптовый склад Луганск- ООО "Хайлер"',
     'Основной склад - ИП Куканянц И.Ю.',
@@ -229,112 +175,267 @@ def build_region_to_group() -> Dict[str, str]:
     mapping: Dict[str, str] = {}
 
     def add(group: str, regions: Sequence[str]) -> None:
-        for r in regions:
-            mapping[r] = group
+        for region in regions:
+            mapping[region] = group
 
     add("MOSCOW_CLUSTER", ["Москва", "Московская область"])
 
-    add("Краснодар", [
-        "Краснодарский край", "Ростовская область", "Республика Крым", "Севастополь",
-        "Республика Адыгея", "Ереван", "Котайкская область", "Лорийская область",
-        "Гехаркуникская область", "Ширакская область", "федеральная территория Сириус",
-        "Тавушская область", "Республика Каракалпакстан", "Вайоцдзорская область",
-    ])
+    add(
+        "Краснодар",
+        [
+            "Краснодарский край",
+            "Ростовская область",
+            "Республика Крым",
+            "Севастополь",
+            "Республика Адыгея",
+            "Ереван",
+            "Котайкская область",
+            "Лорийская область",
+            "Гехаркуникская область",
+            "Ширакская область",
+            "федеральная территория Сириус",
+            "Тавушская область",
+            "Республика Каракалпакстан",
+            "Вайоцдзорская область",
+        ],
+    )
 
-    add("Санкт-Петербург Уткина Заводь", [
-        "Санкт-Петербург", "Ленинградская область", "Новгородская область", "Республика Карелия",
-    ])
+    add(
+        "Санкт-Петербург Уткина Заводь",
+        [
+            "Санкт-Петербург",
+            "Ленинградская область",
+            "Новгородская область",
+            "Республика Карелия",
+        ],
+    )
 
-    add("Невинномысск", [
-        "Ставропольский край", "Республика Дагестан", "Чеченская Республика",
-        "Республика Северная Осетия — Алания", "Кабардино-Балкарская Республика",
-        "Карачаево-Черкесская Республика", "Республика Ингушетия", "Республика Калмыкия",
-        "Армавирская область", "Араратская область", "Сюникская область", "Арагацотнская область",
-    ])
+    add(
+        "Невинномысск",
+        [
+            "Ставропольский край",
+            "Республика Дагестан",
+            "Чеченская Республика",
+            "Республика Северная Осетия — Алания",
+            "Кабардино-Балкарская Республика",
+            "Карачаево-Черкесская Республика",
+            "Республика Ингушетия",
+            "Республика Калмыкия",
+            "Армавирская область",
+            "Араратская область",
+            "Сюникская область",
+            "Арагацотнская область",
+        ],
+    )
 
-    add("Казань", [
-        "Республика Татарстан", "Ульяновская область", "Кировская область",
-        "Чувашская Республика", "Республика Коми", "Республика Марий Эл",
-    ])
+    add(
+        "Казань",
+        [
+            "Республика Татарстан",
+            "Ульяновская область",
+            "Кировская область",
+            "Чувашская Республика",
+            "Республика Коми",
+            "Республика Марий Эл",
+        ],
+    )
 
-    add("Владимир", [
-        "Нижегородская область", "Владимирская область", "Ярославская область",
-        "Ивановская область", "Костромская область", "Бухарская область",
-    ])
+    add(
+        "Владимир",
+        [
+            "Нижегородская область",
+            "Владимирская область",
+            "Ярославская область",
+            "Ивановская область",
+            "Костромская область",
+            "Бухарская область",
+        ],
+    )
 
-    add("Екатеринбург - Перспективная 14", [
-        "Свердловская область", "Иркутская область", "Красноярский край",
-        "Челябинская область", "Новосибирская область", "Кемеровская область",
-        "Ханты-Мансийский автономный округ", "Тюменская область", "Алтайский край",
-        "Омская область", "Томская область", "Республика Саха (Якутия)", "Республика Бурятия",
-        "Забайкальский край", "Амурская область", "Ямало-Ненецкий автономный округ",
-        "Курганская область", "Республика Алтай", "Алматы", "Карагандинская область",
-        "Костанайская область", "Восточно-Казахстанская область",
-        "город республиканского значения Астана", "Астана", "Павлодарская область",
-        "город республиканского подчинения Бишкек", "Акмолинская область",
-        "Северо-Казахстанская область", "город Бишкек", "Алматинская область",
-        "область Абай", "область Жетысу", "Джалал-Абадская область", "область Улытау",
-        "Абайская область", "город республиканского подчинения Ош", "Ошская область",
-        "Иссык-Кульская область", "Улутауская область", "Нарынская область",
-        "город республиканского значения Нур-Султан",
-    ])
+    add(
+        "Екатеринбург - Перспективная 14",
+        [
+            "Свердловская область",
+            "Иркутская область",
+            "Красноярский край",
+            "Челябинская область",
+            "Новосибирская область",
+            "Кемеровская область",
+            "Ханты-Мансийский автономный округ",
+            "Тюменская область",
+            "Алтайский край",
+            "Омская область",
+            "Томская область",
+            "Республика Саха (Якутия)",
+            "Республика Бурятия",
+            "Забайкальский край",
+            "Амурская область",
+            "Ямало-Ненецкий автономный округ",
+            "Курганская область",
+            "Республика Алтай",
+            "Алматы",
+            "Карагандинская область",
+            "Костанайская область",
+            "Восточно-Казахстанская область",
+            "город республиканского значения Астана",
+            "Астана",
+            "Павлодарская область",
+            "город республиканского подчинения Бишкек",
+            "Акмолинская область",
+            "Северо-Казахстанская область",
+            "город Бишкек",
+            "Алматинская область",
+            "область Абай",
+            "область Жетысу",
+            "Джалал-Абадская область",
+            "область Улытау",
+            "Абайская область",
+            "город республиканского подчинения Ош",
+            "Ошская область",
+            "Иссык-Кульская область",
+            "Улутауская область",
+            "Нарынская область",
+            "город республиканского значения Нур-Султан",
+        ],
+    )
 
-    add("Самара (Новосемейкино)", [
-        "Самарская область", "Оренбургская область", "Западно-Казахстанская область",
-        "Актюбинская область", "Чуйская область", "Жамбылская область", "Шымкент",
-        "Туркестанская область", "город республиканского значения Байконур",
-        "Баткенская область", "Кызылординская область", "город Ош",
-    ])
+    add(
+        "Самара (Новосемейкино)",
+        [
+            "Самарская область",
+            "Оренбургская область",
+            "Западно-Казахстанская область",
+            "Актюбинская область",
+            "Чуйская область",
+            "Жамбылская область",
+            "Шымкент",
+            "Туркестанская область",
+            "город республиканского значения Байконур",
+            "Баткенская область",
+            "Кызылординская область",
+            "город Ош",
+        ],
+    )
 
-    add("Сарапул", [
-        "Республика Башкортостан", "Пермский край", "Удмуртская Республика", "Республика Хакасия",
-    ])
+    add(
+        "Сарапул",
+        [
+            "Республика Башкортостан",
+            "Пермский край",
+            "Удмуртская Республика",
+            "Республика Хакасия",
+        ],
+    )
 
-    add("Воронеж", [
-        "Воронежская область", "Хатлонская область",
-    ])
+    add(
+        "Воронеж",
+        [
+            "Воронежская область",
+            "Хатлонская область",
+        ],
+    )
 
-    add("Тула", [
-        "Тульская область", "Белгородская область", "Курская область", "Брянская область",
-        "Орловская область", "Гомельская область", "Могилёвская область", "Витебская область",
-    ])
+    add(
+        "Тула",
+        [
+            "Тульская область",
+            "Белгородская область",
+            "Курская область",
+            "Брянская область",
+            "Орловская область",
+            "Гомельская область",
+            "Могилёвская область",
+            "Витебская область",
+        ],
+    )
 
-    add("Волгоград", [
-        "Саратовская область", "Волгоградская область", "Астраханская область",
-        "Атырауская область", "Мангистауская область",
-    ])
+    add(
+        "Волгоград",
+        [
+            "Саратовская область",
+            "Волгоградская область",
+            "Астраханская область",
+            "Атырауская область",
+            "Мангистауская область",
+        ],
+    )
 
-    add("Котовск", [
-        "Липецкая область", "Пензенская область", "Тамбовская область",
-        "Республика Мордовия", "Сурхандарьинская область",
-    ])
+    add(
+        "Котовск",
+        [
+            "Липецкая область",
+            "Пензенская область",
+            "Тамбовская область",
+            "Республика Мордовия",
+            "Сурхандарьинская область",
+        ],
+    )
 
-    add("Рязань (Тюшевское)", [
-        "Рязанская область", "Навоийская область",
-    ])
+    add(
+        "Рязань (Тюшевское)",
+        [
+            "Рязанская область",
+            "Навоийская область",
+        ],
+    )
 
-    add("Новосибирск", [
-        "Республика Тыва", "Ташкентская область",
-    ])
+    add(
+        "Новосибирск",
+        [
+            "Республика Тыва",
+            "Ташкентская область",
+        ],
+    )
 
-    add("MOSCOW_CLUSTER", [
-        "Приморский край", "Калужская область", "Вологодская область", "Архангельская область",
-        "Минск", "Тверская область", "Мурманская область", "Смоленская область",
-        "Калининградская область", "Хабаровский край", "Сахалинская область", "Псковская область",
-        "Минская область", "Гродненская область", "Брестская область", "Камчатский край",
-        "Магаданская область", "Ташкент", "Еврейская автономная область", "Тбилиси",
-        "Ненецкий автономный округ", "Душанбе", "Квемо Картли", "Чукотский автономный округ",
-        "Аджарская Автономная Республика", "Самаркандская область", "Хорезмская область",
-        "муниципалитет Тбилиси", "Районы республиканского подчинения", "Самцхе-Джавахети",
-        "Ферганская область", "Согдийская область", "Горно-Бадахшанская автономная область",
-        "Имеретия",
-    ])
+    add(
+        "MOSCOW_CLUSTER",
+        [
+            "Приморский край",
+            "Калужская область",
+            "Вологодская область",
+            "Архангельская область",
+            "Минск",
+            "Тверская область",
+            "Мурманская область",
+            "Смоленская область",
+            "Калининградская область",
+            "Хабаровский край",
+            "Сахалинская область",
+            "Псковская область",
+            "Минская область",
+            "Гродненская область",
+            "Брестская область",
+            "Камчатский край",
+            "Магаданская область",
+            "Ташкент",
+            "Еврейская автономная область",
+            "Тбилиси",
+            "Ненецкий автономный округ",
+            "Душанбе",
+            "Квемо Картли",
+            "Чукотский автономный округ",
+            "Аджарская Автономная Республика",
+            "Самаркандская область",
+            "Хорезмская область",
+            "муниципалитет Тбилиси",
+            "Районы республиканского подчинения",
+            "Самцхе-Джавахети",
+            "Ферганская область",
+            "Согдийская область",
+            "Горно-Бадахшанская автономная область",
+            "Имеретия",
+        ],
+    )
 
     return mapping
 
 
-REGION_TO_GROUP = build_region_to_group()
+REGION_TO_GROUP: Dict[str, str] = build_region_to_group()
 
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНОЕ
+# ============================================================
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -362,70 +463,139 @@ def normalize_template_warehouse(name: object) -> str:
 
 
 def floor_int(value: float) -> int:
-    return 0 if pd.isna(value) else int(math.floor(float(value)))
+    if pd.isna(value):
+        return 0
+    return int(math.floor(float(value)))
 
 
 def ceil_int(value: float) -> int:
-    return 0 if pd.isna(value) else int(math.ceil(float(value)))
+    if pd.isna(value):
+        return 0
+    return int(math.ceil(float(value)))
 
 
 def parse_week_key_date(key: str) -> Optional[datetime]:
-    m = re.search(r"_(\d{4}-W\d{2})\.xlsx$", key)
-    if not m:
+    match = re.search(r"_(\d{4}-W\d{2})\.xlsx$", key)
+    if not match:
         return None
-    year, week = m.group(1).split("-W")
+    year, week = match.group(1).split("-W")
     return datetime.fromisocalendar(int(year), int(week), 1)
 
 
 def find_header_row(ws, search_terms: Sequence[str], max_rows: int = 10) -> int:
-    terms = [s.lower() for s in search_terms]
-    for r in range(1, max_rows + 1):
-        vals = [normalize_text(ws.cell(r, c).value).lower() for c in range(1, ws.max_column + 1)]
-        if all(t in " | ".join(vals) for t in terms):
-            return r
+    terms = [term.lower() for term in search_terms]
+    for row_idx in range(1, max_rows + 1):
+        values = [normalize_text(ws.cell(row_idx, col).value).lower() for col in range(1, ws.max_column + 1)]
+        haystack = " | ".join(values)
+        if all(term in haystack for term in terms):
+            return row_idx
     return 1
 
 
 def largest_remainder_allocation(
     total: int,
     weights: Dict[str, float],
-    minimum_one_for_nonzero: bool = False
+    minimum_one_for_nonzero: bool = False,
 ) -> Dict[str, int]:
     keys = list(weights.keys())
     if total <= 0 or not keys:
-        return {k: 0 for k in keys}
+        return {key: 0 for key in keys}
 
-    clean = {k: max(float(v), 0.0) for k, v in weights.items()}
-    if sum(clean.values()) == 0:
+    clean_weights = {key: max(float(val), 0.0) for key, val in weights.items()}
+    if sum(clean_weights.values()) == 0:
         each = total // len(keys)
         rem = total - each * len(keys)
-        out = {k: each for k in keys}
-        for k in keys[:rem]:
-            out[k] += 1
+        out = {key: each for key in keys}
+        for key in keys[:rem]:
+            out[key] += 1
         return out
 
     base = {}
     reserved = 0
     if minimum_one_for_nonzero:
-        for k, v in clean.items():
-            if v > 0 and reserved < total:
-                base[k] = 1
+        for key, val in clean_weights.items():
+            if val > 0 and reserved < total:
+                base[key] = 1
                 reserved += 1
             else:
-                base[k] = 0
+                base[key] = 0
+    else:
+        base = {key: 0 for key in keys}
 
     remaining = max(total - reserved, 0)
-    total_w = sum(clean.values())
-    raw = {k: remaining * clean[k] / total_w for k in keys}
-    floored = {k: int(math.floor(raw[k])) for k in keys}
-    out = {k: base.get(k, 0) + floored[k] for k in keys}
+    total_weight = sum(clean_weights.values())
+    raw = {key: remaining * clean_weights[key] / total_weight for key in keys}
+    floored = {key: int(math.floor(raw[key])) for key in keys}
 
+    out = {key: base[key] + floored[key] for key in keys}
     rest = total - sum(out.values())
-    for _, k in sorted(((raw[k] - floored[k], k) for k in keys), reverse=True)[:rest]:
-        out[k] += 1
+
+    remainders = sorted(((raw[key] - floored[key], key) for key in keys), reverse=True)
+    for _, key in remainders[:rest]:
+        out[key] += 1
 
     return out
 
+
+# ============================================================
+# S3
+# ============================================================
+
+class S3Storage:
+    def __init__(self, cfg: AppConfig):
+        if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
+            raise ValueError(
+                "Не заданы параметры Object Storage. "
+                "Нужны env: WB_S3_BUCKET, WB_S3_ACCESS_KEY, WB_S3_SECRET_KEY."
+            )
+
+        self.bucket = cfg.bucket_name
+        self.s3 = boto3.client(
+            "s3",
+            endpoint_url=cfg.endpoint_url,
+            aws_access_key_id=cfg.access_key,
+            aws_secret_access_key=cfg.secret_key,
+            region_name=cfg.region_name,
+            config=BotoConfig(signature_version="s3v4", read_timeout=300, connect_timeout=60),
+        )
+
+    def list_keys(self, prefix: str) -> List[str]:
+        keys: List[str] = []
+        continuation_token = None
+
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+
+            resp = self.s3.list_objects_v2(**kwargs)
+            keys.extend([obj["Key"] for obj in resp.get("Contents", [])])
+
+            if not resp.get("IsTruncated"):
+                break
+            continuation_token = resp.get("NextContinuationToken")
+
+        return keys
+
+    def read_bytes(self, key: str) -> bytes:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        return obj["Body"].read()
+
+    def read_excel(self, key: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+        return pd.read_excel(io.BytesIO(self.read_bytes(key)), sheet_name=sheet_name)
+
+    def download_file(self, key: str, local_path: str) -> str:
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(local_path).write_bytes(self.read_bytes(key))
+        return local_path
+
+    def upload_file(self, local_path: str, key: str) -> None:
+        self.s3.upload_file(local_path, self.bucket, key)
+
+
+# ============================================================
+# ЗАГРУЗКА ДАННЫХ
+# ============================================================
 
 def load_weekly_window(
     storage: S3Storage,
@@ -440,14 +610,14 @@ def load_weekly_window(
 
     cutoff = run_date - timedelta(days=lookback_days + 21)
     selected = [
-        (parse_week_key_date(k) or datetime.min, k)
-        for k in keys
-        if (parse_week_key_date(k) or datetime.min) >= cutoff
+        (parse_week_key_date(key) or datetime.min, key)
+        for key in keys
+        if (parse_week_key_date(key) or datetime.min) >= cutoff
     ]
     if not selected:
-        selected = [(parse_week_key_date(k) or datetime.min, k) for k in keys]
+        selected = [(parse_week_key_date(key) or datetime.min, key) for key in keys]
 
-    parts = []
+    parts: List[pd.DataFrame] = []
     for _, key in sorted(selected, key=lambda x: x[0]):
         try:
             df = storage.read_excel(key, sheet_name=expected_sheet)
@@ -456,8 +626,8 @@ def load_weekly_window(
             if not df.empty:
                 parts.append(df)
                 log(f"Загружен файл: {key}")
-        except Exception as e:
-            log(f"⚠️ Не удалось прочитать {key}: {e}")
+        except Exception as exc:
+            log(f"⚠️ Не удалось прочитать {key}: {exc}")
 
     if not parts:
         raise ValueError(f"Не удалось прочитать ни одного файла по префиксу {prefix}")
@@ -467,27 +637,32 @@ def load_weekly_window(
 
 def load_orders(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df = load_weekly_window(
-        storage,
-        cfg.orders_prefix_tpl.format(store=cfg.store_name),
-        cfg.run_date,
-        cfg.lookback_days,
+        storage=storage,
+        prefix=cfg.orders_prefix_tpl.format(store=cfg.store_name),
+        run_date=cfg.run_date,
+        lookback_days=cfg.lookback_days,
         expected_sheet="Заказы",
     )
 
-    req = [
-        "date", "warehouseName", "oblastOkrugName",
-        "regionName", "supplierArticle", "nmId",
-        "subject", "finishedPrice"
+    required = [
+        "date",
+        "warehouseName",
+        "oblastOkrugName",
+        "regionName",
+        "supplierArticle",
+        "nmId",
+        "subject",
+        "finishedPrice",
     ]
-    miss = [c for c in req if c not in df.columns]
-    if miss:
-        raise KeyError(f"В заказах отсутствуют обязательные колонки: {miss}")
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise KeyError(f"В заказах отсутствуют обязательные колонки: {missing}")
 
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     df = df[
-        (df["date"] >= (cfg.run_date - timedelta(days=cfg.lookback_days - 1))) &
-        (df["date"] <= cfg.run_date)
+        (df["date"] >= (cfg.run_date - timedelta(days=cfg.lookback_days - 1)))
+        & (df["date"] <= cfg.run_date)
     ].copy()
 
     if "isCancel" in df.columns:
@@ -502,30 +677,33 @@ def load_orders(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df["finishedPrice"] = pd.to_numeric(df["finishedPrice"], errors="coerce")
     df["qty"] = 1
 
+    before = len(df)
     df = df[~df["subject"].isin(cfg.excluded_subjects)].copy()
+    log(f"Исключено строк заказов по запрещённым категориям: {before - len(df)}")
+
     return df
 
 
 def load_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df = load_weekly_window(
-        storage,
-        cfg.stocks_prefix_tpl.format(store=cfg.store_name),
-        cfg.run_date,
-        cfg.lookback_days,
+        storage=storage,
+        prefix=cfg.stocks_prefix_tpl.format(store=cfg.store_name),
+        run_date=cfg.run_date,
+        lookback_days=cfg.lookback_days,
         expected_sheet="Остатки",
     )
 
-    req = ["Склад", "Артикул WB", "Полное количество"]
-    miss = [c for c in req if c not in df.columns]
-    if miss:
-        raise KeyError(f"В остатках отсутствуют обязательные колонки: {miss}")
+    required = ["Склад", "Артикул WB", "Полное количество"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise KeyError(f"В остатках отсутствуют обязательные колонки: {missing}")
 
     df = df.copy()
     date_col = "Дата запроса" if "Дата запроса" in df.columns else "Дата сбора"
     df["stock_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     df = df[
-        (df["stock_date"] >= (cfg.run_date - timedelta(days=cfg.lookback_days - 1))) &
-        (df["stock_date"] <= cfg.run_date)
+        (df["stock_date"] >= (cfg.run_date - timedelta(days=cfg.lookback_days - 1)))
+        & (df["stock_date"] <= cfg.run_date)
     ].copy()
 
     df["warehouse"] = df["Склад"].map(normalize_warehouse)
@@ -533,10 +711,15 @@ def load_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df["qty_full"] = pd.to_numeric(df["Полное количество"], errors="coerce").fillna(0)
     df["qty_available"] = (
         pd.to_numeric(df["Доступно для продажи"], errors="coerce").fillna(0)
-        if "Доступно для продажи" in df.columns else df["qty_full"]
+        if "Доступно для продажи" in df.columns
+        else df["qty_full"]
     )
     df["subject"] = df["Предмет"].map(normalize_text) if "Предмет" in df.columns else ""
+
+    before = len(df)
     df = df[~df["subject"].isin(cfg.excluded_subjects)].copy()
+    log(f"Исключено строк остатков по запрещённым категориям: {before - len(df)}")
+
     return df
 
 
@@ -548,13 +731,14 @@ def load_article_map_1c(storage: S3Storage, cfg: AppConfig) -> Dict[str, str]:
     wb_col = df.columns[0]
     col_1c = df.columns[2] if len(df.columns) >= 3 else df.columns[-1]
 
-    out = {}
+    out: Dict[str, str] = {}
     for _, row in df.iterrows():
-        wb = normalize_nmid(row.get(wb_col))
-        art1c = normalize_text(row.get(col_1c))
-        if wb:
-            out[wb] = art1c
+        wb_article = normalize_nmid(row.get(wb_col))
+        article_1c = normalize_text(row.get(col_1c))
+        if wb_article:
+            out[wb_article] = article_1c
 
+    log(f"Загружено соответствий WB -> 1С: {len(out)}")
     return out
 
 
@@ -563,29 +747,45 @@ def load_1c_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     if isinstance(df, dict):
         df = next(iter(df.values()))
     df = df.copy()
-    df.columns = [normalize_text(c) for c in df.columns]
+    df.columns = [normalize_text(col) for col in df.columns]
     return df
 
+
+# ============================================================
+# РАСЧЁТ СПРОСА
+# ============================================================
 
 def prepare_daily_orders(orders: pd.DataFrame) -> pd.DataFrame:
     df = orders.copy()
     df["region_group"] = df["regionName"].map(REGION_TO_GROUP)
-    df = df[df["region_group"].notna()].copy()
 
-    return df.groupby(
-        ["nmId", "supplierArticle", "subject", "date", "regionName", "region_group", "oblastOkrugName"],
-        as_index=False
-    ).agg(
-        qty=("qty", "sum"),
-        avg_price=("finishedPrice", "mean"),
+    unmapped = int(df["region_group"].isna().sum())
+    if unmapped:
+        log(f"⚠️ Регионов без привязки к группе обслуживания: {unmapped}. Они будут отброшены.")
+        df = df[df["region_group"].notna()].copy()
+
+    daily = (
+        df.groupby(
+            ["nmId", "supplierArticle", "subject", "date", "regionName", "region_group", "oblastOkrugName"],
+            as_index=False,
+        )
+        .agg(qty=("qty", "sum"), avg_price=("finishedPrice", "mean"))
     )
+
+    return daily
 
 
 def build_daily_grid(daily_orders: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
-    all_dates = pd.date_range(cfg.run_date - timedelta(days=cfg.lookback_days - 1), cfg.run_date, freq="D")
+    all_dates = pd.date_range(
+        cfg.run_date - timedelta(days=cfg.lookback_days - 1),
+        cfg.run_date,
+        freq="D",
+    )
+
     keys = daily_orders[
         ["nmId", "supplierArticle", "subject", "regionName", "region_group", "oblastOkrugName"]
     ].drop_duplicates()
+
     keys["__tmp"] = 1
     dates_df = pd.DataFrame({"date": all_dates, "__tmp": 1})
 
@@ -593,86 +793,107 @@ def build_daily_grid(daily_orders: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame
     grid = grid.merge(
         daily_orders,
         on=["nmId", "supplierArticle", "subject", "regionName", "region_group", "oblastOkrugName", "date"],
-        how="left"
+        how="left",
     )
     grid["qty"] = grid["qty"].fillna(0)
+
     return grid
 
 
-def prepare_stock_presence(stocks: pd.DataFrame):
-    per_wh = stocks.groupby(
-        ["stock_date", "nmId", "warehouse"],
-        as_index=False
-    ).agg(
-        qty_full=("qty_full", "sum"),
-        qty_available=("qty_available", "sum")
+def prepare_stock_presence(
+    stocks: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Set[pd.Timestamp], pd.DataFrame, pd.DataFrame, pd.Timestamp]:
+    per_wh = (
+        stocks.groupby(["stock_date", "nmId", "warehouse"], as_index=False)
+        .agg(qty_full=("qty_full", "sum"), qty_available=("qty_available", "sum"))
     )
 
-    history_dates = set(pd.to_datetime(per_wh["stock_date"]).dt.normalize().unique()) if not per_wh.empty else set()
+    history_dates: Set[pd.Timestamp] = (
+        set(pd.to_datetime(per_wh["stock_date"]).dt.normalize().unique()) if not per_wh.empty else set()
+    )
 
     per_wh["district"] = per_wh["warehouse"].map(WAREHOUSE_TO_DISTRICT)
-    per_district = per_wh.groupby(
-        ["stock_date", "nmId", "district"],
-        as_index=False
-    ).agg(
-        qty_full=("qty_full", "sum"),
-        qty_available=("qty_available", "sum")
+    per_district = (
+        per_wh.groupby(["stock_date", "nmId", "district"], as_index=False)
+        .agg(qty_full=("qty_full", "sum"), qty_available=("qty_available", "sum"))
     )
 
-    latest = per_wh["stock_date"].max() if not per_wh.empty else pd.NaT
-    current_wh = per_wh[per_wh["stock_date"] == latest].copy() if pd.notna(latest) else per_wh.iloc[0:0].copy()
+    latest_stock_date = per_wh["stock_date"].max() if not per_wh.empty else pd.NaT
+    current_wh = (
+        per_wh[per_wh["stock_date"] == latest_stock_date].copy()
+        if pd.notna(latest_stock_date)
+        else per_wh.iloc[0:0].copy()
+    )
     current_wh = current_wh.rename(columns={"stock_date": "latest_stock_date"})
 
-    return current_wh, history_dates, per_wh, per_district, latest
+    return current_wh, history_dates, per_wh, per_district, latest_stock_date
 
 
 def attach_presence_flags(
     grid: pd.DataFrame,
     per_wh: pd.DataFrame,
     per_district: pd.DataFrame,
-    history_dates: Set[pd.Timestamp]
+    history_dates: Set[pd.Timestamp],
 ) -> pd.DataFrame:
     grid = grid.copy()
     wh_presence = per_wh.copy()
     wh_presence["is_positive"] = wh_presence["qty_full"] > 0
 
-    local_records = []
+    local_records: List[pd.DataFrame] = []
     for group in grid["region_group"].dropna().unique():
         needed = MOSCOW_CLUSTER if group == "MOSCOW_CLUSTER" else [group]
-        tmp = wh_presence[wh_presence["warehouse"].isin(needed)].groupby(
-            ["stock_date", "nmId"], as_index=False
-        )["is_positive"].max()
+        tmp = (
+            wh_presence[wh_presence["warehouse"].isin(needed)]
+            .groupby(["stock_date", "nmId"], as_index=False)["is_positive"]
+            .max()
+        )
         tmp["region_group"] = group
         local_records.append(tmp)
 
-    local_presence = (
-        pd.concat(local_records, ignore_index=True)
-        if local_records else
-        pd.DataFrame(columns=["stock_date", "nmId", "is_positive", "region_group"])
+    if local_records:
+        local_presence = pd.concat(local_records, ignore_index=True)
+    else:
+        local_presence = pd.DataFrame(columns=["stock_date", "nmId", "is_positive", "region_group"])
+
+    local_presence = local_presence.rename(
+        columns={"stock_date": "date", "is_positive": "local_positive"}
     )
-    local_presence = local_presence.rename(columns={"stock_date": "date", "is_positive": "local_positive"})
     grid = grid.merge(local_presence, on=["date", "nmId", "region_group"], how="left")
 
     district_presence = per_district.copy()
     district_presence["district_positive"] = district_presence["qty_full"] > 0
     district_presence = district_presence.rename(columns={"stock_date": "date"})
 
-    grid["target_district"] = grid["region_group"].map(
-        lambda g: "Центральный федеральный округ" if g == "MOSCOW_CLUSTER" else WAREHOUSE_TO_DISTRICT.get(g, "")
-    )
+    def region_target_district(region_group: str) -> str:
+        if region_group == "MOSCOW_CLUSTER":
+            return "Центральный федеральный округ"
+        return WAREHOUSE_TO_DISTRICT.get(region_group, "")
+
+    grid["target_district"] = grid["region_group"].map(region_target_district)
 
     grid = grid.merge(
         district_presence[["date", "nmId", "district", "district_positive"]],
         left_on=["date", "nmId", "target_district"],
         right_on=["date", "nmId", "district"],
-        how="left"
+        how="left",
     ).drop(columns=["district"])
 
-    known = set(pd.to_datetime(pd.Series(list(history_dates))).dt.normalize()) if history_dates else set()
-    grid["history_date_exists"] = grid["date"].isin(known)
+    known_dates = (
+        set(pd.to_datetime(pd.Series(list(history_dates))).dt.normalize()) if history_dates else set()
+    )
+    grid["history_date_exists"] = grid["date"].isin(known_dates)
 
-    grid["local_positive"] = np.where(grid["history_date_exists"], grid["local_positive"].fillna(False), True)
-    grid["district_positive"] = np.where(grid["history_date_exists"], grid["district_positive"].fillna(False), True)
+    # Если за дату история остатков ещё не накопилась, считаем, что товар был.
+    grid["local_positive"] = np.where(
+        grid["history_date_exists"],
+        grid["local_positive"].fillna(False),
+        True,
+    )
+    grid["district_positive"] = np.where(
+        grid["history_date_exists"],
+        grid["district_positive"].fillna(False),
+        True,
+    )
 
     grid["status"] = np.select(
         [
@@ -681,7 +902,7 @@ def attach_presence_flags(
             (grid["local_positive"] == False) & (grid["district_positive"] == False),
         ],
         ["local", "okrug", "far"],
-        default="local"
+        default="local",
     )
 
     return grid
@@ -702,30 +923,32 @@ def mark_valid_days(group_df: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
 
     sales_floor = prelim_mean * (1 - cfg.sales_drop_threshold)
     df["drop_invalid"] = (
-        (df["qty"] > 0) &
-        (~df["promo_invalid"]) &
-        (df["qty"] < sales_floor)
+        (df["qty"] > 0)
+        & (~df["promo_invalid"])
+        & (df["qty"] < sales_floor)
     )
 
     df["valid_day"] = ~(df["promo_invalid"] | df["drop_invalid"])
+
     return df
 
 
 def aggregate_region_metrics(grid: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
-    rows = []
+    rows: List[Dict[str, object]] = []
 
     group_cols = ["nmId", "supplierArticle", "subject", "regionName", "region_group", "oblastOkrugName"]
-
     for keys, part in grid.groupby(group_cols, dropna=False):
         part = mark_valid_days(part.sort_values("date"), cfg)
 
         base90 = part.loc[part["valid_day"], "qty"].mean()
-        base90 = part["qty"].mean() if pd.isna(base90) else base90
+        if pd.isna(base90):
+            base90 = part["qty"].mean()
         base90 = 0.0 if pd.isna(base90) else float(base90)
 
         last14 = part[part["date"] >= (cfg.run_date - timedelta(days=cfg.recent_days - 1))]
         base14 = last14.loc[last14["valid_day"], "qty"].mean()
-        base14 = last14["qty"].mean() if pd.isna(base14) else base14
+        if pd.isna(base14):
+            base14 = last14["qty"].mean()
         base14 = 0.0 if pd.isna(base14) else float(base14)
 
         d_local90 = int((part["status"] == "local").sum())
@@ -737,39 +960,42 @@ def aggregate_region_metrics(grid: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame
         d_far14 = int((last14["status"] == "far").sum())
 
         avg_adj90 = base90 * (
-            cfg.coeff_local * d_local90 +
-            cfg.coeff_okrug * d_okrug90 +
-            cfg.coeff_far * d_far90
+            cfg.coeff_local * d_local90
+            + cfg.coeff_okrug * d_okrug90
+            + cfg.coeff_far * d_far90
         ) / max(cfg.lookback_days, 1)
 
         avg_adj14 = base14 * (
-            cfg.coeff_local * d_local14 +
-            cfg.coeff_okrug * d_okrug14 +
-            cfg.coeff_far * d_far14
+            cfg.coeff_local * d_local14
+            + cfg.coeff_okrug * d_okrug14
+            + cfg.coeff_far * d_far14
         ) / max(cfg.recent_days, 1)
 
-        rows.append({
-            "nmId": keys[0],
-            "supplierArticle": keys[1],
-            "subject": keys[2],
-            "regionName": keys[3],
-            "region_group": keys[4],
-            "oblastOkrugName": keys[5],
-            "sales_90": int(part["qty"].sum()),
-            "sales_14": int(last14["qty"].sum()),
-            "avg_adj90_region": float(avg_adj90),
-            "avg_adj14_region": float(avg_adj14),
-            "avg_price90_region": float(part.loc[part["qty"] > 0, "avg_price"].mean())
-            if pd.notna(part.loc[part["qty"] > 0, "avg_price"].mean()) else np.nan,
-            "avg_price14_region": float(last14.loc[last14["qty"] > 0, "avg_price"].mean())
-            if pd.notna(last14.loc[last14["qty"] > 0, "avg_price"].mean()) else np.nan,
-        })
+        price90 = part.loc[part["qty"] > 0, "avg_price"].mean()
+        price14 = last14.loc[last14["qty"] > 0, "avg_price"].mean()
+
+        rows.append(
+            {
+                "nmId": keys[0],
+                "supplierArticle": keys[1],
+                "subject": keys[2],
+                "regionName": keys[3],
+                "region_group": keys[4],
+                "oblastOkrugName": keys[5],
+                "sales_90": int(part["qty"].sum()),
+                "sales_14": int(last14["qty"].sum()),
+                "avg_adj90_region": float(avg_adj90),
+                "avg_adj14_region": float(avg_adj14),
+                "avg_price90_region": float(price90) if pd.notna(price90) else np.nan,
+                "avg_price14_region": float(price14) if pd.notna(price14) else np.nan,
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
 def choose_final_daily_demand(region_metrics: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
-    rows = []
+    rows: List[Dict[str, object]] = []
 
     for (nmid, supplier_article, subject), part in region_metrics.groupby(
         ["nmId", "supplierArticle", "subject"], dropna=False
@@ -787,55 +1013,65 @@ def choose_final_daily_demand(region_metrics: pd.DataFrame, cfg: AppConfig) -> p
         price90 = float(np.average(p90, weights=w90)) if len(part) else np.nan
         price14 = float(np.average(p14, weights=w14)) if len(part) else np.nan
 
-        can14 = (
-            avg14 > avg90 * cfg.growth_threshold and
-            (pd.isna(price90) or pd.isna(price14) or price14 >= (1 - cfg.price_drop_threshold) * price90)
+        can_use_14 = (
+            avg14 > avg90 * cfg.growth_threshold
+            and (
+                pd.isna(price90)
+                or pd.isna(price14)
+                or price14 >= (1 - cfg.price_drop_threshold) * price90
+            )
         )
 
-        rows.append({
-            "nmId": nmid,
-            "supplierArticle": supplier_article,
-            "subject": subject,
-            "sales_90_total": sales90,
-            "sales_14_total": sales14,
-            "daily_demand_final": float((avg14 if can14 else avg90) * cfg.season_coeff),
-        })
+        base_daily = avg14 if can_use_14 else avg90
+
+        rows.append(
+            {
+                "nmId": nmid,
+                "supplierArticle": supplier_article,
+                "subject": subject,
+                "sales_90_total": sales90,
+                "sales_14_total": sales14,
+                "daily_demand_final": float(base_daily * cfg.season_coeff),
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
 def build_warehouse_shares(region_metrics: pd.DataFrame) -> pd.DataFrame:
-    rows = []
+    rows: List[Dict[str, object]] = []
 
     for (nmid, supplier_article, subject), part in region_metrics.groupby(
         ["nmId", "supplierArticle", "subject"], dropna=False
     ):
         total_sales = float(part["sales_90"].sum())
-        warehouse_sales = defaultdict(float)
+        warehouse_sales: Dict[str, float] = defaultdict(float)
 
         for _, row in part.iterrows():
             group = row["region_group"]
             sales = float(row["sales_90"])
 
             if group == "MOSCOW_CLUSTER":
-                for wh, share in MOSCOW_SPLIT_TARGET.items():
-                    warehouse_sales[wh] += sales * share
+                for warehouse, share in MOSCOW_SPLIT_TARGET.items():
+                    warehouse_sales[warehouse] += sales * share
             else:
                 warehouse_sales[group] += sales
 
         if total_sales <= 0 and warehouse_sales:
-            for wh in warehouse_sales:
-                warehouse_sales[wh] = 1.0
+            for warehouse in warehouse_sales:
+                warehouse_sales[warehouse] = 1.0
             total_sales = sum(warehouse_sales.values())
 
-        for wh, sales in warehouse_sales.items():
-            rows.append({
-                "nmId": nmid,
-                "supplierArticle": supplier_article,
-                "subject": subject,
-                "warehouse": wh,
-                "warehouse_share": (sales / total_sales) if total_sales > 0 else 0.0,
-            })
+        for warehouse, sales in warehouse_sales.items():
+            rows.append(
+                {
+                    "nmId": nmid,
+                    "supplierArticle": supplier_article,
+                    "subject": subject,
+                    "warehouse": warehouse,
+                    "warehouse_share": (sales / total_sales) if total_sales > 0 else 0.0,
+                }
+            )
 
     shares = pd.DataFrame(rows)
     if not shares.empty:
@@ -853,23 +1089,21 @@ def apply_strategy(shares_df: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
     mask = df["subject"].isin(cfg.economy_subjects) & df["warehouse"].isin(ECONOMY_REPLACEMENT_MAP)
     df.loc[mask, "warehouse"] = df.loc[mask, "warehouse"].map(ECONOMY_REPLACEMENT_MAP)
 
-    df = df.groupby(
-        ["nmId", "supplierArticle", "subject", "warehouse"],
-        as_index=False
-    ).agg(
-        warehouse_share=("warehouse_share", "sum")
+    df = (
+        df.groupby(["nmId", "supplierArticle", "subject", "warehouse"], as_index=False)
+        .agg(warehouse_share=("warehouse_share", "sum"))
     )
 
     sums = df.groupby("nmId")["warehouse_share"].transform("sum").replace(0, 1)
     df["warehouse_share"] = df["warehouse_share"] / sums
+
     return df
 
 
 def current_stock_by_warehouse(current_wh: pd.DataFrame) -> pd.DataFrame:
-    return current_wh.groupby(
-        ["nmId", "warehouse"], as_index=False
-    ).agg(
-        current_stock_full=("qty_full", "sum")
+    return (
+        current_wh.groupby(["nmId", "warehouse"], as_index=False)
+        .agg(current_stock_full=("qty_full", "sum"))
     )
 
 
@@ -881,17 +1115,17 @@ def allocate_low_turnover(shares_sku: pd.DataFrame, cfg: AppConfig) -> Dict[str,
     }
 
     selected = dict(weights)
-    for _, wh in cfg.district_primary_warehouse.items():
-        selected.setdefault(wh, 0.0001)
+    for _, warehouse in cfg.district_primary_warehouse.items():
+        selected.setdefault(warehouse, 0.0001)
 
-    selected = {wh: w for wh, w in selected.items() if wh in ALL_TARGET_WAREHOUSES}
+    selected = {warehouse: weight for warehouse, weight in selected.items() if warehouse in ALL_TARGET_WAREHOUSES}
     if not selected:
-        selected = {wh: 1.0 for wh in cfg.district_primary_warehouse.values()}
+        selected = {warehouse: 1.0 for warehouse in cfg.district_primary_warehouse.values()}
 
     return largest_remainder_allocation(
-        cfg.low_turnover_network_stock,
-        selected,
-        minimum_one_for_nonzero=True
+        total=cfg.low_turnover_network_stock,
+        weights=selected,
+        minimum_one_for_nonzero=True,
     )
 
 
@@ -904,10 +1138,11 @@ def calculate_supply_plan(
 ) -> pd.DataFrame:
     current_lookup = (
         current_stock_df.set_index(["nmId", "warehouse"]).to_dict("index")
-        if not current_stock_df.empty else {}
+        if not current_stock_df.empty
+        else {}
     )
 
-    rows = []
+    rows: List[Dict[str, object]] = []
 
     for _, sku in sku_df.iterrows():
         nmid = sku["nmId"]
@@ -915,50 +1150,56 @@ def calculate_supply_plan(
         if sku_shares.empty:
             continue
 
-        art1c = article_1c_map.get(nmid, "")
+        article_1c = article_1c_map.get(nmid, "")
 
         if int(sku["sales_90_total"]) < cfg.low_turnover_sales_threshold:
-            alloc = allocate_low_turnover(sku_shares, cfg)
-            for wh, target_qty in alloc.items():
-                current_stock = float(current_lookup.get((nmid, wh), {}).get("current_stock_full", 0))
-                rows.append({
-                    "nmId": nmid,
-                    "supplierArticle": sku["supplierArticle"],
-                    "subject": sku["subject"],
-                    "Артикул 1С": art1c,
-                    "warehouse": wh,
-                    "to_supply": max(0, int(target_qty - current_stock)),
-                })
+            allocations = allocate_low_turnover(sku_shares, cfg)
+            for warehouse, target_qty in allocations.items():
+                current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
+                rows.append(
+                    {
+                        "nmId": nmid,
+                        "supplierArticle": sku["supplierArticle"],
+                        "subject": sku["subject"],
+                        "Артикул 1С": article_1c,
+                        "warehouse": warehouse,
+                        "to_supply": max(0, int(target_qty - current_stock)),
+                    }
+                )
             continue
 
         for _, share_row in sku_shares.iterrows():
-            wh = share_row["warehouse"]
+            warehouse = share_row["warehouse"]
             share = float(share_row["warehouse_share"])
             target_stock = float(sku["daily_demand_final"]) * share * cfg.target_days
-            current_stock = float(current_lookup.get((nmid, wh), {}).get("current_stock_full", 0))
+            current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
 
-            rows.append({
-                "nmId": nmid,
-                "supplierArticle": sku["supplierArticle"],
-                "subject": sku["subject"],
-                "Артикул 1С": art1c,
-                "warehouse": wh,
-                "to_supply": max(0, ceil_int(target_stock - current_stock)),
-            })
+            rows.append(
+                {
+                    "nmId": nmid,
+                    "supplierArticle": sku["supplierArticle"],
+                    "subject": sku["subject"],
+                    "Артикул 1С": article_1c,
+                    "warehouse": warehouse,
+                    "to_supply": max(0, ceil_int(target_stock - current_stock)),
+                }
+            )
 
     plan = pd.DataFrame(rows)
     if plan.empty:
         return plan
 
-    plan = plan.groupby(
-        ["nmId", "supplierArticle", "subject", "Артикул 1С", "warehouse"],
-        as_index=False
-    ).agg(
-        to_supply=("to_supply", "sum")
+    plan = (
+        plan.groupby(["nmId", "supplierArticle", "subject", "Артикул 1С", "warehouse"], as_index=False)
+        .agg(to_supply=("to_supply", "sum"))
     )
 
     return plan[plan["to_supply"] > 0].copy()
 
+
+# ============================================================
+# 1С
+# ============================================================
 
 def prepare_1c_stocks_map(df_1c_stocks: pd.DataFrame) -> pd.DataFrame:
     df = df_1c_stocks.copy()
@@ -971,8 +1212,13 @@ def prepare_1c_stocks_map(df_1c_stocks: pd.DataFrame) -> pd.DataFrame:
             df[col] = 0
 
     df["Артикул"] = df["Артикул"].map(normalize_text)
+
     return df[["Артикул"] + ONE_C_STOCK_COLUMNS].drop_duplicates(subset=["Артикул"])
 
+
+# ============================================================
+# ШАБЛОН
+# ============================================================
 
 def resolve_template(storage: S3Storage, cfg: AppConfig, workdir: str) -> str:
     target = Path(workdir) / "Согласование поставки WB.xlsm"
@@ -999,13 +1245,13 @@ def build_template_dataset(plan_df: pd.DataFrame, stocks_1c_map: pd.DataFrame) -
     ).reset_index()
 
     warehouse_cols = [
-        c for c in wide.columns
-        if c not in ["supplierArticle", "Артикул 1С", "nmId", "subject"]
+        col for col in wide.columns if col not in ["supplierArticle", "Артикул 1С", "nmId", "subject"]
     ]
     wide["Общий итог"] = wide[warehouse_cols].sum(axis=1) if warehouse_cols else 0
 
     stocks_1c_map = stocks_1c_map.rename(columns={"Артикул": "Артикул 1С"})
     out = wide.merge(stocks_1c_map, on="Артикул 1С", how="left")
+
     out["missing_1c_article"] = out["Артикул 1С"].eq("") | out[ONE_C_STOCK_COLUMNS].isna().all(axis=1)
 
     for col in ONE_C_STOCK_COLUMNS:
@@ -1018,7 +1264,7 @@ def fill_template_file(
     template_path: str,
     output_path: str,
     data_df: pd.DataFrame,
-    cfg: AppConfig
+    cfg: AppConfig,
 ) -> str:
     shutil.copy2(template_path, output_path)
 
@@ -1027,9 +1273,9 @@ def fill_template_file(
 
     header_row = find_header_row(ws, ["артикул", "1с"], max_rows=10)
     header_map = {
-        normalize_text(ws.cell(header_row, c).value): c
-        for c in range(1, ws.max_column + 1)
-        if normalize_text(ws.cell(header_row, c).value)
+        normalize_text(ws.cell(header_row, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if normalize_text(ws.cell(header_row, col).value)
     }
 
     if ws.max_row > header_row:
@@ -1038,22 +1284,26 @@ def fill_template_file(
     red_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
 
     supplier_header = next(
-        (h for h in header_map if "артикул продавца" in h.lower() or "артикул поставщика" in h.lower()),
-        None
+        (
+            header
+            for header in header_map
+            if "артикул продавца" in header.lower() or "артикул поставщика" in header.lower()
+        ),
+        None,
     )
-    art1c_header = next(
-        (h for h in header_map if "1с" in h.lower() or "1c" in h.lower()),
-        None
+    article_1c_header = next(
+        (header for header in header_map if "1с" in header.lower() or "1c" in header.lower()),
+        None,
     )
 
-    if not supplier_header or not art1c_header:
+    if not supplier_header or not article_1c_header:
         raise KeyError("В шаблоне не найдены колонки 'Артикул продавца' / 'Артикул 1С'.")
 
     row_idx = header_row + 1
 
     for _, row in data_df.iterrows():
         ws.cell(row_idx, header_map[supplier_header], row["supplierArticle"])
-        ws.cell(row_idx, header_map[art1c_header], row["Артикул 1С"])
+        ws.cell(row_idx, header_map[article_1c_header], row["Артикул 1С"])
 
         for header, col_idx in header_map.items():
             canonical = normalize_template_warehouse(header)
@@ -1068,15 +1318,20 @@ def fill_template_file(
                 ws.cell(row_idx, header_map[col], floor_int(row.get(col, 0)))
 
         if bool(row.get("missing_1c_article", False)):
-            for c in range(1, ws.max_column + 1):
-                ws.cell(row_idx, c).fill = red_fill
+            for col_idx in range(1, ws.max_column + 1):
+                ws.cell(row_idx, col_idx).fill = red_fill
 
         row_idx += 1
 
     wb.save(output_path)
     wb.close()
+
     return output_path
 
+
+# ============================================================
+# TELEGRAM
+# ============================================================
 
 def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str = "") -> None:
     if not bot_token or not chat_id:
@@ -1086,10 +1341,7 @@ def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption
 
     with open(file_path, "rb") as f:
         files = {"document": (Path(file_path).name, f)}
-        data = {
-            "chat_id": chat_id,
-            "caption": caption[:1024],
-        }
+        data = {"chat_id": chat_id, "caption": caption[:1024]}
         response = requests.post(url, data=data, files=files, timeout=300)
 
     if response.status_code != 200:
@@ -1111,38 +1363,56 @@ def send_results_to_telegram(cfg: AppConfig, files: List[str]) -> None:
         )
         log(f"Файл отправлен в Telegram: {file_path}")
 
+
+# ============================================================
+# DEBUG
+# ============================================================
+
 def save_debug_files(
     output_dir: str,
     sku_df: pd.DataFrame,
     region_metrics: pd.DataFrame,
     shares_df: pd.DataFrame,
     plan_df: pd.DataFrame,
-    filled_template_path: str
+    filled_template_path: str,
 ) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    with pd.ExcelWriter(Path(output_dir) / "wb_supply_debug.xlsx", engine="openpyxl") as writer:
+    debug_path = Path(output_dir) / "wb_supply_debug.xlsx"
+    with pd.ExcelWriter(debug_path, engine="openpyxl") as writer:
         sku_df.to_excel(writer, index=False, sheet_name="SKU")
         region_metrics.to_excel(writer, index=False, sheet_name="RegionMetrics")
         shares_df.to_excel(writer, index=False, sheet_name="WarehouseShares")
         plan_df.to_excel(writer, index=False, sheet_name="Plan")
 
+    log(f"Сохранён debug-файл: {debug_path}")
     log(f"Сохранён шаблон: {filled_template_path}")
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main(cfg: AppConfig = CONFIG) -> str:
     Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
 
-    log(f"Старт расчёта. store={cfg.store_name}, season_coeff={cfg.season_coeff}, run_date={cfg.run_date:%Y-%m-%d}")
+    log(
+        f"Старт расчёта. "
+        f"store={cfg.store_name}, season_coeff={cfg.season_coeff}, "
+        f"run_date={cfg.run_date:%Y-%m-%d}, strategy={cfg.strategy_mode}"
+    )
 
     storage = S3Storage(cfg)
 
     orders = load_orders(storage, cfg)
     stocks = load_stocks(storage, cfg)
     article_1c_map = load_article_map_1c(storage, cfg)
-    stocks_1c_map = prepare_1c_stocks_map(load_1c_stocks(storage, cfg))
+    stocks_1c_raw = load_1c_stocks(storage, cfg)
+    stocks_1c_map = prepare_1c_stocks_map(stocks_1c_raw)
+
     stocks_1c_local = str(Path(cfg.output_dir) / "Остатки 1С.xlsx")
     storage.download_file(cfg.stocks_1c_key, stocks_1c_local)
+
     daily_orders = prepare_daily_orders(orders)
     grid = build_daily_grid(daily_orders, cfg)
 
@@ -1153,13 +1423,16 @@ def main(cfg: AppConfig = CONFIG) -> str:
     grid = attach_presence_flags(grid, per_wh, per_district, history_dates)
     region_metrics = aggregate_region_metrics(grid, cfg)
     sku_df = choose_final_daily_demand(region_metrics, cfg)
-    shares_df = apply_strategy(build_warehouse_shares(region_metrics), cfg)
+    shares_df = build_warehouse_shares(region_metrics)
+    shares_df = apply_strategy(shares_df, cfg)
+    current_stock = current_stock_by_warehouse(current_stock_df)
+
     plan_df = calculate_supply_plan(
-        sku_df,
-        shares_df,
-        current_stock_by_warehouse(current_stock_df),
-        article_1c_map,
-        cfg,
+        sku_df=sku_df,
+        shares_df=shares_df,
+        current_stock_df=current_stock,
+        article_1c_map=article_1c_map,
+        cfg=cfg,
     )
 
     if plan_df.empty:
@@ -1174,21 +1447,27 @@ def main(cfg: AppConfig = CONFIG) -> str:
         )
         fill_template_file(template_path, output_path, template_data, cfg)
 
-    save_debug_files(cfg.output_dir, sku_df, region_metrics, shares_df, plan_df, output_path)
+    save_debug_files(
+        output_dir=cfg.output_dir,
+        sku_df=sku_df,
+        region_metrics=region_metrics,
+        shares_df=shares_df,
+        plan_df=plan_df,
+        filled_template_path=output_path,
+    )
 
     if cfg.upload_result_to_s3:
-        storage.upload_file(
-            output_path,
-            f"Отчёты/Поставки/{cfg.store_name}/{Path(output_path).name}"
-        )
-        log("Результат загружен в Object Storage")
+        result_key = f"Отчёты/Поставки/{cfg.store_name}/{Path(output_path).name}"
+        storage.upload_file(output_path, result_key)
+        log(f"Результат загружен в Object Storage: {result_key}")
 
     files_to_send = [
-    output_path,
-    str(Path(cfg.output_dir) / "wb_supply_debug.xlsx"),
-    stocks_1c_local,
-]
-send_results_to_telegram(cfg, files_to_send)
+        output_path,
+        str(Path(cfg.output_dir) / "wb_supply_debug.xlsx"),
+        stocks_1c_local,
+    ]
+    send_results_to_telegram(cfg, files_to_send)
+
     log("Готово")
     return output_path
 
