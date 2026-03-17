@@ -212,7 +212,9 @@ def target_week_range(explicit_week: Optional[str] = None) -> Tuple[str, date, d
         start = week_start_from_label(explicit_week)
         return explicit_week, start, start + timedelta(days=6)
     yesterday = tz_now().date() - timedelta(days=1)
-    start = yesterday - timedelta(days=yesterday.weekday())
+    # Понедельник предыдущей полной недели
+    days_to_monday = yesterday.weekday()  # сколько дней назад от yesterday до его понедельника
+    start = yesterday - timedelta(days=days_to_monday + 7)
     return iso_week_label(start), start, start + timedelta(days=6)
 
 def ads_weekly_key(week_label: str) -> str:
