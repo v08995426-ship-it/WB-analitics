@@ -1141,8 +1141,8 @@ def main(cfg: AppConfig = CONFIG) -> str:
     stocks = load_stocks(storage, cfg)
     article_1c_map = load_article_map_1c(storage, cfg)
     stocks_1c_map = prepare_1c_stocks_map(load_1c_stocks(storage, cfg))
-stocks_1c_local = str(Path(cfg.output_dir) / "Остатки 1С.xlsx")
-storage.download_file(cfg.stocks_1c_key, stocks_1c_local)
+    stocks_1c_local = str(Path(cfg.output_dir) / "Остатки 1С.xlsx")
+    storage.download_file(cfg.stocks_1c_key, stocks_1c_local)
     daily_orders = prepare_daily_orders(orders)
     grid = build_daily_grid(daily_orders, cfg)
 
