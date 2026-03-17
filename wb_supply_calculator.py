@@ -163,7 +163,6 @@ WAREHOUSE_TO_DISTRICT: Dict[str, str] = {
     "Сарапул": "Приволжский федеральный округ",
     "Екатеринбург - Перспективная 14": "Уральский федеральный округ",
     "Новосибирск": "Сибирский федеральный округ",
-    "Санкт-Петербург Уткина Заводь": "Северо-Западный федеральный округ",
 }
 
 ALL_TARGET_WAREHOUSES: List[str] = list(WAREHOUSE_TO_DISTRICT.keys())
@@ -783,8 +782,19 @@ def allocate_low_turnover(shares_sku: pd.DataFrame, cfg: AppConfig) -> Dict[str,
     return largest_remainder_allocation(cfg.low_turnover_network_stock, selected, minimum_one_for_nonzero=True)
 
 
-def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current_stock_df: pd.DataFrame, article_1c_map: Dict[str, str], cfg: AppConfig) -> pd.DataFrame:
-    current_lookup = current_stock_df.set_index(["nmId", "warehouse"]).to_dict("index") if not current_stock_df.empty else {}
+def calculate_supply_plan(
+    sku_df: pd.DataFrame,
+    shares_df: pd.DataFrame,
+    current_stock_df: pd.DataFrame,
+    article_1c_map: Dict[str, str],
+    cfg: AppConfig,
+) -> pd.DataFrame:
+    current_lookup = (
+        current_stock_df.set_index(["nmId", "warehouse"]).to_dict("index")
+        if not current_stock_df.empty
+        else {}
+    )
+
     rows: List[Dict[str, object]] = []
 
     for _, sku in sku_df.iterrows():
@@ -799,6 +809,8 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
             allocations = allocate_low_turnover(sku_shares, cfg)
             for warehouse, target_qty in allocations.items():
                 current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
+                to_supply = max(0, int(target_qty - current_stock))
+
                 rows.append(
                     {
                         "nmId": nmid,
@@ -806,7 +818,14 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
                         "subject": sku["subject"],
                         "Артикул 1С": article_1c,
                         "warehouse": warehouse,
-                        "to_supply": max(0, int(target_qty - current_stock)),
+                        "warehouse_share": float(
+                            sku_shares.loc[sku_shares["warehouse"] == warehouse, "warehouse_share"].sum()
+                        ) if warehouse in sku_shares["warehouse"].values else 0.0,
+                        "daily_demand_final": float(sku["daily_demand_final"]),
+                        "target_stock": float(target_qty),
+                        "current_stock_full": float(current_stock),
+                        "to_supply": float(to_supply),
+                        "calc_mode": "low_turnover",
                     }
                 )
             continue
@@ -816,6 +835,7 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
             share = float(share_row["warehouse_share"])
             target_stock = float(sku["daily_demand_final"]) * share * cfg.target_days
             current_stock = float(current_lookup.get((nmid, warehouse), {}).get("current_stock_full", 0))
+            to_supply = max(0, ceil_int(target_stock - current_stock))
 
             rows.append(
                 {
@@ -824,7 +844,12 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
                     "subject": sku["subject"],
                     "Артикул 1С": article_1c,
                     "warehouse": warehouse,
-                    "to_supply": max(0, ceil_int(target_stock - current_stock)),
+                    "warehouse_share": share,
+                    "daily_demand_final": float(sku["daily_demand_final"]),
+                    "target_stock": float(target_stock),
+                    "current_stock_full": float(current_stock),
+                    "to_supply": float(to_supply),
+                    "calc_mode": "regular",
                 }
             )
 
@@ -833,11 +858,21 @@ def calculate_supply_plan(sku_df: pd.DataFrame, shares_df: pd.DataFrame, current
         return plan
 
     plan = (
-        plan.groupby(["nmId", "supplierArticle", "subject", "Артикул 1С", "warehouse"], as_index=False)
-        .agg(to_supply=("to_supply", "sum"))
+        plan.groupby(
+            ["nmId", "supplierArticle", "subject", "Артикул 1С", "warehouse", "calc_mode"],
+            as_index=False,
+        )
+        .agg(
+            warehouse_share=("warehouse_share", "sum"),
+            daily_demand_final=("daily_demand_final", "first"),
+            target_stock=("target_stock", "sum"),
+            current_stock_full=("current_stock_full", "sum"),
+            to_supply=("to_supply", "sum"),
+        )
     )
 
-    return plan[plan["to_supply"] > 0].copy()
+    plan = plan[plan["to_supply"] > 0].copy()
+    return plan
 
 
 def prepare_1c_stocks_map(df_1c_stocks: pd.DataFrame) -> pd.DataFrame:
@@ -930,6 +965,13 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
     if total_col is None:
         raise KeyError(f"Не найдена колонка 'Общий итог'. Заголовки шаблона: {list(header_map.keys())}")
 
+    one_c_col_map = {
+        col_name: header_map[col_name]
+        for col_name in ONE_C_STOCK_COLUMNS
+        if col_name in header_map
+    }
+    sobrat_col = header_map.get("Собрать всего")
+
     technical_cols = {"supplierArticle", "Артикул 1С", "nmId", "subject", "Общий итог", "missing_1c_article"}
     source_warehouse_cols = [
         c for c in data_df.columns
@@ -954,53 +996,42 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         "Санкт-Петербург Уткина Заводь",
         "Новосибирск",
     ]
-
     ordered_warehouses = [w for w in preferred_order if w in source_warehouse_cols]
     ordered_warehouses += [w for w in source_warehouse_cols if w not in ordered_warehouses]
 
-    current_header_map = get_header_map()
-    current_warehouse_headers: List[str] = []
-    for col in range(article_1c_col + 1, total_col):
-        val = normalize_template_header(ws.cell(header_row, col).value)
-        if val:
-            current_warehouse_headers.append(val)
-
-    current_internal_warehouses: List[str] = []
-    for header in current_warehouse_headers:
-        current_internal_warehouses.append(TEMPLATE_WAREHOUSE_ALIASES.get(header, header))
-
-    missing_warehouses = [w for w in ordered_warehouses if w not in current_internal_warehouses]
-
-    if missing_warehouses:
-        insert_at = total_col
-        ws.insert_cols(insert_at, amount=len(missing_warehouses))
-
-        reverse_template_names = {
-            "Самара (Новосемейкино)": "Новосемейкино",
-            "Рязань (Тюшевское)": "Рязань",
-            "Екатеринбург - Перспективная 14": "Екатеринбург",
-            "Санкт-Петербург Уткина Заводь": "СПб Уткина Заводь",
-        }
-
-        style_source_col = max(article_1c_col + 1, insert_at - 1)
-
-        for i, wh in enumerate(missing_warehouses):
-            col_idx = insert_at + i
-            header_value = reverse_template_names.get(wh, wh)
-            ws.cell(header_row, col_idx, header_value)
-            try:
-                ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = ws.column_dimensions[
-                    ws.cell(1, style_source_col).column_letter
-                ].width
-            except Exception:
-                pass
-
-        header_map = get_header_map()
-        total_col = header_map.get("Общий итог")
+    # Полностью перестраиваем складскую зону:
+    # удаляем все колонки между A и "Общий итог", затем вставляем нужное число складских колонок с B
+    if total_col > article_1c_col + 1:
+        ws.delete_cols(article_1c_col + 1, total_col - article_1c_col - 1)
 
     header_map = get_header_map()
     total_col = header_map.get("Общий итог")
+    if total_col is None:
+        raise KeyError("После перестройки не найдена колонка 'Общий итог'")
+
+    if ordered_warehouses:
+        ws.insert_cols(article_1c_col + 1, amount=len(ordered_warehouses))
+
+    reverse_template_names = {
+        "Самара (Новосемейкино)": "Новосемейкино",
+        "Рязань (Тюшевское)": "Рязань",
+        "Екатеринбург - Перспективная 14": "Екатеринбург",
+        "Санкт-Петербург Уткина Заводь": "СПб Уткина Заводь",
+    }
+
+    for i, wh in enumerate(ordered_warehouses, start=article_1c_col + 1):
+        ws.cell(header_row, i, reverse_template_names.get(wh, wh))
+
+    # после вставки пересчитываем карту заголовков
+    header_map = get_header_map()
+    total_col = header_map.get("Общий итог")
     article_1c_col = header_map.get("Артикул 1С") or header_map.get("Артикул 1с")
+    one_c_col_map = {
+        col_name: header_map[col_name]
+        for col_name in ONE_C_STOCK_COLUMNS
+        if col_name in header_map
+    }
+    sobrat_col = header_map.get("Собрать всего")
 
     warehouse_write_map: Dict[str, int] = {}
     for col in range(article_1c_col + 1, total_col):
@@ -1010,21 +1041,17 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         internal_name = TEMPLATE_WAREHOUSE_ALIASES.get(header, header)
         warehouse_write_map[internal_name] = col
 
-    one_c_col_map = {
-        col_name: header_map[col_name]
-        for col_name in ONE_C_STOCK_COLUMNS
-        if col_name in header_map
-    }
-
     template_warehouse_cols = [c for c in warehouse_write_map.keys() if c in data_df.columns]
     if template_warehouse_cols:
         data_df = data_df.copy()
         data_df["template_total"] = data_df[template_warehouse_cols].sum(axis=1)
         data_df = data_df[data_df["template_total"] > 0].copy()
 
+    # очищаем только нужные области
     clear_cols = {article_1c_col, total_col}
     clear_cols.update(warehouse_write_map.values())
     clear_cols.update(one_c_col_map.values())
+    # Собрать всего НЕ трогаем
 
     for row_idx in range(2, ws.max_row + 1):
         for col_idx in clear_cols:
@@ -1053,6 +1080,8 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
 
         for col_name, col_idx in one_c_col_map.items():
             ws.cell(i, col_idx, floor_int(row.get(col_name, 0)))
+
+        # Собрать всего не заполняем
 
         if bool(row.get("missing_1c_article", False)):
             for col_idx in range(1, ws.max_column + 1):
@@ -1088,7 +1117,14 @@ def send_results_to_telegram(cfg: AppConfig, files: List[str]) -> None:
         log(f"Файл отправлен в Telegram: {file_path}")
 
 
-def save_debug_files(output_dir: str, sku_df: pd.DataFrame, region_metrics: pd.DataFrame, shares_df: pd.DataFrame, plan_df: pd.DataFrame, filled_template_path: str) -> None:
+def save_debug_files(
+    output_dir: str,
+    sku_df: pd.DataFrame,
+    region_metrics: pd.DataFrame,
+    shares_df: pd.DataFrame,
+    plan_df: pd.DataFrame,
+    filled_template_path: str,
+) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     debug_path = Path(output_dir) / "wb_supply_debug.xlsx"
@@ -1128,6 +1164,10 @@ def main(cfg: AppConfig = CONFIG) -> str:
     if pd.notna(latest_stock_date):
         log(f"Актуальная дата остатков: {latest_stock_date:%Y-%m-%d}")
 
+    current_stock = current_stock_by_warehouse(current_stock_df)
+    log(f"Текущих остатков по складам в расчёте: {len(current_stock):,} строк")
+    log(f"Сумма текущих остатков по складам: {current_stock['current_stock_full'].sum():,.0f}")
+
     grid = attach_presence_flags(grid, per_wh, per_district, history_dates)
     log(f"GRID SIZE: {len(grid):,}")
 
@@ -1138,7 +1178,6 @@ def main(cfg: AppConfig = CONFIG) -> str:
     sku_df = choose_final_daily_demand(region_metrics, cfg)
     shares_df = build_warehouse_shares(region_metrics)
     shares_df = apply_strategy(shares_df, cfg)
-    current_stock = current_stock_by_warehouse(current_stock_df)
 
     plan_df = calculate_supply_plan(sku_df, shares_df, current_stock, article_1c_map, cfg)
     if plan_df.empty:
