@@ -45,7 +45,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       WB_TEMPLATE_KEY: ${{ secrets.WB_TEMPLATE_KEY }}
-
+WB_SEND_TELEGRAM: "1"
       WB_UPLOAD_RESULT_TO_S3: "1"
       WB_OUTPUT_DIR: "output"
       WB_SEND_TELEGRAM: "1"
