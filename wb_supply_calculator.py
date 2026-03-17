@@ -60,7 +60,8 @@ class AppConfig:
     low_turnover_sales_threshold: int = 100
     low_turnover_network_stock: int = 50
 
-    min_review_rating: float = float(os.getenv("WB_MIN_REVIEW_RATING", "4.6"))
+    # 4.6 и ниже исключаем => порог 4.7 и оператор "<"
+    min_review_rating: float = float(os.getenv("WB_MIN_REVIEW_RATING", "4.7"))
 
     output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
     upload_result_to_s3: bool = env_bool("WB_UPLOAD_RESULT_TO_S3", False)
@@ -75,7 +76,6 @@ class AppConfig:
     article_map_1c_key: str = "Отчёты/Остатки/1С/Артикулы 1с.xlsx"
     template_key: str = os.getenv("WB_TEMPLATE_KEY", "Служебные файлы/Согласование поставки WB.xlsm")
 
-    # можно задать точный ключ через secret/env
     ratings_key: str = os.getenv("WB_RATINGS_KEY", "").strip()
     ratings_prefix_candidates: Tuple[str, ...] = (
         "Отчёты/Позиции по ключам/{store}/Недельные/",
@@ -436,7 +436,6 @@ def resolve_ratings_key(storage: S3Storage, cfg: AppConfig) -> Optional[str]:
             filename = key.split("/")[-1]
             if any(p == filename for p in patterns):
                 return key
-        # fallback: взять самый свежий файл "Неделя"
         week_keys = [k for k in keys if "Неделя" in k.split("/")[-1]]
         if week_keys:
             return sorted(week_keys)[-1]
@@ -459,7 +458,7 @@ def load_ratings_map(storage: S3Storage, cfg: AppConfig) -> Dict[str, float]:
     rating_col = None
 
     for k, original in cols.items():
-        if "артикул wb" in k or k == "nmid" or k == "nmid":
+        if "артикул wb" in k or k == "nmid":
             nm_col = original
         if "рейтинг отзывов" in k:
             rating_col = original
@@ -1254,6 +1253,7 @@ def save_debug_files(
     region_metrics: pd.DataFrame,
     shares_df: pd.DataFrame,
     plan_df: pd.DataFrame,
+    current_stock_df: pd.DataFrame,
     filled_template_path: str,
 ) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -1263,6 +1263,16 @@ def save_debug_files(
         sku_df.to_excel(writer, index=False, sheet_name="SKU")
         region_metrics.to_excel(writer, index=False, sheet_name="RegionMetrics")
         shares_df.to_excel(writer, index=False, sheet_name="WarehouseShares")
+        current_stock_df.to_excel(writer, index=False, sheet_name="CurrentStocks")
+        if not current_stock_df.empty:
+            network = (
+                current_stock_df.groupby("nmId", as_index=False)
+                .agg(
+                    network_stock_full=("current_stock_full", "sum"),
+                    network_stock_available=("current_stock_available", "sum"),
+                )
+            )
+            network.to_excel(writer, index=False, sheet_name="NetworkStocks")
         plan_df.to_excel(writer, index=False, sheet_name="Plan")
 
     log(f"Сохранён debug-файл: {debug_path}")
@@ -1286,13 +1296,13 @@ def main(cfg: AppConfig = CONFIG) -> str:
     stocks_1c_map = prepare_1c_stocks_map(stocks_1c_raw)
     ratings_map = load_ratings_map(storage, cfg)
 
-    # фильтр по рейтингу отзывов
     if ratings_map:
         sku_df_tmp = orders[["nmId"]].drop_duplicates().copy()
         sku_df_tmp["review_rating"] = sku_df_tmp["nmId"].map(ratings_map)
         bad_skus = set(
             sku_df_tmp.loc[
-                sku_df_tmp["review_rating"].notna() & (sku_df_tmp["review_rating"] < cfg.min_review_rating),
+                sku_df_tmp["review_rating"].notna()
+                & (sku_df_tmp["review_rating"] < cfg.min_review_rating),
                 "nmId",
             ].astype(str)
         )
@@ -1313,11 +1323,11 @@ def main(cfg: AppConfig = CONFIG) -> str:
     daily_orders = prepare_daily_orders(orders)
     grid = build_daily_grid(daily_orders, cfg)
 
-    current_stock_df, history_dates, per_wh, per_district, latest_stock_date = prepare_stock_presence(stocks)
+    current_stock_df_raw, history_dates, per_wh, per_district, latest_stock_date = prepare_stock_presence(stocks)
     if pd.notna(latest_stock_date):
         log(f"Актуальная дата остатков: {latest_stock_date:%Y-%m-%d}")
 
-    current_stock = current_stock_by_warehouse(current_stock_df)
+    current_stock = current_stock_by_warehouse(current_stock_df_raw)
     log(f"Текущих остатков по складам в расчёте: {len(current_stock):,} строк")
     log(f"Сумма текущих остатков по складам (full): {current_stock['current_stock_full'].sum():,.0f}")
     log(f"Сумма текущих остатков по складам (available): {current_stock['current_stock_available'].sum():,.0f}")
@@ -1333,7 +1343,6 @@ def main(cfg: AppConfig = CONFIG) -> str:
     shares_df = build_warehouse_shares(region_metrics)
     shares_df = apply_strategy(shares_df, cfg)
 
-    # рейтинг в debug
     if ratings_map:
         sku_df["review_rating"] = sku_df["nmId"].map(ratings_map)
 
@@ -1348,7 +1357,7 @@ def main(cfg: AppConfig = CONFIG) -> str:
         output_path = str(Path(cfg.output_dir) / f"Согласование поставки WB_{cfg.store_name}_{cfg.run_date:%Y%m%d}.xlsm")
         fill_template_file(template_path, output_path, template_data, cfg)
 
-    save_debug_files(cfg.output_dir, sku_df, region_metrics, shares_df, plan_df, output_path)
+    save_debug_files(cfg.output_dir, sku_df, region_metrics, shares_df, plan_df, current_stock, output_path)
 
     if cfg.upload_result_to_s3:
         result_key = f"Отчёты/Поставки/{cfg.store_name}/{Path(output_path).name}"
