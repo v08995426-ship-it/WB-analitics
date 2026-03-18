@@ -323,7 +323,19 @@ def load_wb_stocks(storage: S3Storage, cfg: AppConfig, stock_key: str) -> pd.Dat
     df.columns = [str(c).strip() for c in df.columns]
 
     nm_col = choose_existing_column(df, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
-    qty_col = choose_existing_column(df, ["Остатки МП", "Количество", "Доступно", "Остаток", "Остатки"], "остаток WB")
+    qty_col = choose_existing_column(
+    df,
+    [
+        "Доступно для продажи",
+        "Полное количество",
+        "Остатки МП",
+        "Количество",
+        "Доступно",
+        "Остаток",
+        "Остатки",
+    ],
+    "остаток WB",
+)
     article_wb_col = None
     for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика", "Артикул WB"]:
         try:
