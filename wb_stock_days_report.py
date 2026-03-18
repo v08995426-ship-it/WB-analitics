@@ -16,13 +16,13 @@ import boto3
 import pandas as pd
 import requests
 from botocore.client import Config as BotoConfig
-from botocore.exceptions import ClientError
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 
 # =========================
-# Общие утилиты
+# Базовые утилиты
 # =========================
 
 
@@ -40,7 +40,7 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def normalize_text(value: object) -> str:
-    if pd.isna(value) or value is None:
+    if value is None or pd.isna(value):
         return ""
     text = str(value).strip()
     if text.endswith(".0"):
@@ -55,53 +55,49 @@ def normalize_key(value: object) -> str:
 
 
 def safe_float(value: object) -> float:
-    if pd.isna(value) or value is None or value == "":
+    if value is None or value == "" or pd.isna(value):
         return 0.0
-    try:
+    if isinstance(value, (int, float)):
         return float(value)
-    except Exception:
-        text = normalize_text(value).replace(" ", "").replace(",", ".")
-        return float(text) if text else 0.0
+    text = normalize_text(value).replace(" ", "").replace(",", ".")
+    return float(text) if text else 0.0
 
 
 
 def ceil_int(value: object) -> int:
-    return int(math.ceil(safe_float(value)))
+    return int(math.ceil(max(0.0, safe_float(value))))
 
 
 
-def format_days(value: Optional[float]) -> str:
-    if value is None:
-        return "∞"
-    return f"{value:.1f}"
+def int_or_zero(value: object) -> int:
+    return int(round(safe_float(value)))
 
 
 
-def calculate_days(stock_qty: float, avg_daily_sales: float) -> Optional[float]:
+def calculate_days(stock_qty: float, avg_daily_sales: float) -> int:
     if avg_daily_sales <= 0:
-        return None if stock_qty > 0 else 0.0
-    return stock_qty / avg_daily_sales
-
-
-
-def should_send_to_telegram(run_date: datetime, force_send: bool) -> bool:
-    if force_send:
-        log("Ручной запуск — отчёт будет отправлен в Telegram")
-        return True
-    # Понедельник=0, пятница=4
-    if run_date.weekday() in {0, 4}:
-        return True
-    return False
+        return 999999 if stock_qty > 0 else 0
+    return int(math.floor(stock_qty / avg_daily_sales))
 
 
 
 def choose_existing_column(df: pd.DataFrame, candidates: Iterable[str], label: str) -> str:
     normalized = {str(col).strip().lower(): col for col in df.columns}
     for candidate in candidates:
-        real = normalized.get(candidate.strip().lower())
+        real = normalized.get(str(candidate).strip().lower())
         if real is not None:
             return real
     raise KeyError(f"Не найдена колонка для '{label}'. Доступные колонки: {list(df.columns)}")
+
+
+
+def try_choose_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    normalized = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        real = normalized.get(str(candidate).strip().lower())
+        if real is not None:
+            return real
+    return None
 
 
 
@@ -109,8 +105,7 @@ def parse_stop_articles(raw: str) -> set[str]:
     if not raw:
         return set()
     normalized = raw.replace("\r", "\n").replace(";", "\n").replace(",", "\n")
-    items = {normalize_key(item) for item in normalized.split("\n") if normalize_text(item)}
-    return items
+    return {normalize_key(item) for item in normalized.split("\n") if normalize_text(item)}
 
 
 
@@ -160,13 +155,12 @@ class AppConfig:
     region_name: str = os.getenv("WB_S3_REGION") or os.getenv("YC_REGION") or "ru-central1"
 
     store_name: str = os.getenv("WB_STORE", "TOPFACE").strip()
-    run_date: datetime = datetime.strptime(
-        os.getenv("WB_RUN_DATE", datetime.now().strftime("%Y-%m-%d")),
-        "%Y-%m-%d",
-    )
+    run_date: datetime = datetime.strptime(os.getenv("WB_RUN_DATE", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d")
+
     sales_window_days: int = int(os.getenv("WB_SALES_WINDOW_DAYS", "7"))
     activity_window_days: int = int(os.getenv("WB_ACTIVITY_WINDOW_DAYS", "60"))
-    days_threshold: float = float(os.getenv("WB_LOW_STOCK_DAYS_THRESHOLD", "14"))
+    low_stock_days_threshold: int = int(os.getenv("WB_LOW_STOCK_DAYS_THRESHOLD", "14"))
+    dead_stock_days_threshold: int = int(os.getenv("WB_DEAD_STOCK_DAYS_THRESHOLD", "120"))
     output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
 
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -174,17 +168,16 @@ class AppConfig:
     send_telegram: bool = env_bool("WB_SEND_TELEGRAM", True)
     force_send_env: bool = env_bool("WB_FORCE_SEND", False)
 
-    # Пути в Object Storage
     stocks_prefix: str = os.getenv("WB_STOCKS_PREFIX", "Отчёты/Остатки/{store}/Недельные/")
     orders_prefix: str = os.getenv("WB_ORDERS_PREFIX", "Отчёты/Заказы/{store}/Недельные/")
     article_map_key: str = os.getenv("WB_ARTICLE_MAP_KEY", "Отчёты/Остатки/1С/Артикулы 1с.xlsx")
     stocks_1c_key: str = os.getenv("WB_STOCKS_1C_KEY", "Отчёты/Остатки/1С/Остатки 1С.xlsx")
-
     stop_articles_raw: str = os.getenv("WB_STOP_LIST_KEY", "")
+    exclude_article_prefixes: tuple[str, ...] = ("PT104",)
 
 
 # =========================
-# S3 / Object Storage
+# Object Storage
 # =========================
 
 
@@ -192,8 +185,7 @@ class S3Storage:
     def __init__(self, cfg: AppConfig):
         if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
             raise ValueError(
-                "Не заданы параметры Object Storage. Нужны env из одной из схем: "
-                "WB_S3_*, YC_* или CLOUD_RU_*"
+                "Не заданы параметры Object Storage. Нужны env из одной из схем: WB_S3_*, YC_* или CLOUD_RU_*"
             )
         self.bucket = cfg.bucket_name
         self.s3 = boto3.client(
@@ -232,7 +224,7 @@ class S3Storage:
 
 
 # =========================
-# Загрузка источников
+# Источники
 # =========================
 
 
@@ -260,7 +252,7 @@ def find_order_files_for_window(storage: S3Storage, cfg: AppConfig) -> list[str]
         raise FileNotFoundError(f"Не найдены weekly-файлы заказов по префиксу: {prefix}")
 
     history_days = max(cfg.sales_window_days, cfg.activity_window_days)
-    lower_bound = cfg.run_date - timedelta(days=history_days + 10)
+    lower_bound = cfg.run_date - timedelta(days=history_days + 14)
     selected: list[tuple[datetime, str]] = []
     for key in keys:
         parsed = parse_iso_week_from_key(key)
@@ -271,16 +263,30 @@ def find_order_files_for_window(storage: S3Storage, cfg: AppConfig) -> list[str]
             selected.append((week_start, key))
 
     if not selected:
-        # fallback — берём 2 последних weekly-файла
-        all_dated = []
-        for key in keys:
-            parsed = parse_iso_week_from_key(key)
-            week_start = iso_week_start(*parsed) if parsed else datetime.min
-            all_dated.append((week_start, key))
-        selected = sorted(all_dated, key=lambda x: x[0])[-2:]
+        selected = sorted(
+            [(iso_week_start(*p), k) for k in keys if (p := parse_iso_week_from_key(k))],
+            key=lambda x: x[0],
+        )[-10:]
 
     selected_keys = [key for _, key in sorted(selected, key=lambda x: x[0])]
     log(f"Берём заказы WB из файлов: {selected_keys}")
+    return selected_keys
+
+
+
+def find_stock_history_files_for_month(storage: S3Storage, cfg: AppConfig) -> list[str]:
+    prefix = cfg.stocks_prefix.format(store=cfg.store_name)
+    keys = [k for k in storage.list_keys(prefix) if k.lower().endswith(".xlsx")]
+    month_start = cfg.run_date.replace(day=1)
+    selected: list[tuple[datetime, str]] = []
+    for key in keys:
+        parsed = parse_iso_week_from_key(key)
+        if not parsed:
+            continue
+        week_start = iso_week_start(*parsed)
+        if week_start >= month_start - timedelta(days=7):
+            selected.append((week_start, key))
+    selected_keys = [k for _, k in sorted(selected, key=lambda x: x[0])]
     return selected_keys
 
 
@@ -307,7 +313,7 @@ def load_1c_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
 
     article_col = choose_existing_column(df, ["Артикул", "АРТ"], "Артикул 1С")
-    mp_col = choose_existing_column(df, ["Остатки МП"], "Остатки МП")
+    mp_col = choose_existing_column(df, ["Остатки МП", "Остатки МП (Липецк), шт"], "Остатки МП")
 
     result = pd.DataFrame(
         {
@@ -320,31 +326,33 @@ def load_1c_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
 
 
 
-def load_wb_stocks(storage: S3Storage, cfg: AppConfig, stock_key: str) -> pd.DataFrame:
+def load_wb_stocks(storage: S3Storage, stock_key: str) -> pd.DataFrame:
     df = storage.read_excel(stock_key)
     df.columns = [str(c).strip() for c in df.columns]
 
     nm_col = choose_existing_column(df, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
-    qty_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество", "Остатки МП", "Количество", "Доступно", "Остаток", "Остатки"], "остаток WB")
-    article_wb_col = None
-    for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика", "Артикул WB"]:
-        try:
-            article_wb_col = choose_existing_column(df, [candidate], "Артикул WB")
-            break
-        except Exception:
-            continue
+    qty_col = choose_existing_column(
+        df,
+        [
+            "Доступно для продажи",
+            "Полное количество",
+            "Остатки МП",
+            "Количество",
+            "Доступно",
+            "Остаток",
+            "Остатки",
+        ],
+        "остаток WB",
+    )
+    article_wb_col = try_choose_column(df, ["supplierArticle", "Артикул продавца", "Артикул поставщика", "Артикул WB"])
 
     out = pd.DataFrame(
         {
             "nmId": df[nm_col].map(normalize_text),
             "stock_wb_qty": df[qty_col].map(ceil_int),
+            "supplierArticle": df[article_wb_col].map(normalize_text) if article_wb_col else "",
         }
     )
-    if article_wb_col:
-        out["supplierArticle"] = df[article_wb_col].map(normalize_text)
-    else:
-        out["supplierArticle"] = ""
-
     out = out[out["nmId"] != ""].copy()
     out = out.groupby(["nmId", "supplierArticle"], as_index=False).agg(stock_wb_qty=("stock_wb_qty", "sum"))
     return out
@@ -361,40 +369,22 @@ def load_orders(storage: S3Storage, cfg: AppConfig, order_keys: list[str]) -> pd
         df.columns = [str(c).strip() for c in df.columns]
         frames.append(df)
 
-    orders = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not frames:
+        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "sales_60d", "avg_daily_sales_7d"])
+
+    orders = pd.concat(frames, ignore_index=True)
     if orders.empty:
-        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "avg_daily_sales_7d"])
+        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "sales_60d", "avg_daily_sales_7d"])
 
     date_col = choose_existing_column(orders, ["date", "Дата заказа", "Дата"], "дата заказа")
     nm_col = choose_existing_column(orders, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
-    art_col = None
-    for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика"]:
-        try:
-            art_col = choose_existing_column(orders, [candidate], "Артикул продавца")
-            break
-        except Exception:
-            continue
-
-    qty_col = None
-    for candidate in ["quantity", "qty", "Количество", "Кол-во", "Количество, шт"]:
-        try:
-            qty_col = choose_existing_column(orders, [candidate], "количество")
-            break
-        except Exception:
-            continue
-
-    cancel_col = None
-    for candidate in ["isCancel", "cancel", "Отмена", "is_cancel"]:
-        try:
-            cancel_col = choose_existing_column(orders, [candidate], "признак отмены")
-            break
-        except Exception:
-            continue
+    art_col = try_choose_column(orders, ["supplierArticle", "Артикул продавца", "Артикул поставщика"])
+    qty_col = try_choose_column(orders, ["quantity", "qty", "Количество", "Кол-во", "Количество, шт"])
+    cancel_col = try_choose_column(orders, ["isCancel", "cancel", "Отмена", "is_cancel"])
 
     orders = orders.copy()
     orders[date_col] = pd.to_datetime(orders[date_col], errors="coerce").dt.normalize()
-    start_date = cfg.run_date - timedelta(days=cfg.sales_window_days - 1)
-    orders = orders[(orders[date_col] >= start_date) & (orders[date_col] <= cfg.run_date)].copy()
+    orders = orders[orders[date_col].notna()].copy()
 
     if cancel_col:
         orders = orders[~orders[cancel_col].fillna(False).astype(bool)].copy()
@@ -403,9 +393,75 @@ def load_orders(storage: S3Storage, cfg: AppConfig, order_keys: list[str]) -> pd
     orders["supplierArticle"] = orders[art_col].map(normalize_text) if art_col else ""
     orders["qty"] = orders[qty_col].map(safe_float) if qty_col else 1.0
 
-    grouped = orders.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_7d=("qty", "sum"))
-    grouped["avg_daily_sales_7d"] = grouped["sales_7d"] / float(cfg.sales_window_days)
-    return grouped
+    start_60d = cfg.run_date - timedelta(days=cfg.activity_window_days - 1)
+    start_7d = cfg.run_date - timedelta(days=cfg.sales_window_days - 1)
+
+    orders_60d = orders[(orders[date_col] >= start_60d) & (orders[date_col] <= cfg.run_date)].copy()
+    orders_7d = orders[(orders[date_col] >= start_7d) & (orders[date_col] <= cfg.run_date)].copy()
+
+    agg_60d = orders_60d.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_60d=("qty", "sum"))
+    agg_7d = orders_7d.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_7d=("qty", "sum"))
+
+    sales = agg_60d.merge(agg_7d, on=["nmId", "supplierArticle"], how="outer").fillna(0.0)
+    sales["avg_daily_sales_7d"] = sales["sales_7d"] / float(cfg.sales_window_days)
+    return sales
+
+
+
+def count_zero_stock_days_current_month(
+    storage: S3Storage,
+    cfg: AppConfig,
+    history_keys: list[str],
+    current_zero_nmids: set[str],
+) -> pd.DataFrame:
+    if not current_zero_nmids:
+        return pd.DataFrame(columns=["nmId", "days_zero_in_month"])
+
+    month_start = cfg.run_date.replace(day=1)
+    dates_by_nmid: dict[str, set[datetime.date]] = {nmid: set() for nmid in current_zero_nmids}
+
+    for key in history_keys:
+        try:
+            df = storage.read_excel(key)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        df.columns = [str(c).strip() for c in df.columns]
+
+        try:
+            nm_col = choose_existing_column(df, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
+            qty_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество", "Количество", "Остаток", "Остатки"], "остаток WB")
+        except Exception:
+            continue
+
+        date_col = try_choose_column(df, ["Дата сбора", "Дата запроса", "Дата последнего изменения", "Дата"])
+        if date_col:
+            stock_dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+        else:
+            parsed = parse_iso_week_from_key(key)
+            fallback_date = iso_week_start(*parsed) if parsed else cfg.run_date
+            stock_dates = pd.Series([fallback_date] * len(df))
+
+        tmp = pd.DataFrame(
+            {
+                "nmId": df[nm_col].map(normalize_text),
+                "stock_wb_qty": df[qty_col].map(ceil_int),
+                "stock_date": stock_dates,
+            }
+        )
+        tmp = tmp[tmp["nmId"].isin(current_zero_nmids)].copy()
+        tmp = tmp[tmp["stock_date"].notna()].copy()
+        tmp = tmp[tmp["stock_date"] >= month_start].copy()
+        tmp = tmp[tmp["stock_wb_qty"] <= 0].copy()
+
+        for row in tmp.itertuples(index=False):
+            dates_by_nmid[row.nmId].add(row.stock_date.date())
+
+    result = pd.DataFrame(
+        {"nmId": list(dates_by_nmid.keys()), "days_zero_in_month": [len(v) for v in dates_by_nmid.values()]}
+    )
+    return result
 
 
 # =========================
@@ -418,18 +474,27 @@ def build_report_dataframe(
     sales: pd.DataFrame,
     article_map: pd.DataFrame,
     stocks_1c: pd.DataFrame,
+    zero_days_df: pd.DataFrame,
     stop_articles: set[str],
+    cfg: AppConfig,
 ) -> pd.DataFrame:
     df = wb_stocks.merge(sales, on=["nmId", "supplierArticle"], how="left")
-    df["sales_7d"] = df["sales_7d"].fillna(0.0)
-    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].fillna(0.0)
-    df["sales_60d"] = df["sales_60d"].fillna(0.0)
+    for col in ["sales_7d", "sales_60d", "avg_daily_sales_7d"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
 
     df = df.merge(article_map, on="nmId", how="left")
     df["article_1c"] = df["article_1c"].fillna("").map(normalize_text)
 
     df = df.merge(stocks_1c, on="article_1c", how="left")
-    df["stock_company_qty"] = df["stock_company_qty"].fillna(0).astype(int)
+    df["stock_company_qty"] = df.get("stock_company_qty", 0).fillna(0).map(ceil_int)
+
+    if not zero_days_df.empty:
+        df = df.merge(zero_days_df, on="nmId", how="left")
+    if "days_zero_in_month" not in df.columns:
+        df["days_zero_in_month"] = 0
+    df["days_zero_in_month"] = df["days_zero_in_month"].fillna(0).astype(int)
 
     df["days_wb"] = df.apply(lambda x: calculate_days(safe_float(x["stock_wb_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
     df["days_company"] = df.apply(lambda x: calculate_days(safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
@@ -437,17 +502,21 @@ def build_report_dataframe(
         lambda x: calculate_days(safe_float(x["stock_wb_qty"]) + safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])),
         axis=1,
     )
-
     df["status"] = df["article_1c"].map(lambda x: "Delist" if normalize_key(x) in stop_articles else "")
 
-    df["sales_7d"] = df["sales_7d"].round(2)
-    df["sales_60d"] = df["sales_60d"].round(2)
-    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].round(4)
+    for col in ["stock_wb_qty", "stock_company_qty", "sales_7d", "sales_60d"]:
+        df[col] = df[col].map(int_or_zero)
+    for col in ["days_wb", "days_company", "days_total"]:
+        df[col] = df[col].map(int_or_zero)
 
-    sort_key = df["days_wb"].copy()
-    sort_key = sort_key.where(sort_key.notna(), 999999.0)
-    df = df.assign(_sort_days=sort_key).sort_values(["_sort_days", "stock_wb_qty", "article_1c"], ascending=[True, True, True]).drop(columns=["_sort_days"])
-    df = df.reset_index(drop=True)
+    exclude_mask = pd.Series(False, index=df.index)
+    for prefix in cfg.exclude_article_prefixes:
+        exclude_mask = exclude_mask | df["article_1c"].map(normalize_key).str.startswith(prefix)
+    df = df[~exclude_mask].copy()
+
+    sort_days = df["days_wb"].replace(0, 0).fillna(999999)
+    df = df.assign(_sort_days=sort_days).sort_values(["_sort_days", "stock_wb_qty", "article_1c"], ascending=[True, True, True])
+    df = df.drop(columns=["_sort_days"]).reset_index(drop=True)
     return df
 
 
@@ -460,73 +529,89 @@ HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 WARNING_FILL = PatternFill("solid", fgColor="FFF2CC")
 CRITICAL_FILL = PatternFill("solid", fgColor="F4CCCC")
 DELIST_FILL = PatternFill("solid", fgColor="D9D2E9")
+DEAD_FILL = PatternFill("solid", fgColor="000000")
+WHITE_FONT = Font(name="Calibri", size=14, color="FFFFFF")
+BASE_FONT = Font(name="Calibri", size=14)
+HEADER_FONT = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+TITLE_FONT = Font(name="Calibri", size=15, bold=True, color="FFFFFF")
 BORDER = Border(
     left=Side(style="thin", color="D9D9D9"),
     right=Side(style="thin", color="D9D9D9"),
     top=Side(style="thin", color="D9D9D9"),
     bottom=Side(style="thin", color="D9D9D9"),
 )
-BASE_FONT = Font(name="Calibri", size=14)
-HEADER_FONT = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
-TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
 
-def style_title(ws, cell_range: str, text: str) -> None:
-    ws[cell_range.split(":")[0]] = text
-    ws.merge_cells(cell_range)
-    cell = ws[cell_range.split(":")[0]]
+def write_title(ws, text: str, columns: int) -> None:
+    ws.cell(1, 1, text)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=columns)
+    cell = ws.cell(1, 1)
     cell.fill = HEADER_FILL
     cell.font = TITLE_FONT
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.alignment = CENTER
+    ws.row_dimensions[1].height = 28
 
 
 
-def style_header(ws, row_idx: int) -> None:
-    for cell in ws[row_idx]:
-        if cell.value is None:
-            continue
+def write_headers(ws, headers: list[str]) -> None:
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(2, col_idx, header)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.alignment = CENTER
         cell.border = BORDER
+    ws.row_dimensions[2].height = 42
 
 
 
-def style_data_row(ws, row_idx: int, days_wb_col: int, status_col: int) -> None:
+def apply_row_style(ws, row_idx: int, days_col: int, status_col: int, dead: bool = False) -> None:
     row_fill = None
-    days_value = ws.cell(row_idx, days_wb_col).value
-    status_value = normalize_text(ws.cell(row_idx, status_col).value)
+    row_font = BASE_FONT
 
-    try:
-        numeric_days = float(days_value) if days_value is not None else None
-    except Exception:
-        numeric_days = None
-
-    if status_value == "Delist":
-        row_fill = DELIST_FILL
-    if numeric_days is not None and numeric_days < 7:
-        row_fill = CRITICAL_FILL
-    elif numeric_days is not None and numeric_days < 14 and row_fill is None:
-        row_fill = WARNING_FILL
+    if dead:
+        row_fill = DEAD_FILL
+        row_font = WHITE_FONT
+    else:
+        days_value = ws.cell(row_idx, days_col).value
+        status_value = normalize_text(ws.cell(row_idx, status_col).value)
+        numeric_days = safe_float(days_value)
+        if status_value == "Delist":
+            row_fill = DELIST_FILL
+        if numeric_days < 7:
+            row_fill = CRITICAL_FILL
+        elif numeric_days < 14 and row_fill is None:
+            row_fill = WARNING_FILL
 
     for cell in ws[row_idx]:
-        cell.font = BASE_FONT
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.font = row_font
+        cell.alignment = CENTER
         cell.border = BORDER
         if row_fill is not None:
             cell.fill = row_fill
 
 
 
-def set_sheet_layout(ws, widths: dict[str, float], title_row: int = 1, header_row: int = 3) -> None:
-    for col, width in widths.items():
-        ws.column_dimensions[col].width = width
-    ws.row_dimensions[title_row].height = 28
-    ws.row_dimensions[header_row].height = 44
-    ws.freeze_panes = f"A{header_row + 1}"
+def autofit_worksheet(ws) -> None:
+    for col_cells in ws.columns:
+        col_idx = col_cells[0].column
+        max_len = 0
+        for cell in col_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, max((len(x) for x in value.split("\n")), default=0))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 3, 12), 36)
+    ws.freeze_panes = "A3"
     ws.sheet_view.showGridLines = False
-    ws.auto_filter.ref = f"A{header_row}:{chr(64 + ws.max_column)}{max(ws.max_row, header_row)}"
+    ws.auto_filter.ref = f"A2:{get_column_letter(ws.max_column)}{max(ws.max_row, 2)}"
+
+
+
+def dataframe_rows(df: pd.DataFrame, columns: list[str]) -> list[list[object]]:
+    rows = []
+    for _, row in df.iterrows():
+        rows.append([row.get(col, "") for col in columns])
+    return rows
 
 
 
@@ -535,78 +620,112 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
     ws_short = wb.active
     ws_short.title = "Критично <14 дней"
     ws_calc = wb.create_sheet("Расчёт")
+    ws_dead = wb.create_sheet("Dead_Stock")
 
     report_date_text = cfg.run_date.strftime("%d.%m.%Y")
 
+    short_df = df[(df["sales_60d"] > 0) & ((df["stock_wb_qty"] <= 0) | (df["days_wb"] < cfg.low_stock_days_threshold))].copy()
+    dead_df = df[(df["sales_60d"] > 0) & (df["days_total"] > cfg.dead_stock_days_threshold)].copy()
+
     # Лист 1
-    style_title(ws_short, "A1:F1", f"Контроль остатка WB — были продажи за {cfg.activity_window_days} дней и сейчас 0 либо менее {int(cfg.days_threshold)} дней на {report_date_text}")
-    ws_short.append([])
     short_headers = [
         "Артикул 1С",
-        "Остатка WB\nхватит, дней",
-        "В Липецке есть запас\nна, дней",
-        "Суммарно WB + Липецк\nхватит, дней",
+        "Продажи за 60 дней, шт",
+        "Остаток WB, шт",
+        "WB хватит, дней",
+        "Остатки МП (Липецк), шт",
+        "Липецк хватит, дней",
+        "WB + Липецк, дней",
+        "Дней без остатка в текущем месяце",
         "Статус",
     ]
-    ws_short.append(short_headers)
-    style_header(ws_short, 3)
-
-    short_df = df[(df["sales_60d"] > 0) & ((df["stock_wb_qty"] <= 0) | ((df["days_wb"].notna()) & (df["days_wb"] < cfg.days_threshold)))].copy()
-    for _, row in short_df.iterrows():
-        ws_short.append([
-            row["article_1c"],
-            int(round(row["sales_60d"])),
-            row["days_wb"],
-            row["days_company"],
-            row["days_total"],
-            row["status"],
-        ])
-
-    for r in range(4, ws_short.max_row + 1):
-        style_data_row(ws_short, r, days_wb_col=3, status_col=6)
-    set_sheet_layout(ws_short, {"A": 28, "B": 18, "C": 18, "D": 22, "E": 24, "F": 14})
+    write_title(
+        ws_short,
+        f"Товары с продажами за {cfg.activity_window_days} дней и текущим остатком WB = 0 или < {cfg.low_stock_days_threshold} дней на {report_date_text}",
+        len(short_headers),
+    )
+    write_headers(ws_short, short_headers)
+    short_export = short_df.rename(columns={
+        "article_1c": "Артикул 1С",
+        "sales_60d": "Продажи за 60 дней, шт",
+        "stock_wb_qty": "Остаток WB, шт",
+        "days_wb": "WB хватит, дней",
+        "stock_company_qty": "Остатки МП (Липецк), шт",
+        "days_company": "Липецк хватит, дней",
+        "days_total": "WB + Липецк, дней",
+        "days_zero_in_month": "Дней без остатка в текущем месяце",
+        "status": "Статус",
+    })
+    for values in dataframe_rows(short_export, short_headers):
+        ws_short.append(values)
+    for r in range(3, ws_short.max_row + 1):
+        apply_row_style(ws_short, r, days_col=4, status_col=9)
+    autofit_worksheet(ws_short)
 
     # Лист 2
-    style_title(ws_calc, "A1:L1", f"Расчёт дней до конца остатка WB — {cfg.store_name} — {report_date_text}")
-    ws_calc.append([])
     calc_headers = [
         "nmId",
         "Артикул WB",
         "Артикул 1С",
         "Остаток WB, шт",
         "Продажи за 7 дней, шт",
-        "Среднесуточные продажи\nза 7 дней, шт",
-        "Остатки МП\n(Липецк), шт",
+        "Продажи за 60 дней, шт",
+        "Среднесуточные продажи за 7 дней, шт",
+        "Остатки МП (Липецк), шт",
         "WB хватит, дней",
         "Липецк хватит, дней",
         "WB + Липецк, дней",
+        "Дней без остатка в текущем месяце",
         "Статус",
     ]
-    ws_calc.append(calc_headers)
-    style_header(ws_calc, 3)
+    write_title(ws_calc, f"Полный расчёт дней остатка WB — {cfg.store_name} — {report_date_text}", len(calc_headers))
+    write_headers(ws_calc, calc_headers)
+    calc_export = df.rename(columns={
+        "nmId": "nmId",
+        "supplierArticle": "Артикул WB",
+        "article_1c": "Артикул 1С",
+        "stock_wb_qty": "Остаток WB, шт",
+        "sales_7d": "Продажи за 7 дней, шт",
+        "sales_60d": "Продажи за 60 дней, шт",
+        "avg_daily_sales_7d": "Среднесуточные продажи за 7 дней, шт",
+        "stock_company_qty": "Остатки МП (Липецк), шт",
+        "days_wb": "WB хватит, дней",
+        "days_company": "Липецк хватит, дней",
+        "days_total": "WB + Липецк, дней",
+        "days_zero_in_month": "Дней без остатка в текущем месяце",
+        "status": "Статус",
+    }).copy()
+    calc_export["Среднесуточные продажи за 7 дней, шт"] = calc_export["Среднесуточные продажи за 7 дней, шт"].map(int_or_zero)
+    for values in dataframe_rows(calc_export, calc_headers):
+        ws_calc.append(values)
+    for r in range(3, ws_calc.max_row + 1):
+        apply_row_style(ws_calc, r, days_col=9, status_col=13)
+    autofit_worksheet(ws_calc)
 
-    for _, row in df.iterrows():
-        ws_calc.append([
-            row["nmId"],
-            row["supplierArticle"],
-            row["article_1c"],
-            row["stock_wb_qty"],
-            row["sales_60d"],
-            row["sales_7d"],
-            row["avg_daily_sales_7d"],
-            row["stock_company_qty"],
-            row["days_wb"],
-            row["days_company"],
-            row["days_total"],
-            row["status"],
-        ])
-
-    for r in range(4, ws_calc.max_row + 1):
-        style_data_row(ws_calc, r, days_wb_col=9, status_col=12)
-    set_sheet_layout(
-        ws_calc,
-        {"A": 14, "B": 20, "C": 28, "D": 14, "E": 16, "F": 16, "G": 22, "H": 18, "I": 16, "J": 18, "K": 18, "L": 14},
-    )
+    # Лист 3
+    dead_headers = [
+        "Артикул 1С",
+        "Продажи за 60 дней, шт",
+        "Остаток WB, шт",
+        "Остатки МП (Липецк), шт",
+        "WB + Липецк, дней",
+        "Статус",
+    ]
+    write_title(ws_dead, f"Dead Stock — запас более {cfg.dead_stock_days_threshold} дней на {report_date_text}", len(dead_headers))
+    write_headers(ws_dead, dead_headers)
+    dead_export = dead_df.rename(columns={
+        "article_1c": "Артикул 1С",
+        "sales_60d": "Продажи за 60 дней, шт",
+        "stock_wb_qty": "Остаток WB, шт",
+        "stock_company_qty": "Остатки МП (Липецк), шт",
+        "days_total": "WB + Липецк, дней",
+        "status": "Статус",
+    })
+    for values in dataframe_rows(dead_export, dead_headers):
+        ws_dead.append(values)
+    for r in range(3, ws_dead.max_row + 1):
+        apply_row_style(ws_dead, r, days_col=5, status_col=6, dead=True)
+    autofit_worksheet(ws_dead)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -618,16 +737,22 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
 
 
 
+def should_send_to_telegram(run_date: datetime, force_send: bool) -> bool:
+    if force_send:
+        log("Ручной запуск — отчёт будет отправлен в Telegram")
+        return True
+    return run_date.weekday() in {0, 4}
+
+
+
 def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str) -> None:
     if not bot_token or not chat_id:
         raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
-
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
     with open(file_path, "rb") as fh:
         files = {"document": (Path(file_path).name, fh)}
         data = {"chat_id": chat_id, "caption": caption[:1024]}
         response = requests.post(url, data=data, files=files, timeout=300)
-
     if response.status_code != 200:
         raise RuntimeError(f"Ошибка отправки в Telegram: {response.status_code} {response.text}")
 
@@ -644,26 +769,33 @@ def run() -> str:
 
     stock_key = find_latest_stock_file(storage, cfg)
     order_keys = find_order_files_for_window(storage, cfg)
+    stock_history_keys = find_stock_history_files_for_month(storage, cfg)
 
-    wb_stocks = load_wb_stocks(storage, cfg, stock_key)
+    wb_stocks = load_wb_stocks(storage, stock_key)
     sales = load_orders(storage, cfg, order_keys)
     article_map = load_article_map(storage, cfg)
     stocks_1c = load_1c_stocks(storage, cfg)
     stop_articles = parse_stop_articles(cfg.stop_articles_raw)
 
-    report_df = build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articles)
+    current_zero_nmids = set(wb_stocks.loc[wb_stocks["stock_wb_qty"] <= 0, "nmId"].astype(str).tolist())
+    zero_days_df = count_zero_stock_days_current_month(storage, cfg, stock_history_keys, current_zero_nmids)
+
+    report_df = build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, zero_days_df, stop_articles, cfg)
 
     output_path = str(Path(cfg.output_dir) / f"Отчёт_дни_остатка_WB_{cfg.store_name}_{cfg.run_date:%Y%m%d}.xlsx")
     save_excel_report(report_df, cfg, output_path)
     log(f"Отчёт сохранён: {output_path}")
 
+    short_df = report_df[(report_df["sales_60d"] > 0) & ((report_df["stock_wb_qty"] <= 0) | (report_df["days_wb"] < cfg.low_stock_days_threshold))]
+    dead_df = report_df[(report_df["sales_60d"] > 0) & (report_df["days_total"] > cfg.dead_stock_days_threshold)]
+
     if cfg.send_telegram and should_send_to_telegram(cfg.run_date, cfg.force_send_env):
-        short_df = report_df[(report_df["sales_60d"] > 0) & ((report_df["stock_wb_qty"] <= 0) | ((report_df["days_wb"].notna()) & (report_df["days_wb"] < cfg.days_threshold)))]
         delist_count = int((short_df["status"] == "Delist").sum())
         caption = (
             f"📦 Отчёт по остаткам WB {cfg.store_name}\n"
             f"Дата: {cfg.run_date:%d.%m.%Y}\n"
-            f"Товаров с продажами за {cfg.activity_window_days} дней и остатком 0/< {int(cfg.days_threshold)} дней: {len(short_df)}\n"
+            f"Критичных товаров: {len(short_df)}\n"
+            f"Dead Stock: {len(dead_df)}\n"
             f"Delist в критичных: {delist_count}"
         )
         send_telegram_document(cfg.telegram_bot_token, cfg.telegram_chat_id, output_path, caption)
