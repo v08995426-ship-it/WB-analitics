@@ -3,24 +3,27 @@
 
 from __future__ import annotations
 
-import argparse
 import io
 import math
 import os
 import re
-import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Iterable, Optional
 
 import boto3
 import pandas as pd
 import requests
 from botocore.client import Config as BotoConfig
-from openpyxl import load_workbook
+from botocore.exceptions import ClientError
+from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+
+
+# =========================
+# Общие утилиты
+# =========================
 
 
 def log(message: str) -> None:
@@ -37,165 +40,162 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def normalize_text(value: object) -> str:
-    if pd.isna(value):
+    if pd.isna(value) or value is None:
         return ""
-    return str(value).strip()
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
 
 
 
-def normalize_nmid(value: object) -> str:
-    text = normalize_text(value)
-    return text[:-2] if text.endswith(".0") else text
-
-
-
-def normalize_article_1c(value: object) -> str:
+def normalize_key(value: object) -> str:
     return normalize_text(value).upper()
 
 
 
+def safe_float(value: object) -> float:
+    if pd.isna(value) or value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except Exception:
+        text = normalize_text(value).replace(" ", "").replace(",", ".")
+        return float(text) if text else 0.0
+
+
+
 def ceil_int(value: object) -> int:
-    if pd.isna(value) or normalize_text(value) == "":
-        return 0
-    return int(math.ceil(float(value)))
+    return int(math.ceil(safe_float(value)))
 
 
 
-def find_first_existing(columns: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
-    lowered = {normalize_text(c).lower(): c for c in columns}
+def format_days(value: Optional[float]) -> str:
+    if value is None:
+        return "∞"
+    return f"{value:.1f}"
+
+
+
+def calculate_days(stock_qty: float, avg_daily_sales: float) -> Optional[float]:
+    if avg_daily_sales <= 0:
+        return None if stock_qty > 0 else 0.0
+    return stock_qty / avg_daily_sales
+
+
+
+def should_send_to_telegram(run_date: datetime, force_send: bool) -> bool:
+    if force_send:
+        log("Ручной запуск — отчёт будет отправлен в Telegram")
+        return True
+    # Понедельник=0, пятница=4
+    if run_date.weekday() in {0, 4}:
+        return True
+    return False
+
+
+
+def choose_existing_column(df: pd.DataFrame, candidates: Iterable[str], label: str) -> str:
+    normalized = {str(col).strip().lower(): col for col in df.columns}
     for candidate in candidates:
-        original = lowered.get(candidate.lower())
-        if original is not None:
-            return original
-    return None
+        real = normalized.get(candidate.strip().lower())
+        if real is not None:
+            return real
+    raise KeyError(f"Не найдена колонка для '{label}'. Доступные колонки: {list(df.columns)}")
 
 
 
-def parse_stop_list_env(raw: str) -> Set[str]:
+def parse_stop_articles(raw: str) -> set[str]:
     if not raw:
         return set()
-    normalized = raw.replace(";", "\n").replace(",", "\n")
-    result: Set[str] = set()
-    for item in normalized.splitlines():
-        val = normalize_article_1c(item)
-        if val:
-            result.add(val)
-    return result
+    normalized = raw.replace("\r", "\n").replace(";", "\n").replace(",", "\n")
+    items = {normalize_key(item) for item in normalized.split("\n") if normalize_text(item)}
+    return items
 
 
 
-def iso_week_monday(year: int, week: int) -> datetime:
+def parse_iso_week_from_key(key: str) -> Optional[tuple[int, int]]:
+    match = re.search(r"_(\d{4})-W(\d{2})\.xlsx$", key, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+
+def iso_week_start(year: int, week: int) -> datetime:
     return datetime.fromisocalendar(year, week, 1)
 
 
-
-def extract_week_from_key(key: str) -> Optional[datetime]:
-    match = re.search(r"(\d{4})-W(\d{2})", key)
-    if not match:
-        return None
-    year = int(match.group(1))
-    week = int(match.group(2))
-    return iso_week_monday(year, week)
+# =========================
+# Конфиг
+# =========================
 
 
 @dataclass
 class AppConfig:
-    bucket_name: str
-    access_key: str
-    secret_key: str
-    endpoint_url: str
-    region_name: str
-    store_name: str
-    telegram_bot_token: str
-    telegram_chat_id: str
-    send_telegram: bool
-    upload_result_to_s3: bool
-    result_prefix: str
-    run_date: datetime
-    output_dir: str
-    stock_prefix_tpl: str
-    orders_prefix_tpl: str
-    article_map_1c_key: str
-    stocks_1c_key: str
-    stop_list_articles: Set[str]
-    critical_days_threshold: float
-    sheet_stocks_name: str
-    sheet_orders_name: str
+    bucket_name: str = (
+        os.getenv("WB_S3_BUCKET")
+        or os.getenv("YC_BUCKET_NAME")
+        or os.getenv("CLOUD_RU_BUCKET")
+        or ""
+    )
+    access_key: str = (
+        os.getenv("WB_S3_ACCESS_KEY")
+        or os.getenv("YC_ACCESS_KEY_ID")
+        or os.getenv("CLOUD_RU_ACCESS_KEY")
+        or ""
+    )
+    secret_key: str = (
+        os.getenv("WB_S3_SECRET_KEY")
+        or os.getenv("YC_SECRET_ACCESS_KEY")
+        or os.getenv("CLOUD_RU_SECRET_KEY")
+        or ""
+    )
+    endpoint_url: str = (
+        os.getenv("WB_S3_ENDPOINT")
+        or os.getenv("YC_ENDPOINT")
+        or os.getenv("CLOUD_RU_ENDPOINT")
+        or "https://storage.yandexcloud.net"
+    )
+    region_name: str = os.getenv("WB_S3_REGION") or os.getenv("YC_REGION") or "ru-central1"
 
-    @classmethod
-    def from_env(cls, run_date: Optional[str] = None) -> "AppConfig":
-        bucket_name = (
-            os.getenv("WB_S3_BUCKET")
-            or os.getenv("YC_BUCKET_NAME")
-            or os.getenv("CLOUD_RU_BUCKET")
-            or ""
-        ).strip()
-        access_key = (
-            os.getenv("WB_S3_ACCESS_KEY")
-            or os.getenv("YC_ACCESS_KEY_ID")
-            or os.getenv("CLOUD_RU_ACCESS_KEY")
-            or ""
-        ).strip()
-        secret_key = (
-            os.getenv("WB_S3_SECRET_KEY")
-            or os.getenv("YC_SECRET_ACCESS_KEY")
-            or os.getenv("CLOUD_RU_SECRET_KEY")
-            or ""
-        ).strip()
+    store_name: str = os.getenv("WB_STORE", "TOPFACE").strip()
+    run_date: datetime = datetime.strptime(
+        os.getenv("WB_RUN_DATE", datetime.now().strftime("%Y-%m-%d")),
+        "%Y-%m-%d",
+    )
+    sales_window_days: int = int(os.getenv("WB_SALES_WINDOW_DAYS", "7"))
+    days_threshold: float = float(os.getenv("WB_LOW_STOCK_DAYS_THRESHOLD", "14"))
+    output_dir: str = os.getenv("WB_OUTPUT_DIR", "output")
 
-        endpoint_url = (
-            os.getenv("WB_S3_ENDPOINT")
-            or os.getenv("YC_ENDPOINT_URL")
-            or os.getenv("CLOUD_RU_ENDPOINT_URL")
-            or "https://storage.yandexcloud.net"
-        ).strip()
-        region_name = os.getenv("WB_S3_REGION", "ru-central1").strip()
-        store_name = os.getenv("WB_STORE", "TOPFACE").strip() or "TOPFACE"
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    send_telegram: bool = env_bool("WB_SEND_TELEGRAM", True)
+    force_send_env: bool = env_bool("WB_FORCE_SEND", False)
 
-        run_date_value = (
-            datetime.strptime(run_date, "%Y-%m-%d")
-            if run_date
-            else datetime.strptime(
-                os.getenv("WB_RUN_DATE", datetime.now().strftime("%Y-%m-%d")),
-                "%Y-%m-%d",
-            )
-        )
+    # Пути в Object Storage
+    stocks_prefix: str = os.getenv("WB_STOCKS_PREFIX", "Отчёты/Остатки/{store}/Недельные/")
+    orders_prefix: str = os.getenv("WB_ORDERS_PREFIX", "Отчёты/Заказы/{store}/Недельные/")
+    article_map_key: str = os.getenv("WB_ARTICLE_MAP_KEY", "Отчёты/Остатки/1С/Артикулы 1с.xlsx")
+    stocks_1c_key: str = os.getenv("WB_STOCKS_1C_KEY", "Отчёты/Остатки/1С/Остатки 1С.xlsx")
 
-        return cls(
-            bucket_name=bucket_name,
-            access_key=access_key,
-            secret_key=secret_key,
-            endpoint_url=endpoint_url,
-            region_name=region_name,
-            store_name=store_name,
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-            send_telegram=env_bool("WB_SEND_TELEGRAM", True),
-            upload_result_to_s3=env_bool("WB_UPLOAD_RESULT_TO_S3", False),
-            result_prefix=os.getenv("WB_RESULT_PREFIX", f"Отчёты/Остатки/{store_name}/Отчёт дней остатка/").strip(),
-            run_date=run_date_value,
-            output_dir=os.getenv("WB_OUTPUT_DIR", "output").strip() or "output",
-            stock_prefix_tpl=os.getenv("WB_STOCKS_PREFIX_TPL", "Отчёты/Остатки/{store}/Недельные/"),
-            orders_prefix_tpl=os.getenv("WB_ORDERS_PREFIX_TPL", "Отчёты/Заказы/{store}/Недельные/"),
-            article_map_1c_key=os.getenv("WB_ARTICLE_MAP_1C_KEY", "Отчёты/Остатки/1С/Артикулы 1с.xlsx").strip(),
-            stocks_1c_key=os.getenv("WB_STOCKS_1C_KEY", "Отчёты/Остатки/1С/Остатки 1С.xlsx").strip(),
-            stop_list_articles=parse_stop_list_env(os.getenv("WB_STOP_LIST_KEY", "")),
-            critical_days_threshold=float(os.getenv("WB_CRITICAL_DAYS_THRESHOLD", "14")),
-            sheet_stocks_name=os.getenv("WB_STOCKS_SHEET_NAME", "Остатки").strip(),
-            sheet_orders_name=os.getenv("WB_ORDERS_SHEET_NAME", "Заказы").strip(),
-        )
+    stop_articles_raw: str = os.getenv("WB_STOP_LIST_KEY", "")
+
+
+# =========================
+# S3 / Object Storage
+# =========================
 
 
 class S3Storage:
-    def __init__(self, cfg: AppConfig) -> None:
+    def __init__(self, cfg: AppConfig):
         if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
             raise ValueError(
-                "Не заданы параметры Object Storage. "
-                "Нужны env: YC_BUCKET_NAME/YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY "
-                "или CLOUD_RU_* / WB_S3_*.")
-
+                "Не заданы параметры Object Storage. Нужны env из одной из схем: "
+                "WB_S3_*, YC_* или CLOUD_RU_*"
+            )
         self.bucket = cfg.bucket_name
-        self.client = boto3.client(
+        self.s3 = boto3.client(
             "s3",
             endpoint_url=cfg.endpoint_url,
             aws_access_key_id=cfg.access_key,
@@ -204,399 +204,461 @@ class S3Storage:
             config=BotoConfig(signature_version="s3v4", read_timeout=300, connect_timeout=60),
         )
 
-    def list_keys(self, prefix: str) -> List[dict]:
-        items: List[dict] = []
+    def list_keys(self, prefix: str) -> list[str]:
+        keys: list[str] = []
         token = None
         while True:
-            kwargs = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
+            params = {"Bucket": self.bucket, "Prefix": prefix, "MaxKeys": 1000}
             if token:
-                kwargs["ContinuationToken"] = token
-            response = self.client.list_objects_v2(**kwargs)
-            items.extend(response.get("Contents", []))
-            if not response.get("IsTruncated"):
+                params["ContinuationToken"] = token
+            resp = self.s3.list_objects_v2(**params)
+            keys.extend(obj["Key"] for obj in resp.get("Contents", []))
+            if not resp.get("IsTruncated"):
                 break
-            token = response.get("NextContinuationToken")
-        return items
+            token = resp.get("NextContinuationToken")
+        return keys
 
     def read_bytes(self, key: str) -> bytes:
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
-        return response["Body"].read()
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        return obj["Body"].read()
 
     def read_excel(self, key: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-        result = pd.read_excel(io.BytesIO(self.read_bytes(key)), sheet_name=sheet_name)
-        if isinstance(result, dict):
-            return next(iter(result.values()))
-        return result
-
-    def upload_file(self, local_path: str, key: str) -> None:
-        self.client.upload_file(local_path, self.bucket, key)
+        content = self.read_bytes(key)
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
+        if isinstance(df, dict):
+            return next(iter(df.values()))
+        return df
 
 
+# =========================
+# Загрузка источников
+# =========================
 
-def choose_latest_weekly_key(storage: S3Storage, prefix: str) -> str:
-    items = storage.list_keys(prefix)
-    if not items:
-        raise FileNotFoundError(f"В Object Storage нет файлов по префиксу: {prefix}")
 
-    xlsx_items = [x for x in items if x["Key"].lower().endswith(".xlsx")]
-    if not xlsx_items:
-        raise FileNotFoundError(f"По префиксу {prefix} не найдено xlsx-файлов")
+def find_latest_stock_file(storage: S3Storage, cfg: AppConfig) -> str:
+    prefix = cfg.stocks_prefix.format(store=cfg.store_name)
+    keys = [k for k in storage.list_keys(prefix) if k.lower().endswith(".xlsx")]
+    if not keys:
+        raise FileNotFoundError(f"Не найдены weekly-файлы остатков по префиксу: {prefix}")
 
-    def sort_key(item: dict) -> Tuple[datetime, datetime]:
-        week_dt = extract_week_from_key(item["Key"]) or datetime.min
-        last_modified = item.get("LastModified")
-        if hasattr(last_modified, "replace"):
-            last_modified = last_modified.replace(tzinfo=None)
-        else:
-            last_modified = datetime.min
-        return week_dt, last_modified
-
-    latest = sorted(xlsx_items, key=sort_key)[-1]
-    return latest["Key"]
+    dated = []
+    for key in keys:
+        parsed = parse_iso_week_from_key(key)
+        week_start = iso_week_start(*parsed) if parsed else datetime.min
+        dated.append((week_start, key))
+    latest_key = max(dated, key=lambda x: x[0])[1]
+    log(f"Берём остатки WB из файла: {latest_key}")
+    return latest_key
 
 
 
-def choose_order_keys_for_last_7_days(storage: S3Storage, prefix: str, run_date: datetime) -> List[str]:
-    items = storage.list_keys(prefix)
-    xlsx_items = [x for x in items if x["Key"].lower().endswith(".xlsx")]
-    if not xlsx_items:
-        raise FileNotFoundError(f"По префиксу {prefix} не найдено xlsx-файлов")
+def find_order_files_for_window(storage: S3Storage, cfg: AppConfig) -> list[str]:
+    prefix = cfg.orders_prefix.format(store=cfg.store_name)
+    keys = [k for k in storage.list_keys(prefix) if k.lower().endswith(".xlsx")]
+    if not keys:
+        raise FileNotFoundError(f"Не найдены weekly-файлы заказов по префиксу: {prefix}")
 
-    start_date = run_date - timedelta(days=6)
-    selected: List[str] = []
-    for item in xlsx_items:
-        week_dt = extract_week_from_key(item["Key"])
-        if week_dt is None:
+    lower_bound = cfg.run_date - timedelta(days=cfg.sales_window_days + 10)
+    selected: list[tuple[datetime, str]] = []
+    for key in keys:
+        parsed = parse_iso_week_from_key(key)
+        if not parsed:
             continue
-        week_end = week_dt + timedelta(days=6)
-        if week_end >= start_date and week_dt <= run_date:
-            selected.append(item["Key"])
+        week_start = iso_week_start(*parsed)
+        if week_start >= lower_bound:
+            selected.append((week_start, key))
 
     if not selected:
-        selected = [choose_latest_weekly_key(storage, prefix)]
+        # fallback — берём 2 последних weekly-файла
+        all_dated = []
+        for key in keys:
+            parsed = parse_iso_week_from_key(key)
+            week_start = iso_week_start(*parsed) if parsed else datetime.min
+            all_dated.append((week_start, key))
+        selected = sorted(all_dated, key=lambda x: x[0])[-2:]
 
-    return sorted(set(selected))
+    selected_keys = [key for _, key in sorted(selected, key=lambda x: x[0])]
+    log(f"Берём заказы WB из файлов: {selected_keys}")
+    return selected_keys
 
 
 
-def load_article_map_1c(storage: S3Storage, cfg: AppConfig) -> Dict[str, str]:
-    df = storage.read_excel(cfg.article_map_1c_key)
-    df.columns = [normalize_text(c) for c in df.columns]
+def load_article_map(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
+    df = storage.read_excel(cfg.article_map_key)
+    if df.shape[1] < 3:
+        raise ValueError("Файл Артикулы 1с.xlsx должен содержать минимум 3 колонки")
 
-    wb_col = df.columns[0]
-    one_c_col = df.columns[2] if len(df.columns) >= 3 else df.columns[-1]
-
-    mapping: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        wb_article = normalize_nmid(row.get(wb_col))
-        article_1c = normalize_text(row.get(one_c_col))
-        if wb_article and article_1c:
-            mapping[wb_article] = article_1c
-
-    log(f"Загружено соответствий WB -> 1С: {len(mapping):,}")
-    return mapping
+    mapped = pd.DataFrame(
+        {
+            "nmId": df.iloc[:, 0].map(normalize_text),
+            "article_1c": df.iloc[:, 2].map(normalize_text),
+        }
+    )
+    mapped = mapped[(mapped["nmId"] != "") & (mapped["article_1c"] != "")].drop_duplicates("nmId")
+    log(f"Загружено соответствий WB -> 1С: {len(mapped)}")
+    return mapped
 
 
 
 def load_1c_stocks(storage: S3Storage, cfg: AppConfig) -> pd.DataFrame:
     df = storage.read_excel(cfg.stocks_1c_key)
-    df.columns = [normalize_text(c) for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
-    required = ["Артикул", "Остатки МП"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise KeyError(f"В файле 1С отсутствуют колонки: {missing}")
+    article_col = choose_existing_column(df, ["Артикул", "АРТ"], "Артикул 1С")
+    mp_col = choose_existing_column(df, ["Остатки МП"], "Остатки МП")
 
-    out = df.copy()
-    out["Артикул 1С"] = out["Артикул"].map(normalize_text)
-    out["Артикул 1С_norm"] = out["Артикул 1С"].map(normalize_article_1c)
-    out["Остатки МП"] = pd.to_numeric(out["Остатки МП"], errors="coerce").fillna(0).map(ceil_int)
-
-    return out[["Артикул 1С", "Артикул 1С_norm", "Остатки МП"]].drop_duplicates(subset=["Артикул 1С_norm"], keep="first")
-
-
-
-def load_wb_stocks(storage: S3Storage, cfg: AppConfig) -> Tuple[pd.DataFrame, str]:
-    prefix = cfg.stock_prefix_tpl.format(store=cfg.store_name)
-    key = choose_latest_weekly_key(storage, prefix)
-    log(f"Берём остатки WB из файла: {key}")
-
-    df = storage.read_excel(key, sheet_name=cfg.sheet_stocks_name)
-    df.columns = [normalize_text(c) for c in df.columns]
-
-    id_col = find_first_existing(df.columns, ["nmId", "Артикул WB", "Код номенклатуры"])
-    wb_article_col = find_first_existing(df.columns, ["Артикул WB", "nmId", "Код номенклатуры"])
-    qty_col = find_first_existing(df.columns, ["Доступно для продажи", "Полное количество", "Количество", "Остаток"])
-    subject_col = find_first_existing(df.columns, ["Предмет", "subject"])
-
-    if id_col is None or qty_col is None:
-        raise KeyError(
-            f"Не найдены нужные колонки в weekly-файле остатков. "
-            f"id_col={id_col}, qty_col={qty_col}, колонки={list(df.columns)}"
-        )
-
-    out = df.copy()
-    out["nmId"] = out[id_col].map(normalize_nmid)
-    out["Артикул WB"] = out[wb_article_col].map(normalize_nmid) if wb_article_col else out["nmId"]
-    out["stock_wb"] = pd.to_numeric(out[qty_col], errors="coerce").fillna(0)
-    out["subject"] = out[subject_col].map(normalize_text) if subject_col else ""
-
-    out = out.groupby(["nmId", "Артикул WB", "subject"], dropna=False, as_index=False).agg(stock_wb=("stock_wb", "sum"))
-    return out, key
+    result = pd.DataFrame(
+        {
+            "article_1c": df[article_col].map(normalize_text),
+            "stock_company_qty": df[mp_col].map(ceil_int),
+        }
+    )
+    result = result[result["article_1c"] != ""].drop_duplicates("article_1c", keep="first")
+    return result
 
 
 
-def load_orders_last_7_days(storage: S3Storage, cfg: AppConfig) -> Tuple[pd.DataFrame, List[str]]:
-    prefix = cfg.orders_prefix_tpl.format(store=cfg.store_name)
-    keys = choose_order_keys_for_last_7_days(storage, prefix, cfg.run_date)
-    log(f"Берём заказы WB из файлов: {keys}")
+def load_wb_stocks(storage: S3Storage, cfg: AppConfig, stock_key: str) -> pd.DataFrame:
+    df = storage.read_excel(stock_key)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    parts: List[pd.DataFrame] = []
-    for key in keys:
-        df = storage.read_excel(key, sheet_name=cfg.sheet_orders_name)
-        df.columns = [normalize_text(c) for c in df.columns]
-        parts.append(df)
+    nm_col = choose_existing_column(df, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
+    qty_col = choose_existing_column(df, ["Остатки МП", "Количество", "Доступно", "Остаток", "Остатки"], "остаток WB")
+    article_wb_col = None
+    for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика", "Артикул WB"]:
+        try:
+            article_wb_col = choose_existing_column(df, [candidate], "Артикул WB")
+            break
+        except Exception:
+            continue
 
-    orders = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    out = pd.DataFrame(
+        {
+            "nmId": df[nm_col].map(normalize_text),
+            "stock_wb_qty": df[qty_col].map(ceil_int),
+        }
+    )
+    if article_wb_col:
+        out["supplierArticle"] = df[article_wb_col].map(normalize_text)
+    else:
+        out["supplierArticle"] = ""
+
+    out = out[out["nmId"] != ""].copy()
+    out = out.groupby(["nmId", "supplierArticle"], as_index=False).agg(stock_wb_qty=("stock_wb_qty", "sum"))
+    return out
+
+
+
+def load_orders(storage: S3Storage, cfg: AppConfig, order_keys: list[str]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for key in order_keys:
+        try:
+            df = storage.read_excel(key, sheet_name="Заказы")
+        except Exception:
+            df = storage.read_excel(key)
+        df.columns = [str(c).strip() for c in df.columns]
+        frames.append(df)
+
+    orders = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if orders.empty:
-        raise ValueError("Файлы заказов прочитаны, но данных в них нет.")
+        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "avg_daily_sales_7d"])
 
-    date_col = find_first_existing(orders.columns, ["date", "Дата", "Дата заказа"])
-    nmid_col = find_first_existing(orders.columns, ["nmId", "Артикул WB", "Код номенклатуры"])
-    if date_col is None or nmid_col is None:
-        raise KeyError(
-            f"В weekly-файле заказов не найдены колонки date/nmId. Колонки: {list(orders.columns)}"
-        )
+    date_col = choose_existing_column(orders, ["date", "Дата заказа", "Дата"], "дата заказа")
+    nm_col = choose_existing_column(orders, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
+    art_col = None
+    for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика"]:
+        try:
+            art_col = choose_existing_column(orders, [candidate], "Артикул продавца")
+            break
+        except Exception:
+            continue
 
-    out = orders.copy()
-    out["date"] = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
-    out["nmId"] = out[nmid_col].map(normalize_nmid)
+    qty_col = None
+    for candidate in ["quantity", "qty", "Количество", "Кол-во", "Количество, шт"]:
+        try:
+            qty_col = choose_existing_column(orders, [candidate], "количество")
+            break
+        except Exception:
+            continue
 
-    if "isCancel" in out.columns:
-        out = out[~out["isCancel"].fillna(False)].copy()
+    cancel_col = None
+    for candidate in ["isCancel", "cancel", "Отмена", "is_cancel"]:
+        try:
+            cancel_col = choose_existing_column(orders, [candidate], "признак отмены")
+            break
+        except Exception:
+            continue
 
-    start_date = cfg.run_date - timedelta(days=6)
-    out = out[(out["date"] >= start_date) & (out["date"] <= cfg.run_date)].copy()
+    orders = orders.copy()
+    orders[date_col] = pd.to_datetime(orders[date_col], errors="coerce").dt.normalize()
+    start_date = cfg.run_date - timedelta(days=cfg.sales_window_days - 1)
+    orders = orders[(orders[date_col] >= start_date) & (orders[date_col] <= cfg.run_date)].copy()
 
-    sales = out.groupby("nmId", as_index=False).size().rename(columns={"size": "sales_7d"})
-    sales["avg_sales_per_day"] = sales["sales_7d"] / 7.0
-    return sales, keys
+    if cancel_col:
+        orders = orders[~orders[cancel_col].fillna(False).astype(bool)].copy()
+
+    orders["nmId"] = orders[nm_col].map(normalize_text)
+    orders["supplierArticle"] = orders[art_col].map(normalize_text) if art_col else ""
+    orders["qty"] = orders[qty_col].map(safe_float) if qty_col else 1.0
+
+    grouped = orders.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_7d=("qty", "sum"))
+    grouped["avg_daily_sales_7d"] = grouped["sales_7d"] / float(cfg.sales_window_days)
+    return grouped
 
 
+# =========================
+# Расчёт
+# =========================
 
-def prepare_report_dataframe(
+
+def build_report_dataframe(
     wb_stocks: pd.DataFrame,
     sales: pd.DataFrame,
-    article_map_1c: Dict[str, str],
+    article_map: pd.DataFrame,
     stocks_1c: pd.DataFrame,
-    stop_list_articles: Set[str],
+    stop_articles: set[str],
 ) -> pd.DataFrame:
-    df = wb_stocks.merge(sales, on="nmId", how="left").copy()
-    df["sales_7d"] = df["sales_7d"].fillna(0).astype(int)
-    df["avg_sales_per_day"] = df["avg_sales_per_day"].fillna(0.0)
+    df = wb_stocks.merge(sales, on=["nmId", "supplierArticle"], how="left")
+    df["sales_7d"] = df["sales_7d"].fillna(0.0)
+    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].fillna(0.0)
 
-    df["Артикул 1С"] = df["nmId"].map(article_map_1c).fillna("")
-    df["Артикул 1С_norm"] = df["Артикул 1С"].map(normalize_article_1c)
+    df = df.merge(article_map, on="nmId", how="left")
+    df["article_1c"] = df["article_1c"].fillna("").map(normalize_text)
 
-    df = df.merge(stocks_1c[["Артикул 1С_norm", "Остатки МП"]], on="Артикул 1С_norm", how="left")
-    df["Остатки МП"] = df["Остатки МП"].fillna(0).astype(int)
+    df = df.merge(stocks_1c, on="article_1c", how="left")
+    df["stock_company_qty"] = df["stock_company_qty"].fillna(0).astype(int)
 
-    zero_sales_mask = df["avg_sales_per_day"] <= 0
-    denominator = df["avg_sales_per_day"].where(~zero_sales_mask, other=pd.NA)
-    df["Дней остатка WB"] = df["stock_wb"] / denominator
-    df["Дней запаса Липецк"] = df["Остатки МП"] / denominator
-    df["Дней суммарно WB+Липецк"] = (df["stock_wb"] + df["Остатки МП"]) / denominator
-    df.loc[zero_sales_mask, ["Дней остатка WB", "Дней запаса Липецк", "Дней суммарно WB+Липецк"]] = pd.NA
+    df["days_wb"] = df.apply(lambda x: calculate_days(safe_float(x["stock_wb_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
+    df["days_company"] = df.apply(lambda x: calculate_days(safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
+    df["days_total"] = df.apply(
+        lambda x: calculate_days(safe_float(x["stock_wb_qty"]) + safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])),
+        axis=1,
+    )
 
-    df["Delist"] = df["Артикул 1С_norm"].apply(lambda x: "Delist" if x in stop_list_articles else "")
-    df["Комментарий"] = df["Delist"].apply(lambda x: "Товар на вывод, пополнения не будет" if x == "Delist" else "")
+    df["status"] = df["article_1c"].map(lambda x: "Delist" if normalize_key(x) in stop_articles else "")
 
-    df = df.sort_values(by=["Дней остатка WB", "sales_7d", "stock_wb"], ascending=[True, False, True], na_position="last").reset_index(drop=True)
+    df["sales_7d"] = df["sales_7d"].round(2)
+    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].round(4)
+
+    sort_key = df["days_wb"].copy()
+    sort_key = sort_key.where(sort_key.notna(), 999999.0)
+    df = df.assign(_sort_days=sort_key).sort_values(["_sort_days", "stock_wb_qty", "article_1c"], ascending=[True, True, True]).drop(columns=["_sort_days"])
+    df = df.reset_index(drop=True)
     return df
 
 
+# =========================
+# Excel
+# =========================
 
-def build_export_frames(df: pd.DataFrame, threshold: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    report = df.copy()
-    critical = report[(report["Дней остатка WB"].notna()) & (report["Дней остатка WB"] < threshold)].copy()
 
-    public_df = critical[["Артикул 1С", "Дней остатка WB", "Дней запаса Липецк", "Delist", "Комментарий"]].copy()
-    public_df.rename(columns={
-        "Дней остатка WB": "Остатка WB хватит на, дней",
-        "Дней запаса Липецк": "В Липецке есть запас на, дней",
-        "Delist": "Статус",
-        "Комментарий": "Примечание",
-    }, inplace=True)
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+WARNING_FILL = PatternFill("solid", fgColor="FFF2CC")
+CRITICAL_FILL = PatternFill("solid", fgColor="F4CCCC")
+DELIST_FILL = PatternFill("solid", fgColor="D9D2E9")
+BORDER = Border(
+    left=Side(style="thin", color="D9D9D9"),
+    right=Side(style="thin", color="D9D9D9"),
+    top=Side(style="thin", color="D9D9D9"),
+    bottom=Side(style="thin", color="D9D9D9"),
+)
+BASE_FONT = Font(name="Calibri", size=14)
+HEADER_FONT = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+TITLE_FONT = Font(name="Calibri", size=16, bold=True, color="FFFFFF")
 
-    calc_df = report[[
+
+
+def style_title(ws, cell_range: str, text: str) -> None:
+    ws[cell_range.split(":")[0]] = text
+    ws.merge_cells(cell_range)
+    cell = ws[cell_range.split(":")[0]]
+    cell.fill = HEADER_FILL
+    cell.font = TITLE_FONT
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+
+def style_header(ws, row_idx: int) -> None:
+    for cell in ws[row_idx]:
+        if cell.value is None:
+            continue
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
+
+
+
+def style_data_row(ws, row_idx: int, days_wb_col: int, status_col: int) -> None:
+    row_fill = None
+    days_value = ws.cell(row_idx, days_wb_col).value
+    status_value = normalize_text(ws.cell(row_idx, status_col).value)
+
+    try:
+        numeric_days = float(days_value) if days_value is not None else None
+    except Exception:
+        numeric_days = None
+
+    if status_value == "Delist":
+        row_fill = DELIST_FILL
+    if numeric_days is not None and numeric_days < 7:
+        row_fill = CRITICAL_FILL
+    elif numeric_days is not None and numeric_days < 14 and row_fill is None:
+        row_fill = WARNING_FILL
+
+    for cell in ws[row_idx]:
+        cell.font = BASE_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDER
+        if row_fill is not None:
+            cell.fill = row_fill
+
+
+
+def set_sheet_layout(ws, widths: dict[str, float], title_row: int = 1, header_row: int = 3) -> None:
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.row_dimensions[title_row].height = 28
+    ws.row_dimensions[header_row].height = 44
+    ws.freeze_panes = f"A{header_row + 1}"
+    ws.sheet_view.showGridLines = False
+    ws.auto_filter.ref = f"A{header_row}:{chr(64 + ws.max_column)}{max(ws.max_row, header_row)}"
+
+
+
+def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> None:
+    wb = Workbook()
+    ws_short = wb.active
+    ws_short.title = "Критично <14 дней"
+    ws_calc = wb.create_sheet("Расчёт")
+
+    report_date_text = cfg.run_date.strftime("%d.%m.%Y")
+
+    # Лист 1
+    style_title(ws_short, "A1:E1", f"Контроль остатка WB — товары менее {int(cfg.days_threshold)} дней на {report_date_text}")
+    ws_short.append([])
+    short_headers = [
+        "Артикул 1С",
+        "Остатка WB\nхватит, дней",
+        "В Липецке есть запас\nна, дней",
+        "Суммарно WB + Липецк\nхватит, дней",
+        "Статус",
+    ]
+    ws_short.append(short_headers)
+    style_header(ws_short, 3)
+
+    short_df = df[(df["days_wb"].notna()) & (df["days_wb"] < cfg.days_threshold)].copy()
+    for _, row in short_df.iterrows():
+        ws_short.append([
+            row["article_1c"],
+            row["days_wb"],
+            row["days_company"],
+            row["days_total"],
+            row["status"],
+        ])
+
+    for r in range(4, ws_short.max_row + 1):
+        style_data_row(ws_short, r, days_wb_col=2, status_col=5)
+    set_sheet_layout(ws_short, {"A": 28, "B": 18, "C": 22, "D": 24, "E": 14})
+
+    # Лист 2
+    style_title(ws_calc, "A1:J1", f"Расчёт дней до конца остатка WB — {cfg.store_name} — {report_date_text}")
+    ws_calc.append([])
+    calc_headers = [
         "nmId",
         "Артикул WB",
         "Артикул 1С",
-        "subject",
-        "stock_wb",
-        "sales_7d",
-        "avg_sales_per_day",
-        "Дней остатка WB",
-        "Остатки МП",
-        "Дней запаса Липецк",
-        "Дней суммарно WB+Липецк",
-        "Delist",
-        "Комментарий",
-    ]].copy()
-    calc_df.rename(columns={
-        "subject": "Предмет",
-        "stock_wb": "Остаток WB",
-        "sales_7d": "Продажи за 7 дней",
-        "avg_sales_per_day": "Среднесуточные продажи",
-        "Остатки МП": "Остатки МП (Липецк)",
-        "Delist": "Статус",
-        "Комментарий": "Примечание",
-    }, inplace=True)
+        "Остаток WB, шт",
+        "Продажи за 7 дней, шт",
+        "Среднесуточные продажи\nза 7 дней, шт",
+        "Остатки МП\n(Липецк), шт",
+        "WB хватит, дней",
+        "Липецк хватит, дней",
+        "WB + Липецк, дней",
+        "Статус",
+    ]
+    ws_calc.append(calc_headers)
+    style_header(ws_calc, 3)
 
-    return public_df, calc_df
+    for _, row in df.iterrows():
+        ws_calc.append([
+            row["nmId"],
+            row["supplierArticle"],
+            row["article_1c"],
+            row["stock_wb_qty"],
+            row["sales_7d"],
+            row["avg_daily_sales_7d"],
+            row["stock_company_qty"],
+            row["days_wb"],
+            row["days_company"],
+            row["days_total"],
+            row["status"],
+        ])
 
+    for r in range(4, ws_calc.max_row + 1):
+        style_data_row(ws_calc, r, days_wb_col=8, status_col=11)
+    set_sheet_layout(
+        ws_calc,
+        {"A": 14, "B": 20, "C": 28, "D": 14, "E": 16, "F": 22, "G": 18, "H": 16, "I": 18, "J": 18, "K": 14},
+    )
 
-
-def autosize_and_style_workbook(file_path: str, threshold: float) -> None:
-    wb = load_workbook(file_path)
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
-    body_font = Font(name="Calibri", size=14)
-    center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin_side = Side(border_style="thin", color="D9D9D9")
-    border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-
-    red_fill = PatternFill("solid", fgColor="F4CCCC")
-    yellow_fill = PatternFill("solid", fgColor="FFF2CC")
-    delist_fill = PatternFill("solid", fgColor="D9EAD3")
-
-    for ws in wb.worksheets:
-        ws.freeze_panes = "A2"
-
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.font = body_font
-                cell.alignment = center_alignment
-                cell.border = border
-
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = center_alignment
-            cell.border = border
-
-        ws.row_dimensions[1].height = 34
-        for row_idx in range(2, ws.max_row + 1):
-            ws.row_dimensions[row_idx].height = 28
-
-        for col_idx in range(1, ws.max_column + 1):
-            max_len = 0
-            for row_idx in range(1, ws.max_row + 1):
-                value = ws.cell(row=row_idx, column=col_idx).value
-                text = "" if value is None else str(value)
-                max_len = max(max_len, max((len(part) for part in text.split("\n")), default=0))
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 16), 42)
-
-        headers = {str(ws.cell(1, c).value): c for c in range(1, ws.max_column + 1)}
-        day_col = headers.get("Остатка WB хватит на, дней") or headers.get("Дней остатка WB")
-        status_col = headers.get("Статус")
-
-        for row_idx in range(2, ws.max_row + 1):
-            if day_col:
-                value = ws.cell(row_idx, day_col).value
-                try:
-                    days = float(value)
-                except Exception:
-                    days = None
-                if days is not None:
-                    fill = red_fill if days < 7 else yellow_fill if days < threshold else None
-                    if fill:
-                        for col_idx in range(1, ws.max_column + 1):
-                            ws.cell(row_idx, col_idx).fill = fill
-
-            if status_col and normalize_text(ws.cell(row_idx, status_col).value).lower() == "delist":
-                for col_idx in range(1, ws.max_column + 1):
-                    ws.cell(row_idx, col_idx).fill = delist_fill
-
-    wb.save(file_path)
-
-
-
-def save_report_xlsx(public_df: pd.DataFrame, calc_df: pd.DataFrame, output_path: str, threshold: float) -> str:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        public_df.to_excel(writer, index=False, sheet_name="Критично <14 дней")
-        calc_df.to_excel(writer, index=False, sheet_name="Расчёт")
-    autosize_and_style_workbook(output_path, threshold)
-    return output_path
+    wb.save(output_path)
+
+
+# =========================
+# Telegram
+# =========================
 
 
 
 def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str) -> None:
     if not bot_token or not chat_id:
-        raise ValueError("Не заданы TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        raise ValueError("Не заданы TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID")
 
     url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
-    with open(file_path, "rb") as f:
-        response = requests.post(
-            url,
-            data={"chat_id": chat_id, "caption": caption},
-            files={"document": (Path(file_path).name, f)},
-            timeout=300,
-        )
+    with open(file_path, "rb") as fh:
+        files = {"document": (Path(file_path).name, fh)}
+        data = {"chat_id": chat_id, "caption": caption[:1024]}
+        response = requests.post(url, data=data, files=files, timeout=300)
 
     if response.status_code != 200:
         raise RuntimeError(f"Ошибка отправки в Telegram: {response.status_code} {response.text}")
 
 
-
-def upload_report_if_needed(storage: S3Storage, cfg: AppConfig, file_path: str) -> None:
-    if not cfg.upload_result_to_s3:
-        return
-    key = f"{cfg.result_prefix.rstrip('/')}/{Path(file_path).name}"
-    storage.upload_file(file_path, key)
-    log(f"Отчёт загружен в Object Storage: {key}")
+# =========================
+# Main
+# =========================
 
 
 
-def should_send_today(run_date: datetime) -> bool:
-    return run_date.weekday() in {0, 4}
-
-
-
-def run_report(cfg: AppConfig, force_send: bool = False) -> str:
+def run() -> str:
+    cfg = AppConfig()
     storage = S3Storage(cfg)
 
-    wb_stocks, stock_key = load_wb_stocks(storage, cfg)
-    sales_7d, order_keys = load_orders_last_7_days(storage, cfg)
-    article_map_1c = load_article_map_1c(storage, cfg)
+    stock_key = find_latest_stock_file(storage, cfg)
+    order_keys = find_order_files_for_window(storage, cfg)
+
+    wb_stocks = load_wb_stocks(storage, cfg, stock_key)
+    sales = load_orders(storage, cfg, order_keys)
+    article_map = load_article_map(storage, cfg)
     stocks_1c = load_1c_stocks(storage, cfg)
+    stop_articles = parse_stop_articles(cfg.stop_articles_raw)
 
-    df = prepare_report_dataframe(
-        wb_stocks=wb_stocks,
-        sales=sales_7d,
-        article_map_1c=article_map_1c,
-        stocks_1c=stocks_1c,
-        stop_list_articles=cfg.stop_list_articles,
-    )
+    report_df = build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articles)
 
-    public_df, calc_df = build_export_frames(df, cfg.critical_days_threshold)
-
-    report_name = f"Отчёт_дни_остатка_WB_{cfg.store_name}_{cfg.run_date:%Y%m%d}.xlsx"
-    output_path = str(Path(cfg.output_dir) / report_name)
-    save_report_xlsx(public_df, calc_df, output_path, cfg.critical_days_threshold)
+    output_path = str(Path(cfg.output_dir) / f"Отчёт_дни_остатка_WB_{cfg.store_name}_{cfg.run_date:%Y%m%d}.xlsx")
+    save_excel_report(report_df, cfg, output_path)
     log(f"Отчёт сохранён: {output_path}")
 
-    upload_report_if_needed(storage, cfg, output_path)
-
-    if cfg.send_telegram and (force_send or should_send_today(cfg.run_date)):
-        delist_count = int((calc_df["Статус"] == "Delist").sum()) if "Статус" in calc_df.columns else 0
-        critical_count = len(public_df)
+    if cfg.send_telegram and should_send_to_telegram(cfg.run_date, cfg.force_send_env):
+        short_df = report_df[(report_df["days_wb"].notna()) & (report_df["days_wb"] < cfg.days_threshold)]
+        delist_count = int((short_df["status"] == "Delist").sum())
         caption = (
-            f"{cfg.store_name} | {cfg.run_date:%Y-%m-%d}\n"
-            f"Товаров < {int(cfg.critical_days_threshold)} дней: {critical_count}\n"
-            f"Delist: {delist_count}"
+            f"📦 Отчёт по остаткам WB {cfg.store_name}\n"
+            f"Дата: {cfg.run_date:%d.%m.%Y}\n"
+            f"Товаров < {int(cfg.days_threshold)} дней: {len(short_df)}\n"
+            f"Delist в критичных: {delist_count}"
         )
         send_telegram_document(cfg.telegram_bot_token, cfg.telegram_chat_id, output_path, caption)
         log("Отчёт отправлен в Telegram")
@@ -605,36 +667,9 @@ def run_report(cfg: AppConfig, force_send: bool = False) -> str:
 
     log(f"Источник остатков: {stock_key}")
     log(f"Источники заказов: {', '.join(order_keys)}")
-    log(f"Delist-артикулов из env: {len(cfg.stop_list_articles)}")
+    log(f"Delist-артикулов из env: {len(stop_articles)}")
     return output_path
 
 
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Отчёт по дням остатка WB")
-    subparsers = parser.add_subparsers(dest="command")
-
-    run_parser = subparsers.add_parser("run", help="Сформировать отчёт")
-    run_parser.add_argument("--run-date", dest="run_date", help="Дата запуска YYYY-MM-DD")
-    run_parser.add_argument("--force-send", action="store_true", help="Принудительно отправить в Telegram")
-
-    parser.set_defaults(command="run")
-    return parser
-
-
-
-def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    cfg = AppConfig.from_env(run_date=getattr(args, "run_date", None))
-    if args.command == "run":
-        run_report(cfg, force_send=getattr(args, "force_send", False))
-        return
-
-    parser.print_help()
-    sys.exit(1)
-
-
 if __name__ == "__main__":
-    main()
+    run()
