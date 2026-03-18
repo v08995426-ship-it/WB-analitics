@@ -2,7 +2,8 @@ name: WB Stock Days Report
 
 on:
   schedule:
-    - cron: "0 7 * * 1,5"
+    # Понедельник и пятница в 10:00 (по UTC ~ 13:00 МСК)
+    - cron: "0 10 * * 1,5"
   workflow_dispatch:
 
 jobs:
@@ -10,30 +11,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v3
 
-      - name: Install Python
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
 
-      - name: Install deps
+      - name: 📦 Install dependencies
         run: |
+          pip install --upgrade pip
           pip install pandas boto3 openpyxl xlsxwriter requests
 
-      - name: Run script
+      - name: 🚀 Run WB stock report
         env:
+          # ===== Object Storage (YC) =====
           YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
 
+          # ===== Object Storage (Cloud.ru fallback) =====
           CLOUD_RU_ACCESS_KEY: ${{ secrets.CLOUD_RU_ACCESS_KEY }}
           CLOUD_RU_SECRET_KEY: ${{ secrets.CLOUD_RU_SECRET_KEY }}
           CLOUD_RU_BUCKET: ${{ secrets.CLOUD_RU_BUCKET }}
 
+          # ===== Telegram =====
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
+          # ===== Дополнительно =====
           URL_1C_STOCKS: ${{ secrets.URL_1C_STOCKS }}
+
+          # ===== Delist список (ВАЖНО) =====
+          WB_STOP_LIST_KEY: ${{ secrets.WB_STOP_LIST_KEY }}
 
         run: python wb_stock_days_report.py
