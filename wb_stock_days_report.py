@@ -68,7 +68,9 @@ def get_config() -> Config:
     region_name = (os.getenv("WB_S3_REGION") or "ru-central1").strip()
 
     if not bucket or not access_key or not secret_key:
-        raise ValueError("Не заданы параметры Object Storage.")
+        raise ValueError(
+            "Не заданы параметры Object Storage. Нужны env: YC_BUCKET_NAME/YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY или CLOUD_RU_* / WB_S3_*."
+        )
 
     telegram_bot_token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     telegram_chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
@@ -274,14 +276,7 @@ def load_orders_windows(storage: S3Storage):
 
 
 def build_sales_by_windows(orders: pd.DataFrame):
-    empty_cols = [
-        "wb_key",
-        "Продажи 7 дней, шт",
-        "Продажи 60 дней, шт",
-        "Среднесуточные продажи 7д",
-        "Среднесуточные продажи 60д",
-        "Цена покупателя",
-    ]
+    empty_cols = ["wb_key", "Продажи 7 дней, шт", "Продажи 60 дней, шт", "Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Цена покупателя"]
     if orders.empty:
         return pd.DataFrame(columns=empty_cols)
 
@@ -308,13 +303,7 @@ def build_sales_by_windows(orders: pd.DataFrame):
     res["Среднесуточные продажи 60д"] = res["Продажи 60 дней, шт"] / 60.0
 
     if "finishedPrice" in work.columns:
-        price_last = (
-            work[work["dt"] == max_dt]
-            .groupby("wb_key")["finishedPrice"]
-            .mean()
-            .rename("Цена покупателя")
-            .reset_index()
-        )
+        price_last = work[work["dt"] == max_dt].groupby("wb_key")["finishedPrice"].mean().rename("Цена покупателя").reset_index()
         price_last["Цена покупателя"] = to_numeric(price_last["Цена покупателя"]).map(round_int)
         res = res.merge(price_last, on="wb_key", how="left")
     else:
@@ -378,13 +367,7 @@ def select_daily_sales(row):
 def build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articles, rrc_df, zero_days_map):
     df = wb_stocks.merge(sales, on="wb_key", how="left")
 
-    for col in [
-        "Продажи 7 дней, шт",
-        "Продажи 60 дней, шт",
-        "Среднесуточные продажи 7д",
-        "Среднесуточные продажи 60д",
-        "Цена покупателя",
-    ]:
+    for col in ["Продажи 7 дней, шт", "Продажи 60 дней, шт", "Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Цена покупателя"]:
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -398,10 +381,7 @@ def build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articl
     df["Расчётный спрос в день, шт"] = df.apply(select_daily_sales, axis=1)
     df["WB хватит, дней"] = df.apply(lambda r: safe_div(r["Остаток WB, шт"], r["Расчётный спрос в день, шт"]), axis=1).map(round_int)
     df["Липецк хватит, дней"] = df.apply(lambda r: safe_div(r["Остатки МП (Липецк), шт"], r["Расчётный спрос в день, шт"]), axis=1).map(round_int)
-    df["WB + Липецк, дней"] = df.apply(
-        lambda r: safe_div(r["Остаток WB, шт"] + r["Остатки МП (Липецк), шт"], r["Расчётный спрос в день, шт"]),
-        axis=1,
-    ).map(round_int)
+    df["WB + Липецк, дней"] = df.apply(lambda r: safe_div(r["Остаток WB, шт"] + r["Остатки МП (Липецк), шт"], r["Расчётный спрос в день, шт"]), axis=1).map(round_int)
 
     df["Дней без остатка WB в текущем месяце"] = df["wb_key"].map(zero_days_map).fillna(0).astype(int)
     df.loc[df["Остаток WB, шт"] > 0, "Дней без остатка WB в текущем месяце"] = 0
@@ -413,22 +393,10 @@ def build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articl
     df["Коэффициент"] = df.apply(lambda r: format_coef_rrc(r["Цена покупателя"], r["РРЦ"]), axis=1)
 
     result_cols = [
-        "Артикул 1С",
-        "Остаток WB, шт",
-        "Продажи 7 дней, шт",
-        "Продажи 60 дней, шт",
-        "Среднесуточные продажи 7д",
-        "Среднесуточные продажи 60д",
-        "Расчётный спрос в день, шт",
-        "WB хватит, дней",
-        "Остатки МП (Липецк), шт",
-        "Липецк хватит, дней",
-        "WB + Липецк, дней",
-        "Дней без остатка WB в текущем месяце",
-        "Цена покупателя",
-        "РРЦ",
-        "Коэффициент",
-        "Delist",
+        "Артикул 1С", "Остаток WB, шт", "Продажи 7 дней, шт", "Продажи 60 дней, шт",
+        "Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Расчётный спрос в день, шт",
+        "WB хватит, дней", "Остатки МП (Липецк), шт", "Липецк хватит, дней", "WB + Липецк, дней",
+        "Дней без остатка WB в текущем месяце", "Цена покупателя", "РРЦ", "Коэффициент", "Delist"
     ]
     df = df[result_cols].copy()
 
@@ -459,42 +427,20 @@ def build_report_dataframe(wb_stocks, sales, article_map, stocks_1c, stop_articl
 
 
 def split_report_sheets(df):
-    critical = df[
-        (df["Продажи 60 дней, шт"] > 0)
-        & ((df["Остаток WB, шт"] <= 0) | (df["WB хватит, дней"] < 14))
-    ].copy()
-
+    critical = df[(df["Продажи 60 дней, шт"] > 0) & ((df["Остаток WB, шт"] <= 0) | (df["WB хватит, дней"] < 14))].copy()
     calc = df.copy()
     dead = df[df["WB + Липецк, дней"] > 120].copy()
 
-    critical = critical[
-        [
-            "Артикул 1С",
-            "WB хватит, дней",
-            "Липецк хватит, дней",
-            "Остаток WB, шт",
-            "Остатки МП (Липецк), шт",
-            "Продажи 60 дней, шт",
-            "Дней без остатка WB в текущем месяце",
-            "Delist",
-        ]
-    ].copy()
+    critical = critical[[
+        "Артикул 1С", "WB хватит, дней", "Липецк хватит, дней", "Остаток WB, шт",
+        "Остатки МП (Липецк), шт", "Продажи 60 дней, шт", "Дней без остатка WB в текущем месяце", "Delist"
+    ]].copy()
 
-    dead = dead[
-        [
-            "Артикул 1С",
-            "WB хватит, дней",
-            "Липецк хватит, дней",
-            "WB + Липецк, дней",
-            "Остаток WB, шт",
-            "Остатки МП (Липецк), шт",
-            "Продажи 60 дней, шт",
-            "Цена покупателя",
-            "РРЦ",
-            "Коэффициент",
-            "Delist",
-        ]
-    ].copy()
+    dead = dead[[
+        "Артикул 1С", "WB хватит, дней", "Липецк хватит, дней", "WB + Липецк, дней",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Продажи 60 дней, шт",
+        "Цена покупателя", "РРЦ", "Коэффициент", "Delist"
+    ]].copy()
 
     dead = dead.sort_values(by="Артикул 1С", key=lambda s: s.map(natural_sort_key)).reset_index(drop=True)
     return critical, calc, dead
@@ -571,4 +517,66 @@ def save_report_xlsx(critical_df, calc_df, dead_df, out_path: str):
     days_col = header.index("WB + Липецк, дней") + 1 if "WB + Липецк, дней" in header else None
     style_ws(ws_dead, price_cols=price_cols, dead_stock_days_col=days_col)
 
-    for ws
+    for ws in [ws_critical, ws_calc, ws_dead]:
+        ws.row_dimensions[1].height = 32
+        for r in range(2, ws.max_row + 1):
+            ws.row_dimensions[r].height = 24
+
+    wb.save(out_path)
+
+
+def send_to_telegram(cfg: Config, file_path: str, critical_count: int, dead_count: int):
+    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+        now_log("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID не заданы — отправку пропускаем")
+        return
+    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendDocument"
+    caption = f"📦 Отчёт по остаткам WB {STORE_NAME}\nКритично <14 дней: {critical_count}\nDead_Stock: {dead_count}"
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            url,
+            data={"chat_id": cfg.telegram_chat_id, "caption": caption},
+            files={"document": (os.path.basename(file_path), f)},
+            timeout=120,
+        )
+    resp.raise_for_status()
+    now_log("Отчёт отправлен в Telegram")
+
+
+def run():
+    cfg = get_config()
+    storage = S3Storage(cfg)
+    stop_articles = split_stop_articles(cfg.stop_articles_raw)
+    now_log(f"Delist-артикулов из env: {len(stop_articles)}")
+
+    wb_stocks, stock_source_key = load_latest_wb_stocks(storage)
+    orders_df, order_source_keys = load_orders_windows(storage)
+    sales_df = build_sales_by_windows(orders_df)
+    article_map = load_article_map(storage)
+    stocks_1c = load_stocks_1c(storage)
+    rrc_df = load_rrc(storage)
+
+    current_zero_keys = set(wb_stocks.loc[wb_stocks["Остаток WB, шт"] <= 0, "wb_key"].tolist())
+    zero_days_map = load_current_month_zero_days(storage, current_zero_keys)
+
+    report_df = build_report_dataframe(wb_stocks, sales_df, article_map, stocks_1c, stop_articles, rrc_df, zero_days_map)
+    critical_df, calc_df, dead_df = split_report_sheets(report_df)
+
+    out_path = os.path.join(OUT_DIR, f"Отчёт_дни_остатка_WB_{STORE_NAME}_{datetime.now().strftime('%Y%m%d')}.xlsx")
+    save_report_xlsx(critical_df, calc_df, dead_df, out_path)
+
+    now_log(f"Отчёт сохранён: {out_path}")
+    now_log(f"Источник остатков: {stock_source_key}")
+    now_log(f"Источники заказов: {', '.join(order_source_keys)}")
+
+    if should_send_report(cfg):
+        send_to_telegram(cfg, out_path, len(critical_df), len(dead_df))
+
+    return out_path
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception as exc:
+        now_log(f"Ошибка: {exc}")
+        raise
