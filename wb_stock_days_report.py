@@ -16,7 +16,6 @@ import boto3
 import pandas as pd
 import requests
 from botocore.client import Config as BotoConfig
-from botocore.exceptions import ClientError
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
@@ -43,7 +42,7 @@ def normalize_text(value: object) -> str:
     if pd.isna(value) or value is None:
         return ""
     text = str(value).strip()
-    if text.endswith(".0"):
+    if text.endswith(".0") and re.fullmatch(r"\d+\.0", text):
         text = text[:-2]
     return text
 
@@ -70,10 +69,8 @@ def ceil_int(value: object) -> int:
 
 
 
-def format_days(value: Optional[float]) -> str:
-    if value is None:
-        return "∞"
-    return f"{value:.1f}"
+def round_int(value: object) -> int:
+    return int(round(safe_float(value)))
 
 
 
@@ -88,8 +85,7 @@ def should_send_to_telegram(run_date: datetime, force_send: bool) -> bool:
     if force_send:
         log("Ручной запуск — отчёт будет отправлен в Telegram")
         return True
-    # Понедельник=0, пятница=4
-    if run_date.weekday() in {0, 4}:
+    if run_date.weekday() in {0, 4}:  # понедельник, пятница
         return True
     return False
 
@@ -174,7 +170,6 @@ class AppConfig:
     send_telegram: bool = env_bool("WB_SEND_TELEGRAM", True)
     force_send_env: bool = env_bool("WB_FORCE_SEND", False)
 
-    # Пути в Object Storage
     stocks_prefix: str = os.getenv("WB_STOCKS_PREFIX", "Отчёты/Остатки/{store}/Недельные/")
     orders_prefix: str = os.getenv("WB_ORDERS_PREFIX", "Отчёты/Заказы/{store}/Недельные/")
     article_map_key: str = os.getenv("WB_ARTICLE_MAP_KEY", "Отчёты/Остатки/1С/Артикулы 1с.xlsx")
@@ -271,7 +266,6 @@ def find_order_files_for_window(storage: S3Storage, cfg: AppConfig) -> list[str]
             selected.append((week_start, key))
 
     if not selected:
-        # fallback — берём 2 последних weekly-файла
         all_dated = []
         for key in keys:
             parsed = parse_iso_week_from_key(key)
@@ -325,7 +319,11 @@ def load_wb_stocks(storage: S3Storage, cfg: AppConfig, stock_key: str) -> pd.Dat
     df.columns = [str(c).strip() for c in df.columns]
 
     nm_col = choose_existing_column(df, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
-    qty_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество", "Остатки МП", "Количество", "Доступно", "Остаток", "Остатки"], "остаток WB")
+    qty_col = choose_existing_column(
+        df,
+        ["Доступно для продажи", "Полное количество", "Остатки МП", "Количество", "Доступно", "Остаток", "Остатки"],
+        "остаток WB",
+    )
     article_wb_col = None
     for candidate in ["supplierArticle", "Артикул продавца", "Артикул поставщика", "Артикул WB"]:
         try:
@@ -340,11 +338,7 @@ def load_wb_stocks(storage: S3Storage, cfg: AppConfig, stock_key: str) -> pd.Dat
             "stock_wb_qty": df[qty_col].map(ceil_int),
         }
     )
-    if article_wb_col:
-        out["supplierArticle"] = df[article_wb_col].map(normalize_text)
-    else:
-        out["supplierArticle"] = ""
-
+    out["supplierArticle"] = df[article_wb_col].map(normalize_text) if article_wb_col else ""
     out = out[out["nmId"] != ""].copy()
     out = out.groupby(["nmId", "supplierArticle"], as_index=False).agg(stock_wb_qty=("stock_wb_qty", "sum"))
     return out
@@ -363,7 +357,7 @@ def load_orders(storage: S3Storage, cfg: AppConfig, order_keys: list[str]) -> pd
 
     orders = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if orders.empty:
-        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "avg_daily_sales_7d"])
+        return pd.DataFrame(columns=["nmId", "supplierArticle", "sales_7d", "sales_60d", "avg_daily_sales_7d", "avg_daily_sales_60d"])
 
     date_col = choose_existing_column(orders, ["date", "Дата заказа", "Дата"], "дата заказа")
     nm_col = choose_existing_column(orders, ["nmId", "Артикул WB", "Артикул wb"], "идентификатор товара WB")
@@ -393,24 +387,44 @@ def load_orders(storage: S3Storage, cfg: AppConfig, order_keys: list[str]) -> pd
 
     orders = orders.copy()
     orders[date_col] = pd.to_datetime(orders[date_col], errors="coerce").dt.normalize()
-    start_date = cfg.run_date - timedelta(days=cfg.sales_window_days - 1)
-    orders = orders[(orders[date_col] >= start_date) & (orders[date_col] <= cfg.run_date)].copy()
-
     if cancel_col:
         orders = orders[~orders[cancel_col].fillna(False).astype(bool)].copy()
 
     orders["nmId"] = orders[nm_col].map(normalize_text)
     orders["supplierArticle"] = orders[art_col].map(normalize_text) if art_col else ""
     orders["qty"] = orders[qty_col].map(safe_float) if qty_col else 1.0
+    orders = orders[orders["nmId"] != ""].copy()
 
-    grouped = orders.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_7d=("qty", "sum"))
+    start_date_7 = cfg.run_date - timedelta(days=cfg.sales_window_days - 1)
+    start_date_60 = cfg.run_date - timedelta(days=cfg.activity_window_days - 1)
+
+    orders_7 = orders[(orders[date_col] >= start_date_7) & (orders[date_col] <= cfg.run_date)].copy()
+    orders_60 = orders[(orders[date_col] >= start_date_60) & (orders[date_col] <= cfg.run_date)].copy()
+
+    grouped_7 = orders_7.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_7d=("qty", "sum"))
+    grouped_60 = orders_60.groupby(["nmId", "supplierArticle"], as_index=False).agg(sales_60d=("qty", "sum"))
+
+    grouped = grouped_60.merge(grouped_7, on=["nmId", "supplierArticle"], how="outer")
+    grouped["sales_7d"] = grouped["sales_7d"].fillna(0.0)
+    grouped["sales_60d"] = grouped["sales_60d"].fillna(0.0)
     grouped["avg_daily_sales_7d"] = grouped["sales_7d"] / float(cfg.sales_window_days)
+    grouped["avg_daily_sales_60d"] = grouped["sales_60d"] / float(cfg.activity_window_days)
     return grouped
 
 
 # =========================
 # Расчёт
 # =========================
+
+
+def choose_daily_sales(row: pd.Series) -> float:
+    avg_7 = safe_float(row.get("avg_daily_sales_7d"))
+    avg_60 = safe_float(row.get("avg_daily_sales_60d"))
+    stock_wb_qty = safe_float(row.get("stock_wb_qty"))
+    if stock_wb_qty <= 0 or avg_7 <= 0:
+        return avg_60
+    return avg_7
+
 
 
 def build_report_dataframe(
@@ -421,9 +435,10 @@ def build_report_dataframe(
     stop_articles: set[str],
 ) -> pd.DataFrame:
     df = wb_stocks.merge(sales, on=["nmId", "supplierArticle"], how="left")
-    df["sales_7d"] = df["sales_7d"].fillna(0.0)
-    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].fillna(0.0)
-    df["sales_60d"] = df["sales_60d"].fillna(0.0)
+    for col in ["sales_7d", "sales_60d", "avg_daily_sales_7d", "avg_daily_sales_60d"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = df[col].fillna(0.0)
 
     df = df.merge(article_map, on="nmId", how="left")
     df["article_1c"] = df["article_1c"].fillna("").map(normalize_text)
@@ -431,18 +446,15 @@ def build_report_dataframe(
     df = df.merge(stocks_1c, on="article_1c", how="left")
     df["stock_company_qty"] = df["stock_company_qty"].fillna(0).astype(int)
 
-    df["days_wb"] = df.apply(lambda x: calculate_days(safe_float(x["stock_wb_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
-    df["days_company"] = df.apply(lambda x: calculate_days(safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])), axis=1)
+    df["selected_avg_daily_sales"] = df.apply(choose_daily_sales, axis=1)
+    df["days_wb"] = df.apply(lambda x: calculate_days(safe_float(x["stock_wb_qty"]), safe_float(x["selected_avg_daily_sales"])), axis=1)
+    df["days_company"] = df.apply(lambda x: calculate_days(safe_float(x["stock_company_qty"]), safe_float(x["selected_avg_daily_sales"])), axis=1)
     df["days_total"] = df.apply(
-        lambda x: calculate_days(safe_float(x["stock_wb_qty"]) + safe_float(x["stock_company_qty"]), safe_float(x["avg_daily_sales_7d"])),
+        lambda x: calculate_days(safe_float(x["stock_wb_qty"]) + safe_float(x["stock_company_qty"]), safe_float(x["selected_avg_daily_sales"])),
         axis=1,
     )
 
     df["status"] = df["article_1c"].map(lambda x: "Delist" if normalize_key(x) in stop_articles else "")
-
-    df["sales_7d"] = df["sales_7d"].round(2)
-    df["sales_60d"] = df["sales_60d"].round(2)
-    df["avg_daily_sales_7d"] = df["avg_daily_sales_7d"].round(4)
 
     sort_key = df["days_wb"].copy()
     sort_key = sort_key.where(sort_key.notna(), 999999.0)
@@ -526,7 +538,8 @@ def set_sheet_layout(ws, widths: dict[str, float], title_row: int = 1, header_ro
     ws.row_dimensions[header_row].height = 44
     ws.freeze_panes = f"A{header_row + 1}"
     ws.sheet_view.showGridLines = False
-    ws.auto_filter.ref = f"A{header_row}:{chr(64 + ws.max_column)}{max(ws.max_row, header_row)}"
+    end_col = chr(64 + ws.max_column) if ws.max_column <= 26 else "Z"
+    ws.auto_filter.ref = f"A{header_row}:{end_col}{max(ws.max_row, header_row)}"
 
 
 
@@ -539,10 +552,15 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
     report_date_text = cfg.run_date.strftime("%d.%m.%Y")
 
     # Лист 1
-    style_title(ws_short, "A1:F1", f"Контроль остатка WB — были продажи за {cfg.activity_window_days} дней и сейчас 0 либо менее {int(cfg.days_threshold)} дней на {report_date_text}")
+    style_title(
+        ws_short,
+        "A1:F1",
+        f"Контроль остатка WB — были продажи за {cfg.activity_window_days} дней и сейчас 0 либо менее {int(cfg.days_threshold)} дней на {report_date_text}",
+    )
     ws_short.append([])
     short_headers = [
         "Артикул 1С",
+        f"Продажи за {cfg.activity_window_days} дней, шт",
         "Остатка WB\nхватит, дней",
         "В Липецке есть запас\nна, дней",
         "Суммарно WB + Липецк\nхватит, дней",
@@ -555,27 +573,29 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
     for _, row in short_df.iterrows():
         ws_short.append([
             row["article_1c"],
-            int(round(row["sales_60d"])),
-            row["days_wb"],
-            row["days_company"],
-            row["days_total"],
+            round_int(row["sales_60d"]),
+            None if row["days_wb"] is None else round(row["days_wb"], 1),
+            None if row["days_company"] is None else round(row["days_company"], 1),
+            None if row["days_total"] is None else round(row["days_total"], 1),
             row["status"],
         ])
 
     for r in range(4, ws_short.max_row + 1):
         style_data_row(ws_short, r, days_wb_col=3, status_col=6)
-    set_sheet_layout(ws_short, {"A": 28, "B": 18, "C": 18, "D": 22, "E": 24, "F": 14})
+    set_sheet_layout(ws_short, {"A": 28, "B": 18, "C": 18, "D": 18, "E": 22, "F": 14})
 
     # Лист 2
-    style_title(ws_calc, "A1:L1", f"Расчёт дней до конца остатка WB — {cfg.store_name} — {report_date_text}")
+    style_title(ws_calc, "A1:M1", f"Расчёт дней до конца остатка WB — {cfg.store_name} — {report_date_text}")
     ws_calc.append([])
     calc_headers = [
         "nmId",
         "Артикул WB",
         "Артикул 1С",
         "Остаток WB, шт",
-        "Продажи за 7 дней, шт",
-        "Среднесуточные продажи\nза 7 дней, шт",
+        f"Продажи за {cfg.activity_window_days} дней, шт",
+        f"Продажи за {cfg.sales_window_days} дней, шт",
+        f"Среднесуточные продажи\nза {cfg.activity_window_days} дней, шт",
+        f"Среднесуточные продажи\nза {cfg.sales_window_days} дней, шт",
         "Остатки МП\n(Липецк), шт",
         "WB хватит, дней",
         "Липецк хватит, дней",
@@ -590,22 +610,23 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
             row["nmId"],
             row["supplierArticle"],
             row["article_1c"],
-            row["stock_wb_qty"],
-            row["sales_60d"],
-            row["sales_7d"],
-            row["avg_daily_sales_7d"],
-            row["stock_company_qty"],
-            row["days_wb"],
-            row["days_company"],
-            row["days_total"],
+            round_int(row["stock_wb_qty"]),
+            round_int(row["sales_60d"]),
+            round_int(row["sales_7d"]),
+            round(row["avg_daily_sales_60d"], 4),
+            round(row["avg_daily_sales_7d"], 4),
+            round_int(row["stock_company_qty"]),
+            None if row["days_wb"] is None else round(row["days_wb"], 1),
+            None if row["days_company"] is None else round(row["days_company"], 1),
+            None if row["days_total"] is None else round(row["days_total"], 1),
             row["status"],
         ])
 
     for r in range(4, ws_calc.max_row + 1):
-        style_data_row(ws_calc, r, days_wb_col=9, status_col=12)
+        style_data_row(ws_calc, r, days_wb_col=10, status_col=13)
     set_sheet_layout(
         ws_calc,
-        {"A": 14, "B": 20, "C": 28, "D": 14, "E": 16, "F": 16, "G": 22, "H": 18, "I": 16, "J": 18, "K": 18, "L": 14},
+        {"A": 14, "B": 20, "C": 28, "D": 14, "E": 16, "F": 16, "G": 18, "H": 18, "I": 18, "J": 16, "K": 18, "L": 18, "M": 14},
     )
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -615,7 +636,6 @@ def save_excel_report(df: pd.DataFrame, cfg: AppConfig, output_path: str) -> Non
 # =========================
 # Telegram
 # =========================
-
 
 
 def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption: str) -> None:
@@ -635,7 +655,6 @@ def send_telegram_document(bot_token: str, chat_id: str, file_path: str, caption
 # =========================
 # Main
 # =========================
-
 
 
 def run() -> str:
