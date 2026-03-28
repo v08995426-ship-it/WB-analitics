@@ -1161,6 +1161,25 @@ def compute_bid_caps(row: pd.Series, mode: str, config: ManagerConfig) -> Dict[s
             return 0.0
         return cpc_val * 1000.0 * ctr_est
 
+    current_bid_rub = safe_float(row.get("current_bid_rub", 0))
+    current_eff_cpc = current_bid_rub if payment_type == "cpc" else (current_bid_rub / (1000.0 * ctr_est) if ctr_est > 0 else 0.0)
+    if current_eff_cpc <= 0:
+        current_eff_cpc = applied_comfort_cpc if applied_comfort_cpc > 0 else (applied_max_cpc * 0.7 if applied_max_cpc > 0 else 0.0)
+
+    # Жёсткий защитный cap, чтобы на низком объёме кликов формула не раздувала max-ставку до нерабочих значений.
+    relative_mult = 2.0 if subject in GROWTH_SUBJECTS else 1.6
+    floor_eff_cpc = 8.0 if subject in GROWTH_SUBJECTS else 6.0
+    anchor_max_cpc = max(current_eff_cpc * relative_mult, min(applied_comfort_cpc * 1.25 if applied_comfort_cpc > 0 else 0.0, 18.0), floor_eff_cpc)
+    if applied_max_cpc > 0:
+        applied_max_cpc = min(applied_max_cpc, anchor_max_cpc)
+    if applied_comfort_cpc > 0:
+        comfort_anchor = max(current_eff_cpc * 1.20 if current_eff_cpc > 0 else 0.0, min(applied_max_cpc * 0.85 if applied_max_cpc > 0 else 0.0, 14.0), floor_eff_cpc * 0.75)
+        applied_comfort_cpc = min(applied_comfort_cpc, comfort_anchor)
+    if applied_max_cpc > 0 and applied_comfort_cpc > applied_max_cpc:
+        applied_comfort_cpc = applied_max_cpc
+    if experiment_cpc > 0 and applied_max_cpc > 0:
+        experiment_cpc = min(experiment_cpc, applied_max_cpc * 1.25)
+
     if payment_type == "cpc":
         comfort_bid = applied_comfort_cpc
         max_bid = applied_max_cpc
@@ -1227,8 +1246,10 @@ def compute_bid_efficiency(row: pd.Series, subject_baselines: pd.DataFrame) -> D
     return {
         "capture_imp": round(capture_imp, 6),
         "capture_click": round(capture_click, 6),
-        "eff_imp": round(eff_imp, 8),
-        "eff_click": round(eff_click, 8),
+        "eff_imp": round(eff_imp, 12),
+        "eff_click": round(eff_click, 12),
+        "eff_imp_ppm": round(eff_imp * 1_000_000.0, 4),
+        "eff_click_ppm": round(eff_click * 1_000_000.0, 4),
         "bei_imp": round(bei_imp, 4),
         "bei_click": round(bei_click, 4),
     }
@@ -1344,23 +1365,35 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
     strong_response = (bei_imp > 1.10 or bei_click > 1.10)
     within_growth_budget = blended_drr <= (max_drr * 100 + 0.01)
     materially_over_budget = blended_drr > (max_drr * 100 + (1.0 if is_growth_subject else 0.3))
-    near_limit = current_bid >= max_bid * 0.98 if max_bid > 0 else False
+    near_limit = current_bid >= max_bid * 0.95 if max_bid > 0 else False
     low_bid_vs_cap = current_bid <= max(max_bid * 0.82, comfort_bid * 0.95) if max_bid > 0 else current_bid <= comfort_bid * 0.95
     order_growth_soft_ok = order_growth >= max(required_growth * 0.60, 2.0 if is_growth_subject else 3.0)
     order_growth_good = order_growth >= max(required_growth, 4.0 if is_growth_subject else 3.0)
+    root_strength = total_orders >= (16 if is_growth_subject else 12) and order_growth >= 0 and blended_drr <= (12.0 if is_growth_subject else max_drr * 100)
     rate_limit_flag = False
 
-    if gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT:
+    if gp_realized <= 0:
+        new_bid = MIN_CPC_RUB if payment_type == "cpc" else (MIN_CPM_RECOMMENDATIONS_RUB if row.get("placement") == "recommendations" else MIN_CPM_SEARCH_RUB)
+        return "DOWN", round(min(current_bid, new_bid), 2), "Негативная экономика товара", rate_limit_flag
+
+    if (rating < MIN_RATING or buyout_rate < MIN_BUYOUT):
+        if is_growth_subject and root_strength and weak_position and current_bid <= max_bid * 1.05:
+            return "HOLD", round(current_bid, 2), "Ростовая категория: локальные метрики слабые, но товар в целом держится — ставку пока не сушим", rate_limit_flag
         new_bid = MIN_CPC_RUB if payment_type == "cpc" else (MIN_CPM_RECOMMENDATIONS_RUB if row.get("placement") == "recommendations" else MIN_CPM_SEARCH_RUB)
         return "DOWN", round(min(current_bid, new_bid), 2), "Негативная экономика / рейтинг / выкуп", rate_limit_flag
 
-    if near_limit and weak_position and weak_traffic_signal and (materially_over_budget or order_growth < 0):
+    if near_limit and weak_position and (weak_traffic_signal or (order_growth < required_growth and blended_drr >= max_drr * 100 - 0.3)):
         rate_limit_flag = True
         return "LIMIT_REACHED", round(current_bid, 2), "Повысить эффективность ставки — реклама работает на пределе", rate_limit_flag
 
     if materially_over_budget and order_growth < required_growth:
-        if is_growth_subject and weak_position and blended_drr <= max_drr * 100 + 1.5 and order_growth_soft_ok:
-            return "HOLD", round(current_bid, 2), f"Ростовая категория: общий ДРР {blended_drr:.1f}% чуть выше лимита, наблюдаем эффект", rate_limit_flag
+        if is_growth_subject:
+            if blended_drr <= 12.0 and order_growth >= 0:
+                return "HOLD", round(current_bid, 2), f"Ростовая категория: общий ДРР {blended_drr:.1f}% ещё рабочий, резать ставку рано", rate_limit_flag
+            if weak_position and blended_drr <= max_drr * 100 + 1.5 and order_growth_soft_ok:
+                return "HOLD", round(current_bid, 2), f"Ростовая категория: общий ДРР {blended_drr:.1f}% чуть выше лимита, наблюдаем эффект", rate_limit_flag
+            if blended_drr <= max_drr * 100 and current_bid <= comfort_bid * 1.05:
+                return "HOLD", round(current_bid, 2), "Ростовая категория: ДРР на границе, но ставка ещё не перегрета", rate_limit_flag
         new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_MED)
         return "DOWN", round(new_bid, 2), f"Общий ДРР {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов недостаточный", rate_limit_flag
 
@@ -1384,18 +1417,24 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
             return "TEST_UP", round(new_bid, 2), "Выходной эксперимент выше max для growth-категории", rate_limit_flag
 
     if card_issue and current_bid > comfort_bid:
-        if is_growth_subject and within_growth_budget and weak_position and not weak_traffic_signal:
-            return "HOLD", round(current_bid, 2), "Есть вопросы к карточке, но ростовую категорию пока не сушим", rate_limit_flag
+        if is_growth_subject:
+            if blended_drr <= 12.0 and order_growth >= 0:
+                return "HOLD", round(current_bid, 2), "Есть вопросы к карточке, но общий ДРР и заказы позволяют пока держать ставку", rate_limit_flag
+            if within_growth_budget and weak_position and not weak_traffic_signal:
+                return "HOLD", round(current_bid, 2), "Есть вопросы к карточке, но ростовую категорию пока не сушим", rate_limit_flag
         return "DOWN", compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL), "Проблема в карточке / воронке", rate_limit_flag
 
     if spend_growth > 0 and order_growth < required_growth:
-        if is_growth_subject and within_growth_budget:
-            if weak_position and not weak_traffic_signal:
-                return "HOLD", round(current_bid, 2), "Ростовая категория: ставку держим, наблюдаем общий эффект", rate_limit_flag
-            if near_limit and weak_traffic_signal:
-                new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL)
-                return "DOWN", round(new_bid, 2), "Ростовая категория: ставка высока, а трафик не реагирует", rate_limit_flag
-            return "HOLD", round(current_bid, 2), "Ростовая категория: заказов пока мало, но лимит ДРР ещё не исчерпан", rate_limit_flag
+        if is_growth_subject:
+            if blended_drr <= 12.0 and order_growth >= 0:
+                return "HOLD", round(current_bid, 2), "Ростовая категория: общий ДРР ещё в рабочей зоне, ждём накопления эффекта", rate_limit_flag
+            if within_growth_budget:
+                if weak_position and not weak_traffic_signal:
+                    return "HOLD", round(current_bid, 2), "Ростовая категория: ставку держим, наблюдаем общий эффект", rate_limit_flag
+                if near_limit and weak_traffic_signal and current_bid > comfort_bid * 1.05:
+                    new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL)
+                    return "DOWN", round(new_bid, 2), "Ростовая категория: ставка высока, а трафик не реагирует", rate_limit_flag
+                return "HOLD", round(current_bid, 2), "Ростовая категория: заказов пока мало, но лимит ДРР ещё не исчерпан", rate_limit_flag
         new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL)
         return "DOWN", round(new_bid, 2), "Рост расходов не поддержан достаточным ростом заказов", rate_limit_flag
 
@@ -1749,11 +1788,12 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     weak_df = decisions_df[
         (decisions_df["median_position"] == 0) |
         (decisions_df["median_position"] > 20) |
-        (decisions_df["action"] == "LIMIT_REACHED")
+        (decisions_df["action"] == "LIMIT_REACHED") |
+        ((decisions_df["current_bid_rub"] >= decisions_df["max_bid_rub"] * 0.95) & (decisions_df["median_position"] > 12))
     ].copy()
     if not weak_df.empty:
         weak_df["comment"] = weak_df.apply(
-            lambda x: "Повысить эффективность ставки — реклама работает на пределе" if x["action"] == "LIMIT_REACHED" else "Слабая позиция, нужна работа по карточке и ставке",
+            lambda x: "Повысить эффективность ставки — реклама работает на пределе" if (x["action"] == "LIMIT_REACHED" or (safe_float(x["current_bid_rub"]) >= safe_float(x["max_bid_rub"]) * 0.95 and safe_float(x["median_position"]) > 12)) else "Слабая позиция, нужна работа по карточке и ставке",
             axis=1,
         )
 
@@ -1767,7 +1807,7 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     # Efficiency snapshot
     eff_df = decisions_base[[
         "advert_id", "nmId", "supplier_article", "product_root", "subject", "placement", "current_bid_rub",
-        "demand_week", "ad_impressions_current", "ad_clicks_current", "capture_imp", "capture_click", "eff_imp", "eff_click", "bei_imp", "bei_click",
+        "demand_week", "ad_impressions_current", "ad_clicks_current", "capture_imp", "capture_click", "eff_imp", "eff_click", "eff_imp_ppm", "eff_click_ppm", "bei_imp", "bei_click",
         "median_position", "visibility_pct", "action", "reason"
     ]].copy()
 
@@ -1781,7 +1821,7 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
         "order_growth_pct", "spend_growth_pct", "required_order_growth_pct", "drr_growth_pp",
         "gp_realized", "buyout_rate", "rating_reviews", "rating_card", "median_position", "visibility_pct",
         "openCardCount", "addToCartCount", "ordersCount", "buyoutsCount", "addToCartConversion", "cartToOrderConversion", "buyoutPercent",
-        "demand_week", "keyword_clicks", "keyword_orders", "capture_imp", "capture_click", "eff_imp", "eff_click", "bei_imp", "bei_click",
+        "demand_week", "keyword_clicks", "keyword_orders", "capture_imp", "capture_click", "eff_imp", "eff_click", "eff_imp_ppm", "eff_click_ppm", "bei_imp", "bei_click",
         "card_issue", "rate_limit_flag", "effect_flag", "effect_comment", "bid_delta_pct"
     ]].copy()
 
