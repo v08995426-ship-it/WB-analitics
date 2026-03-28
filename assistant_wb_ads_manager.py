@@ -44,6 +44,7 @@ from botocore.client import Config as BotoConfig
 from botocore.exceptions import ClientError
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 # ======================================================================================
 # КОНСТАНТЫ
@@ -187,9 +188,13 @@ def pct(numerator: float, denominator: float, scale: float = 100.0) -> float:
 
 def product_root_from_supplier_article(value: Any) -> str:
     s = str(value).strip()
-    if not s:
+    if not s or s.lower() in {"nan", "none"}:
         return ""
-    return s.split("/")[0].strip()
+    root = s.split("/")[0].strip()
+    root = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "", root)
+    root = re.sub(r"_+$", "", root)
+    root = re.sub(r"-+$", "", root)
+    return root.upper()
 
 
 def canonical_subject(value: Any) -> str:
@@ -304,11 +309,20 @@ class S3Provider(BaseProvider):
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=text.encode("utf-8"))
 
     def write_excel(self, key: str, sheets: Dict[str, pd.DataFrame]) -> None:
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            for sh, df in sheets.items():
-                (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=sh[:31], index=False)
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=bio.getvalue())
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
+                for sh, df in sheets.items():
+                    (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=sh[:31], index=False)
+            style_workbook(tmp_path)
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=tmp_path.read_bytes())
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def list_keys(self, prefix: str) -> List[str]:
         out: List[str] = []
@@ -471,52 +485,65 @@ def style_workbook(path: Path) -> None:
         wb = load_workbook(path)
         header_fill = PatternFill("solid", fgColor="1F4E78")
         header_font = Font(color="FFFFFF", bold=True)
-        kp_fill = PatternFill("solid", fgColor="D9EAF7")
         warn_fill = PatternFill("solid", fgColor="FFF2CC")
         bad_fill = PatternFill("solid", fgColor="F4CCCC")
         good_fill = PatternFill("solid", fgColor="D9EAD3")
+        neutral_fill = PatternFill("solid", fgColor="D9EAF7")
 
         for ws in wb.worksheets:
             ws.freeze_panes = "A2"
             ws.sheet_view.showGridLines = False
+            ws.row_dimensions[1].height = 34
+            widths: Dict[int, int] = {}
+
             for cell in ws[1]:
                 cell.fill = header_fill
                 cell.font = header_font
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            widths: Dict[int, int] = {}
-            for row in ws.iter_rows():
+                widths[cell.column] = max(14, min(len(str(cell.value or "")) + 4, 55))
+
+            for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+                ws.row_dimensions[row_idx].height = 22
                 for cell in row:
                     if cell.value is None:
                         continue
+                    header = str(ws.cell(1, cell.column).value or "")
+                    header_norm = norm_col(header)
                     val = str(cell.value)
-                    widths[cell.column] = min(max(widths.get(cell.column, 0), len(val) + 2), 40)
+                    widths[cell.column] = max(widths.get(cell.column, 12), min(max(len(val) + 2, len(header) + 2), 55))
+                    cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
                     if isinstance(cell.value, (int, float)):
-                        if "drr" in str(ws.cell(1, cell.column).value).lower() or "%" in str(ws.cell(1, cell.column).value):
-                            cell.number_format = '0.0%'
-                        elif "ставк" in str(ws.cell(1, cell.column).value).lower() or "расход" in str(ws.cell(1, cell.column).value).lower() or "выруч" in str(ws.cell(1, cell.column).value).lower() or "прибыл" in str(ws.cell(1, cell.column).value).lower():
+                        if any(x in header_norm for x in ["ддр", "рост", "видим", "ctr", "cr", "эффектив", "доля", "выкупа"]) or "%" in header:
+                            cell.number_format = '0.00'
+                        elif any(x in header_norm for x in ["ставк", "расход", "выруч", "прибыл", "цена", "cpc", "cpm"]):
                             cell.number_format = '#,##0.00'
+                        else:
+                            cell.number_format = '#,##0.00' if abs(float(cell.value)) % 1 else '#,##0'
+
             for col_idx, width in widths.items():
-                ws.column_dimensions[chr(64 + min(col_idx, 26))].width = width
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width, 12), 55)
 
             header_map = {norm_col(c.value): i + 1 for i, c in enumerate(ws[1]) if c.value is not None}
-            if "action" in header_map:
-                cidx = header_map["action"]
+            action_key = "решение" if "решение" in header_map else "action"
+            reason_key = "обоснование" if "обоснование" in header_map else "reason"
+            if action_key in header_map:
+                cidx = header_map[action_key]
                 for r in range(2, ws.max_row + 1):
-                    val = str(ws.cell(r, cidx).value or "").upper()
-                    if val in {"UP", "TEST_UP"}:
+                    val = str(ws.cell(r, cidx).value or "").lower()
+                    if val in {"повысить", "тест выше max", "up", "test_up"}:
                         ws.cell(r, cidx).fill = good_fill
-                    elif val in {"DOWN", "LIMIT_REACHED"}:
+                    elif val in {"снизить", "предел эффективности ставки", "down", "limit_reached"}:
                         ws.cell(r, cidx).fill = bad_fill
                     else:
-                        ws.cell(r, cidx).fill = kp_fill
-            if "reason" in header_map:
-                cidx = header_map["reason"]
+                        ws.cell(r, cidx).fill = neutral_fill
+            if reason_key in header_map:
+                cidx = header_map[reason_key]
                 for r in range(2, ws.max_row + 1):
                     if "предел" in str(ws.cell(r, cidx).value or "").lower():
                         ws.cell(r, cidx).fill = warn_fill
         wb.save(path)
     except Exception as e:
-        log(f"⚠️ Не удалось причесать workbook {path}: {e}")
+        log(f"⚠️ Не удалось оформить workbook {path}: {e}")
 
 
 # ======================================================================================
@@ -950,10 +977,12 @@ def classify_product_mode(row: pd.Series, subject_funnel_medians: pd.DataFrame) 
     buyout_rate = safe_float(row.get("buyout_rate", 0))
     pos = safe_float(row.get("median_position", 0))
     visibility = safe_float(row.get("visibility_pct", 0))
-    total_orders = safe_float(row.get("total_orders_current", 0))
+    root_orders = safe_float(row.get("root_total_orders_current", row.get("total_orders_current", 0)))
+    blended_drr = safe_float(row.get("blended_drr_current_pct", 0))
     atc = safe_float(row.get("addToCartConversion", 0))
     cto = safe_float(row.get("cartToOrderConversion", 0))
 
+    severe_card_issue = False
     card_issue = False
     med = subject_funnel_medians[subject_funnel_medians["subject_norm"] == subject]
     if not med.empty:
@@ -963,17 +992,27 @@ def classify_product_mode(row: pd.Series, subject_funnel_medians: pd.DataFrame) 
             card_issue = True
         if med_cto > 0 and cto > 0 and cto < med_cto * 0.70:
             card_issue = True
+        if med_atc > 0 and atc > 0 and atc < med_atc * 0.55:
+            severe_card_issue = True
+        if med_cto > 0 and cto > 0 and cto < med_cto * 0.55:
+            severe_card_issue = True
 
     if gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT:
         return "problem", card_issue
-    if card_issue:
+
+    if subject in GROWTH_SUBJECTS:
+        if rating >= GOOD_RATING and root_orders >= 20 and (pos == 0 or pos <= 15) and blended_drr <= 12.5:
+            return "hero", card_issue
+        if pos == 0 or pos > 20 or visibility < 5 or root_orders < 12 or blended_drr <= 15:
+            return "growth", card_issue
+        if severe_card_issue:
+            return "margin_guard", card_issue
+        return "balanced", card_issue
+
+    if severe_card_issue:
         return "margin_guard", card_issue
-    if subject in GROWTH_SUBJECTS and (pos == 0 or pos > 20 or visibility < 5 or total_orders < 8):
-        return "growth", card_issue
     if subject == "кисти косметические" and (pos > 20 or visibility < 4):
         return "balanced", card_issue
-    if subject in GROWTH_SUBJECTS and rating >= GOOD_RATING and total_orders >= 15 and pos <= 15:
-        return "hero", card_issue
     return "balanced", card_issue
 
 
@@ -995,16 +1034,48 @@ def get_blended_caps(subject: str, config: ManagerConfig) -> Tuple[float, float,
     return comfort, BRUSHES_DRR_MAX if subject == "кисти косметические" else config.default_blended_drr_max, config.default_blended_drr_max
 
 
-def compute_required_growth(current_blended_drr_pct: float, prev_blended_drr_pct: float, spend_growth_pct: float) -> float:
-    drr_growth_pp = max(0.0, safe_float(current_blended_drr_pct) - safe_float(prev_blended_drr_pct))
+def compute_required_growth(current_blended_drr_pct: float, prev_blended_drr_pct: float, spend_growth_pct: float, subject: str = "") -> float:
+    """
+    Возвращает минимально достаточный рост заказов, который должен сопровождать
+    рост общих расходов/ДРР. Для growth-категорий формула мягче, чтобы алгоритм
+    не душил развитие из-за низкой базы.
+    """
+    current_blended_drr_pct = safe_float(current_blended_drr_pct)
+    prev_blended_drr_pct = safe_float(prev_blended_drr_pct)
+    spend_growth_pct = max(0.0, safe_float(spend_growth_pct))
+    drr_growth_pp = max(0.0, current_blended_drr_pct - prev_blended_drr_pct)
+    subject = canonical_subject(subject)
+
+    if drr_growth_pp <= 0 and spend_growth_pct <= 0:
+        return 0.0
+
     if current_blended_drr_pct <= 12.0:
-        kdrr, kspend, floor = 2.0, 0.7, 3.0
+        kdrr, kspend, floor, cap, spend_cap = 1.5, 0.25, 2.0, 10.0, 24.0
     elif current_blended_drr_pct <= 15.0:
-        kdrr, kspend, floor = 3.0, 0.9, 6.0
+        kdrr, kspend, floor, cap, spend_cap = 2.0, 0.35, 4.0, 15.0, 30.0
     else:
-        kdrr, kspend, floor = 4.0, 1.1, 10.0
-    required = max(kdrr * drr_growth_pp, kspend * max(0.0, spend_growth_pct), floor if (drr_growth_pp > 0 or spend_growth_pct > 0) else 0.0)
-    return round(required, 2)
+        kdrr, kspend, floor, cap, spend_cap = 2.5, 0.50, 8.0, 22.0, 40.0
+
+    effective_spend_growth = min(spend_growth_pct, spend_cap)
+
+    if subject in GROWTH_SUBJECTS:
+        floor = max(1.5, floor - 1.0)
+        cap += 3.0
+        effective_spend_growth *= 0.85
+
+    required = max(
+        kdrr * drr_growth_pp,
+        kspend * effective_spend_growth,
+        floor,
+    )
+    return round(min(required, cap), 2)
+
+
+def compute_safe_down_bid(current_bid: float, comfort_bid: float, step: float) -> float:
+    reduced = current_bid * (1 - step)
+    if comfort_bid >= current_bid:
+        return round(reduced, 2)
+    return round(max(comfort_bid, reduced), 2)
 
 
 def choose_clicks_per_order(ad_clicks: float, ad_orders: float, total_orders: float, subject: str) -> Tuple[float, float]:
@@ -1025,12 +1096,30 @@ def compute_bid_caps(row: pd.Series, mode: str, config: ManagerConfig) -> Dict[s
     payment_type = row.get("payment_type", "cpc")
 
     gp_realized = safe_float(row.get("gp_realized", 0))
-    ctr_est = safe_float(row.get("ctr_est", 0)) / 100.0
+    ad_impressions = safe_float(row.get("ad_impressions_current", 0))
     ad_clicks = safe_float(row.get("ad_clicks_current", 0))
     ad_orders = safe_float(row.get("ad_orders_current", 0))
     total_orders = safe_float(row.get("total_orders_current", 0))
     ad_revenue = safe_float(row.get("ad_revenue_current", 0))
     total_revenue = safe_float(row.get("total_revenue_current", 0))
+
+    ctr_est = safe_float(row.get("ctr_est", 0)) / 100.0
+    actual_ctr = (ad_clicks / ad_impressions) if ad_impressions > 0 else 0.0
+    placement_ctr = safe_float(row.get("placement_ctr_median_pct", 0)) / 100.0
+    subject_ctr = safe_float(row.get("subject_ctr_median_pct", 0)) / 100.0
+    if ctr_est <= 0:
+        ctr_est = actual_ctr
+    if ctr_est <= 0:
+        ctr_est = placement_ctr
+    if ctr_est <= 0:
+        ctr_est = subject_ctr
+    if ctr_est <= 0:
+        if payment_type == "cpc":
+            ctr_est = 0.015
+        elif placement == "recommendations":
+            ctr_est = 0.008
+        else:
+            ctr_est = 0.012
 
     comfort_share, max_share = get_mode_shares(mode)
     comfort_cpo = gp_realized * comfort_share
@@ -1133,6 +1222,8 @@ def compute_bid_efficiency(row: pd.Series, subject_baselines: pd.DataFrame) -> D
 
     bei_imp = eff_imp / base_imp if base_imp > 0 else 1.0
     bei_click = eff_click / base_click if base_click > 0 else 1.0
+    bei_imp = clamp(bei_imp, 0.0, 5.0)
+    bei_click = clamp(bei_click, 0.0, 5.0)
     return {
         "capture_imp": round(capture_imp, 6),
         "capture_click": round(capture_click, 6),
@@ -1225,12 +1316,11 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
     comfort_bid = safe_float(row.get("comfort_bid_rub", 0))
     max_bid = safe_float(row.get("max_bid_rub", 0))
     experiment_bid = safe_float(row.get("experiment_bid_rub", 0))
-    mode = row.get("mode", "balanced")
 
     blended_drr = safe_float(row.get("blended_drr_current_pct", 0))
     blended_prev = safe_float(row.get("blended_drr_prev_pct", 0))
-    total_orders = safe_float(row.get("total_orders_current", 0))
-    total_orders_prev = safe_float(row.get("total_orders_prev", 0))
+    total_orders = safe_float(row.get("root_total_orders_current", row.get("total_orders_current", 0)))
+    total_orders_prev = safe_float(row.get("root_total_orders_prev", row.get("total_orders_prev", 0)))
     spend = safe_float(row.get("ad_spend_root_current", 0))
     spend_prev = safe_float(row.get("ad_spend_root_prev", 0))
     gp_realized = safe_float(row.get("gp_realized", 0))
@@ -1238,68 +1328,89 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
     buyout_rate = safe_float(row.get("buyout_rate", 0))
     position = safe_float(row.get("median_position", 0))
     visibility = safe_float(row.get("visibility_pct", 0))
-    bei_imp = safe_float(row.get("bei_imp", 1))
-    bei_click = safe_float(row.get("bei_click", 1))
+    bei_imp = clamp(safe_float(row.get("bei_imp", 1)), 0, 5)
+    bei_click = clamp(safe_float(row.get("bei_click", 1)), 0, 5)
     card_issue = bool(row.get("card_issue", False))
 
-    comfort_drr, max_drr, weekend_drr = get_blended_caps(subject, config)
+    _, max_drr, _ = get_blended_caps(subject, config)
     order_growth = pct(total_orders - total_orders_prev, total_orders_prev) if total_orders_prev > 0 else (100.0 if total_orders > 0 else 0.0)
     spend_growth = pct(spend - spend_prev, spend_prev) if spend_prev > 0 else (100.0 if spend > 0 else 0.0)
-    required_growth = compute_required_growth(blended_drr, blended_prev, spend_growth)
-    drr_growth_pp = blended_drr - blended_prev
+    required_growth = compute_required_growth(blended_drr, blended_prev, spend_growth, subject)
 
-    weak_position = (position == 0 or position > 20 or visibility < 5)
+    is_growth_subject = subject in GROWTH_SUBJECTS
+    weak_position = (position == 0 or position > (18 if is_growth_subject else 20) or visibility < (4.0 if is_growth_subject else 5.0))
     traffic_not_efficient = (bei_imp < 0.90 and bei_click < 0.90)
+    weak_traffic_signal = (bei_imp < 0.80 and bei_click < 0.80)
     strong_response = (bei_imp > 1.10 or bei_click > 1.10)
+    within_growth_budget = blended_drr <= (max_drr * 100 + 0.01)
+    materially_over_budget = blended_drr > (max_drr * 100 + (1.0 if is_growth_subject else 0.3))
+    near_limit = current_bid >= max_bid * 0.98 if max_bid > 0 else False
+    low_bid_vs_cap = current_bid <= max(max_bid * 0.82, comfort_bid * 0.95) if max_bid > 0 else current_bid <= comfort_bid * 0.95
+    order_growth_soft_ok = order_growth >= max(required_growth * 0.60, 2.0 if is_growth_subject else 3.0)
+    order_growth_good = order_growth >= max(required_growth, 4.0 if is_growth_subject else 3.0)
     rate_limit_flag = False
 
-    # Жёсткие блокировки
     if gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT:
         new_bid = MIN_CPC_RUB if payment_type == "cpc" else (MIN_CPM_RECOMMENDATIONS_RUB if row.get("placement") == "recommendations" else MIN_CPM_SEARCH_RUB)
         return "DOWN", round(min(current_bid, new_bid), 2), "Негативная экономика / рейтинг / выкуп", rate_limit_flag
 
-    # Если карточка не конвертит, ставку не увеличиваем.
-    if card_issue and current_bid > max(comfort_bid, 0):
-        return "DOWN", round(max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), 2), "Проблема в карточке / воронке", rate_limit_flag
-
-    # Уперлись в предел ставки, но позиция слабая и эффективность низкая.
-    if current_bid >= max_bid * 0.95 and weak_position and traffic_not_efficient:
+    if near_limit and weak_position and weak_traffic_signal and (materially_over_budget or order_growth < 0):
         rate_limit_flag = True
         return "LIMIT_REACHED", round(current_bid, 2), "Повысить эффективность ставки — реклама работает на пределе", rate_limit_flag
 
-    # Если blended DRR ушёл выше допустимого и роста заказов не хватило — снижаем.
-    if blended_drr > max_drr * 100 and order_growth < required_growth:
-        new_bid = max(comfort_bid, current_bid * (1 - DOWN_STEP_MED))
-        return "DOWN", round(new_bid, 2), f"Blended DRR {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов слабый", rate_limit_flag
+    if materially_over_budget and order_growth < required_growth:
+        if is_growth_subject and weak_position and blended_drr <= max_drr * 100 + 1.5 and order_growth_soft_ok:
+            return "HOLD", round(current_bid, 2), f"Ростовая категория: общий ДРР {blended_drr:.1f}% чуть выше лимита, наблюдаем эффект", rate_limit_flag
+        new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_MED)
+        return "DOWN", round(new_bid, 2), f"Общий ДРР {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов недостаточный", rate_limit_flag
 
-    # Growth-решение.
-    if weak_position and not card_issue:
-        if current_bid < comfort_bid and (order_growth >= required_growth or subject in GROWTH_SUBJECTS):
-            step = UP_STEP_BIG if subject in GROWTH_SUBJECTS else UP_STEP_MED
-            new_bid = min(comfort_bid, current_bid * (1 + step))
-            new_bid = max(new_bid, comfort_bid * 0.90 if current_bid == 0 else new_bid)
-            return "UP", round(new_bid, 2), "Слабая позиция, ставку можно подтянуть до комфортной", rate_limit_flag
-        if current_bid < max_bid and (order_growth >= required_growth or strong_response or subject in GROWTH_SUBJECTS):
-            step = UP_STEP_MED if subject in GROWTH_SUBJECTS else UP_STEP_SMALL
+    if weak_position:
+        if current_bid < comfort_bid and (is_growth_subject or order_growth_soft_ok or strong_response):
+            step = UP_STEP_BIG if is_growth_subject else UP_STEP_MED
+            new_bid = min(comfort_bid, current_bid * (1 + step) if current_bid > 0 else comfort_bid)
+            return "UP", round(new_bid, 2), "Слабая позиция: подтягиваем ставку к комфортной", rate_limit_flag
+        if current_bid < max_bid and (
+            (is_growth_subject and within_growth_budget and not weak_traffic_signal and (low_bid_vs_cap or order_growth_soft_ok))
+            or order_growth_good
+            or strong_response
+        ):
+            step = UP_STEP_MED if is_growth_subject else UP_STEP_SMALL
             new_bid = min(max_bid, current_bid * (1 + step))
             return "UP", round(new_bid, 2), "Есть запас по max-ставке и потенциал роста позиции", rate_limit_flag
 
-    # Выходной эксперимент для growth-категорий.
-    if subject in GROWTH_SUBJECTS and as_of_date.weekday() in config.experiment_weekdays:
-        if blended_drr <= max_drr * 100 and current_bid < experiment_bid and weak_position and (strong_response or order_growth >= required_growth):
+    if is_growth_subject and as_of_date.weekday() in config.experiment_weekdays:
+        if within_growth_budget and current_bid < experiment_bid and weak_position and (strong_response or order_growth_good):
             new_bid = min(experiment_bid, max(max_bid, current_bid * 1.15))
             return "TEST_UP", round(new_bid, 2), "Выходной эксперимент выше max для growth-категории", rate_limit_flag
 
-    # Если расходы растут, а заказы не растут адекватно — мягко снижаем.
-    if spend_growth > 0 and order_growth < required_growth:
-        new_bid = max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL))
-        return "DOWN", round(new_bid, 2), "Рост расходов не поддержан ростом заказов", rate_limit_flag
+    if card_issue and current_bid > comfort_bid:
+        if is_growth_subject and within_growth_budget and weak_position and not weak_traffic_signal:
+            return "HOLD", round(current_bid, 2), "Есть вопросы к карточке, но ростовую категорию пока не сушим", rate_limit_flag
+        return "DOWN", compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL), "Проблема в карточке / воронке", rate_limit_flag
 
-    # Если ставка выше max — возвращаем в диапазон.
-    if current_bid > max_bid:
+    if spend_growth > 0 and order_growth < required_growth:
+        if is_growth_subject and within_growth_budget:
+            if weak_position and not weak_traffic_signal:
+                return "HOLD", round(current_bid, 2), "Ростовая категория: ставку держим, наблюдаем общий эффект", rate_limit_flag
+            if near_limit and weak_traffic_signal:
+                new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL)
+                return "DOWN", round(new_bid, 2), "Ростовая категория: ставка высока, а трафик не реагирует", rate_limit_flag
+            return "HOLD", round(current_bid, 2), "Ростовая категория: заказов пока мало, но лимит ДРР ещё не исчерпан", rate_limit_flag
+        new_bid = compute_safe_down_bid(current_bid, comfort_bid, DOWN_STEP_SMALL)
+        return "DOWN", round(new_bid, 2), "Рост расходов не поддержан достаточным ростом заказов", rate_limit_flag
+
+    if current_bid > max_bid and max_bid > 0:
+        if is_growth_subject and within_growth_budget and weak_position and not weak_traffic_signal:
+            return "HOLD", round(current_bid, 2), "Ростовая категория: временно допускаем ставку выше расчётного max", rate_limit_flag
         return "DOWN", round(max_bid, 2), "Текущая ставка выше расчётного max", rate_limit_flag
 
-    # Если всё в порядке — держим.
+    if is_growth_subject and weak_position and within_growth_budget:
+        if low_bid_vs_cap and (strong_response or order_growth_soft_ok):
+            new_bid = min(max_bid, current_bid * (1 + UP_STEP_SMALL))
+            if new_bid > current_bid:
+                return "UP", round(new_bid, 2), "Ростовая категория в допустимом ДРР: мягко усиливаем ставку", rate_limit_flag
+        return "HOLD", round(current_bid, 2), "Ростовая категория в допустимом ДРР: ставку пока держим", rate_limit_flag
+
     return "HOLD", round(current_bid, 2), "Рабочий диапазон ставки", rate_limit_flag
 
 
@@ -1544,7 +1655,7 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     product_metrics["ad_drr_current_pct"] = product_metrics.apply(lambda x: pct(x["ad_spend_root_current"], x["ad_revenue_root_current"]), axis=1)
     product_metrics["order_growth_pct"] = product_metrics.apply(lambda x: pct(x["total_orders_current"] - x["total_orders_prev"], x["total_orders_prev"]) if x["total_orders_prev"] > 0 else (100.0 if x["total_orders_current"] > 0 else 0.0), axis=1)
     product_metrics["spend_growth_pct"] = product_metrics.apply(lambda x: pct(x["ad_spend_root_current"] - x["ad_spend_root_prev"], x["ad_spend_root_prev"]) if x["ad_spend_root_prev"] > 0 else (100.0 if x["ad_spend_root_current"] > 0 else 0.0), axis=1)
-    product_metrics["required_order_growth_pct"] = product_metrics.apply(lambda x: compute_required_growth(x["blended_drr_current_pct"], x["blended_drr_prev_pct"], x["spend_growth_pct"]), axis=1)
+    product_metrics["required_order_growth_pct"] = product_metrics.apply(lambda x: compute_required_growth(x["blended_drr_current_pct"], x["blended_drr_prev_pct"], x["spend_growth_pct"], x.get("subject_norm", "")), axis=1)
     product_metrics["drr_growth_pp"] = product_metrics["blended_drr_current_pct"] - product_metrics["blended_drr_prev_pct"]
 
     # Pull root metrics back to fact.
@@ -1556,15 +1667,24 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     tmp_for_eff["capture_click"] = tmp_for_eff.apply(lambda x: safe_float(x["ad_clicks_current"]) / safe_float(x["demand_week"]) if safe_float(x["demand_week"]) > 0 else 0.0, axis=1)
     tmp_for_eff["eff_imp"] = tmp_for_eff.apply(lambda x: x["capture_imp"] / safe_float(x["current_bid_rub"]) if safe_float(x["current_bid_rub"]) > 0 else 0.0, axis=1)
     tmp_for_eff["eff_click"] = tmp_for_eff.apply(lambda x: x["capture_click"] / safe_float(x["current_bid_rub"]) if safe_float(x["current_bid_rub"]) > 0 else 0.0, axis=1)
+    tmp_for_eff["current_ctr_pct"] = tmp_for_eff.apply(lambda x: pct(safe_float(x["ad_clicks_current"]), safe_float(x["ad_impressions_current"])) if safe_float(x["ad_impressions_current"]) > 0 else 0.0, axis=1)
     subject_eff = tmp_for_eff.groupby(["subject_norm", "placement"], as_index=False).agg(
         eff_imp_median=("eff_imp", "median"),
         eff_click_median=("eff_click", "median"),
+        placement_ctr_median_pct=("current_ctr_pct", "median"),
     )
+    subject_ctr = tmp_for_eff.groupby(["subject_norm"], as_index=False).agg(subject_ctr_median_pct=("current_ctr_pct", "median"))
 
     # Classify mode, compute bid caps, compute efficiency.
     out_rows = []
     for _, r in fact.iterrows():
         row = r.copy()
+        base_ctr = subject_eff[(subject_eff["subject_norm"] == row.get("subject_norm")) & (subject_eff["placement"] == row.get("placement"))]
+        if not base_ctr.empty:
+            row["placement_ctr_median_pct"] = safe_float(base_ctr.iloc[0].get("placement_ctr_median_pct", 0))
+        subj_ctr_row = subject_ctr[subject_ctr["subject_norm"] == row.get("subject_norm")]
+        if not subj_ctr_row.empty:
+            row["subject_ctr_median_pct"] = safe_float(subj_ctr_row.iloc[0].get("subject_ctr_median_pct", 0))
         mode, card_issue = classify_product_mode(row, subject_funnel_medians)
         row["mode"] = mode
         row["card_issue"] = card_issue
@@ -1696,6 +1816,148 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     }
 
 
+RUS_ACTION_MAP = {
+    "UP": "Повысить",
+    "DOWN": "Снизить",
+    "HOLD": "Без изменений",
+    "TEST_UP": "Тест выше max",
+    "LIMIT_REACHED": "Предел эффективности ставки",
+}
+
+
+def _bool_to_ru(v: Any) -> str:
+    return "Да" if bool(v) else "Нет"
+
+
+def _round_export_numbers(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_float_dtype(out[c]):
+            out[c] = out[c].round(2)
+    return out
+
+
+def localize_export_sheets(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    decisions = results["decisions"].copy()
+    decisions["action"] = decisions["action"].map(lambda x: RUS_ACTION_MAP.get(str(x), str(x)))
+    decisions["card_issue"] = decisions["card_issue"].map(_bool_to_ru)
+    decisions["rate_limit_flag"] = decisions["rate_limit_flag"].map(_bool_to_ru)
+    decisions = decisions.rename(columns={
+        "run_date": "Дата расчёта", "id_campaign": "ID кампании", "nm_id": "Артикул WB", "supplier_article": "Артикул продавца",
+        "product_root": "Товар", "subject": "Предмет", "placement": "Плейсмент", "payment_type": "Тип оплаты",
+        "current_bid_rub": "Текущая ставка, ₽", "comfort_bid_rub": "Комфортная ставка, ₽", "max_bid_rub": "Максимальная ставка, ₽",
+        "experiment_bid_rub": "Экспериментальная ставка, ₽", "action": "Решение", "new_bid_rub": "Новая ставка, ₽",
+        "reason": "Обоснование", "mode": "Режим товара", "current_blended_drr_pct": "Общий ДРР, %", "total_orders": "Все заказы товара",
+        "ad_orders": "Рекламные заказы", "bid_eff_index_imp": "Индекс эффективности ставки по показам", "bid_eff_index_click": "Индекс эффективности ставки по кликам",
+        "median_position": "Медианная позиция", "visibility_pct": "Видимость, %", "demand_week": "Спрос по запросам, неделя",
+        "gp_realized": "Валовая прибыль на реализованный заказ, ₽", "order_growth_pct": "Рост заказов, %",
+        "required_order_growth_pct": "Требуемый рост заказов, %", "spend_growth_pct": "Рост расходов, %", "drr_growth_pp": "Рост общего ДРР, п.п.",
+        "card_issue": "Проблема карточки", "rate_limit_flag": "Предел эффективности ставки"
+    })
+
+    logic = results["logic"].copy()
+    logic["action"] = logic["action"].map(lambda x: RUS_ACTION_MAP.get(str(x), str(x)))
+    for bcol in ["card_issue", "rate_limit_flag"]:
+        if bcol in logic.columns:
+            logic[bcol] = logic[bcol].map(_bool_to_ru)
+    logic = logic.rename(columns={
+        "advert_id": "ID кампании", "nmId": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар", "subject": "Предмет",
+        "placement": "Плейсмент", "payment_type": "Тип оплаты", "mode": "Режим товара", "current_bid_rub": "Текущая ставка, ₽",
+        "comfort_bid_rub": "Комфортная ставка, ₽", "max_bid_rub": "Максимальная ставка, ₽", "experiment_bid_rub": "Экспериментальная ставка, ₽",
+        "action": "Решение", "new_bid_rub": "Новая ставка, ₽", "reason": "Обоснование", "ad_impressions_current": "Показы рекламы",
+        "ad_clicks_current": "Клики рекламы", "ad_orders_current": "Рекламные заказы", "ad_spend_current": "Расход рекламы, ₽", "ad_revenue_current": "Рекламная выручка, ₽",
+        "root_total_orders_current": "Все заказы товара", "root_total_revenue_current": "Вся выручка товара, ₽", "ad_spend_root_current": "Общий рекламный расход товара, ₽",
+        "blended_drr_current_pct": "Общий ДРР, %", "ad_drr_current_pct": "Рекламный ДРР, %", "root_total_orders_prev": "Все заказы товара, база",
+        "root_total_revenue_prev": "Вся выручка товара, база, ₽", "ad_spend_root_prev": "Общий рекламный расход товара, база, ₽", "blended_drr_prev_pct": "Общий ДРР, база, %",
+        "order_growth_pct": "Рост заказов, %", "spend_growth_pct": "Рост расходов, %", "required_order_growth_pct": "Требуемый рост заказов, %",
+        "drr_growth_pp": "Рост общего ДРР, п.п.", "gp_realized": "Валовая прибыль на реализованный заказ, ₽", "buyout_rate": "Процент выкупа, доля",
+        "rating_reviews": "Рейтинг отзывов", "rating_card": "Рейтинг карточки", "median_position": "Медианная позиция", "visibility_pct": "Видимость, %",
+        "openCardCount": "Открытия карточки", "addToCartCount": "Добавления в корзину", "ordersCount": "Заказы воронки", "buyoutsCount": "Выкупы",
+        "addToCartConversion": "Конверсия в корзину, %", "cartToOrderConversion": "Конверсия корзина→заказ, %", "buyoutPercent": "Выкуп по воронке, %",
+        "demand_week": "Спрос по запросам, неделя", "keyword_clicks": "Клики по ключам", "keyword_orders": "Заказы по ключам", "capture_imp": "Доля захваченных показов",
+        "capture_click": "Доля захваченных кликов", "eff_imp": "Эффективность ставки по показам", "eff_click": "Эффективность ставки по кликам",
+        "bei_imp": "Индекс эффективности ставки по показам", "bei_click": "Индекс эффективности ставки по кликам", "card_issue": "Проблема карточки",
+        "rate_limit_flag": "Предел эффективности ставки", "effect_flag": "Статус оценки прошлых изменений", "effect_comment": "Комментарий по прошлым изменениям",
+        "bid_delta_pct": "Последнее изменение ставки, %"
+    })
+
+    product = results["product"].copy().rename(columns={
+        "product_root": "Товар", "subject_norm": "Предмет", "total_orders_current": "Все заказы товара", "total_revenue_current": "Вся выручка товара, ₽",
+        "total_orders_prev": "Все заказы товара, база", "total_revenue_prev": "Вся выручка товара, база, ₽", "ad_spend_root_current": "Общий рекламный расход, ₽",
+        "ad_revenue_root_current": "Рекламная выручка, ₽", "ad_orders_root_current": "Рекламные заказы", "ad_clicks_root_current": "Рекламные клики",
+        "ad_spend_root_prev": "Общий рекламный расход, база, ₽", "blended_drr_current_pct": "Общий ДРР, %", "blended_drr_prev_pct": "Общий ДРР, база, %",
+        "ad_drr_current_pct": "Рекламный ДРР, %", "order_growth_pct": "Рост заказов, %", "spend_growth_pct": "Рост расходов, %",
+        "required_order_growth_pct": "Требуемый рост заказов, %", "drr_growth_pp": "Рост общего ДРР, п.п.", "sku_rows": "Число рекламных строк",
+        "growth_rows": "Строк growth", "limit_rows": "Строк на пределе ставки", "comment": "Комментарий"
+    })
+
+    weak = results["weak"].copy()
+    if not weak.empty:
+        weak["action"] = weak["action"].map(lambda x: RUS_ACTION_MAP.get(str(x), str(x)))
+    weak = weak.rename(columns={
+        "run_date": "Дата расчёта", "id_campaign": "ID кампании", "nm_id": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар",
+        "subject": "Предмет", "placement": "Плейсмент", "payment_type": "Тип оплаты", "current_bid_rub": "Текущая ставка, ₽",
+        "comfort_bid_rub": "Комфортная ставка, ₽", "max_bid_rub": "Максимальная ставка, ₽", "experiment_bid_rub": "Экспериментальная ставка, ₽",
+        "action": "Решение", "new_bid_rub": "Новая ставка, ₽", "reason": "Обоснование", "mode": "Режим товара", "current_blended_drr_pct": "Общий ДРР, %",
+        "total_orders": "Все заказы товара", "ad_orders": "Рекламные заказы", "bid_eff_index_imp": "Индекс эффективности ставки по показам",
+        "bid_eff_index_click": "Индекс эффективности ставки по кликам", "median_position": "Медианная позиция", "visibility_pct": "Видимость, %",
+        "demand_week": "Спрос по запросам, неделя", "gp_realized": "Валовая прибыль на реализованный заказ, ₽", "order_growth_pct": "Рост заказов, %",
+        "required_order_growth_pct": "Требуемый рост заказов, %", "spend_growth_pct": "Рост расходов, %", "drr_growth_pp": "Рост общего ДРР, п.п.", "comment": "Комментарий"
+    })
+
+    limits = results["limits"].copy().rename(columns={
+        "advert_id": "ID кампании", "nmId": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар", "subject": "Предмет",
+        "placement": "Плейсмент", "payment_type": "Тип оплаты", "mode": "Режим товара", "current_bid_rub": "Текущая ставка, ₽",
+        "comfort_bid_rub": "Комфортная ставка, ₽", "max_bid_rub": "Максимальная ставка, ₽", "experiment_bid_rub": "Экспериментальная ставка, ₽",
+        "clicks_per_ad_order": "Кликов на 1 рекламный заказ", "clicks_per_total_order": "Кликов на 1 общий заказ товара", "comfort_cpo": "Комфортная стоимость заказа, ₽",
+        "max_cpo": "Максимальная стоимость заказа, ₽", "gp_realized": "Валовая прибыль на реализованный заказ, ₽", "ctr_est": "Оценочный CTR, %",
+        "applied_comfort_cpc": "Комфортная ставка CPC, ₽", "applied_max_cpc": "Максимальная ставка CPC, ₽"
+    })
+
+    eff = results["eff"].copy()
+    if not eff.empty:
+        eff["action"] = eff["action"].map(lambda x: RUS_ACTION_MAP.get(str(x), str(x)))
+    eff = eff.rename(columns={
+        "advert_id": "ID кампании", "nmId": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар", "subject": "Предмет",
+        "placement": "Плейсмент", "current_bid_rub": "Текущая ставка, ₽", "demand_week": "Спрос по запросам, неделя", "ad_impressions_current": "Показы рекламы",
+        "ad_clicks_current": "Клики рекламы", "capture_imp": "Доля захваченных показов", "capture_click": "Доля захваченных кликов",
+        "eff_imp": "Эффективность ставки по показам", "eff_click": "Эффективность ставки по кликам", "bei_imp": "Индекс эффективности ставки по показам",
+        "bei_click": "Индекс эффективности ставки по кликам", "median_position": "Медианная позиция", "visibility_pct": "Видимость, %", "action": "Решение", "reason": "Обоснование"
+    })
+
+    effects = results["effects"].copy().rename(columns={
+        "placement": "Плейсмент", "recent_changes": "Число последних изменений", "last_bid_change_dt": "Дата последнего изменения",
+        "last_bid_rub": "Последняя ставка, ₽", "prev_bid_rub": "Предыдущая ставка, ₽", "bid_delta_pct": "Изменение ставки, %",
+        "effect_flag": "Статус оценки", "effect_comment": "Комментарий"
+    })
+
+    # Чистим дубли и приводим ключевые идентификаторы к строкам.
+    for frame in [decisions, logic, weak, limits, eff]:
+        for key_col in ["Товар", "Артикул продавца", "Плейсмент", "Предмет"]:
+            if key_col in frame.columns:
+                frame[key_col] = frame[key_col].fillna("").astype(str)
+
+    product = product.drop(columns=[c for c in ["sku_count_x", "sku_count_y", "ad_revenue_root_prev", "ad_orders_root_prev", "ad_clicks_root_prev", "subject"] if c in product.columns])
+    if "Товар" in product.columns:
+        product["Товар"] = product["Товар"].fillna("").astype(str)
+
+    window = results["window"].copy().rename(columns={
+        "as_of_date": "Дата расчёта", "current_start": "Начало текущего зрелого окна", "current_end": "Конец текущего зрелого окна",
+        "prev_start": "Начало базового окна", "prev_end": "Конец базового окна"
+    })
+
+    return {
+        "Решения_по_ставкам": _round_export_numbers(decisions),
+        "Расчёт_логики": _round_export_numbers(logic),
+        "Статистика_по_товарам": _round_export_numbers(product),
+        "Эффективность_ставки": _round_export_numbers(eff),
+        "Слабая_позиция": _round_export_numbers(weak),
+        "Эффект_изменений": _round_export_numbers(effects),
+        "Лимиты_ставок": _round_export_numbers(limits),
+        "Окно_анализа": window,
+    }
+
+
 # ======================================================================================
 # SAVE / REPORT
 # ======================================================================================
@@ -1722,23 +1984,14 @@ def save_outputs(provider: BaseProvider, results: Dict[str, pd.DataFrame], mode:
     effects = results["effects"].copy()
     window_df = results["window"].copy()
 
-    preview_sheets = {
-        "Решения_по_ставкам": decisions,
-        "Расчёт_логики": logic,
-        "Статистика_по_товарам": product,
-        "Эффективность_ставки": eff,
-        "Слабая_позиция": weak,
-        "Эффект_изменений": effects,
-        "Лимиты_ставок": limits,
-        "Окно_анализа": window_df,
-    }
+    preview_sheets = localize_export_sheets(results)
     provider.write_excel(SERVICE_PREVIEW_KEY, preview_sheets)
 
-    provider.write_excel(SERVICE_LIMITS_KEY, {"limits": limits})
-    provider.write_excel(SERVICE_PRODUCT_KEY, {"product_root": product})
-    provider.write_excel(SERVICE_EFF_KEY, {"efficiency": eff})
-    provider.write_excel(SERVICE_WEAK_KEY, {"weak_positions": weak})
-    provider.write_excel(SERVICE_EFFECTS_KEY, {"effects": effects})
+    provider.write_excel(SERVICE_LIMITS_KEY, {"Лимиты ставок": preview_sheets["Лимиты_ставок"]})
+    provider.write_excel(SERVICE_PRODUCT_KEY, {"Статистика по товарам": preview_sheets["Статистика_по_товарам"]})
+    provider.write_excel(SERVICE_EFF_KEY, {"Эффективность ставки": preview_sheets["Эффективность_ставки"]})
+    provider.write_excel(SERVICE_WEAK_KEY, {"Слабая позиция": preview_sheets["Слабая_позиция"]})
+    provider.write_excel(SERVICE_EFFECTS_KEY, {"Эффект изменений": preview_sheets["Эффект_изменений"]})
 
     summary = {
         "generated_at": datetime.now().isoformat(),
