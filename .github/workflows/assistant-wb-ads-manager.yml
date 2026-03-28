@@ -1,39 +1,105 @@
-name: Assistant WB Ads Manager
+name: assistant_wb_ads_manager
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска'
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - run
+      confirm_live:
+        description: 'Подтвердить live-отправку ставок (нужно только для mode=run)'
+        required: false
+        type: boolean
+        default: false
+      as_of_date:
+        description: 'Дата запуска в формате YYYY-MM-DD (необязательно)'
+        required: false
+        type: string
+        default: ''
   schedule:
-    # Каждый день в 08:00, 11:00, 14:00, 17:00, 20:00 по UTC
-    # При необходимости поменяешь
-    - cron: '0 8,11,14,17,20 * * *'
+    # 03:15 UTC = 06:15 Москва
+    - cron: '15 3 * * *'
+
+concurrency:
+  group: assistant-wb-ads-manager-topface
+  cancel-in-progress: false
 
 jobs:
-  run-assistant-wb-ads-manager:
+  preview_daily:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    permissions:
+      contents: read
     env:
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl boto3 pytz requests
+          pip install boto3 pandas openpyxl requests botocore
 
-      - name: Check script exists
-        run: test -f assistant_wb_ads_manager.py
+      - name: Run preview (scheduled safe mode)
+        run: |
+          python assistant_wb_ads_manager.py preview
 
-      - name: Run assistant_wb_ads_manager
-        run: python assistant_wb_ads_manager.py run
+  manual_run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pandas openpyxl requests botocore
+
+      - name: Validate live confirmation
+        if: ${{ inputs.mode == 'run' && inputs.confirm_live != true }}
+        run: |
+          echo 'Для mode=run нужно поставить confirm_live=true'
+          exit 1
+
+      - name: Run selected mode without as_of_date
+        if: ${{ inputs.as_of_date == '' }}
+        run: |
+          python assistant_wb_ads_manager.py ${{ inputs.mode }}
+
+      - name: Run selected mode with as_of_date
+        if: ${{ inputs.as_of_date != '' }}
+        run: |
+          python assistant_wb_ads_manager.py ${{ inputs.mode }} --as-of-date "${{ inputs.as_of_date }}"
