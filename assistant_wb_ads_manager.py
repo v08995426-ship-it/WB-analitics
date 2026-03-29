@@ -1361,10 +1361,25 @@ def build_shade_universe(fact_df: pd.DataFrame) -> pd.DataFrame:
 def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFrame, decisions_base: pd.DataFrame) -> pd.DataFrame:
     if campaigns_df.empty or shade_universe.empty:
         return pd.DataFrame()
-    base = campaigns_df.rename(columns={"ID кампании":"advert_id","Артикул WB":"nmId"}).copy()
+    base = campaigns_df.copy()
+    rename_map = {}
+    if "advert_id" not in base.columns:
+        for candidate in ["ID кампании", "id_campaign", "advertId", "advert"]:
+            if candidate in base.columns:
+                rename_map[candidate] = "advert_id"
+                break
+    if "nmId" not in base.columns:
+        for candidate in ["Артикул WB", "nm_id", "nmID"]:
+            if candidate in base.columns:
+                rename_map[candidate] = "nmId"
+                break
+    if rename_map:
+        base = base.rename(columns=rename_map)
+    if "advert_id" not in base.columns or "nmId" not in base.columns:
+        return pd.DataFrame()
     keep = [c for c in ["advert_id","nmId","payment_type","bid_type","status_norm","Название предмета"] if c in base.columns]
     base = base[keep].copy().merge(shade_universe, on="nmId", how="left")
-    if decisions_base is not None and not decisions_base.empty:
+    if decisions_base is not None and not decisions_base.empty and {"advert_id","nmId"}.issubset(decisions_base.columns):
         placement_map = decisions_base.groupby(["advert_id","nmId"], as_index=False).agg(placement=("placement", lambda s: ",".join(sorted(set(map(str,s))))), current_bid_rub=("current_bid_rub","max"))
         base = base.merge(placement_map, on=["advert_id","nmId"], how="left")
     base["subject"] = base["subject"].fillna(base.get("Название предмета",""))
@@ -1375,6 +1390,8 @@ def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFra
         g["shade_status"] = g["nmId"].map(lambda x: "CORE" if safe_int(x) == core_nm else "WORKING")
         g["core_nm_id"] = core_nm
         return g
+    if base.empty:
+        return base
     return base.groupby("advert_id", group_keys=False).apply(_pick_core).reset_index(drop=True)
 
 
@@ -1397,6 +1414,13 @@ def build_shade_actions(provider: BaseProvider, shade_portfolio: pd.DataFrame, s
         return pd.DataFrame(), existing_tests
     actions=[]; reserved_by_root={}
     portfolio = shade_portfolio.copy()
+    if "advert_id" not in portfolio.columns:
+        for candidate in ["ID кампании", "id_campaign", "advertId", "advert"]:
+            if candidate in portfolio.columns:
+                portfolio = portfolio.rename(columns={candidate: "advert_id"})
+                break
+    if "advert_id" not in portfolio.columns:
+        return pd.DataFrame(), existing_tests
     portfolio["subject_norm"] = portfolio["subject_norm"].fillna(portfolio["subject"].map(canonical_subject))
     for advert_id, g in portfolio.groupby("advert_id"):
         subject = canonical_subject(g["subject_norm"].iloc[0])
