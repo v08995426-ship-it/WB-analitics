@@ -1361,7 +1361,17 @@ def build_shade_universe(fact_df: pd.DataFrame) -> pd.DataFrame:
 def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFrame, decisions_base: pd.DataFrame) -> pd.DataFrame:
     if campaigns_df.empty or shade_universe.empty:
         return pd.DataFrame()
-    base = campaigns_df.rename(columns={"ID кампании":"advert_id","Артикул WB":"nmId"}).copy()
+    base = campaigns_df.rename(columns={
+        "ID кампании": "advert_id",
+        "id_campaign": "advert_id",
+        "advertId": "advert_id",
+        "advert": "advert_id",
+        "Артикул WB": "nmId",
+        "nm_id": "nmId",
+        "nmID": "nmId",
+    }).copy()
+    if "advert_id" not in base.columns or "nmId" not in base.columns:
+        return pd.DataFrame()
     keep = [c for c in ["advert_id","nmId","payment_type","bid_type","status_norm","Название предмета"] if c in base.columns]
     base = base[keep].copy().merge(shade_universe, on="nmId", how="left")
     if decisions_base is not None and not decisions_base.empty:
@@ -1397,7 +1407,23 @@ def build_shade_actions(provider: BaseProvider, shade_portfolio: pd.DataFrame, s
         return pd.DataFrame(), existing_tests
     actions=[]; reserved_by_root={}
     portfolio = shade_portfolio.copy()
-    portfolio["subject_norm"] = portfolio["subject_norm"].fillna(portfolio["subject"].map(canonical_subject))
+    portfolio = portfolio.rename(columns={
+        "ID кампании": "advert_id",
+        "id_campaign": "advert_id",
+        "advertId": "advert_id",
+        "advert": "advert_id",
+        "Артикул WB": "nmId",
+        "nm_id": "nmId",
+        "nmID": "nmId",
+    })
+    if "advert_id" not in portfolio.columns:
+        return pd.DataFrame(), existing_tests
+    if "subject" not in portfolio.columns:
+        portfolio["subject"] = ""
+    if "subject_norm" not in portfolio.columns:
+        portfolio["subject_norm"] = portfolio["subject"].map(canonical_subject)
+    else:
+        portfolio["subject_norm"] = portfolio["subject_norm"].fillna(portfolio["subject"].map(canonical_subject))
     for advert_id, g in portfolio.groupby("advert_id"):
         subject = canonical_subject(g["subject_norm"].iloc[0])
         if subject not in GROWTH_SUBJECTS:
