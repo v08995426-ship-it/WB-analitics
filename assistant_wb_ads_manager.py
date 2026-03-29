@@ -1007,10 +1007,21 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     ads_base_article = aggregate_ads_control(ads_daily, window["base_start"], window["base_end"], master, "supplier_article").rename(columns={
         "ad_spend":"base_ad_spend","ad_clicks":"base_ad_clicks","ad_orders":"base_ad_orders","ad_impressions":"base_ad_impressions","base_ad_revenue":"ad_revenue","ad_revenue":"base_ad_revenue"})
 
-    # attach based on control type
+    # attach based on control type (safe merges without duplicate key columns)
     root_rows = rows["subject_norm"].isin(GROWTH_SUBJECTS)
-    growth_part = rows[root_rows].merge(orders_cur_root, left_on="control_key", right_on="product_root", how="left").merge(orders_base_root, left_on="control_key", right_on="product_root", how="left", suffixes=("","_b")).merge(ads_cur_root, left_on="control_key", right_on="product_root", how="left").merge(ads_base_root, left_on="control_key", right_on="product_root", how="left", suffixes=("","_ab"))
-    brush_part = rows[~root_rows].merge(orders_cur_article, left_on="control_key", right_on="supplier_article", how="left").merge(orders_base_article, left_on="control_key", right_on="supplier_article", how="left", suffixes=("","_b")).merge(ads_cur_article, left_on="control_key", right_on="supplier_article", how="left").merge(ads_base_article, left_on="control_key", right_on="supplier_article", how="left", suffixes=("","_ab"))
+
+    growth_part = rows[root_rows].copy()
+    growth_part = growth_part.merge(orders_cur_root.rename(columns={"product_root": "control_key"}), on="control_key", how="left")
+    growth_part = growth_part.merge(orders_base_root.rename(columns={"product_root": "control_key"}), on="control_key", how="left")
+    growth_part = growth_part.merge(ads_cur_root.rename(columns={"product_root": "control_key"}), on="control_key", how="left")
+    growth_part = growth_part.merge(ads_base_root.rename(columns={"product_root": "control_key"}), on="control_key", how="left")
+
+    brush_part = rows[~root_rows].copy()
+    brush_part = brush_part.merge(orders_cur_article.rename(columns={"supplier_article": "control_key"}), on="control_key", how="left")
+    brush_part = brush_part.merge(orders_base_article.rename(columns={"supplier_article": "control_key"}), on="control_key", how="left")
+    brush_part = brush_part.merge(ads_cur_article.rename(columns={"supplier_article": "control_key"}), on="control_key", how="left")
+    brush_part = brush_part.merge(ads_base_article.rename(columns={"supplier_article": "control_key"}), on="control_key", how="left")
+
     rows = pd.concat([growth_part, brush_part], ignore_index=True, sort=False).fillna(0)
 
     rows = rows.merge(keywords_current, on=["nmId","supplier_article"], how="left")
