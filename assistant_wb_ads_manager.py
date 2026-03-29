@@ -73,19 +73,19 @@ KEYWORDS_WEEKLY_PREFIX = f"Отчёты/Поисковые запросы/{STORE
 ADS_HISTORY_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/История_рекламы_14дней.xlsx"
 
 SERVICE_ROOT = f"Служебные файлы/Ассистент WB/{STORE_NAME}/"
-SERVICE_PREVIEW_KEY = SERVICE_ROOT + "preview_last_run.xlsx"
-SERVICE_SUMMARY_KEY = SERVICE_ROOT + "last_run_summary.json"
-SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "decision_archive.xlsx"
+SERVICE_PREVIEW_KEY = SERVICE_ROOT + "Предпросмотр_последнего_запуска.xlsx"
+SERVICE_SUMMARY_KEY = SERVICE_ROOT + "Сводка_последнего_запуска.json"
+SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "Архив_решений.xlsx"
 SERVICE_BID_HISTORY_KEY = SERVICE_ROOT + "bid_history.xlsx"
-SERVICE_LIMITS_KEY = SERVICE_ROOT + "bid_limits_daily.xlsx"
-SERVICE_PRODUCT_KEY = SERVICE_ROOT + "product_root_metrics.xlsx"
-SERVICE_EFF_KEY = SERVICE_ROOT + "bid_efficiency_daily.xlsx"
-SERVICE_WEAK_KEY = SERVICE_ROOT + "weak_position_priority.xlsx"
-SERVICE_EFFECTS_KEY = SERVICE_ROOT + "change_effects.xlsx"
+SERVICE_LIMITS_KEY = SERVICE_ROOT + "Лимиты_ставок_ежедневно.xlsx"
+SERVICE_PRODUCT_KEY = SERVICE_ROOT + "Метрики_по_товарам.xlsx"
+SERVICE_EFF_KEY = SERVICE_ROOT + "Эффективность_ставки_ежедневно.xlsx"
+SERVICE_WEAK_KEY = SERVICE_ROOT + "Слабые_позиции_приоритет.xlsx"
+SERVICE_EFFECTS_KEY = SERVICE_ROOT + "Эффект_изменений.xlsx"
 SERVICE_EXPERIMENTS_KEY = SERVICE_ROOT + "bid_experiments.xlsx"
-SERVICE_SHADE_PORTFOLIO_KEY = SERVICE_ROOT + "shade_portfolio.xlsx"
-SERVICE_SHADE_ACTIONS_KEY = SERVICE_ROOT + "shade_actions.xlsx"
-SERVICE_SHADE_TESTS_KEY = SERVICE_ROOT + "shade_tests.xlsx"
+SERVICE_SHADE_PORTFOLIO_KEY = SERVICE_ROOT + "Состав_кампаний_по_оттенкам.xlsx"
+SERVICE_SHADE_ACTIONS_KEY = SERVICE_ROOT + "Рекомендации_по_оттенкам.xlsx"
+SERVICE_SHADE_TESTS_KEY = SERVICE_ROOT + "Тесты_оттенков.xlsx"
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
     "expansion_cap": 2.5,
     "max_experiment_days_per_year": 2,
     "experiment_weekdays": [5, 6],  # Saturday, Sunday
-    "preview_filename": "preview_last_run.xlsx",
+    "preview_filename": "Предпросмотр_последнего_запуска.xlsx",
 }
 
 
