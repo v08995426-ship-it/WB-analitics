@@ -73,24 +73,19 @@ KEYWORDS_WEEKLY_PREFIX = f"Отчёты/Поисковые запросы/{STORE
 ADS_HISTORY_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/История_рекламы_14дней.xlsx"
 
 SERVICE_ROOT = f"Служебные файлы/Ассистент WB/{STORE_NAME}/"
-SERVICE_PREVIEW_KEY = SERVICE_ROOT + "Предпросмотр_последнего_запуска.xlsx"
-SERVICE_SUMMARY_KEY = SERVICE_ROOT + "Сводка_последнего_запуска.json"
-SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "Архив_решений.xlsx"
-SERVICE_BID_HISTORY_KEY = SERVICE_ROOT + "История_ставок.xlsx"
-SERVICE_LIMITS_KEY = SERVICE_ROOT + "Лимиты_ставок_ежедневно.xlsx"
-SERVICE_PRODUCT_KEY = SERVICE_ROOT + "Метрики_по_товарам.xlsx"
-SERVICE_EFF_KEY = SERVICE_ROOT + "Эффективность_ставки_ежедневно.xlsx"
-SERVICE_WEAK_KEY = SERVICE_ROOT + "Слабые_позиции_приоритет.xlsx"
-SERVICE_EFFECTS_KEY = SERVICE_ROOT + "Эффект_изменений.xlsx"
-SERVICE_EXPERIMENTS_KEY = SERVICE_ROOT + "Эксперименты_ставок.xlsx"
-SERVICE_SHADE_ACTIONS_KEY = SERVICE_ROOT + "Рекомендации_по_оттенкам.xlsx"
-SERVICE_SHADE_PORTFOLIO_KEY = SERVICE_ROOT + "Состав_кампаний_по_оттенкам.xlsx"
-SERVICE_SHADE_TESTS_KEY = SERVICE_ROOT + "Тесты_оттенков.xlsx"
-SERVICE_BENCHMARKS_KEY = SERVICE_ROOT + "Сравнение_с_сильными_РК.xlsx"
+SERVICE_PREVIEW_KEY = SERVICE_ROOT + "preview_last_run.xlsx"
+SERVICE_SUMMARY_KEY = SERVICE_ROOT + "last_run_summary.json"
+SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "decision_archive.xlsx"
+SERVICE_BID_HISTORY_KEY = SERVICE_ROOT + "bid_history.xlsx"
+SERVICE_LIMITS_KEY = SERVICE_ROOT + "bid_limits_daily.xlsx"
+SERVICE_PRODUCT_KEY = SERVICE_ROOT + "product_root_metrics.xlsx"
+SERVICE_EFF_KEY = SERVICE_ROOT + "bid_efficiency_daily.xlsx"
+SERVICE_WEAK_KEY = SERVICE_ROOT + "weak_position_priority.xlsx"
+SERVICE_EFFECTS_KEY = SERVICE_ROOT + "change_effects.xlsx"
+SERVICE_EXPERIMENTS_KEY = SERVICE_ROOT + "bid_experiments.xlsx"
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
-WB_NMS_URL = "https://advert-api.wildberries.ru/adv/v0/auction/nms"
 
 ACTIVE_STATUS_VALUES = {"активна", "active", "запущена", "started", "4", "9", "11"}
 
@@ -105,10 +100,6 @@ MIN_RATING = 4.5
 GOOD_RATING = 4.7
 MIN_BUYOUT = 0.75
 GOOD_BUYOUT = 0.85
-MIN_SHADE_RATING = 4.6
-SHADE_TEST_MIN_IMPRESSIONS = 4000
-SHADE_TEST_MIN_DAYS = 5
-SHADE_TEST_COOLDOWN_DAYS = 21
 
 # Шаги изменения ставок
 UP_STEP_SMALL = 0.05
@@ -148,7 +139,7 @@ DEFAULT_CONFIG = {
     "expansion_cap": 2.5,
     "max_experiment_days_per_year": 2,
     "experiment_weekdays": [5, 6],  # Saturday, Sunday
-    "preview_filename": "Предпросмотр_последнего_запуска.xlsx",
+    "preview_filename": "preview_last_run.xlsx",
 }
 
 
@@ -219,24 +210,6 @@ def daterange(start: date, end: date) -> Iterable[date]:
 
 def current_local_date() -> date:
     return datetime.now().date()
-
-
-def parse_placement_types(value: Any, fallback: str = "search") -> List[str]:
-    raw = str(value or "").strip().lower()
-    if not raw:
-        return [fallback]
-    raw = raw.replace("recommendation", "recommendations")
-    tokens = re.split(r"[,;/|]+", raw)
-    out: List[str] = []
-    for t in tokens:
-        t = t.strip()
-        if t in {"search", "combined", "recommendations"} and t not in out:
-            out.append(t)
-    return out or [fallback]
-
-
-def human_subject(value: Any) -> str:
-    return str(value or "").strip()
 
 
 def iso_week_label(dt: date) -> str:
@@ -1280,32 +1253,11 @@ def expand_bid_history_to_placements(history: pd.DataFrame) -> pd.DataFrame:
 
 
 def evaluate_recent_bid_effects(history_placements: pd.DataFrame, metrics: pd.DataFrame, current_window: AnalysisWindow) -> pd.DataFrame:
-    """Лёгкая оценка последних изменений ставок. Если зрелого сравнения нет, всё равно возвращаем историю последних правок,
-    чтобы файл не был пустым и было видно, что именно менять оценивать позже."""
-    columns = ["ID кампании", "Артикул WB", "placement", "recent_changes", "last_bid_change_dt", "last_bid_rub", "prev_bid_rub", "bid_delta_pct", "effect_flag", "effect_comment"]
-    if metrics.empty:
-        return pd.DataFrame(columns=columns)
-    if history_placements.empty:
-        # Возвращаем заглушку по строкам, где есть изменение ставки в текущем решении
-        rows = []
-        for _, r in metrics.iterrows():
-            current = safe_float(r.get("current_bid_rub", 0))
-            new = safe_float(r.get("new_bid_rub", current))
-            if abs(new - current) < 0.01:
-                continue
-            rows.append({
-                "ID кампании": safe_int(r.get("advert_id", 0)),
-                "Артикул WB": safe_int(r.get("nmId", 0)),
-                "placement": str(r.get("placement", "search")),
-                "recent_changes": 1,
-                "last_bid_change_dt": pd.NaT,
-                "last_bid_rub": new,
-                "prev_bid_rub": current,
-                "bid_delta_pct": round(pct(new - current, current) if current > 0 else 0.0, 2),
-                "effect_flag": "planned",
-                "effect_comment": "Изменение запланировано, зрелого окна после изменения ещё нет",
-            })
-        return pd.DataFrame(rows, columns=columns)
+    """Простая оценка последних изменений ставок: baseline предыдущие 3 зрелых дня, test текущие 3 зрелых дня.
+    Нужен не для идеальной каузальности, а чтобы отлавливать пустые повышения.
+    """
+    if history_placements.empty or metrics.empty:
+        return pd.DataFrame(columns=["ID кампании", "Артикул WB", "placement", "recent_changes", "last_bid_change_dt", "last_bid_rub", "prev_bid_rub", "bid_delta_pct", "effect_flag", "effect_comment"])
 
     rows = []
     latest_changes = history_placements.groupby(["ID кампании", "Артикул WB", "placement"], as_index=False).tail(2)
@@ -1321,9 +1273,6 @@ def evaluate_recent_bid_effects(history_placements: pd.DataFrame, metrics: pd.Da
         if bid_delta_pct > 2:
             effect_flag = "pending"
             effect_comment = "Нужно сравнить влияние по зрелому окну"
-        elif bid_delta_pct < -2:
-            effect_flag = "pending"
-            effect_comment = "Снижение ставки — ждём зрелое окно для оценки"
         rows.append({
             "ID кампании": int(advert),
             "Артикул WB": int(nm_id),
@@ -1336,8 +1285,7 @@ def evaluate_recent_bid_effects(history_placements: pd.DataFrame, metrics: pd.Da
             "effect_flag": effect_flag,
             "effect_comment": effect_comment,
         })
-    return pd.DataFrame(rows, columns=columns)
-
+    return pd.DataFrame(rows)
 
 
 def count_experiment_days_this_year(provider: BaseProvider, product_root: str, year: int) -> int:
@@ -1353,291 +1301,134 @@ def count_experiment_days_this_year(provider: BaseProvider, product_root: str, y
     return int(df[(df["product_root"] == product_root) & (pd.Series(df["date"]).apply(lambda x: x.year if pd.notna(x) else None) == year)].shape[0])
 
 
-def build_subject_benchmarks(decisions_base: pd.DataFrame) -> pd.DataFrame:
-    if decisions_base.empty:
-        return pd.DataFrame(columns=["subject_norm","placement","peer_capture_imp_median","peer_capture_click_median","peer_eff_imp_median","peer_eff_click_median","peer_ctr_median_pct","peer_total_orders_median"])
-    df = decisions_base.copy()
-    df["current_ctr_pct"] = df.apply(lambda x: pct(safe_float(x.get("ad_clicks_current", 0)), safe_float(x.get("ad_impressions_current", 0))) if safe_float(x.get("ad_impressions_current", 0)) > 0 else 0.0, axis=1)
-    rows=[]
-    for (subject, placement), g in df.groupby(["subject_norm","placement"]):
-        cap = get_blended_caps(subject, ManagerConfig())[1] * 100.0
-        good = g[g["blended_drr_current_pct"] <= cap].copy()
-        if good.empty: good = g.copy()
-        order_thr = good["root_total_orders_current"].quantile(0.50) if "root_total_orders_current" in good.columns else 0
-        click_thr = good["ad_clicks_current"].quantile(0.50) if "ad_clicks_current" in good.columns else 0
-        leaders = good[(good["root_total_orders_current"] >= order_thr) | (good["ad_clicks_current"] >= click_thr)].copy()
-        if leaders.empty: leaders = good.copy()
-        rows.append({"subject_norm": subject, "placement": placement, "peer_capture_imp_median": round(leaders["capture_imp"].median(), 6) if "capture_imp" in leaders else 0.0, "peer_capture_click_median": round(leaders["capture_click"].median(), 6) if "capture_click" in leaders else 0.0, "peer_eff_imp_median": round(leaders["eff_imp"].median(), 8) if "eff_imp" in leaders else 0.0, "peer_eff_click_median": round(leaders["eff_click"].median(), 8) if "eff_click" in leaders else 0.0, "peer_ctr_median_pct": round(leaders["current_ctr_pct"].median(), 4), "peer_total_orders_median": round(leaders["root_total_orders_current"].median(), 2) if "root_total_orders_current" in leaders else 0.0})
-    return pd.DataFrame(rows)
+# ======================================================================================
+# DECISION ENGINE
+# ======================================================================================
+def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) -> Tuple[str, float, str, bool]:
+    subject = canonical_subject(row.get("subject_norm", row.get("subject", "")))
+    payment_type = row.get("payment_type", "cpc")
+    current_bid = safe_float(row.get("current_bid_rub", 0))
+    comfort_bid = safe_float(row.get("comfort_bid_rub", 0))
+    max_bid = safe_float(row.get("max_bid_rub", 0))
+    experiment_bid = safe_float(row.get("experiment_bid_rub", 0))
 
+    blended_drr = safe_float(row.get("blended_drr_current_pct", 0))
+    blended_prev = safe_float(row.get("blended_drr_prev_pct", 0))
+    total_orders = safe_float(row.get("total_orders_current", 0))
+    total_orders_prev = safe_float(row.get("total_orders_prev", 0))
+    spend = safe_float(row.get("ad_spend_root_current", 0))
+    spend_prev = safe_float(row.get("ad_spend_root_prev", 0))
+    gp_realized = safe_float(row.get("gp_realized", 0))
+    rating = safe_float(row.get("rating_reviews", 0))
+    buyout_rate = safe_float(row.get("buyout_rate", 0))
+    position = safe_float(row.get("median_position", 0))
+    visibility = safe_float(row.get("visibility_pct", 0))
+    bei_imp = safe_float(row.get("bei_imp", 1))
+    bei_click = safe_float(row.get("bei_click", 1))
+    card_issue = bool(row.get("card_issue", False))
 
-def build_shade_universe(fact_df: pd.DataFrame) -> pd.DataFrame:
-    if fact_df.empty:
-        return pd.DataFrame()
-    keep = [c for c in ["nmId","supplier_article","product_root","subject","subject_norm","rating_reviews","buyout_rate","gp_realized","total_orders_current","total_revenue_current","ad_impressions_current","ad_clicks_current","ad_orders_current","ad_spend_current","median_position","visibility_pct"] if c in fact_df.columns]
-    df = fact_df[keep].copy()
-    grp = df.groupby(["nmId","supplier_article","product_root","subject_norm"], as_index=False).agg(subject=("subject","first"), rating_reviews=("rating_reviews","max"), buyout_rate=("buyout_rate","max"), gp_realized=("gp_realized","max"), total_orders_current=("total_orders_current","max"), total_revenue_current=("total_revenue_current","max"), ad_impressions_current=("ad_impressions_current","sum"), ad_clicks_current=("ad_clicks_current","sum"), ad_orders_current=("ad_orders_current","sum"), ad_spend_current=("ad_spend_current","sum"), median_position=("median_position","median"), visibility_pct=("visibility_pct","median"))
-    grp["ctr_pct"] = grp.apply(lambda x: pct(x["ad_clicks_current"], x["ad_impressions_current"]) if x["ad_impressions_current"] > 0 else 0.0, axis=1)
-    grp["cr_pct"] = grp.apply(lambda x: pct(x["ad_orders_current"], x["ad_clicks_current"]) if x["ad_clicks_current"] > 0 else 0.0, axis=1)
-    grp["shade_candidate_score"] = (grp["total_orders_current"].rank(pct=True).fillna(0) * 0.35 + grp["ctr_pct"].rank(pct=True).fillna(0) * 0.20 + grp["cr_pct"].rank(pct=True).fillna(0) * 0.20 + grp["rating_reviews"].rank(pct=True).fillna(0) * 0.15 + grp["buyout_rate"].rank(pct=True).fillna(0) * 0.10)
-    return grp
+    comfort_drr, max_drr, _weekend_drr = get_blended_caps(subject, config)
+    order_growth = pct(total_orders - total_orders_prev, total_orders_prev) if total_orders_prev > 0 else (100.0 if total_orders > 0 else 0.0)
+    spend_growth = pct(spend - spend_prev, spend_prev) if spend_prev > 0 else (100.0 if spend > 0 else 0.0)
+    required_growth = compute_required_growth(blended_drr, blended_prev, spend_growth)
 
+    weak_position = (position == 0 or position > 20 or visibility < 5)
+    traffic_not_efficient = (bei_imp < 0.90 and bei_click < 0.90)
+    strong_response = (bei_imp > 1.10 or bei_click > 1.10)
+    rate_limit_flag = False
+    growth_subject = subject in GROWTH_SUBJECTS
+    root_supports_growth = growth_subject and blended_drr <= max_drr * 100 and order_growth > 0
 
-def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFrame, decisions_base: pd.DataFrame) -> pd.DataFrame:
-    if campaigns_df.empty or shade_universe.empty:
-        return pd.DataFrame()
-    base = campaigns_df.rename(columns={
-        "ID кампании": "advert_id",
-        "id_campaign": "advert_id",
-        "advertId": "advert_id",
-        "advert": "advert_id",
-        "Артикул WB": "nmId",
-        "nm_id": "nmId",
-        "nmID": "nmId",
-    }).copy()
-    if "advert_id" not in base.columns or "nmId" not in base.columns:
-        return pd.DataFrame()
-    keep = [c for c in ["advert_id","nmId","payment_type","bid_type","status_norm","Название предмета"] if c in base.columns]
-    base = base[keep].copy().merge(shade_universe, on="nmId", how="left")
-    if base.empty:
-        return pd.DataFrame()
-    if decisions_base is not None and not decisions_base.empty and {"advert_id","nmId"}.issubset(decisions_base.columns):
-        placement_map = decisions_base.groupby(["advert_id","nmId"], as_index=False).agg(
-            placement=("placement", lambda s: ",".join(sorted(set(map(str, s))))),
-            current_bid_rub=("current_bid_rub", "max")
+    def min_bid_value() -> float:
+        if payment_type == "cpc":
+            return MIN_CPC_RUB
+        return MIN_CPM_RECOMMENDATIONS_RUB if row.get("placement") == "recommendations" else MIN_CPM_SEARCH_RUB
+
+    def finalize(action: str, proposed_bid: float, reason: str, flag: bool = False) -> Tuple[str, float, str, bool]:
+        bid = round(safe_float(proposed_bid, 0), 2)
+        current = round(current_bid, 2)
+        if action == "DOWN":
+            bid = min(current, bid)
+            if bid >= current:
+                return "HOLD", current, "Ставка уже на минимально допустимом уровне", flag
+        elif action in {"UP", "TEST_UP"}:
+            bid = max(current, bid)
+            if bid <= current:
+                return "HOLD", current, "Текущая ставка уже в рабочем диапазоне", flag
+        return action, bid, reason, flag
+
+    # Если ставка уже близка к потолку и товар плохо забирает трафик — это limit reached.
+    if current_bid >= max_bid * 0.95 and weak_position and traffic_not_efficient:
+        rate_limit_flag = True
+        return "LIMIT_REACHED", round(current_bid, 2), "Повысить эффективность ставки — реклама работает на пределе", rate_limit_flag
+
+    # Жёсткие блокировки, но для growth-категорий при сильном товаре целиком — не режем автоматически.
+    if gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT:
+        if root_supports_growth and weak_position and current_bid <= max(max_bid, comfort_bid * 1.10):
+            return "HOLD", round(current_bid, 2), "Локально слабая экономика/выкуп, но товар растёт — ставку не повышаем", rate_limit_flag
+        return finalize("DOWN", min_bid_value(), "Негативная экономика / рейтинг / выкуп", rate_limit_flag)
+
+    # Если карточка не конвертит, для growth-категорий в рабочем DRR — HOLD, а не автоматический DOWN.
+    if card_issue and current_bid > max(comfort_bid, 0):
+        if root_supports_growth:
+            return "HOLD", round(current_bid, 2), "Есть проблема в карточке, но товар растёт — держим ставку без роста", rate_limit_flag
+        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Проблема в карточке / воронке", rate_limit_flag)
+
+    # Если blended DRR ушёл выше допустимого и роста заказов не хватило — снижаем.
+    if blended_drr > max_drr * 100 and order_growth < required_growth:
+        return finalize(
+            "DOWN",
+            max(comfort_bid, current_bid * (1 - DOWN_STEP_MED)),
+            f"Blended DRR {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов слабый",
+            rate_limit_flag,
         )
-        base = base.merge(placement_map, on=["advert_id","nmId"], how="left")
-    base["subject"] = base.get("subject", pd.Series(index=base.index, dtype=object)).fillna(base.get("Название предмета", ""))
-    if "subject_norm" not in base.columns:
-        base["subject_norm"] = base["subject"].map(canonical_subject)
+
+    # Growth-решение.
+    if weak_position and not card_issue:
+        if current_bid < comfort_bid and (order_growth >= required_growth or growth_subject):
+            step = UP_STEP_BIG if growth_subject else UP_STEP_MED
+            new_bid = min(comfort_bid, current_bid * (1 + step))
+            new_bid = max(new_bid, comfort_bid * 0.90 if current_bid == 0 else new_bid)
+            return finalize("UP", new_bid, "Слабая позиция: подтягиваем ставку к комфортной", rate_limit_flag)
+        if current_bid < max_bid and (order_growth >= required_growth or strong_response or growth_subject):
+            step = UP_STEP_MED if growth_subject else UP_STEP_SMALL
+            new_bid = min(max_bid, current_bid * (1 + step))
+            return finalize("UP", new_bid, "Есть запас по max-ставке и потенциал роста позиции", rate_limit_flag)
+
+    # Выходной эксперимент для growth-категорий.
+    if growth_subject and as_of_date.weekday() in config.experiment_weekdays:
+        if blended_drr <= max_drr * 100 and current_bid < experiment_bid and weak_position and (strong_response or order_growth >= required_growth):
+            new_bid = min(experiment_bid, max(max_bid, current_bid * 1.15))
+            return finalize("TEST_UP", new_bid, "Выходной эксперимент выше max для growth-категории", rate_limit_flag)
+
+    # Если расходы растут, а заказы не растут адекватно — мягко снижаем.
+    if spend_growth > 0 and order_growth < required_growth:
+        if root_supports_growth and blended_drr <= comfort_drr * 100:
+            return "HOLD", round(current_bid, 2), "Товар растёт и общий DRR в норме — не сушим ставку", rate_limit_flag
+        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Рост расходов не поддержан ростом заказов", rate_limit_flag)
+
+    # Если ставка выше max — возвращаем в диапазон, но growth-категории в рабочем DRR не режем слишком рано.
+    if current_bid > max_bid:
+        if root_supports_growth and blended_drr <= max_drr * 100 and current_bid <= max_bid * 1.25:
+            return "HOLD", round(current_bid, 2), "Ставка выше расчётного max, но товар растёт — пока не понижаем", rate_limit_flag
+        return finalize("DOWN", max_bid, "Текущая ставка выше расчётного max", rate_limit_flag)
+
+    return "HOLD", round(current_bid, 2), "Рабочий диапазон ставки", rate_limit_flag
+
+
+# ======================================================================================
+# WB SEND
+# ======================================================================================
+def normalize_bid_for_wb(bid_rub: float, payment_type: str, placement: str) -> int:
+    bid_rub = safe_float(bid_rub)
+    if payment_type == "cpc":
+        bid_rub = clamp(bid_rub, MIN_CPC_RUB, MAX_CPC_RUB)
     else:
-        base["subject_norm"] = base["subject_norm"].fillna(base["subject"].map(canonical_subject))
-    base = base[base["product_root"].astype(str).str.strip() != ""].copy()
-    if base.empty:
-        return pd.DataFrame()
-
-    def _pick_core(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.copy()
-        for col in ["total_orders_current", "rating_reviews", "buyout_rate", "ctr_pct", "cr_pct"]:
-            if col not in g.columns:
-                g[col] = 0.0
-        g["core_score"] = (
-            g["total_orders_current"].rank(pct=True).fillna(0) * 0.45 +
-            g["rating_reviews"].rank(pct=True).fillna(0) * 0.20 +
-            g["buyout_rate"].rank(pct=True).fillna(0) * 0.15 +
-            g["ctr_pct"].rank(pct=True).fillna(0) * 0.10 +
-            g["cr_pct"].rank(pct=True).fillna(0) * 0.10
-        )
-        core_nm = safe_int(g.sort_values(["core_score","total_orders_current","rating_reviews"], ascending=False).iloc[0]["nmId"])
-        g["shade_status"] = g["nmId"].map(lambda x: "CORE" if safe_int(x) == core_nm else "WORKING")
-        g["core_nm_id"] = core_nm
-        return g
-
-    return base.groupby("advert_id", group_keys=False).apply(_pick_core).reset_index(drop=True)
-
-
-
-def load_existing_shade_tests(provider: BaseProvider) -> pd.DataFrame:
-    try:
-        df = provider.read_excel(SERVICE_SHADE_TESTS_KEY, sheet_name=0)
-    except Exception:
-        return pd.DataFrame()
-    if df.empty:
-        return pd.DataFrame()
-    for c in ["start_date","last_eval_date","remove_date"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce").dt.date
-    return df
-
-
-def build_shade_actions(provider: BaseProvider, shade_portfolio: pd.DataFrame, shade_universe: pd.DataFrame, product_metrics: pd.DataFrame, config: ManagerConfig, as_of_date: date, api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    existing_tests = load_existing_shade_tests(provider)
-    if shade_portfolio.empty or shade_universe.empty:
-        return pd.DataFrame(), existing_tests
-
-    portfolio = shade_portfolio.copy()
-    if "advert_id" not in portfolio.columns:
-        for candidate in ["ID кампании", "id_campaign", "advertId", "advert"]:
-            if candidate in portfolio.columns:
-                portfolio = portfolio.rename(columns={candidate: "advert_id"})
-                break
-    if "nmId" not in portfolio.columns:
-        for candidate in ["Артикул WB", "nm_id", "nmID"]:
-            if candidate in portfolio.columns:
-                portfolio = portfolio.rename(columns={candidate: "nmId"})
-                break
-    if "advert_id" not in portfolio.columns or "nmId" not in portfolio.columns:
-        return pd.DataFrame(), existing_tests
-    if "subject" not in portfolio.columns:
-        portfolio["subject"] = ""
-    if "subject_norm" not in portfolio.columns:
-        portfolio["subject_norm"] = portfolio["subject"].map(canonical_subject)
-    else:
-        portfolio["subject_norm"] = portfolio["subject_norm"].fillna(portfolio["subject"].map(canonical_subject))
-
-    actions: List[Dict[str, Any]] = []
-    reserved_by_root: Dict[str, set] = {}
-
-    def _append_no_action(advert_id: int, product_root: str, subject: str, core_nm: int, core_supplier: str, payment_type: str, placements: List[str], reason: str):
-        actions.append({
-            "advert_id": safe_int(advert_id),
-            "product_root": product_root,
-            "subject": human_subject(subject),
-            "subject_norm": subject,
-            "core_nm_id": core_nm,
-            "core_supplier_article": core_supplier,
-            "candidate_nm_id": None,
-            "candidate_supplier_article": "",
-            "shade_action": "NO_ACTION",
-            "reason": reason,
-            "payment_type": payment_type,
-            "placement": ",".join(placements),
-            "placement_primary": placements[0] if placements else "search",
-            "rating_reviews": None,
-            "candidate_score": None,
-            "root_blended_drr_pct": None,
-            "root_order_growth_pct": None,
-            "min_wb_bid_rub": None,
-            "min_bid_status": "n/a",
-        })
-
-    for advert_id, g in portfolio.groupby("advert_id"):
-        subject = canonical_subject(g["subject_norm"].iloc[0])
-        if subject not in GROWTH_SUBJECTS:
-            continue
-        product_root = str(g["product_root"].dropna().astype(str).iloc[0]) if g["product_root"].notna().any() else ""
-        if not product_root:
-            continue
-        current_nms = {safe_int(x) for x in g["nmId"].tolist() if safe_int(x) > 0}
-        core_nm = safe_int(g["core_nm_id"].iloc[0]) if "core_nm_id" in g.columns else (next(iter(current_nms)) if current_nms else 0)
-        core_supplier = str(g.loc[g["nmId"] == core_nm, "supplier_article"].iloc[0]) if (g["nmId"] == core_nm).any() and "supplier_article" in g.columns else ""
-        placements = parse_placement_types(g["placement"].iloc[0] if "placement" in g.columns else "", "search")
-        payment_type = str(g["payment_type"].iloc[0] if "payment_type" in g.columns else "cpc")
-        root_metrics = product_metrics[(product_metrics["product_root"].astype(str) == product_root) & (product_metrics["subject_norm"] == subject)]
-        blended = safe_float(root_metrics["blended_drr_current_pct"].iloc[0]) if not root_metrics.empty else 0.0
-        order_growth = safe_float(root_metrics["order_growth_pct"].iloc[0]) if not root_metrics.empty else 0.0
-        cap = get_blended_caps(subject, config)[1] * 100.0
-        if blended > cap and order_growth <= 0:
-            _append_no_action(advert_id, product_root, subject, core_nm, core_supplier, payment_type, placements, "Общий ДРР товара выше допустимого и роста заказов нет — новые оттенки не добавляем")
-            continue
-
-        same_root_tests = existing_tests[existing_tests.get("product_root", pd.Series(dtype=str)).astype(str) == product_root].copy() if not existing_tests.empty and "product_root" in existing_tests.columns else pd.DataFrame()
-        active_test_nms = {safe_int(x) for x in same_root_tests[same_root_tests.get("status", pd.Series(dtype=str)).astype(str).isin(["TEST","PENDING_MIN_BID"])] .get("candidate_nm_id", pd.Series(dtype=float)).tolist()} if not same_root_tests.empty else set()
-        if active_test_nms:
-            _append_no_action(advert_id, product_root, subject, core_nm, core_supplier, payment_type, placements, "По товару уже идёт тест оттенка — ждём накопления показов")
-            continue
-
-        candidates = shade_universe[(shade_universe["product_root"].astype(str) == product_root) & (shade_universe["subject_norm"] == subject)].copy()
-        if candidates.empty:
-            _append_no_action(advert_id, product_root, subject, core_nm, core_supplier, payment_type, placements, "Для товара нет доступных оттенков-кандидатов")
-            continue
-        candidates = candidates[(candidates["rating_reviews"] > MIN_SHADE_RATING) & (~candidates["nmId"].isin(current_nms))].copy()
-        if candidates.empty:
-            _append_no_action(advert_id, product_root, subject, core_nm, core_supplier, payment_type, placements, "Нет подходящих оттенков с рейтингом выше 4.6 вне текущего состава кампании")
-            continue
-        reserved = reserved_by_root.setdefault(product_root, set())
-        candidates = candidates[~candidates["nmId"].isin(reserved)].copy()
-        if candidates.empty:
-            _append_no_action(advert_id, product_root, subject, core_nm, core_supplier, payment_type, placements, "Кандидаты уже зарезервированы в другом тесте по этому товару")
-            continue
-        cand = candidates.sort_values(["shade_candidate_score", "total_orders_current", "rating_reviews"], ascending=False).iloc[0]
-        reserved.add(safe_int(cand["nmId"]))
-        actions.append({
-            "advert_id": safe_int(advert_id),
-            "product_root": product_root,
-            "subject": human_subject(cand["subject"]),
-            "subject_norm": subject,
-            "core_nm_id": core_nm,
-            "core_supplier_article": core_supplier,
-            "candidate_nm_id": safe_int(cand["nmId"]),
-            "candidate_supplier_article": str(cand["supplier_article"]),
-            "shade_action": "ADD_TEST",
-            "reason": "Добавляем новый оттенок на минимальной ставке WB и собираем тест до 4000 показов",
-            "payment_type": payment_type,
-            "placement": ",".join(placements),
-            "placement_primary": placements[0] if placements else "search",
-            "rating_reviews": round(safe_float(cand.get("rating_reviews", 0)), 2),
-            "candidate_score": round(safe_float(cand.get("shade_candidate_score", 0)), 4),
-            "root_blended_drr_pct": round(blended, 2),
-            "root_order_growth_pct": round(order_growth, 2),
-            "min_wb_bid_rub": None,
-            "min_bid_status": "pending",
-        })
-
-    actions_df = pd.DataFrame(actions)
-    if actions_df.empty:
-        return actions_df, existing_tests
-
-    add_mask = actions_df["shade_action"] == "ADD_TEST"
-    if add_mask.any() and api_key.strip():
-        query_rows = []
-        for _, r in actions_df[add_mask].iterrows():
-            for pl in parse_placement_types(r.get("placement", ""), r.get("placement_primary", "search")):
-                query_rows.append({
-                    "advert_id": safe_int(r["advert_id"]),
-                    "nm_id": safe_int(r["candidate_nm_id"]),
-                    "payment_type": str(r.get("payment_type", "cpc")),
-                    "placement": pl,
-                })
-        min_bids_df = fetch_min_bids_for_rows(api_key, pd.DataFrame(query_rows))
-        if not min_bids_df.empty:
-            agg = min_bids_df.groupby(["advert_id","nm_id"], as_index=False).agg(
-                min_wb_bid_rub=("min_wb_bid_rub","max"),
-                min_bid_status=("min_bid_status", lambda s: "ok" if "ok" in set(map(str,s)) else "not_found")
-            )
-            actions_df = actions_df.merge(agg, left_on=["advert_id","candidate_nm_id"], right_on=["advert_id","nm_id"], how="left").drop(columns=["nm_id"], errors="ignore")
-        actions_df.loc[add_mask & (actions_df.get("min_bid_status", "not_found") != "ok"), "shade_action"] = "NEED_MIN_BID_CHECK"
-        actions_df.loc[actions_df["shade_action"] == "NEED_MIN_BID_CHECK", "reason"] = "Не удалось получить минимальную ставку WB — автодобавление запрещено"
-    elif add_mask.any():
-        actions_df.loc[add_mask, "shade_action"] = "NEED_MIN_BID_CHECK"
-        actions_df.loc[add_mask, "reason"] = "Нет WB_PROMO_KEY_TOPFACE — минимальная ставка WB не проверена"
-        actions_df.loc[add_mask, "min_bid_status"] = "no_api_key"
-
-    tests_rows = []
-    for _, r in actions_df.iterrows():
-        if r.get("shade_action") not in {"ADD_TEST", "NEED_MIN_BID_CHECK"}:
-            continue
-        tests_rows.append({
-            "start_date": as_of_date,
-            "last_eval_date": as_of_date,
-            "advert_id": safe_int(r.get("advert_id")),
-            "product_root": str(r.get("product_root", "")),
-            "subject": str(r.get("subject", "")),
-            "core_nm_id": safe_int(r.get("core_nm_id")),
-            "candidate_nm_id": safe_int(r.get("candidate_nm_id")),
-            "candidate_supplier_article": str(r.get("candidate_supplier_article", "")),
-            "status": "TEST" if r.get("shade_action") == "ADD_TEST" else "PENDING_MIN_BID",
-            "test_target_impressions": SHADE_TEST_MIN_IMPRESSIONS,
-            "collected_impressions": 0,
-            "collected_clicks": 0,
-            "collected_orders": 0,
-            "min_wb_bid_rub": safe_float(r.get("min_wb_bid_rub", 0)),
-            "reason": str(r.get("reason", "")),
-        })
-    tests_df = pd.concat([existing_tests, pd.DataFrame(tests_rows)], ignore_index=True) if (not existing_tests.empty or tests_rows) else pd.DataFrame()
-    if not tests_df.empty:
-        tests_df = tests_df.drop_duplicates(subset=["advert_id","candidate_nm_id"], keep="last")
-    return actions_df, tests_df
-
-
-
-def build_benchmark_comparison(decisions_base: pd.DataFrame, subject_benchmarks: pd.DataFrame) -> pd.DataFrame:
-    if decisions_base.empty:
-        return pd.DataFrame()
-    df = decisions_base.merge(subject_benchmarks, on=["subject_norm","placement"], how="left")
-    for col in ["peer_capture_imp_median","peer_capture_click_median","peer_eff_imp_median","peer_eff_click_median","peer_ctr_median_pct","peer_total_orders_median"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-    df["vs_peer_capture_imp"] = df.apply(lambda x: safe_float(x.get("capture_imp",0)) / safe_float(x["peer_capture_imp_median"]) if safe_float(x["peer_capture_imp_median"]) > 0 else 1.0, axis=1)
-    df["vs_peer_capture_click"] = df.apply(lambda x: safe_float(x.get("capture_click",0)) / safe_float(x["peer_capture_click_median"]) if safe_float(x["peer_capture_click_median"]) > 0 else 1.0, axis=1)
-    df["current_ctr_pct"] = df.apply(lambda x: pct(safe_float(x.get("ad_clicks_current",0)), safe_float(x.get("ad_impressions_current",0))) if safe_float(x.get("ad_impressions_current",0)) > 0 else 0.0, axis=1)
-    df["vs_peer_ctr"] = df.apply(lambda x: safe_float(x["current_ctr_pct"]) / safe_float(x["peer_ctr_median_pct"]) if safe_float(x["peer_ctr_median_pct"]) > 0 else 1.0, axis=1)
-    df["benchmark_problem_flag"] = (df.get("demand_week", 0) > 0) & (df["vs_peer_capture_imp"] < 0.6) & (df["vs_peer_ctr"] < 0.8)
-    df["problem_bucket"] = df.apply(lambda x: "РК на пределе" if safe_float(x.get("bei_imp",1)) < 0.9 and safe_float(x.get("bei_click",1)) < 0.9 else ("Growth-РК: нужен трафик и портфель оттенков" if bool(x.get("benchmark_problem_flag", False)) else "Нет"), axis=1)
-    # Возвращаем исходный df с добавленными полями — он нужен decision engine и weak list.
-    return df
-
+        if placement == "recommendations":
+            bid_rub = clamp(bid_rub, MIN_CPM_RECOMMENDATIONS_RUB, MAX_CPM_RECOMMENDATIONS_RUB)
+        else:
+            bid_rub = clamp(bid_rub, MIN_CPM_SEARCH_RUB, MAX_CPM_SEARCH_RUB)
+    return to_kopecks(bid_rub)
 
 
 def placement_for_min_bids_api(placement: str) -> str:
@@ -1675,45 +1466,6 @@ def fetch_min_bids_for_advert(api_key: str, advert_id: int, nm_ids: List[int], p
                 return {}
             time.sleep(1)
     return {}
-
-
-def fetch_min_bids_for_rows(api_key: str, rows_df: pd.DataFrame) -> pd.DataFrame:
-    if rows_df is None or rows_df.empty or not api_key.strip():
-        return pd.DataFrame(columns=["advert_id", "nm_id", "placement", "min_wb_bid_rub", "min_wb_bid_kop", "min_bid_status"])
-    rows = rows_df.copy()
-    out_rows: List[Dict[str, Any]] = []
-    for (advert_id, payment_type), g in rows.groupby(["advert_id", "payment_type"]):
-        advert_id = safe_int(advert_id)
-        payment_type = str(payment_type)
-        nm_ids = sorted({safe_int(x) for x in g["nm_id"].tolist() if safe_int(x) > 0})
-        placements = sorted({str(x) for x in g["placement"].tolist() if str(x)})
-        result = fetch_min_bids_for_advert(api_key, advert_id, nm_ids, payment_type, placements)
-        for _, r in g.iterrows():
-            nm_id = safe_int(r["nm_id"]); placement = str(r["placement"])
-            min_kop = result.get((nm_id, placement))
-            out_rows.append({"advert_id": advert_id, "nm_id": nm_id, "placement": placement, "min_wb_bid_kop": min_kop if min_kop is not None else None, "min_wb_bid_rub": from_kopecks(min_kop) if min_kop is not None else None, "min_bid_status": "ok" if min_kop is not None else "not_found"})
-    return pd.DataFrame(out_rows)
-
-
-def patch_campaign_nms(api_key: str, actions_df: pd.DataFrame, dry_run: bool = True) -> pd.DataFrame:
-    if actions_df is None or actions_df.empty:
-        return pd.DataFrame(columns=["timestamp", "advert_id", "status", "http_status", "response"])
-    logs: List[Dict[str, Any]] = []
-    headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
-    for advert_id, g in actions_df.groupby("advert_id"):
-        add_ids = sorted({safe_int(x) for x in g.loc[g["shade_action"] == "ADD_TEST", "candidate_nm_id"].tolist() if safe_int(x) > 0})
-        del_ids = sorted({safe_int(x) for x in g.loc[g["shade_action"] == "REMOVE_SHADE", "candidate_nm_id"].tolist() if safe_int(x) > 0})
-        payload = {"nms": [{"advert_id": safe_int(advert_id), "nms": {"add": add_ids, "delete": del_ids}}]}
-        if dry_run:
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": safe_int(advert_id), "status": "dry-run", "http_status": "", "response": json.dumps(payload, ensure_ascii=False)})
-            continue
-        try:
-            resp = requests.patch(WB_NMS_URL, headers=headers, json=payload, timeout=120)
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": safe_int(advert_id), "status": "ok" if resp.status_code == 200 else "failed", "http_status": resp.status_code, "response": resp.text[:2000]})
-        except Exception as e:
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": safe_int(advert_id), "status": "failed", "http_status": "", "response": str(e)})
-        time.sleep(1.05)
-    return pd.DataFrame(logs)
 
 
 def decisions_to_payload(decisions_df: pd.DataFrame, use_only_changed: bool = True) -> Dict[str, Any]:
@@ -1957,14 +1709,6 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
     effects_df = evaluate_recent_bid_effects(history_expanded, decisions_base, window)
     decisions_base = decisions_base.merge(effects_df, left_on=["advert_id", "nmId", "placement"], right_on=["ID кампании", "Артикул WB", "placement"], how="left")
 
-    # Сравнение с сильными РК и контур оттенков
-    subject_benchmarks = build_subject_benchmarks(decisions_base)
-    decisions_base = build_benchmark_comparison(decisions_base, subject_benchmarks)
-    api_key_for_min = os.environ.get("WB_PROMO_KEY_TOPFACE", "").strip()
-    shade_universe = build_shade_universe(fact)
-    shade_portfolio = build_shade_portfolio(campaigns, shade_universe, decisions_base)
-    shade_actions_df, shade_tests_df = build_shade_actions(provider, shade_portfolio, shade_universe, product_metrics, config, as_of_date, api_key=api_key_for_min)
-
     # Make human-readable decision table
     decision_rows: List[Decision] = []
     for _, r in decisions_base.iterrows():
@@ -2003,19 +1747,17 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
         ))
     decisions_df = pd.DataFrame([d.to_dict() for d in decision_rows])
 
-    # Weak positions / слабые РК по эффективности ставки
-    weak_mask = (
+    # Weak positions list
+    weak_df = decisions_df[
         (decisions_df["median_position"] == 0) |
         (decisions_df["median_position"] > 20) |
         (decisions_df["action"] == "LIMIT_REACHED")
-    )
-    if "benchmark_problem_flag" in decisions_base.columns:
-        weak_mask = weak_mask | decisions_base["benchmark_problem_flag"].fillna(False).values
-    weak_df = decisions_df[weak_mask].copy()
+    ].copy()
     if not weak_df.empty:
-        enrich_cols = [c for c in ["advert_id","nmId","placement","capture_imp","capture_click","eff_imp","eff_click","bei_imp","bei_click","peer_capture_imp_median","peer_capture_click_median","peer_eff_imp_median","peer_eff_click_median","peer_ctr_median_pct","vs_peer_capture_imp","vs_peer_capture_click","vs_peer_ctr","benchmark_problem_flag","problem_bucket"] if c in decisions_base.columns]
-        weak_df = weak_df.merge(decisions_base[enrich_cols].rename(columns={"advert_id":"id_campaign","nmId":"nm_id"}), on=["id_campaign","nm_id","placement"], how="left")
-        weak_df["comment"] = weak_df.apply(lambda x: "Повысить эффективность ставки — реклама работает на пределе" if x["action"] == "LIMIT_REACHED" else (str(x.get("problem_bucket")) if str(x.get("problem_bucket","")).strip() else "Слабая позиция, нужна работа по карточке и ставке"), axis=1)
+        weak_df["comment"] = weak_df.apply(
+            lambda x: "Повысить эффективность ставки — реклама работает на пределе" if x["action"] == "LIMIT_REACHED" else "Слабая позиция, нужна работа по карточке и ставке",
+            axis=1,
+        )
 
     # Bid limits snapshot
     limits_df = decisions_base[[
@@ -2066,11 +1808,6 @@ def prepare_metrics(provider: BaseProvider, config: ManagerConfig, as_of_date: d
         "eff": eff_df,
         "effects": effects_df,
         "ads_history": ads_history,
-        "shade_portfolio": shade_portfolio,
-        "shade_actions": shade_actions_df,
-        "shade_tests": shade_tests_df,
-        "benchmark_cmp": build_benchmark_report(build_benchmark_comparison(decisions_base, subject_benchmarks)),
-        "subject_benchmarks": subject_benchmarks,
         "window": pd.DataFrame([{
             "as_of_date": as_of_date,
             "current_start": window.current_start,
@@ -2098,15 +1835,8 @@ def _round_export_numbers(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
         if pd.api.types.is_float_dtype(out[c]):
-            cl = str(c).lower()
-            if any(token in cl for token in ["eff_", "bei_", "capture", "эталон", "отн."]):
-                out[c] = out[c].round(6)
-            elif "ctr" in cl or "cr" in cl:
-                out[c] = out[c].round(4)
-            else:
-                out[c] = out[c].round(2)
+            out[c] = out[c].round(2)
     return out
-
 
 
 def localize_export_sheets(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -2197,15 +1927,11 @@ def localize_export_sheets(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.Dat
         "bei_click": "Индекс эффективности ставки по кликам", "median_position": "Медианная позиция", "visibility_pct": "Видимость, %", "action": "Решение", "reason": "Обоснование"
     })
 
-    effects_src = results["effects"].copy()
-    if effects_src.empty:
-        effects = pd.DataFrame([{"Комментарий": "Нет созревших изменений для оценки"}])
-    else:
-        effects = effects_src.rename(columns={
-            "placement": "Плейсмент", "recent_changes": "Число последних изменений", "last_bid_change_dt": "Дата последнего изменения",
-            "last_bid_rub": "Последняя ставка, ₽", "prev_bid_rub": "Предыдущая ставка, ₽", "bid_delta_pct": "Изменение ставки, %",
-            "effect_flag": "Статус оценки", "effect_comment": "Комментарий"
-        })
+    effects = results["effects"].copy().rename(columns={
+        "placement": "Плейсмент", "recent_changes": "Число последних изменений", "last_bid_change_dt": "Дата последнего изменения",
+        "last_bid_rub": "Последняя ставка, ₽", "prev_bid_rub": "Предыдущая ставка, ₽", "bid_delta_pct": "Изменение ставки, %",
+        "effect_flag": "Статус оценки", "effect_comment": "Комментарий"
+    })
 
     # Чистим дубли и приводим ключевые идентификаторы к строкам.
     for frame in [decisions, logic, weak, limits, eff]:
@@ -2222,59 +1948,6 @@ def localize_export_sheets(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.Dat
         "prev_start": "Начало базового окна", "prev_end": "Конец базового окна"
     })
 
-    shade_portfolio = results.get("shade_portfolio", pd.DataFrame()).copy()
-    if not shade_portfolio.empty:
-        shade_portfolio = shade_portfolio.rename(columns={
-            "advert_id": "ID кампании", "nmId": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар",
-            "subject": "Предмет", "subject_norm": "Предмет (норм.)", "payment_type": "Тип оплаты", "bid_type": "Тип кампании",
-            "status_norm": "Статус РК", "placement": "Плейсменты", "current_bid_rub": "Текущая ставка, ₽",
-            "rating_reviews": "Рейтинг", "buyout_rate": "Выкуп", "gp_realized": "Валовая прибыль на реализованный заказ, ₽",
-            "total_orders_current": "Все заказы оттенка", "total_revenue_current": "Выручка оттенка, ₽",
-            "ad_impressions_current": "Показы рекламы", "ad_clicks_current": "Клики рекламы", "ad_orders_current": "Рекламные заказы",
-            "ad_spend_current": "Расход рекламы, ₽", "median_position": "Медианная позиция", "visibility_pct": "Видимость, %",
-            "ctr_pct": "CTR, %", "cr_pct": "CR, %", "core_score": "Оценка core", "shade_status": "Статус оттенка", "core_nm_id": "Core Артикул WB"
-        })
-    shade_actions = results.get("shade_actions", pd.DataFrame()).copy()
-    if shade_actions.empty:
-        shade_actions = pd.DataFrame([{"Комментарий": "По текущему запуску действий по оттенкам нет"}])
-    else:
-        shade_actions = shade_actions.rename(columns={
-            "advert_id": "ID кампании", "product_root": "Товар", "subject": "Предмет", "subject_norm": "Предмет (норм.)",
-            "core_nm_id": "Core Артикул WB", "core_supplier_article": "Core артикул продавца", "candidate_nm_id": "Кандидат Артикул WB",
-            "candidate_supplier_article": "Кандидат артикул продавца", "shade_action": "Действие по оттенку", "reason": "Обоснование",
-            "payment_type": "Тип оплаты", "placement": "Плейсменты", "placement_primary": "Основной плейсмент",
-            "rating_reviews": "Рейтинг", "candidate_score": "Оценка кандидата", "root_blended_drr_pct": "Общий ДРР товара, %",
-            "root_order_growth_pct": "Рост заказов товара, %", "min_wb_bid_rub": "Минимальная ставка WB, ₽", "min_bid_status": "Статус проверки минимума"
-        })
-    shade_tests = results.get("shade_tests", pd.DataFrame()).copy()
-    if shade_tests.empty:
-        shade_tests = pd.DataFrame([{"Комментарий": "Активных тестов оттенков нет"}])
-    else:
-        shade_tests = shade_tests.rename(columns={
-            "start_date": "Дата старта", "last_eval_date": "Дата последней оценки", "advert_id": "ID кампании", "product_root": "Товар",
-            "subject": "Предмет", "core_nm_id": "Core Артикул WB", "candidate_nm_id": "Кандидат Артикул WB",
-            "candidate_supplier_article": "Кандидат артикул продавца", "status": "Статус теста", "test_target_impressions": "Целевые показы",
-            "collected_impressions": "Собрано показов", "collected_clicks": "Собрано кликов", "collected_orders": "Собрано заказов",
-            "min_wb_bid_rub": "Минимальная ставка WB, ₽", "reason": "Обоснование", "remove_date": "Дата удаления"
-        })
-    benchmark_cmp = results.get("benchmark_cmp", pd.DataFrame()).copy()
-    if benchmark_cmp.empty:
-        benchmark_cmp = pd.DataFrame([{"Комментарий": "Недостаточно данных для сравнения с сильными РК"}])
-    else:
-        benchmark_cmp["action"] = benchmark_cmp["action"].map(lambda x: RUS_ACTION_MAP.get(str(x), str(x)))
-        benchmark_cmp = benchmark_cmp.rename(columns={
-            "advert_id": "ID кампании", "nmId": "Артикул WB", "supplier_article": "Артикул продавца", "product_root": "Товар",
-            "subject": "Предмет", "placement": "Плейсмент", "current_bid_rub": "Текущая ставка, ₽", "capture_imp": "Доля захваченных показов",
-            "capture_click": "Доля захваченных кликов", "eff_imp": "Эффективность ставки по показам", "eff_click": "Эффективность ставки по кликам",
-            "bei_imp": "Индекс эффективности ставки по показам", "bei_click": "Индекс эффективности ставки по кликам",
-            "peer_capture_imp_median": "Эталон: медиана доли показов", "peer_capture_click_median": "Эталон: медиана доли кликов",
-            "peer_eff_imp_median": "Эталон: медиана эфф. по показам", "peer_eff_click_median": "Эталон: медиана эфф. по кликам",
-            "peer_ctr_median_pct": "Эталон: медиана CTR, %", "peer_total_orders_median": "Эталон: медиана заказов товара",
-            "vs_peer_capture_imp": "Отн. к эталону по показам", "vs_peer_capture_click": "Отн. к эталону по кликам",
-            "vs_peer_ctr": "Отн. к эталону по CTR", "benchmark_problem_flag": "Флаг проблемы по эталону", "problem_bucket": "Тип проблемы", "action": "Решение"
-        })
-        if "Флаг проблемы по эталону" in benchmark_cmp.columns:
-            benchmark_cmp["Флаг проблемы по эталону"] = benchmark_cmp["Флаг проблемы по эталону"].map(_bool_to_ru)
     return {
         "Решения_по_ставкам": _round_export_numbers(decisions),
         "Расчёт_логики": _round_export_numbers(logic),
@@ -2283,10 +1956,6 @@ def localize_export_sheets(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.Dat
         "Слабая_позиция": _round_export_numbers(weak),
         "Эффект_изменений": _round_export_numbers(effects),
         "Лимиты_ставок": _round_export_numbers(limits),
-        "Состав_кампаний_по_оттенкам": _round_export_numbers(shade_portfolio),
-        "Рекомендации_по_оттенкам": _round_export_numbers(shade_actions),
-        "Тесты_оттенков": _round_export_numbers(shade_tests),
-        "Сравнение_с_сильными_РК": _round_export_numbers(benchmark_cmp),
         "Окно_анализа": window,
     }
 
@@ -2325,16 +1994,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, pd.DataFrame], mode:
     provider.write_excel(SERVICE_EFF_KEY, {"Эффективность ставки": preview_sheets["Эффективность_ставки"]})
     provider.write_excel(SERVICE_WEAK_KEY, {"Слабая позиция": preview_sheets["Слабая_позиция"]})
     provider.write_excel(SERVICE_EFFECTS_KEY, {"Эффект изменений": preview_sheets["Эффект_изменений"]})
-    if "Состав_кампаний_по_оттенкам" in preview_sheets:
-        provider.write_excel(SERVICE_SHADE_PORTFOLIO_KEY, {"Состав кампаний по оттенкам": preview_sheets["Состав_кампаний_по_оттенкам"]})
-    if "Рекомендации_по_оттенкам" in preview_sheets:
-        provider.write_excel(SERVICE_SHADE_ACTIONS_KEY, {"Рекомендации по оттенкам": preview_sheets["Рекомендации_по_оттенкам"]})
-    if "Тесты_оттенков" in preview_sheets:
-        provider.write_excel(SERVICE_SHADE_TESTS_KEY, {"Тесты оттенков": preview_sheets["Тесты_оттенков"]})
-    if "Сравнение_с_сильными_РК" in preview_sheets:
-        provider.write_excel(SERVICE_BENCHMARKS_KEY, {"Сравнение с сильными РК": preview_sheets["Сравнение_с_сильными_РК"]})
 
-    shade_actions = results.get("shade_actions", pd.DataFrame())
     summary = {
         "generated_at": datetime.now().isoformat(),
         "mode": mode,
@@ -2343,9 +2003,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, pd.DataFrame], mode:
         "changed_count": int(decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP"]) & (decisions["new_bid_rub"].round(2) != decisions["current_bid_rub"].round(2))].shape[0]),
         "limit_reached_count": int(decisions[decisions["action"] == "LIMIT_REACHED"].shape[0]),
         "weak_items_count": int(len(weak)),
-        "shade_actions_count": int(len(shade_actions)),
-        "shade_add_test_count": int((shade_actions.get("shade_action", pd.Series(dtype=str)) == "ADD_TEST").sum()) if isinstance(shade_actions, pd.DataFrame) and not shade_actions.empty else 0,
-        "shade_remove_count": int((shade_actions.get("shade_action", pd.Series(dtype=str)) == "REMOVE_SHADE").sum()) if isinstance(shade_actions, pd.DataFrame) and not shade_actions.empty else 0,
     }
     provider.write_text(SERVICE_SUMMARY_KEY, json.dumps(summary, ensure_ascii=False, indent=2, default=str))
 
@@ -2432,8 +2089,8 @@ def run_manager(args: argparse.Namespace) -> None:
     save_outputs(provider, results, mode=mode, as_of_date=as_of_date)
     print_console_summary(decisions)
 
-    if mode in {"preview", "report"}:
-        log("🧪 Preview/report-режим: ставки и изменения оттенков не отправлялись")
+    if mode == "preview":
+        log("🧪 Preview-режим: ставки не отправлялись")
         return
 
     if mode == "run":
@@ -2444,16 +2101,9 @@ def run_manager(args: argparse.Namespace) -> None:
         send_log = send_payload(payload, api_key=api_key, dry_run=False)
         if not send_log.empty:
             append_or_replace_history(provider, SERVICE_ARCHIVE_KEY, send_log.assign(kind="wb_send"), sheet_name="archive", tail=50000)
-        if getattr(args, "apply_shades", False):
-            shade_actions = results.get("shade_actions", pd.DataFrame())
-            shade_apply_df = shade_actions[shade_actions.get("shade_action", pd.Series(dtype=str)) == "ADD_TEST"].copy() if isinstance(shade_actions, pd.DataFrame) and not shade_actions.empty else pd.DataFrame()
-            shade_send_log = patch_campaign_nms(api_key, shade_apply_df, dry_run=False)
-            if not shade_send_log.empty:
-                append_or_replace_history(provider, SERVICE_ARCHIVE_KEY, shade_send_log.assign(kind="wb_shade_send"), sheet_name="archive", tail=50000)
-            log(f"🧩 Отправлено действий по оттенкам: {len(shade_apply_df)}")
         update_bid_history(provider, decisions, as_of_date)
         save_experiments(provider, decisions, as_of_date)
-        log(f"📤 Отправлено блоков ставок в WB: {len(payload.get('bids', []))}")
+        log(f"📤 Отправлено блоков в WB: {len(payload.get('bids', []))}")
         return
 
     raise RuntimeError(f"Неизвестная команда: {mode}")
@@ -2463,12 +2113,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WB Ads Manager V2 — balanced growth algorithm")
     sub = p.add_subparsers(dest="command")
 
-    for cmd in ["preview", "run", "report"]:
+    for cmd in ["preview", "run"]:
         sc = sub.add_parser(cmd)
         sc.add_argument("--local-data-dir", type=str, default=None, help="Локальная папка с выгруженными файлами")
         sc.add_argument("--as-of-date", type=str, default=None, help="Дата запуска YYYY-MM-DD")
-        if cmd == "run":
-            sc.add_argument("--apply-shades", action="store_true", help="Применять изменения состава кампаний по оттенкам")
     return p
 
 
