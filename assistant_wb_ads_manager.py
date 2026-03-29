@@ -2565,9 +2565,6 @@ def main() -> None:
     run_manager(args)
 
 
-if __name__ == "__main__":
-    main()
-
 def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) -> Tuple[str, float, str, bool]:
     subject = canonical_subject(row.get("subject_norm", row.get("subject", "")))
     payment_type = str(row.get("payment_type", "cpc")).lower()
@@ -2732,3 +2729,5 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
 
     return "HOLD", round(current_bid, 2), "Рабочий диапазон ставки", False
 
+if __name__ == "__main__":
+    main()
