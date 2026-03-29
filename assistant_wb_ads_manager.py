@@ -957,22 +957,30 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows = campaign_base.merge(campaign_cur, on=["id_campaign","nmId"], how="left").merge(campaign_base_stats, on=["id_campaign","nmId"], how="left").fillna(0)
 
     # robustly restore key descriptive columns after merges
+    # restore subject and subject_norm after merges
+    if "subject" not in rows.columns:
+        subject_cols = [c for c in ["subject_x", "subject_y"] if c in rows.columns]
+        if subject_cols:
+            rows["subject"] = rows[subject_cols[0]]
+            for c in subject_cols[1:]:
+                rows["subject"] = rows["subject"].where(rows["subject"].astype(str).str.strip() != "", rows[c])
+        else:
+            rows["subject"] = ""
+    else:
+        rows["subject"] = rows["subject"].fillna("")
+
     if "subject_norm" not in rows.columns:
         subject_candidates = [c for c in ["subject_norm_x", "subject_norm_y"] if c in rows.columns]
         if subject_candidates:
             rows["subject_norm"] = rows[subject_candidates[0]]
             for c in subject_candidates[1:]:
                 rows["subject_norm"] = rows["subject_norm"].where(rows["subject_norm"].astype(str).str.strip() != "", rows[c])
-        elif "subject" in rows.columns:
-            rows["subject_norm"] = rows["subject"].map(canonical_subject)
-        elif "subject_x" in rows.columns:
-            rows["subject_norm"] = rows["subject_x"].map(canonical_subject)
-        elif "subject_y" in rows.columns:
-            rows["subject_norm"] = rows["subject_y"].map(canonical_subject)
         else:
-            rows["subject_norm"] = ""
+            rows["subject_norm"] = rows["subject"].map(canonical_subject)
     else:
         rows["subject_norm"] = rows["subject_norm"].fillna("")
+        mask_empty = rows["subject_norm"].astype(str).str.strip() == ""
+        rows.loc[mask_empty, "subject_norm"] = rows.loc[mask_empty, "subject"].map(canonical_subject)
 
     if "supplier_article" not in rows.columns:
         for c in ["supplier_article_x", "supplier_article_y", "supplierArticle", "supplierArticle_x", "supplierArticle_y"]:
@@ -1057,7 +1065,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
             "Артикул WB": safe_int(r["nmId"]),
             "Артикул продавца": r["supplier_article"],
             "Товар": r["control_key"],
-            "Предмет": r["subject"],
+            "Предмет": r.get("subject", ""),
             "Плейсмент": r["placement"],
             "Тип кампании": f'{r["payment_type"]}_{r["placement"]}',
             "Текущая ставка, ₽": round(safe_float(r["current_bid_rub"]), 2),
