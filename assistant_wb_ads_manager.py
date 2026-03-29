@@ -956,8 +956,45 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     )
     rows = campaign_base.merge(campaign_cur, on=["id_campaign","nmId"], how="left").merge(campaign_base_stats, on=["id_campaign","nmId"], how="left").fillna(0)
 
+    # robustly restore key descriptive columns after merges
+    if "subject_norm" not in rows.columns:
+        subject_candidates = [c for c in ["subject_norm_x", "subject_norm_y"] if c in rows.columns]
+        if subject_candidates:
+            rows["subject_norm"] = rows[subject_candidates[0]]
+            for c in subject_candidates[1:]:
+                rows["subject_norm"] = rows["subject_norm"].where(rows["subject_norm"].astype(str).str.strip() != "", rows[c])
+        elif "subject" in rows.columns:
+            rows["subject_norm"] = rows["subject"].map(canonical_subject)
+        elif "subject_x" in rows.columns:
+            rows["subject_norm"] = rows["subject_x"].map(canonical_subject)
+        elif "subject_y" in rows.columns:
+            rows["subject_norm"] = rows["subject_y"].map(canonical_subject)
+        else:
+            rows["subject_norm"] = ""
+    else:
+        rows["subject_norm"] = rows["subject_norm"].fillna("")
+
+    if "supplier_article" not in rows.columns:
+        for c in ["supplier_article_x", "supplier_article_y", "supplierArticle", "supplierArticle_x", "supplierArticle_y"]:
+            if c in rows.columns:
+                rows["supplier_article"] = rows[c]
+                break
+        else:
+            rows["supplier_article"] = ""
+    rows["supplier_article"] = rows["supplier_article"].fillna("").astype(str)
+
+    if "product_root" not in rows.columns:
+        for c in ["product_root_x", "product_root_y"]:
+            if c in rows.columns:
+                rows["product_root"] = rows[c]
+                break
+        else:
+            rows["product_root"] = rows["supplier_article"].map(product_root_from_supplier_article)
+    missing_root = rows["product_root"].isna() | (rows["product_root"].astype(str).str.strip() == "")
+    rows.loc[missing_root, "product_root"] = rows.loc[missing_root, "supplier_article"].map(product_root_from_supplier_article)
+
     # control metrics
-    rows["control_key"] = rows.apply(lambda r: choose_control_key(r["subject_norm"], r["supplier_article"], r["product_root"]), axis=1)
+    rows["control_key"] = rows.apply(lambda r: choose_control_key(r.get("subject_norm", ""), r.get("supplier_article", ""), r.get("product_root", "")), axis=1)
     orders_cur_root = aggregate_orders(orders, window["cur_start"], window["cur_end"], "product_root")
     orders_base_root = aggregate_orders(orders, window["base_start"], window["base_end"], "product_root").rename(columns={"total_orders":"base_total_orders","total_revenue":"base_total_revenue"})
     orders_cur_article = aggregate_orders(orders, window["cur_start"], window["cur_end"], "supplier_article")
