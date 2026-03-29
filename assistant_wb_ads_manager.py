@@ -73,20 +73,20 @@ KEYWORDS_WEEKLY_PREFIX = f"Отчёты/Поисковые запросы/{STORE
 ADS_HISTORY_KEY = f"Служебные файлы/Ассистент WB/{STORE_NAME}/История_рекламы_14дней.xlsx"
 
 SERVICE_ROOT = f"Служебные файлы/Ассистент WB/{STORE_NAME}/"
-SERVICE_PREVIEW_KEY = SERVICE_ROOT + "preview_last_run.xlsx"
-SERVICE_SUMMARY_KEY = SERVICE_ROOT + "last_run_summary.json"
-SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "decision_archive.xlsx"
-SERVICE_BID_HISTORY_KEY = SERVICE_ROOT + "bid_history.xlsx"
-SERVICE_LIMITS_KEY = SERVICE_ROOT + "bid_limits_daily.xlsx"
-SERVICE_PRODUCT_KEY = SERVICE_ROOT + "product_root_metrics.xlsx"
-SERVICE_EFF_KEY = SERVICE_ROOT + "bid_efficiency_daily.xlsx"
-SERVICE_WEAK_KEY = SERVICE_ROOT + "weak_position_priority.xlsx"
-SERVICE_EFFECTS_KEY = SERVICE_ROOT + "change_effects.xlsx"
-SERVICE_EXPERIMENTS_KEY = SERVICE_ROOT + "bid_experiments.xlsx"
-SERVICE_SHADE_ACTIONS_KEY = SERVICE_ROOT + "shade_actions.xlsx"
-SERVICE_SHADE_PORTFOLIO_KEY = SERVICE_ROOT + "shade_portfolio.xlsx"
-SERVICE_SHADE_TESTS_KEY = SERVICE_ROOT + "shade_tests.xlsx"
-SERVICE_BENCHMARKS_KEY = SERVICE_ROOT + "subject_benchmark_comparison.xlsx"
+SERVICE_PREVIEW_KEY = SERVICE_ROOT + "Предпросмотр_последнего_запуска.xlsx"
+SERVICE_SUMMARY_KEY = SERVICE_ROOT + "Сводка_последнего_запуска.json"
+SERVICE_ARCHIVE_KEY = SERVICE_ROOT + "Архив_решений.xlsx"
+SERVICE_BID_HISTORY_KEY = SERVICE_ROOT + "История_ставок.xlsx"
+SERVICE_LIMITS_KEY = SERVICE_ROOT + "Лимиты_ставок_ежедневно.xlsx"
+SERVICE_PRODUCT_KEY = SERVICE_ROOT + "Метрики_по_товарам.xlsx"
+SERVICE_EFF_KEY = SERVICE_ROOT + "Эффективность_ставки_ежедневно.xlsx"
+SERVICE_WEAK_KEY = SERVICE_ROOT + "Слабые_позиции_приоритет.xlsx"
+SERVICE_EFFECTS_KEY = SERVICE_ROOT + "Эффект_изменений.xlsx"
+SERVICE_EXPERIMENTS_KEY = SERVICE_ROOT + "Эксперименты_ставок.xlsx"
+SERVICE_SHADE_ACTIONS_KEY = SERVICE_ROOT + "Рекомендации_по_оттенкам.xlsx"
+SERVICE_SHADE_PORTFOLIO_KEY = SERVICE_ROOT + "Состав_кампаний_по_оттенкам.xlsx"
+SERVICE_SHADE_TESTS_KEY = SERVICE_ROOT + "Тесты_оттенков.xlsx"
+SERVICE_BENCHMARKS_KEY = SERVICE_ROOT + "Сравнение_с_сильными_РК.xlsx"
 
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
@@ -148,7 +148,7 @@ DEFAULT_CONFIG = {
     "expansion_cap": 2.5,
     "max_experiment_days_per_year": 2,
     "experiment_weekdays": [5, 6],  # Saturday, Sunday
-    "preview_filename": "preview_last_run.xlsx",
+    "preview_filename": "Предпросмотр_последнего_запуска.xlsx",
 }
 
 
@@ -387,10 +387,10 @@ class LocalProvider(BaseProvider):
             (ECONOMICS_KEY, [r"^Экономика.*\.xlsx$"]),
             (FUNNEL_KEY, [r"^Воронка продаж.*\.xlsx$"]),
             (ADS_HISTORY_KEY, [r"^История_рекламы.*\.xlsx$"]),
-            (SERVICE_BID_HISTORY_KEY, [r"^bid_history.*\.xlsx$"]),
-            (SERVICE_PREVIEW_KEY, [r"^preview_last_run.*\.xlsx$"]),
-            (SERVICE_SUMMARY_KEY, [r"^last_run_summary.*\.json$"]),
-            (SERVICE_ARCHIVE_KEY, [r"^decision_archive.*\.xlsx$"]),
+            (SERVICE_BID_HISTORY_KEY, [r"^История_ставок.*\.xlsx$", r"^bid_history.*\.xlsx$"]),
+            (SERVICE_PREVIEW_KEY, [r"^Предпросмотр_последнего_запуска.*\.xlsx$", r"^preview_last_run.*\.xlsx$"]),
+            (SERVICE_SUMMARY_KEY, [r"^Сводка_последнего_запуска.*\.json$", r"^last_run_summary.*\.json$"]),
+            (SERVICE_ARCHIVE_KEY, [r"^Архив_решений.*\.xlsx$", r"^decision_archive.*\.xlsx$"]),
         ]
         name = None
         for logical, patterns in mappings:
@@ -1361,25 +1361,10 @@ def build_shade_universe(fact_df: pd.DataFrame) -> pd.DataFrame:
 def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFrame, decisions_base: pd.DataFrame) -> pd.DataFrame:
     if campaigns_df.empty or shade_universe.empty:
         return pd.DataFrame()
-    base = campaigns_df.copy()
-    rename_map = {}
-    if "advert_id" not in base.columns:
-        for candidate in ["ID кампании", "id_campaign", "advertId", "advert"]:
-            if candidate in base.columns:
-                rename_map[candidate] = "advert_id"
-                break
-    if "nmId" not in base.columns:
-        for candidate in ["Артикул WB", "nm_id", "nmID"]:
-            if candidate in base.columns:
-                rename_map[candidate] = "nmId"
-                break
-    if rename_map:
-        base = base.rename(columns=rename_map)
-    if "advert_id" not in base.columns or "nmId" not in base.columns:
-        return pd.DataFrame()
+    base = campaigns_df.rename(columns={"ID кампании":"advert_id","Артикул WB":"nmId"}).copy()
     keep = [c for c in ["advert_id","nmId","payment_type","bid_type","status_norm","Название предмета"] if c in base.columns]
     base = base[keep].copy().merge(shade_universe, on="nmId", how="left")
-    if decisions_base is not None and not decisions_base.empty and {"advert_id","nmId"}.issubset(decisions_base.columns):
+    if decisions_base is not None and not decisions_base.empty:
         placement_map = decisions_base.groupby(["advert_id","nmId"], as_index=False).agg(placement=("placement", lambda s: ",".join(sorted(set(map(str,s))))), current_bid_rub=("current_bid_rub","max"))
         base = base.merge(placement_map, on=["advert_id","nmId"], how="left")
     base["subject"] = base["subject"].fillna(base.get("Название предмета",""))
@@ -1390,8 +1375,6 @@ def build_shade_portfolio(campaigns_df: pd.DataFrame, shade_universe: pd.DataFra
         g["shade_status"] = g["nmId"].map(lambda x: "CORE" if safe_int(x) == core_nm else "WORKING")
         g["core_nm_id"] = core_nm
         return g
-    if base.empty:
-        return base
     return base.groupby("advert_id", group_keys=False).apply(_pick_core).reset_index(drop=True)
 
 
@@ -1414,13 +1397,6 @@ def build_shade_actions(provider: BaseProvider, shade_portfolio: pd.DataFrame, s
         return pd.DataFrame(), existing_tests
     actions=[]; reserved_by_root={}
     portfolio = shade_portfolio.copy()
-    if "advert_id" not in portfolio.columns:
-        for candidate in ["ID кампании", "id_campaign", "advertId", "advert"]:
-            if candidate in portfolio.columns:
-                portfolio = portfolio.rename(columns={candidate: "advert_id"})
-                break
-    if "advert_id" not in portfolio.columns:
-        return pd.DataFrame(), existing_tests
     portfolio["subject_norm"] = portfolio["subject_norm"].fillna(portfolio["subject"].map(canonical_subject))
     for advert_id, g in portfolio.groupby("advert_id"):
         subject = canonical_subject(g["subject_norm"].iloc[0])
@@ -1508,7 +1484,8 @@ def build_benchmark_comparison(decisions_base: pd.DataFrame, subject_benchmarks:
 # ======================================================================================
 def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) -> Tuple[str, float, str, bool]:
     subject = canonical_subject(row.get("subject_norm", row.get("subject", "")))
-    payment_type = row.get("payment_type", "cpc")
+    payment_type = str(row.get("payment_type", "cpc"))
+    placement = str(row.get("placement", "search"))
     current_bid = safe_float(row.get("current_bid_rub", 0))
     comfort_bid = safe_float(row.get("comfort_bid_rub", 0))
     max_bid = safe_float(row.get("max_bid_rub", 0))
@@ -1527,103 +1504,146 @@ def determine_action(row: pd.Series, config: ManagerConfig, as_of_date: date) ->
     visibility = safe_float(row.get("visibility_pct", 0))
     bei_imp = safe_float(row.get("bei_imp", 1))
     bei_click = safe_float(row.get("bei_click", 1))
+    capture_imp = safe_float(row.get("capture_imp", 0))
+    capture_click = safe_float(row.get("capture_click", 0))
+    vs_peer_capture_imp = safe_float(row.get("vs_peer_capture_imp", 1))
+    vs_peer_capture_click = safe_float(row.get("vs_peer_capture_click", 1))
+    vs_peer_ctr = safe_float(row.get("vs_peer_ctr", 1))
+    benchmark_problem_flag = bool(row.get("benchmark_problem_flag", False))
     card_issue = bool(row.get("card_issue", False))
+    effect_flag = str(row.get("effect_flag", "") or "").strip().lower()
+    mode = str(row.get("mode", "")).strip().lower()
 
-    comfort_drr, max_drr, _weekend_drr = get_blended_caps(subject, config)
+    comfort_drr, max_drr, weekend_drr = get_blended_caps(subject, config)
     order_growth = pct(total_orders - total_orders_prev, total_orders_prev) if total_orders_prev > 0 else (100.0 if total_orders > 0 else 0.0)
     spend_growth = pct(spend - spend_prev, spend_prev) if spend_prev > 0 else (100.0 if spend > 0 else 0.0)
     required_growth = compute_required_growth(blended_drr, blended_prev, spend_growth, subject)
 
     weak_position = (position == 0 or position > 20 or visibility < 5)
+    poor_capture_vs_peers = (vs_peer_capture_imp < 0.70 and vs_peer_capture_click < 0.70)
+    poor_ctr_vs_peers = vs_peer_ctr < 0.80
     traffic_not_efficient = (bei_imp < 0.90 and bei_click < 0.90)
-    strong_response = (bei_imp > 1.10 or bei_click > 1.10)
-    rate_limit_flag = False
+    strong_response = (bei_imp > 1.10 or bei_click > 1.10 or capture_imp > 0.03 or capture_click > 0.002)
+    empty_previous_changes = effect_flag in {"no_effect", "negative", "weak", "пусто", "без эффекта"}
     growth_subject = subject in GROWTH_SUBJECTS
-    root_supports_growth = growth_subject and blended_drr <= max_drr * 100 and (order_growth > 0 or blended_drr <= comfort_drr * 100)
+    growth_like = growth_subject or mode in {"growth", "hero"}
+    root_supports_growth = growth_like and blended_drr <= max_drr * 100 and (order_growth > 0 or blended_drr <= comfort_drr * 100)
+    headroom_to_comfort = current_bid < comfort_bid * 0.98 if comfort_bid > 0 else False
+    headroom_to_max = current_bid < max_bid * 0.98 if max_bid > 0 else False
 
     def min_bid_value() -> float:
         if payment_type == "cpc":
             return MIN_CPC_RUB
-        return MIN_CPM_RECOMMENDATIONS_RUB if row.get("placement") == "recommendations" else MIN_CPM_SEARCH_RUB
+        return MIN_CPM_RECOMMENDATIONS_RUB if placement == "recommendations" else MIN_CPM_SEARCH_RUB
+
+    def apply_final_drr_filter(action: str, bid: float, reason: str, flag: bool) -> Tuple[str, float, str, bool]:
+        # Финальный фильтр: при общем DRR > 15% любые новые повышения запрещены.
+        if blended_drr > 15.0 and action in {"UP", "TEST_UP", "TEST_GROWTH"}:
+            if current_bid >= max(min_bid_value(), max_bid * 0.95 if max_bid > 0 else current_bid) or traffic_not_efficient:
+                return "LIMIT_REACHED", round(current_bid, 2), "Общий ДРР товара выше 15% — дальнейший рост ставки запрещён", True
+            return "HOLD", round(current_bid, 2), "Общий ДРР товара выше 15% — повышение ставки запрещено финальным фильтром", flag
+        return action, bid, reason, flag
 
     def finalize(action: str, proposed_bid: float, reason: str, flag: bool = False) -> Tuple[str, float, str, bool]:
         bid = round(safe_float(proposed_bid, 0), 2)
         current = round(current_bid, 2)
+        min_bid = round(min_bid_value(), 2)
         if action == "DOWN":
-            bid = min(current, bid)
-            if bid >= current:
-                return "HOLD", current, "Ставка уже на минимально допустимом уровне", flag
-        elif action in {"UP", "TEST_UP"}:
+            bid = min(current, max(min_bid, bid))
+            if bid >= current or abs(bid - current) < 0.01:
+                return "HOLD", current, "Ставка уже находится на минимально допустимом уровне", flag
+        elif action in {"UP", "TEST_UP", "TEST_GROWTH"}:
             bid = max(current, bid)
-            if bid <= current:
-                return "HOLD", current, "Текущая ставка уже в рабочем диапазоне", flag
-        return action, bid, reason, flag
+            if bid <= current or abs(bid - current) < 0.01:
+                return "HOLD", current, "Текущая ставка уже находится в рабочем диапазоне", flag
+        return apply_final_drr_filter(action, bid, reason, flag)
 
-    # Если ставка уже близка к потолку и товар плохо забирает трафик — это limit reached.
-    if current_bid >= max_bid * 0.95 and weak_position and traffic_not_efficient:
-        rate_limit_flag = True
-        return "LIMIT_REACHED", round(current_bid, 2), "Повысить эффективность ставки — реклама работает на пределе", rate_limit_flag
+    if weak_position and traffic_not_efficient and poor_capture_vs_peers and current_bid >= max(min_bid_value(), max_bid * 0.90 if max_bid > 0 else current_bid):
+        return "LIMIT_REACHED", round(current_bid, 2), "Повысить эффективность ставки — реклама работает на пределе", True
 
-    # Жёсткие блокировки, но для growth-категорий при сильном товаре целиком — не режем автоматически.
-    if gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT:
-        if growth_subject and blended_drr <= comfort_drr * 100:
-            return "HOLD", round(current_bid, 2), "Локально слабая экономика/выкуп, но общий ДРР рабочий — ставку не повышаем", rate_limit_flag
-        if root_supports_growth and weak_position and current_bid <= max(max_bid, comfort_bid * 1.10):
-            return "HOLD", round(current_bid, 2), "Локально слабая экономика/выкуп, но товар растёт — ставку не повышаем", rate_limit_flag
-        return finalize("DOWN", min_bid_value(), "Негативная экономика / рейтинг / выкуп", rate_limit_flag)
+    local_economy_problem = gp_realized <= 0 or rating < MIN_RATING or buyout_rate < MIN_BUYOUT
+    if local_economy_problem:
+        if growth_like and blended_drr <= comfort_drr * 100:
+            return "HOLD", round(current_bid, 2), "Локально слабая экономика/выкуп, но общий ДРР рабочий — товар не сушим", False
+        if root_supports_growth and weak_position:
+            return "HOLD", round(current_bid, 2), "Локально слабая экономика, но товар целиком растёт — ставку не повышаем и не сушим", False
+        if not growth_like:
+            return finalize("DOWN", min_bid_value(), "Негативная экономика / рейтинг / выкуп", False)
 
-    # Если карточка не конвертит, для growth-категорий в рабочем DRR — HOLD, а не автоматический DOWN.
-    if card_issue and current_bid > max(comfort_bid, 0):
-        if growth_subject and blended_drr <= comfort_drr * 100:
-            return "HOLD", round(current_bid, 2), "Есть проблема в карточке, но общий ДРР рабочий — держим ставку без роста", rate_limit_flag
-        if root_supports_growth:
-            return "HOLD", round(current_bid, 2), "Есть проблема в карточке, но товар растёт — держим ставку без роста", rate_limit_flag
-        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Проблема в карточке / воронке", rate_limit_flag)
+    if card_issue:
+        if growth_like and blended_drr <= comfort_drr * 100:
+            return "HOLD", round(current_bid, 2), "Есть проблема в карточке, но общий ДРР рабочий — сначала исправляем карточку", False
+        if growth_like and root_supports_growth and weak_position:
+            return "HOLD", round(current_bid, 2), "Есть проблема в карточке, но товар целиком растёт — ставку не сушим", False
+        if not growth_like and current_bid > max(comfort_bid, min_bid_value()):
+            return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Проблема в карточке / воронке", False)
 
-    # Если blended DRR ушёл выше допустимого и роста заказов не хватило — снижаем.
+    if growth_like and weak_position and benchmark_problem_flag and blended_drr <= max_drr * 100:
+        if headroom_to_comfort:
+            return finalize("UP", min(comfort_bid if comfort_bid > 0 else current_bid * (1 + UP_STEP_MED), current_bid * (1 + UP_STEP_MED)), "Есть большой спрос и отставание от сильных РК — подтягиваем ставку к комфортной", False)
+        if headroom_to_max and not empty_previous_changes and blended_drr <= 15.0:
+            return finalize("TEST_GROWTH", min(max_bid if max_bid > 0 else current_bid * (1 + UP_STEP_SMALL), current_bid * (1 + UP_STEP_SMALL)), "Есть большой спрос и отставание от сильных РК — запускаем тест роста", False)
+
+    hard_negatives = 0
+    if blended_drr > max_drr * 100:
+        hard_negatives += 1
+    if order_growth < required_growth:
+        hard_negatives += 1
+    if empty_previous_changes:
+        hard_negatives += 1
+    if traffic_not_efficient or poor_capture_vs_peers or poor_ctr_vs_peers:
+        hard_negatives += 1
+    if card_issue or local_economy_problem:
+        hard_negatives += 1
+
     if blended_drr > max_drr * 100 and order_growth < required_growth:
-        return finalize(
-            "DOWN",
-            max(comfort_bid, current_bid * (1 - DOWN_STEP_MED)),
-            f"Blended DRR {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов слабый",
-            rate_limit_flag,
-        )
+        if growth_like:
+            if hard_negatives >= 3:
+                return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_MED)), f"Общий ДРР {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов недостаточный", False)
+            return "HOLD", round(current_bid, 2), "Общий ДРР повышен, но для growth-категории пока сохраняем ставку и наблюдаем", False
+        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_MED)), f"Общий ДРР {blended_drr:.1f}% выше лимита {max_drr*100:.1f}% и рост заказов недостаточный", False)
 
-    # Growth-решение.
     if weak_position and not card_issue:
-        if current_bid < comfort_bid and (order_growth >= required_growth or growth_subject):
-            step = UP_STEP_BIG if growth_subject else UP_STEP_MED
-            new_bid = min(comfort_bid, current_bid * (1 + step))
-            new_bid = max(new_bid, comfort_bid * 0.90 if current_bid == 0 else new_bid)
-            return finalize("UP", new_bid, "Слабая позиция: подтягиваем ставку к комфортной", rate_limit_flag)
-        if current_bid < max_bid and (order_growth >= required_growth or strong_response or growth_subject):
-            step = UP_STEP_MED if growth_subject else UP_STEP_SMALL
-            new_bid = min(max_bid, current_bid * (1 + step))
-            return finalize("UP", new_bid, "Есть запас по max-ставке и потенциал роста позиции", rate_limit_flag)
+        if headroom_to_comfort and (order_growth >= required_growth or growth_like or benchmark_problem_flag):
+            step = UP_STEP_BIG if growth_like else UP_STEP_MED
+            target = current_bid * (1 + step)
+            if comfort_bid > 0:
+                target = min(comfort_bid, max(target, comfort_bid * 0.90 if current_bid == 0 else target))
+            return finalize("UP", target, "Слабая позиция: подтягиваем ставку к комфортной", False)
+        if headroom_to_max and (order_growth >= required_growth or strong_response or benchmark_problem_flag):
+            step = UP_STEP_MED if growth_like else UP_STEP_SMALL
+            target = current_bid * (1 + step)
+            if max_bid > 0:
+                target = min(max_bid, target)
+            return finalize("UP", target, "Есть запас по max-ставке и потенциал роста позиции", False)
+        if growth_like and blended_drr <= max_drr * 100:
+            return "HOLD", round(current_bid, 2), "Слабая позиция, но товар ростовый — держим ставку и копим сигнал", False
 
-    # Выходной эксперимент для growth-категорий.
-    if growth_subject and as_of_date.weekday() in config.experiment_weekdays:
-        if blended_drr <= max_drr * 100 and current_bid < experiment_bid and weak_position and (strong_response or order_growth >= required_growth):
-            new_bid = min(experiment_bid, max(max_bid, current_bid * 1.15))
-            return finalize("TEST_UP", new_bid, "Выходной эксперимент выше max для growth-категории", rate_limit_flag)
+    if growth_like and as_of_date.weekday() in config.experiment_weekdays and blended_drr <= 15.0:
+        experiment_cap = min(15.0, weekend_drr * 100)
+        if blended_drr <= experiment_cap and current_bid < experiment_bid and weak_position and not empty_previous_changes:
+            new_bid = min(experiment_bid if experiment_bid > 0 else current_bid * 1.12, max(current_bid * 1.12, max_bid))
+            return finalize("TEST_UP", new_bid, "Выходной эксперимент выше max для growth-категории", False)
 
-    # Если расходы растут, а заказы не растут адекватно — мягко снижаем.
     if spend_growth > 0 and order_growth < required_growth:
-        if growth_subject and blended_drr <= comfort_drr * 100 and order_growth >= 0:
-            return "HOLD", round(current_bid, 2), "Общий ДРР рабочий, рост неидеален — ставку не сушим", rate_limit_flag
-        if root_supports_growth and blended_drr <= comfort_drr * 100:
-            return "HOLD", round(current_bid, 2), "Товар растёт и общий DRR в норме — не сушим ставку", rate_limit_flag
-        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Рост расходов не поддержан ростом заказов", rate_limit_flag)
+        if growth_like and blended_drr <= comfort_drr * 100:
+            return "HOLD", round(current_bid, 2), "Общий ДРР в рабочей зоне — ставку не сушим, несмотря на слабый рост", False
+        if growth_like and benchmark_problem_flag and weak_position and headroom_to_max and blended_drr <= 15.0:
+            target = min(max_bid if max_bid > 0 else current_bid * 1.05, current_bid * 1.05)
+            return finalize("TEST_GROWTH", target, "Есть рынок, но рост пока слабый — проводим тест роста", False)
+        return finalize("DOWN", max(comfort_bid, current_bid * (1 - DOWN_STEP_SMALL)), "Рост расходов не поддержан ростом заказов", False)
 
-    # Если ставка выше max — возвращаем в диапазон, но growth-категории в рабочем DRR не режем слишком рано.
-    if current_bid > max_bid:
-        if growth_subject and blended_drr <= comfort_drr * 100 and current_bid <= max(max_bid * 1.35, max_bid + 1):
-            return "HOLD", round(current_bid, 2), "Ставка выше расчётного max, но общий ДРР рабочий — пока не понижаем", rate_limit_flag
-        if root_supports_growth and blended_drr <= max_drr * 100 and current_bid <= max_bid * 1.25:
-            return "HOLD", round(current_bid, 2), "Ставка выше расчётного max, но товар растёт — пока не понижаем", rate_limit_flag
-        return finalize("DOWN", max_bid, "Текущая ставка выше расчётного max", rate_limit_flag)
+    if current_bid > max_bid and max_bid > 0:
+        if growth_like and blended_drr <= comfort_drr * 100 and current_bid <= max(max_bid * 1.20, max_bid + 1):
+            return "HOLD", round(current_bid, 2), "Ставка немного выше расчётного max, но общий ДРР рабочий — пока не понижаем", False
+        if root_supports_growth and blended_drr <= min(15.0, max_drr * 100) and current_bid <= max_bid * 1.20:
+            return "HOLD", round(current_bid, 2), "Ставка выше расчётного max, но товар ещё в growth-режиме", False
+        return finalize("DOWN", max_bid, "Текущая ставка выше расчётного max", False)
 
-    return "HOLD", round(current_bid, 2), "Рабочий диапазон ставки", rate_limit_flag
+    if growth_like:
+        return "HOLD", round(current_bid, 2), "Growth-категория: базовый режим удержания ставки", False
+
+    return "HOLD", round(current_bid, 2), "Рабочий диапазон ставки", False
 
 
 # ======================================================================================
@@ -1722,7 +1742,7 @@ def decisions_to_payload(decisions_df: pd.DataFrame, use_only_changed: bool = Tr
         return {"bids": []}
     df = decisions_df.copy()
     if use_only_changed:
-        df = df[df["action"].isin(["UP", "DOWN", "TEST_UP"])].copy()
+        df = df[df["action"].isin(["UP", "DOWN", "TEST_UP", "TEST_GROWTH"])].copy()
         df = df[df["new_bid_rub"].round(2) != df["current_bid_rub"].round(2)].copy()
     grouped: Dict[int, List[Dict[str, Any]]] = {}
     for _, r in df.iterrows():
@@ -2082,6 +2102,7 @@ RUS_ACTION_MAP = {
     "DOWN": "Снизить",
     "HOLD": "Без изменений",
     "TEST_UP": "Тест выше max",
+    "TEST_GROWTH": "Тест роста",
     "LIMIT_REACHED": "Предел эффективности ставки",
 }
 
@@ -2276,7 +2297,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, pd.DataFrame], mode:
         "mode": mode,
         "as_of_date": str(as_of_date),
         "recommendations_count": int(len(decisions)),
-        "changed_count": int(decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP"]) & (decisions["new_bid_rub"].round(2) != decisions["current_bid_rub"].round(2))].shape[0]),
+        "changed_count": int(decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP", "TEST_GROWTH"]) & (decisions["new_bid_rub"].round(2) != decisions["current_bid_rub"].round(2))].shape[0]),
         "limit_reached_count": int(decisions[decisions["action"] == "LIMIT_REACHED"].shape[0]),
         "weak_items_count": int(len(weak)),
         "shade_actions_count": int(len(shade_actions)),
@@ -2296,7 +2317,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, pd.DataFrame], mode:
 
 
 def update_bid_history(provider: BaseProvider, decisions: pd.DataFrame, as_of_date: date) -> None:
-    changed = decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP"])].copy()
+    changed = decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP", "TEST_GROWTH"])].copy()
     changed = changed[changed["new_bid_rub"].round(2) != changed["current_bid_rub"].round(2)].copy()
     if changed.empty:
         return
@@ -2318,7 +2339,7 @@ def update_bid_history(provider: BaseProvider, decisions: pd.DataFrame, as_of_da
 
 
 def save_experiments(provider: BaseProvider, decisions: pd.DataFrame, as_of_date: date) -> None:
-    exp = decisions[decisions["action"] == "TEST_UP"].copy()
+    exp = decisions[decisions["action"].isin(["TEST_UP", "TEST_GROWTH"])].copy()
     if exp.empty:
         return
     exp = exp.assign(date=str(as_of_date))
@@ -2329,7 +2350,7 @@ def print_console_summary(decisions: pd.DataFrame) -> None:
     if decisions.empty:
         log("ℹ️ Рекомендаций нет")
         return
-    changed = decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP"]) & (decisions["new_bid_rub"].round(2) != decisions["current_bid_rub"].round(2))].copy()
+    changed = decisions[decisions["action"].isin(["UP", "DOWN", "TEST_UP", "TEST_GROWTH"]) & (decisions["new_bid_rub"].round(2) != decisions["current_bid_rub"].round(2))].copy()
     log(f"✅ Всего строк решений: {len(decisions):,}")
     log(f"🔁 Изменённых ставок: {len(changed):,}")
     if not changed.empty:
