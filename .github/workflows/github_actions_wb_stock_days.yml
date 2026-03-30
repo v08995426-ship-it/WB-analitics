@@ -1,48 +1,105 @@
-name: WB Stock Days Report
+name: assistant_wb_ads_manager
 
 on:
-  schedule:
-    - cron: "0 10 * * 1,5"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Режим запуска'
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - run
+      confirm_live:
+        description: 'Подтвердить live-отправку ставок (нужно только для mode=run)'
+        required: false
+        type: boolean
+        default: false
+      as_of_date:
+        description: 'Дата запуска в формате YYYY-MM-DD (необязательно)'
+        required: false
+        type: string
+        default: ''
+  schedule:
+    # 03:15 UTC = 06:15 Москва
+    - cron: '15 3 * * *'
+
+concurrency:
+  group: assistant-wb-ads-manager-topface
+  cancel-in-progress: false
 
 jobs:
-  run:
+  preview_daily:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas boto3 openpyxl requests
+          pip install boto3 pandas openpyxl requests botocore
 
-      - name: Run WB stock report
-        env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      - name: Run preview (scheduled safe mode)
+        run: |
+          python assistant_wb_ads_manager.py preview
 
-          CLOUD_RU_ACCESS_KEY: ${{ secrets.CLOUD_RU_ACCESS_KEY }}
-          CLOUD_RU_SECRET_KEY: ${{ secrets.CLOUD_RU_SECRET_KEY }}
-          CLOUD_RU_BUCKET: ${{ secrets.CLOUD_RU_BUCKET }}
+  manual_run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          WB_STOP_LIST_KEY: ${{ secrets.WB_STOP_LIST_KEY }}
-
-          WB_FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' }}
-        run: python wb_stock_days_report.py
-
-      - name: Upload report artifact
-        uses: actions/upload-artifact@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          name: wb-stock-days-report
-          path: output/*.xlsx
-          if-no-files-found: error
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pandas openpyxl requests botocore
+
+      - name: Validate live confirmation
+        if: ${{ inputs.mode == 'run' && inputs.confirm_live != true }}
+        run: |
+          echo 'Для mode=run нужно поставить confirm_live=true'
+          exit 1
+
+      - name: Run selected mode without as_of_date
+        if: ${{ inputs.as_of_date == '' }}
+        run: |
+          python assistant_wb_ads_manager.py ${{ inputs.mode }}
+
+      - name: Run selected mode with as_of_date
+        if: ${{ inputs.as_of_date != '' }}
+        run: |
+          python assistant_wb_ads_manager.py ${{ inputs.mode }} --as-of-date "${{ inputs.as_of_date }}"
