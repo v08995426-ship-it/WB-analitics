@@ -1,105 +1,154 @@
-name: assistant_wb_ads_manager
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Режим запуска'
-        required: true
-        type: choice
-        default: preview
-        options:
-          - preview
-          - run
-      confirm_live:
-        description: 'Подтвердить live-отправку ставок (нужно только для mode=run)'
-        required: false
-        type: boolean
-        default: false
-      as_of_date:
-        description: 'Дата запуска в формате YYYY-MM-DD (необязательно)'
-        required: false
-        type: string
-        default: ''
-  schedule:
-    # 03:15 UTC = 06:15 Москва
-    - cron: '15 3 * * *'
+from __future__ import annotations
 
-concurrency:
-  group: assistant-wb-ads-manager-topface
-  cancel-in-progress: false
+import json
+from pathlib import Path
+from typing import Dict, List
 
-jobs:
-  preview_daily:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      PYTHONUNBUFFERED: '1'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+# Файлы, которые обычно формирует скрипт
+PREFERRED_ORDER = [
+    'Предпросмотр_последнего_запуска.xlsx',
+    'Сводка_последнего_запуска.json',
+    'Архив_решений.xlsx',
+    'История_ставок.xlsx',
+    'Лимиты_ставок_ежедневно.xlsx',
+    'Метрики_по_товарам.xlsx',
+    'Эффективность_ставки_ежедневно.xlsx',
+    'Слабые_позиции_приоритет.xlsx',
+    'Эффект_изменений.xlsx',
+    'Состав_кампаний_по_оттенкам.xlsx',
+    'Рекомендации_по_оттенкам.xlsx',
+    'Тесты_оттенков.xlsx',
+    'Сравнение_с_сильными_РК.xlsx',
+    # запасной вариант, если файлы всё ещё на английском
+    'preview_last_run.xlsx',
+    'last_run_summary.json',
+    'decision_archive.xlsx',
+    'bid_history.xlsx',
+    'bid_limits_daily.xlsx',
+    'product_root_metrics.xlsx',
+    'bid_efficiency_daily.xlsx',
+    'weak_position_priority.xlsx',
+    'change_effects.xlsx',
+    'shade_portfolio.xlsx',
+    'shade_actions.xlsx',
+    'shade_tests.xlsx',
+    'subject_benchmark_comparison.xlsx',
+]
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install boto3 pandas openpyxl requests botocore
 
-      - name: Run preview (scheduled safe mode)
-        run: |
-          python assistant_wb_ads_manager.py preview
+def safe_sheet_name(name: str, used: set[str]) -> str:
+    base = name.replace('/', '_').replace('\\', '_').replace('[', '(').replace(']', ')').replace(':', ' - ').replace('*', 'x').replace('?', '').strip()
+    if not base:
+        base = 'Лист'
+    base = base[:31]
+    candidate = base
+    i = 2
+    while candidate in used:
+        suffix = f'_{i}'
+        candidate = (base[: 31 - len(suffix)] + suffix)
+        i += 1
+    used.add(candidate)
+    return candidate
 
-  manual_run:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      PYTHONUNBUFFERED: '1'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
+def autosize(ws):
+    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 200), values_only=False):
+        for c in row:
+            if c.value is None:
+                continue
+            c.alignment = Alignment(vertical='top', wrap_text=True)
+    widths: Dict[int, int] = {}
+    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 300), values_only=True):
+        for idx, val in enumerate(row, start=1):
+            l = len(str(val)) if val is not None else 0
+            widths[idx] = min(max(widths.get(idx, 0), l + 2), 45)
+    for idx, width in widths.items():
+        ws.column_dimensions[get_column_letter(idx)].width = max(10, width)
+    if ws.max_row >= 1:
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(wrap_text=True, vertical='center')
+        ws.row_dimensions[1].height = 30
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install boto3 pandas openpyxl requests botocore
 
-      - name: Validate live confirmation
-        if: ${{ inputs.mode == 'run' && inputs.confirm_live != true }}
-        run: |
-          echo 'Для mode=run нужно поставить confirm_live=true'
-          exit 1
+def write_df(writer, df: pd.DataFrame, sheet_name: str):
+    out = df.copy()
+    if out.empty:
+        out = pd.DataFrame({'Статус': ['Пусто']})
+    out.to_excel(writer, sheet_name=sheet_name, index=False)
 
-      - name: Run selected mode without as_of_date
-        if: ${{ inputs.as_of_date == '' }}
-        run: |
-          python assistant_wb_ads_manager.py ${{ inputs.mode }}
 
-      - name: Run selected mode with as_of_date
-        if: ${{ inputs.as_of_date != '' }}
-        run: |
-          python assistant_wb_ads_manager.py ${{ inputs.mode }} --as-of-date "${{ inputs.as_of_date }}"
+def json_to_df(path: Path) -> pd.DataFrame:
+    data = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(data, dict):
+        return pd.DataFrame([data])
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    return pd.DataFrame({'Значение': [str(data)]})
+
+
+def collect_existing(base_dir: Path) -> List[Path]:
+    found = []
+    seen = set()
+    for name in PREFERRED_ORDER:
+        p = base_dir / name
+        if p.exists() and p.name not in seen:
+            found.append(p)
+            seen.add(p.name)
+    return found
+
+
+def main():
+    base_dir = Path('.')
+    out_path = base_dir / 'Результаты_скрипта.xlsx'
+    files = collect_existing(base_dir)
+    if not files:
+        raise SystemExit('Не найдено ни одного файла результатов рядом со скриптом.')
+
+    used = set()
+    with pd.ExcelWriter(out_path, engine='openpyxl') as writer:
+        summary_rows = []
+        for path in files:
+            summary_rows.append({'Файл': path.name, 'Тип': path.suffix.lower()})
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name='Содержание', index=False)
+
+        for path in files:
+            stem = path.stem
+            if path.suffix.lower() == '.json':
+                df = json_to_df(path)
+                write_df(writer, df, safe_sheet_name(stem, used))
+                continue
+            if path.suffix.lower() != '.xlsx':
+                continue
+            try:
+                xl = pd.ExcelFile(path)
+            except Exception as e:
+                err_df = pd.DataFrame({'Файл': [path.name], 'Ошибка': [str(e)]})
+                write_df(writer, err_df, safe_sheet_name(stem, used))
+                continue
+            if len(xl.sheet_names) == 1:
+                df = xl.parse(xl.sheet_names[0])
+                write_df(writer, df, safe_sheet_name(stem, used))
+            else:
+                for sheet in xl.sheet_names:
+                    df = xl.parse(sheet)
+                    full_name = f'{stem[:16]}_{sheet}'
+                    write_df(writer, df, safe_sheet_name(full_name, used))
+
+    wb = load_workbook(out_path)
+    for ws in wb.worksheets:
+        autosize(ws)
+    wb.save(out_path)
+    print(out_path)
+
+
+if __name__ == '__main__':
+    main()
