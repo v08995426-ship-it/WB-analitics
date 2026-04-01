@@ -444,7 +444,13 @@ def yandex_post(url: str, payload: dict[str, Any], cfg: Config) -> dict[str, Any
     return data
 
 
-def build_yandex_payload(cfg: Config, phrase: str, *, for_dynamics: bool = False) -> dict[str, Any]:
+def build_yandex_payload(
+    cfg: Config,
+    phrase: str,
+    *,
+    for_dynamics: bool = False,
+    dynamics_period: str = "PERIOD_WEEKLY",
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "folderId": cfg.yandex_folder_id,
         "phrase": phrase,
@@ -452,11 +458,39 @@ def build_yandex_payload(cfg: Config, phrase: str, *, for_dynamics: bool = False
     if cfg.yandex_region_id:
         payload["regions"] = [str(cfg.yandex_region_id)]
     if for_dynamics:
-        payload["period"] = "WEEKLY"
+        payload["period"] = dynamics_period
     else:
         payload["numPhrases"] = 100
     return payload
 
+
+def try_yandex_dynamics(cfg: Config, phrase: str) -> dict[str, Any]:
+    last_error: Optional[Exception] = None
+    period_candidates = [
+        "PERIOD_WEEKLY",
+        "PERIOD_WEEKLY",
+        "WEEK",
+    ]
+    for period_value in period_candidates:
+        payload = build_yandex_payload(cfg, phrase, for_dynamics=True, dynamics_period=period_value)
+        try:
+            return yandex_post(cfg.yandex_dynamics_url, payload, cfg)
+        except Exception as exc:
+            last_error = exc
+            log(f"Yandex Wordstat: GetDynamics не принял period='{period_value}' для фразы '{phrase}'")
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError("Не удалось выполнить GetDynamics")
+
+def parse_possible_date(value: object) -> Optional[pd.Timestamp]:
+    text = normalize_text(value)
+    if not text:
+        return None
+    dt = pd.to_datetime(text, errors="coerce")
+    if pd.isna(dt):
+        return None
+    return pd.Timestamp(dt).normalize()
 
 def recursive_find_dicts(obj: Any) -> list[dict[str, Any]]:
     found: list[dict[str, Any]] = []
@@ -549,21 +583,28 @@ def load_yandex_wordstat(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
         if not phrase:
             continue
 
-        log(f"Yandex Wordstat: GetTop по фразе '{phrase}'")
-        top_payload = build_yandex_payload(cfg, phrase, for_dynamics=False)
-        top_json = yandex_post(cfg.yandex_top_url, top_payload, cfg)
-        raw_rows.append({"Метод": "top", "Фраза": phrase, "JSON": json.dumps(top_json, ensure_ascii=False)})
-        top_df = extract_yandex_top_records(top_json, phrase)
-        if not top_df.empty:
-            top_frames.append(top_df)
+        try:
+            log(f"Yandex Wordstat: GetTop по фразе '{phrase}'")
+            top_payload = build_yandex_payload(cfg, phrase, for_dynamics=False)
+            top_json = yandex_post(cfg.yandex_top_url, top_payload, cfg)
+            raw_rows.append({"Метод": "top", "Фраза": phrase, "JSON": json.dumps(top_json, ensure_ascii=False)})
+            top_df = extract_yandex_top_records(top_json, phrase)
+            if not top_df.empty:
+                top_frames.append(top_df)
+        except Exception as exc:
+            raw_rows.append({"Метод": "top_error", "Фраза": phrase, "JSON": json.dumps({"error": str(exc)}, ensure_ascii=False)})
+            log(f"Yandex Wordstat: ошибка GetTop по фразе '{phrase}': {exc}")
 
-        log(f"Yandex Wordstat: GetDynamics по фразе '{phrase}'")
-        dyn_payload = build_yandex_payload(cfg, phrase, for_dynamics=True)
-        dyn_json = yandex_post(cfg.yandex_dynamics_url, dyn_payload, cfg)
-        raw_rows.append({"Метод": "dynamics", "Фраза": phrase, "JSON": json.dumps(dyn_json, ensure_ascii=False)})
-        dyn_df = extract_yandex_dynamics_records(dyn_json, phrase)
-        if not dyn_df.empty:
-            dyn_frames.append(dyn_df)
+        try:
+            log(f"Yandex Wordstat: GetDynamics по фразе '{phrase}'")
+            dyn_json = try_yandex_dynamics(cfg, phrase)
+            raw_rows.append({"Метод": "dynamics", "Фраза": phrase, "JSON": json.dumps(dyn_json, ensure_ascii=False)})
+            dyn_df = extract_yandex_dynamics_records(dyn_json, phrase)
+            if not dyn_df.empty:
+                dyn_frames.append(dyn_df)
+        except Exception as exc:
+            raw_rows.append({"Метод": "dynamics_error", "Фраза": phrase, "JSON": json.dumps({"error": str(exc)}, ensure_ascii=False)})
+            log(f"Yandex Wordstat: ошибка GetDynamics по фразе '{phrase}': {exc}")
 
     top_all = pd.concat(top_frames, ignore_index=True) if top_frames else pd.DataFrame()
     dyn_all = pd.concat(dyn_frames, ignore_index=True) if dyn_frames else pd.DataFrame()
@@ -583,6 +624,70 @@ def load_yandex_wordstat(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
         )
     return top_all, dyn_all, raw_df
 
+
+def build_yandex_weekly_table(yandex_dyn_df: pd.DataFrame) -> pd.DataFrame:
+    if yandex_dyn_df is None or yandex_dyn_df.empty:
+        return pd.DataFrame(columns=["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя", "Частотность"])
+
+    df = yandex_dyn_df.copy()
+    df["Дата периода"] = df["Период"].map(parse_possible_date)
+    df = df[df["Дата периода"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя", "Частотность"])
+
+    iso = df["Дата периода"].dt.isocalendar()
+    df["ISO год"] = iso["year"].astype(int)
+    df["ISO неделя"] = iso["week"].astype(int)
+    df["Неделя"] = df["ISO год"].astype(str) + "-W" + df["ISO неделя"].astype(str).str.zfill(2)
+
+    return (
+        df.groupby(["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя"], as_index=False)["Частотность"]
+        .sum()
+        .sort_values(["Источник фраза", "Дата периода"])
+        .reset_index(drop=True)
+    )
+
+def build_yandex_last_full_week(yandex_weekly_df: pd.DataFrame) -> pd.DataFrame:
+    if yandex_weekly_df is None or yandex_weekly_df.empty:
+        return pd.DataFrame(columns=[
+            "Источник фраза", "Последняя полная неделя", "Предыдущая неделя",
+            "Частотность последняя неделя", "Частотность предыдущая неделя", "Δ", "Δ %"
+        ])
+
+    completed = yandex_weekly_df.sort_values(["Источник фраза", "Дата периода"]).copy()
+    rows: list[dict[str, Any]] = []
+    for phrase, grp in completed.groupby("Источник фраза"):
+        grp = grp.sort_values("Дата периода").reset_index(drop=True)
+        if grp.empty:
+            continue
+        last = grp.iloc[-1]
+        prev = grp.iloc[-2] if len(grp) >= 2 else None
+        last_val = safe_float(last.get("Частотность"))
+        prev_val = safe_float(prev.get("Частотность")) if prev is not None else 0.0
+        delta = last_val - prev_val
+        delta_pct = (delta / prev_val * 100.0) if prev_val else None
+        rows.append({
+            "Источник фраза": phrase,
+            "Последняя полная неделя": last.get("Неделя"),
+            "Предыдущая неделя": prev.get("Неделя") if prev is not None else "",
+            "Частотность последняя неделя": last_val,
+            "Частотность предыдущая неделя": prev_val,
+            "Δ": delta,
+            "Δ %": round(delta_pct, 2) if delta_pct is not None else None,
+        })
+    return pd.DataFrame(rows).sort_values("Источник фраза").reset_index(drop=True)
+
+def build_yandex_top_30_summary(yandex_top_df: pd.DataFrame) -> pd.DataFrame:
+    if yandex_top_df is None or yandex_top_df.empty:
+        return pd.DataFrame(columns=["Показатель", "Значение"])
+
+    total_shows = safe_float(yandex_top_df["Показы"].sum()) if "Показы" in yandex_top_df.columns else 0.0
+    return pd.DataFrame([
+        {"Показатель": "Уникальных запросов за последние 30 дней", "Значение": int(len(yandex_top_df))},
+        {"Показатель": "Сумма показов за последние 30 дней", "Значение": round(total_shows, 2)},
+        {"Показатель": "Топ-1 запрос", "Значение": normalize_text(yandex_top_df.iloc[0]["Запрос"])},
+        {"Показатель": "Топ-1 показы", "Значение": round(safe_float(yandex_top_df.iloc[0]["Показы"]), 2)},
+    ])
 
 # =========================
 # Excel / Telegram / S3
@@ -680,6 +785,7 @@ def build_summary_sheet(
     detected_variants: list[str],
     wb_keys: list[str],
     yandex_top_df: pd.DataFrame,
+    yandex_last_week_df: pd.DataFrame,
 ) -> pd.DataFrame:
     rows = [
         {"Параметр": "Магазин", "Значение": cfg.store_name},
@@ -701,7 +807,11 @@ def build_summary_sheet(
             {"Параметр": "WB заказы", "Значение": round(safe_float(last.get("Заказы")), 2)},
         ])
 
-    rows.append({"Параметр": "Yandex уникальных запросов", "Значение": int(len(yandex_top_df)) if not yandex_top_df.empty else 0})
+    rows.append({"Параметр": "Yandex уникальных запросов за 30 дней", "Значение": int(len(yandex_top_df)) if not yandex_top_df.empty else 0})
+    if yandex_last_week_df is not None and not yandex_last_week_df.empty:
+        rows.append({"Параметр": "Yandex последняя полная неделя", "Значение": ", ".join(sorted(set(map(str, yandex_last_week_df["Последняя полная неделя"].dropna().tolist()))))})
+        rows.append({"Параметр": "Yandex частотность последняя полная неделя", "Значение": round(float(yandex_last_week_df["Частотность последняя неделя"].sum()), 2)})
+        rows.append({"Параметр": "Yandex частотность предыдущая неделя", "Значение": round(float(yandex_last_week_df["Частотность предыдущая неделя"].sum()), 2)})
     return pd.DataFrame(rows)
 
 
@@ -738,6 +848,9 @@ def run() -> Path:
     wb_top = build_top_wb_queries(wb_brand_df)
 
     yandex_top_df, yandex_dyn_df, yandex_raw_df = load_yandex_wordstat(cfg)
+    yandex_weekly_df = build_yandex_weekly_table(yandex_dyn_df)
+    yandex_last_week_df = build_yandex_last_full_week(yandex_weekly_df)
+    yandex_top_summary_df = build_yandex_top_30_summary(yandex_top_df)
 
     summary_df = build_summary_sheet(
         cfg=cfg,
@@ -745,6 +858,7 @@ def run() -> Path:
         detected_variants=detected_variants,
         wb_keys=wb_keys,
         yandex_top_df=yandex_top_df,
+        yandex_last_week_df=yandex_last_week_df,
     )
 
     report_name = f"Брендовые_запросы_{cfg.store_name}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
@@ -758,8 +872,11 @@ def run() -> Path:
         "WB_Рост": wb_growth,
         "WB_Падение": wb_decline,
         "WB_Сырые_бренд": wb_brand_df,
-        "Yandex_Top": yandex_top_df,
-        "Yandex_Dynamics": yandex_dyn_df,
+        "Yandex_Last_Full_Week": yandex_last_week_df,
+        "Yandex_Weekly_Dynamics": yandex_weekly_df,
+        "Yandex_Top_30d_Summary": yandex_top_summary_df,
+        "Yandex_Top_30d": yandex_top_df,
+        "Yandex_Dynamics_Raw": yandex_dyn_df,
         "Yandex_Raw": yandex_raw_df,
     }
     save_report(report_path, sheets)
