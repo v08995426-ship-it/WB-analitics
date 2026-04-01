@@ -230,7 +230,7 @@ def get_config() -> Config:
         yandex_api_key=(os.getenv("YANDEX_API_KEY") or "").strip(),
         yandex_folder_id=(os.getenv("YANDEX_FOLDER_ID") or "").strip(),
         yandex_region_id=(os.getenv("YANDEX_REGION_ID") or "").strip() or None,
-        yandex_top_url=(os.getenv("YANDEX_WORDSTAT_TOP_URL") or "https://searchapi.api.cloud.yandex.net/v2/wordstat/top").strip(),
+        yandex_top_url=(os.getenv("YANDEX_WORDSTAT_TOP_URL") or "https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests").strip(),
         yandex_dynamics_url=(os.getenv("YANDEX_WORDSTAT_DYNAMICS_URL") or "https://searchapi.api.cloud.yandex.net/v2/wordstat/dynamics").strip(),
         brand_variants=parse_list_env("BRAND_VARIANTS", DEFAULT_BRAND_VARIANTS),
         yandex_phrases=parse_list_env("YANDEX_PHRASES", DEFAULT_YANDEX_PHRASES),
@@ -444,13 +444,17 @@ def yandex_post(url: str, payload: dict[str, Any], cfg: Config) -> dict[str, Any
     return data
 
 
-def build_yandex_payload(cfg: Config, phrase: str) -> dict[str, Any]:
+def build_yandex_payload(cfg: Config, phrase: str, *, for_dynamics: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "folderId": cfg.yandex_folder_id,
         "phrase": phrase,
     }
     if cfg.yandex_region_id:
-        payload["regionId"] = cfg.yandex_region_id
+        payload["regions"] = [str(cfg.yandex_region_id)]
+    if for_dynamics:
+        payload["period"] = "WEEKLY"
+    else:
+        payload["numPhrases"] = 100
     return payload
 
 
@@ -546,7 +550,7 @@ def load_yandex_wordstat(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
             continue
 
         log(f"Yandex Wordstat: GetTop по фразе '{phrase}'")
-        top_payload = build_yandex_payload(cfg, phrase)
+        top_payload = build_yandex_payload(cfg, phrase, for_dynamics=False)
         top_json = yandex_post(cfg.yandex_top_url, top_payload, cfg)
         raw_rows.append({"Метод": "top", "Фраза": phrase, "JSON": json.dumps(top_json, ensure_ascii=False)})
         top_df = extract_yandex_top_records(top_json, phrase)
@@ -554,7 +558,7 @@ def load_yandex_wordstat(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
             top_frames.append(top_df)
 
         log(f"Yandex Wordstat: GetDynamics по фразе '{phrase}'")
-        dyn_payload = build_yandex_payload(cfg, phrase)
+        dyn_payload = build_yandex_payload(cfg, phrase, for_dynamics=True)
         dyn_json = yandex_post(cfg.yandex_dynamics_url, dyn_payload, cfg)
         raw_rows.append({"Метод": "dynamics", "Фраза": phrase, "JSON": json.dumps(dyn_json, ensure_ascii=False)})
         dyn_df = extract_yandex_dynamics_records(dyn_json, phrase)
