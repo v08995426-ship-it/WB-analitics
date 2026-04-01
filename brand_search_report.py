@@ -408,7 +408,7 @@ def load_yandex_counts(cfg: Config, phrase_pool: pd.DataFrame) -> Tuple[pd.DataF
         log(f"Yandex Wordstat: GetTop по фразе '{phrase}'")
         payload: Dict[str, object] = {
             "folderId": cfg.yandex_folder_id,
-            "text": phrase,
+            "phrase": phrase,
             "numPhrases": 100,
         }
         if cfg.yandex_region_id:
