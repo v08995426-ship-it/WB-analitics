@@ -19,7 +19,7 @@ import requests
 # CONFIG
 # =========================
 
-DEFAULT_STORE = os.getenv("STORE_NAME", "TOPFACE")
+DEFAULT_STORE = "TOPFACE"
 DEFAULT_WEEKLY_PREFIX = os.getenv(
     "WB_WEEKLY_PREFIX",
     f"Отчёты/Поисковые запросы/{DEFAULT_STORE}/Недельные/"
@@ -85,7 +85,7 @@ def build_config() -> Config:
         yandex_api_key=os.getenv("YANDEX_API_KEY", "").strip() or None,
         yandex_folder_id=os.getenv("YANDEX_FOLDER_ID", "").strip() or None,
         yandex_region_id=os.getenv("YANDEX_REGION_ID", "").strip() or None,
-        store_name=os.getenv("STORE_NAME", DEFAULT_STORE).strip() or DEFAULT_STORE,
+        store_name=(os.getenv("STORE_NAME") or DEFAULT_STORE).strip() or DEFAULT_STORE,
         wb_weekly_prefix=os.getenv("WB_WEEKLY_PREFIX", DEFAULT_WEEKLY_PREFIX).strip(),
         wb_archive_prefixes=[p.strip() for p in os.getenv(
             "WB_ARCHIVE_PREFIXES",
