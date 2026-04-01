@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import io
 import json
-import math
 import os
 import re
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import boto3
 import pandas as pd
@@ -19,29 +19,27 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 
 # =========================
-# Конфиг
+# Базовые настройки
 # =========================
 
-DEFAULT_BRAND_VARIANTS = [
+DEFAULT_BRAND_SEEDS = [
     "topface",
     "top face",
     "top-face",
+    "top face ",
     "топфейс",
     "топ фейс",
     "топ-фейс",
-    "топфеис",
-    "топ феис",
-    "топфэйс",
-    "топ фэйс",
+    "топфе",
+    "topfac",
     "topfase",
     "top fase",
 ]
 
-DEFAULT_YANDEX_PHRASES = [
-    "topface",
-    "топфейс",
-    "top face",
-    "топ фейс",
+# Эти префиксы можно переопределить через переменную окружения WB_ARCHIVE_PREFIXES
+DEFAULT_ARCHIVE_PREFIXES = [
+    "Отчёты/Поисковые запросы/TOPFACE/Архив/",
+    "Отчёты/Поисковые запросы/TOPFACE/Архивы/",
 ]
 
 FONT_NAME = "Calibri"
@@ -66,20 +64,21 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     force_send: bool
+    send_on_manual: bool
     run_date: date
 
     store_name: str
     wb_keywords_prefix: str
     output_prefix: str
+    archive_prefixes: list[str]
 
     yandex_api_key: str
     yandex_folder_id: str
     yandex_region_id: Optional[str]
     yandex_top_url: str
-    yandex_dynamics_url: str
 
-    brand_variants: list[str]
-    yandex_phrases: list[str]
+    brand_seeds: list[str]
+    yandex_max_phrases: int
     wb_weeks_to_compare: int
     wb_use_only_orders_filter: bool
 
@@ -112,9 +111,9 @@ class S3Storage:
             token = resp.get("NextContinuationToken")
         return keys
 
-    def read_excel(self, key: str, **kwargs) -> pd.DataFrame:
+    def read_bytes(self, key: str) -> bytes:
         obj = self.client.get_object(Bucket=self.bucket, Key=key)
-        return pd.read_excel(io.BytesIO(obj["Body"].read()), **kwargs)
+        return obj["Body"].read()
 
     def write_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         self.client.put_object(
@@ -129,6 +128,28 @@ def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
+def getenv(name: str, default: Optional[str] = None) -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        raise RuntimeError(f"Не задана переменная окружения {name}")
+    return value
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "да"}
+
+
+def parse_list_env(name: str, default: list[str]) -> list[str]:
+    value = os.getenv(name)
+    if not value:
+        return list(default)
+    parts = [x.strip() for x in re.split(r"[;\n,]+", value) if x.strip()]
+    return parts or list(default)
+
+
 def normalize_text(value: object) -> str:
     if value is None:
         return ""
@@ -137,11 +158,12 @@ def normalize_text(value: object) -> str:
             return ""
     except Exception:
         pass
-    if isinstance(value, float) and float(value).is_integer():
-        return str(int(value)).strip()
-    text = str(value).strip()
-    if re.fullmatch(r"\d+\.0+", text):
-        text = text.split(".")[0]
+    return str(value).strip()
+
+
+def normalize_query(value: object) -> str:
+    text = normalize_text(value).lower().replace("ё", "е")
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
@@ -155,7 +177,7 @@ def safe_float(value: object) -> float:
         pass
     if isinstance(value, (int, float)):
         return float(value)
-    text = str(value).strip().replace(" ", "").replace(",", ".")
+    text = str(value).strip().replace(" ", "").replace(",", ".").replace("%", "")
     if not text:
         return 0.0
     try:
@@ -164,55 +186,37 @@ def safe_float(value: object) -> float:
         return 0.0
 
 
-def parse_list_env(name: str, default_values: list[str]) -> list[str]:
-    raw = (os.getenv(name) or "").strip()
-    if not raw:
-        return default_values[:]
-    items = []
-    for part in re.split(r"[;\n,|]+", raw):
-        part = part.strip()
-        if part:
-            items.append(part)
-    return items or default_values[:]
+def safe_int(value: object) -> int:
+    return int(round(safe_float(value)))
 
 
-def parse_iso_week_from_key(key: str) -> tuple[int, int]:
-    m = re.search(r"_(\d{4})-W(\d{2})\.xlsx$", key, flags=re.IGNORECASE)
-    if not m:
-        return (0, 0)
-    return int(m.group(1)), int(m.group(2))
+def build_config() -> Config:
+    bucket = getenv("YC_BUCKET_NAME")
+    access_key = getenv("YC_ACCESS_KEY_ID")
+    secret_key = getenv("YC_SECRET_ACCESS_KEY")
+    endpoint_url = os.getenv("YC_ENDPOINT_URL", "https://storage.yandexcloud.net")
+    region_name = os.getenv("YC_REGION_NAME", "ru-central1")
 
+    telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    force_send = parse_bool_env("FORCE_SEND", False)
+    send_on_manual = parse_bool_env("SEND_ON_MANUAL", True)
+    run_date = datetime.now().date()
 
-def latest_n_weekly_keys(keys: list[str], n: int) -> list[str]:
-    xlsx = [k for k in keys if k.lower().endswith(".xlsx")]
-    return sorted(xlsx, key=parse_iso_week_from_key)[-n:]
+    store_name = os.getenv("STORE_NAME", "TOPFACE")
+    wb_keywords_prefix = os.getenv("WB_KEYWORDS_PREFIX", f"Отчёты/Поисковые запросы/{store_name}/Недельные/")
+    output_prefix = os.getenv("BRAND_REPORT_OUTPUT_PREFIX", f"Отчёты/Поисковые запросы/Брендовый отчет/{store_name}/")
+    archive_prefixes = parse_list_env("WB_ARCHIVE_PREFIXES", DEFAULT_ARCHIVE_PREFIXES)
 
+    yandex_api_key = os.getenv("YANDEX_API_KEY", "")
+    yandex_folder_id = os.getenv("YANDEX_FOLDER_ID", "")
+    yandex_region_id = os.getenv("YANDEX_REGION_ID", None)
+    yandex_top_url = os.getenv("YANDEX_TOP_URL", "https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests")
 
-def should_send_report(cfg: Config) -> bool:
-    if cfg.force_send:
-        return True
-    return cfg.run_date.weekday() == 0  # только понедельник
-
-
-def get_config() -> Config:
-    bucket = (os.getenv("YC_BUCKET_NAME") or os.getenv("CLOUD_RU_BUCKET") or os.getenv("WB_S3_BUCKET") or "").strip()
-    access_key = (os.getenv("YC_ACCESS_KEY_ID") or os.getenv("CLOUD_RU_ACCESS_KEY") or os.getenv("WB_S3_ACCESS_KEY") or "").strip()
-    secret_key = (os.getenv("YC_SECRET_ACCESS_KEY") or os.getenv("CLOUD_RU_SECRET_KEY") or os.getenv("WB_S3_SECRET_KEY") or "").strip()
-    endpoint_url = (os.getenv("YC_ENDPOINT_URL") or os.getenv("WB_S3_ENDPOINT") or "https://storage.yandexcloud.net").strip()
-    region_name = (os.getenv("WB_S3_REGION") or "ru-central1").strip()
-
-    if not bucket or not access_key or not secret_key:
-        raise ValueError("Не заданы параметры Object Storage")
-
-    store_name = (os.getenv("STORE_NAME") or "TOPFACE").strip()
-    wb_keywords_prefix = (
-        os.getenv("WB_KEYWORDS_PREFIX")
-        or f"Отчёты/Поисковые запросы/{store_name}/Недельные/"
-    ).strip()
-    output_prefix = (
-        os.getenv("BRAND_REPORT_OUTPUT_PREFIX")
-        or f"Отчёты/Поисковые запросы/Брендовый отчет/{store_name}/"
-    ).strip()
+    brand_seeds = parse_list_env("BRAND_SEEDS", DEFAULT_BRAND_SEEDS)
+    yandex_max_phrases = int(os.getenv("YANDEX_MAX_PHRASES", "30"))
+    wb_weeks_to_compare = int(os.getenv("WB_WEEKS_TO_COMPARE", "8"))
+    wb_use_only_orders_filter = parse_bool_env("WB_USE_ONLY_ORDERS_FILTER", True)
 
     return Config(
         bucket=bucket,
@@ -220,676 +224,622 @@ def get_config() -> Config:
         secret_key=secret_key,
         endpoint_url=endpoint_url,
         region_name=region_name,
-        telegram_bot_token=(os.getenv("TELEGRAM_BOT_TOKEN") or "").strip(),
-        telegram_chat_id=(os.getenv("TELEGRAM_CHAT_ID") or "").strip(),
-        force_send=(os.getenv("WB_FORCE_SEND", "false").strip().lower() == "true"),
-        run_date=date.today(),
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        force_send=force_send,
+        send_on_manual=send_on_manual,
+        run_date=run_date,
         store_name=store_name,
         wb_keywords_prefix=wb_keywords_prefix,
-        output_prefix=output_prefix.rstrip("/") + "/",
-        yandex_api_key=(os.getenv("YANDEX_API_KEY") or "").strip(),
-        yandex_folder_id=(os.getenv("YANDEX_FOLDER_ID") or "").strip(),
-        yandex_region_id=(os.getenv("YANDEX_REGION_ID") or "").strip() or None,
-        yandex_top_url=(os.getenv("YANDEX_WORDSTAT_TOP_URL") or "https://searchapi.api.cloud.yandex.net/v2/wordstat/topRequests").strip(),
-        yandex_dynamics_url=(os.getenv("YANDEX_WORDSTAT_DYNAMICS_URL") or "https://searchapi.api.cloud.yandex.net/v2/wordstat/dynamics").strip(),
-        brand_variants=parse_list_env("BRAND_VARIANTS", DEFAULT_BRAND_VARIANTS),
-        yandex_phrases=parse_list_env("YANDEX_PHRASES", DEFAULT_YANDEX_PHRASES),
-        wb_weeks_to_compare=int((os.getenv("WB_WEEKS_TO_COMPARE") or "8").strip()),
-        wb_use_only_orders_filter=(os.getenv("WB_USE_ONLY_ORDERS_FILTER", "true").strip().lower() != "false"),
+        output_prefix=output_prefix,
+        archive_prefixes=archive_prefixes,
+        yandex_api_key=yandex_api_key,
+        yandex_folder_id=yandex_folder_id,
+        yandex_region_id=yandex_region_id,
+        yandex_top_url=yandex_top_url,
+        brand_seeds=brand_seeds,
+        yandex_max_phrases=yandex_max_phrases,
+        wb_weeks_to_compare=wb_weeks_to_compare,
+        wb_use_only_orders_filter=wb_use_only_orders_filter,
     )
 
 
-# =========================
-# WB
-# =========================
-
-def build_brand_regex(variants: Iterable[str]) -> re.Pattern[str]:
-    escaped = [re.escape(v.strip().lower()) for v in variants if str(v).strip()]
-    if not escaped:
-        raise ValueError("Список вариантов бренда пуст")
-    return re.compile("|".join(sorted(set(escaped), key=len, reverse=True)), flags=re.IGNORECASE)
+def contains_brand(query: str, seeds: list[str]) -> bool:
+    q = normalize_query(query)
+    if not q:
+        return False
+    return any(seed in q for seed in seeds)
 
 
-def extract_detected_variants(df: pd.DataFrame, regex: re.Pattern[str]) -> list[str]:
-    variants = set()
-    for value in df["Поисковый запрос"].dropna().astype(str).str.lower():
-        for match in regex.finditer(value):
-            variants.add(match.group(0))
-    return sorted(variants)
+def extract_week_label_from_key(key: str) -> str:
+    m = re.search(r"(20\d{2}-W\d{2})", key)
+    return m.group(1) if m else ""
 
 
-def prepare_wb_week(df: pd.DataFrame, week_key: str, regex: re.Pattern[str], only_orders_filter: bool) -> pd.DataFrame:
-    temp = df.copy()
-    required_cols = [
-        "Дата", "Поисковый запрос", "Фильтр", "Артикул WB", "Артикул продавца",
-        "Бренд", "Частота запросов", "Частота за неделю", "Переходы в карточку",
-        "Добавления в корзину", "Заказы", "Видимость %"
+def parse_weekly_wb_xlsx(content: bytes, week_label: str, source_key: str, cfg: Config) -> pd.DataFrame:
+    df = pd.read_excel(io.BytesIO(content))
+    if df.empty:
+        return pd.DataFrame()
+
+    if "Поисковый запрос" not in df.columns:
+        return pd.DataFrame()
+
+    if cfg.wb_use_only_orders_filter and "Фильтр" in df.columns:
+        df = df[df["Фильтр"].astype(str).str.lower().eq("orders")].copy()
+
+    df["query_norm"] = df["Поисковый запрос"].apply(normalize_query)
+    df = df[df["query_norm"].apply(lambda x: contains_brand(x, cfg.brand_seeds))].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    num_cols = [
+        "Частота запросов",
+        "Частота за неделю",
+        "Переходы в карточку",
+        "Добавления в корзину",
+        "Заказы",
+        "Видимость %",
     ]
-    for col in required_cols:
-        if col not in temp.columns:
-            temp[col] = None
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(safe_float)
 
-    temp["Поисковый запрос"] = temp["Поисковый запрос"].map(normalize_text)
-    temp["query_lower"] = temp["Поисковый запрос"].str.lower()
-    temp = temp[temp["query_lower"].str.contains(regex, na=False)]
-    if only_orders_filter and "Фильтр" in temp.columns:
-        temp = temp[temp["Фильтр"].astype(str).str.lower() == "orders"]
+    agg_map: dict[str, Any] = {
+        "Частота запросов": "max",
+        "Частота за неделю": "max",
+        "Переходы в карточку": "sum",
+        "Добавления в корзину": "sum",
+        "Заказы": "sum",
+        "Видимость %": "max",
+    }
+    existing_agg = {k: v for k, v in agg_map.items() if k in df.columns}
+    grouped = df.groupby("query_norm", as_index=False).agg(existing_agg)
 
-    if temp.empty:
-        return temp
-
-    temp["Дата_dt"] = pd.to_datetime(temp["Дата"], errors="coerce")
-    last_snapshot = temp["Дата_dt"].max()
-    if pd.notna(last_snapshot):
-        temp = temp[temp["Дата_dt"] == last_snapshot]
-
-    numeric_cols = ["Частота запросов", "Частота за неделю", "Переходы в карточку", "Добавления в корзину", "Заказы", "Видимость %"]
-    for col in numeric_cols:
-        temp[col] = temp[col].map(safe_float)
-
-    temp["week_key"] = week_key
-    # Внутри недели на уровне query + article берём max, чтобы не дублировать случайные повторы
-    grouped = (
-        temp.groupby(["week_key", "Поисковый запрос", "Артикул WB", "Артикул продавца"], dropna=False, as_index=False)
-        .agg({
-            "Бренд": "first",
-            "Частота запросов": "max",
-            "Частота за неделю": "max",
-            "Переходы в карточку": "max",
-            "Добавления в корзину": "max",
-            "Заказы": "max",
-            "Видимость %": "max",
-        })
-    )
-    return grouped
-
-
-def load_wb_brand_data(storage: S3Storage, cfg: Config, regex: re.Pattern[str]) -> tuple[pd.DataFrame, list[str]]:
-    keys = storage.list_keys(cfg.wb_keywords_prefix)
-    week_keys = latest_n_weekly_keys(keys, cfg.wb_weeks_to_compare)
-    if not week_keys:
-        raise FileNotFoundError(f"Не найдены weekly xlsx по префиксу: {cfg.wb_keywords_prefix}")
-
-    frames: list[pd.DataFrame] = []
-    for key in week_keys:
-        log(f"WB: читаю {key}")
-        df = storage.read_excel(key)
-        week_df = prepare_wb_week(
-            df=df,
-            week_key=Path(key).name.replace(".xlsx", ""),
-            regex=regex,
-            only_orders_filter=cfg.wb_use_only_orders_filter,
+    # Сохраним исходное написание с максимальной частотой
+    display_map = (
+        df.sort_values(
+            by=["Частота за неделю" if "Частота за неделю" in df.columns else "Частота запросов"],
+            ascending=False,
         )
-        if not week_df.empty:
-            frames.append(week_df)
+        .drop_duplicates("query_norm")
+        [["query_norm", "Поисковый запрос"]]
+        .rename(columns={"Поисковый запрос": "Поисковый запрос (WB)"})
+    )
+    grouped = grouped.merge(display_map, on="query_norm", how="left")
+    grouped["Неделя"] = week_label
+    grouped["Источник"] = "WB weekly"
+    grouped["Файл"] = source_key
 
-    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    return result, week_keys
+    desired_cols = [
+        "Неделя",
+        "Поисковый запрос (WB)",
+        "query_norm",
+        "Частота запросов",
+        "Частота за неделю",
+        "Переходы в карточку",
+        "Добавления в корзину",
+        "Заказы",
+        "Видимость %",
+        "Источник",
+        "Файл",
+    ]
+    return grouped[[c for c in desired_cols if c in grouped.columns]].copy()
 
 
-def build_wb_weekly_summary(wb_brand_df: pd.DataFrame) -> pd.DataFrame:
-    if wb_brand_df.empty:
-        return pd.DataFrame(columns=[
-            "Неделя", "Уникальных брендовых запросов", "Уникальных артикулов",
-            "Сумма частотности", "Сумма частотности за неделю", "Переходы в карточку",
-            "Добавления в корзину", "Заказы"
-        ])
+def parse_archive_query_xlsx(content: bytes, source_key: str, cfg: Config) -> pd.DataFrame:
+    # Ищем лист "Детальная информация" и заголовок на второй строке
+    xls = pd.ExcelFile(io.BytesIO(content))
+    target_sheet = None
+    for sheet in xls.sheet_names:
+        if "детал" in sheet.lower():
+            target_sheet = sheet
+            break
+    if target_sheet is None:
+        return pd.DataFrame()
 
-    summary = (
-        wb_brand_df.groupby("week_key", as_index=False)
-        .agg({
-            "Поисковый запрос": pd.Series.nunique,
-            "Артикул WB": pd.Series.nunique,
-            "Частота запросов": "sum",
-            "Частота за неделю": "sum",
-            "Переходы в карточку": "sum",
-            "Добавления в корзину": "sum",
-            "Заказы": "sum",
-        })
-        .rename(columns={
-            "week_key": "Неделя",
-            "Поисковый запрос": "Уникальных брендовых запросов",
-            "Артикул WB": "Уникальных артикулов",
-            "Частота запросов": "Сумма частотности",
-            "Частота за неделю": "Сумма частотности за неделю",
-        })
-        .sort_values("Неделя")
+    df = pd.read_excel(io.BytesIO(content), sheet_name=target_sheet, header=1)
+    if "Поисковый запрос" not in df.columns:
+        return pd.DataFrame()
+
+    df["query_norm"] = df["Поисковый запрос"].apply(normalize_query)
+    df = df[df["query_norm"].apply(lambda x: contains_brand(x, cfg.brand_seeds))].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    if "Количество запросов" in df.columns:
+        df["Количество запросов"] = df["Количество запросов"].apply(safe_float)
+    if "Запросов в среднем за день" in df.columns:
+        df["Запросов в среднем за день"] = df["Запросов в среднем за день"].apply(safe_float)
+    if "Перешли в карточку товара" in df.columns:
+        df["Перешли в карточку товара"] = df["Перешли в карточку товара"].apply(safe_float)
+    if "Добавили в корзину" in df.columns:
+        df["Добавили в корзину"] = df["Добавили в корзину"].apply(safe_float)
+    if "Заказали товаров" in df.columns:
+        df["Заказали товаров"] = df["Заказали товаров"].apply(safe_float)
+
+    # Период заберём из имени файла, если есть
+    period_match = re.search(r"с (\d{2}[-.]\d{2}[-.]\d{4}) по (\d{2}[-.]\d{2}[-.]\d{4})", source_key)
+    period_label = ""
+    if period_match:
+        period_label = f"{period_match.group(1)} - {period_match.group(2)}"
+
+    out = pd.DataFrame({
+        "Период архива": period_label,
+        "Поисковый запрос (WB)": df["Поисковый запрос"],
+        "query_norm": df["query_norm"],
+        "Количество запросов": df["Количество запросов"] if "Количество запросов" in df.columns else 0,
+        "Запросов в среднем за день": df["Запросов в среднем за день"] if "Запросов в среднем за день" in df.columns else 0,
+        "Перешли в карточку товара": df["Перешли в карточку товара"] if "Перешли в карточку товара" in df.columns else 0,
+        "Добавили в корзину": df["Добавили в корзину"] if "Добавили в корзину" in df.columns else 0,
+        "Заказали товаров": df["Заказали товаров"] if "Заказали товаров" in df.columns else 0,
+        "Источник": "WB archive",
+        "Файл": source_key,
+    })
+    return out
+
+
+def load_wb_weekly_brand_queries(storage: S3Storage, cfg: Config) -> pd.DataFrame:
+    keys = sorted([k for k in storage.list_keys(cfg.wb_keywords_prefix) if k.lower().endswith(".xlsx")])
+    if not keys:
+        log(f"WB: по префиксу {cfg.wb_keywords_prefix} xlsx-файлы не найдены")
+        return pd.DataFrame()
+
+    keys = keys[-cfg.wb_weeks_to_compare:]
+    frames: list[pd.DataFrame] = []
+    for key in keys:
+        log(f"WB: читаю {key}")
+        content = storage.read_bytes(key)
+        week_label = extract_week_label_from_key(key)
+        frame = parse_weekly_wb_xlsx(content, week_label=week_label, source_key=key, cfg=cfg)
+        if not frame.empty:
+            frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def load_wb_archive_brand_queries(storage: S3Storage, cfg: Config) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for prefix in cfg.archive_prefixes:
+        keys = sorted(storage.list_keys(prefix))
+        if not keys:
+            continue
+        for key in keys:
+            low = key.lower()
+            try:
+                if low.endswith(".xlsx"):
+                    log(f"WB archive: читаю {key}")
+                    content = storage.read_bytes(key)
+                    frame = parse_archive_query_xlsx(content, source_key=key, cfg=cfg)
+                    if not frame.empty:
+                        frames.append(frame)
+                elif low.endswith(".zip"):
+                    log(f"WB archive: читаю {key}")
+                    raw = storage.read_bytes(key)
+                    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                        for name in zf.namelist():
+                            if name.lower().endswith(".xlsx"):
+                                frame = parse_archive_query_xlsx(zf.read(name), source_key=f"{key}::{name}", cfg=cfg)
+                                if not frame.empty:
+                                    frames.append(frame)
+            except Exception as e:
+                log(f"WB archive: ошибка чтения {key}: {e}")
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_phrase_pool_from_wb(wb_weekly_df: pd.DataFrame, wb_archive_df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, list[str], list[str]]:
+    candidates: list[pd.DataFrame] = []
+
+    if not wb_weekly_df.empty:
+        tmp = wb_weekly_df.copy()
+        tmp["weight"] = tmp.get("Частота за неделю", 0).apply(safe_float)
+        tmp["source"] = "weekly"
+        candidates.append(tmp[["Поисковый запрос (WB)", "query_norm", "weight", "source"]])
+
+    if not wb_archive_df.empty:
+        tmp = wb_archive_df.copy()
+        tmp["weight"] = tmp.get("Количество запросов", 0).apply(safe_float)
+        tmp["source"] = "archive"
+        candidates.append(tmp[["Поисковый запрос (WB)", "query_norm", "weight", "source"]])
+
+    if not candidates:
+        return pd.DataFrame(), [], list(cfg.brand_seeds)
+
+    pool = pd.concat(candidates, ignore_index=True)
+    pool["query_norm"] = pool["query_norm"].apply(normalize_query)
+    pool = pool[pool["query_norm"].astype(bool)].copy()
+
+    agg = (
+        pool.groupby("query_norm", as_index=False)
+        .agg(
+            weight=("weight", "sum"),
+            sources=("source", lambda s: ", ".join(sorted(set(map(str, s))))),
+            examples=("Поисковый запрос (WB)", lambda s: next((x for x in s if normalize_text(x)), "")),
+        )
+        .sort_values(["weight", "query_norm"], ascending=[False, True])
         .reset_index(drop=True)
     )
-    return summary
+    agg["rank"] = range(1, len(agg) + 1)
 
+    exact_phrases = agg["examples"].head(cfg.yandex_max_phrases).tolist()
 
-def build_wb_compare_tables(wb_brand_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if wb_brand_df.empty:
-        empty = pd.DataFrame()
-        return empty, empty, empty
+    expanded_seeds = list(cfg.brand_seeds)
+    # Добавим короткие brand-токены из реальных запросов
+    token_hits = set()
+    for q in agg["query_norm"].tolist():
+        if "topface" in q:
+            token_hits.add("topface")
+        if "top face" in q:
+            token_hits.add("top face")
+        if "топфейс" in q:
+            token_hits.add("топфейс")
+        if "топ фейс" in q:
+            token_hits.add("топ фейс")
+    expanded_seeds.extend(sorted(token_hits))
+    expanded_seeds = sorted(set([x.strip().lower() for x in expanded_seeds if x.strip()]))
 
-    weeks = sorted(wb_brand_df["week_key"].dropna().astype(str).unique())
-    if len(weeks) < 2:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    prev_week = weeks[-2]
-    curr_week = weeks[-1]
-
-    prev_df = wb_brand_df[wb_brand_df["week_key"] == prev_week].copy()
-    curr_df = wb_brand_df[wb_brand_df["week_key"] == curr_week].copy()
-
-    prev_agg = (
-        prev_df.groupby("Поисковый запрос", as_index=False)
-        .agg({
-            "Частота запросов": "sum",
-            "Частота за неделю": "sum",
-            "Переходы в карточку": "sum",
-            "Добавления в корзину": "sum",
-            "Заказы": "sum",
-        })
-        .rename(columns=lambda c: f"{c} ({prev_week})" if c != "Поисковый запрос" else c)
-    )
-
-    curr_agg = (
-        curr_df.groupby("Поисковый запрос", as_index=False)
-        .agg({
-            "Частота запросов": "sum",
-            "Частота за неделю": "sum",
-            "Переходы в карточку": "sum",
-            "Добавления в корзину": "sum",
-            "Заказы": "sum",
-        })
-        .rename(columns=lambda c: f"{c} ({curr_week})" if c != "Поисковый запрос" else c)
-    )
-
-    merged = prev_agg.merge(curr_agg, on="Поисковый запрос", how="outer").fillna(0)
-    merged["Δ Частота запросов"] = merged[f"Частота запросов ({curr_week})"] - merged[f"Частота запросов ({prev_week})"]
-    merged["Δ Частота за неделю"] = merged[f"Частота за неделю ({curr_week})"] - merged[f"Частота за неделю ({prev_week})"]
-    merged["Δ Переходы"] = merged[f"Переходы в карточку ({curr_week})"] - merged[f"Переходы в карточку ({prev_week})"]
-    merged["Δ Корзина"] = merged[f"Добавления в корзину ({curr_week})"] - merged[f"Добавления в корзину ({prev_week})"]
-    merged["Δ Заказы"] = merged[f"Заказы ({curr_week})"] - merged[f"Заказы ({prev_week})"]
-    merged["Статус"] = "Без изменений"
-    merged.loc[
-        (merged[f"Частота за неделю ({prev_week})"] == 0) & (merged[f"Частота за неделю ({curr_week})"] > 0),
-        "Статус"
-    ] = "Новый запрос"
-    merged.loc[
-        (merged[f"Частота за неделю ({prev_week})"] > 0) & (merged[f"Частота за неделю ({curr_week})"] == 0),
-        "Статус"
-    ] = "Исчез запрос"
-
-    top_growth = merged.sort_values(["Δ Частота за неделю", "Δ Заказы"], ascending=[False, False]).head(50).reset_index(drop=True)
-    top_decline = merged.sort_values(["Δ Частота за неделю", "Δ Заказы"], ascending=[True, True]).head(50).reset_index(drop=True)
-    merged = merged.sort_values(["Δ Частота за неделю", "Δ Заказы"], ascending=[False, False]).reset_index(drop=True)
-    return merged, top_growth, top_decline
-
-
-# =========================
-# Yandex Wordstat
-# =========================
-
-def yandex_headers(cfg: Config) -> dict[str, str]:
-    if not cfg.yandex_api_key:
-        raise ValueError("Не задан YANDEX_API_KEY")
-    return {
-        "Authorization": f"Api-Key {cfg.yandex_api_key}",
-        "Content-Type": "application/json",
-    }
+    return agg.rename(columns={"examples": "Поисковый запрос (WB)"}), exact_phrases, expanded_seeds
 
 
 def yandex_post(url: str, payload: dict[str, Any], cfg: Config) -> dict[str, Any]:
-    resp = requests.post(url, headers=yandex_headers(cfg), json=payload, timeout=120)
+    headers = {
+        "Authorization": f"Api-Key {cfg.yandex_api_key}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
     try:
         data = resp.json()
     except Exception:
         data = {"raw_text": resp.text}
     if resp.status_code >= 400:
-        raise RuntimeError(f"Yandex API {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:1000]}")
+        raise RuntimeError(f"Yandex API {resp.status_code}: {json.dumps(data, ensure_ascii=False)[:1500]}")
     return data
 
 
-def build_yandex_payload(
-    cfg: Config,
-    phrase: str,
-    *,
-    for_dynamics: bool = False,
-    dynamics_period: str = "PERIOD_WEEKLY",
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "folderId": cfg.yandex_folder_id,
-        "phrase": phrase,
-    }
-    if cfg.yandex_region_id:
-        payload["regions"] = [str(cfg.yandex_region_id)]
-    if for_dynamics:
-        payload["period"] = dynamics_period
-    else:
-        payload["numPhrases"] = 100
-    return payload
-
-
-def try_yandex_dynamics(cfg: Config, phrase: str) -> dict[str, Any]:
-    last_error: Optional[Exception] = None
-    period_candidates = [
-        "PERIOD_WEEKLY",
-        "PERIOD_WEEKLY",
-        "WEEK",
-    ]
-    for period_value in period_candidates:
-        payload = build_yandex_payload(cfg, phrase, for_dynamics=True, dynamics_period=period_value)
-        try:
-            return yandex_post(cfg.yandex_dynamics_url, payload, cfg)
-        except Exception as exc:
-            last_error = exc
-            log(f"Yandex Wordstat: GetDynamics не принял period='{period_value}' для фразы '{phrase}'")
-            continue
-    if last_error:
-        raise last_error
-    raise RuntimeError("Не удалось выполнить GetDynamics")
-
-def parse_possible_date(value: object) -> Optional[pd.Timestamp]:
-    text = normalize_text(value)
-    if not text:
-        return None
-    dt = pd.to_datetime(text, errors="coerce")
-    if pd.isna(dt):
-        return None
-    return pd.Timestamp(dt).normalize()
-
-def recursive_find_dicts(obj: Any) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    if isinstance(obj, dict):
-        found.append(obj)
-        for value in obj.values():
-            found.extend(recursive_find_dicts(value))
-    elif isinstance(obj, list):
-        for item in obj:
-            found.extend(recursive_find_dicts(item))
-    return found
-
-
-def extract_yandex_top_records(response_json: dict[str, Any], source_phrase: str) -> pd.DataFrame:
+def flatten_top_items(data: Any, phrase: str, source_phrase_rank: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for item in recursive_find_dicts(response_json):
-        query = (
-            item.get("query")
-            or item.get("phrase")
-            or item.get("text")
-            or item.get("keyword")
-            or item.get("searchText")
-        )
-        if not query:
-            continue
 
-        rows.append({
-            "Источник фраза": source_phrase,
-            "Запрос": normalize_text(query),
-            "Показы": safe_float(
-                item.get("shows")
-                or item.get("showsCount")
-                or item.get("count")
-                or item.get("freq")
-                or item.get("value")
-                or item.get("searches")
-                or item.get("frequency")
-            ),
-            "Тип": normalize_text(item.get("type") or item.get("kind") or item.get("group")),
-            "Регион": normalize_text(item.get("region") or item.get("regionName")),
-        })
+    def walk(node: Any, path: str = "") -> None:
+        if isinstance(node, dict):
+            # Кандидаты на запись
+            text_candidates = [
+                node.get("text"),
+                node.get("phrase"),
+                node.get("query"),
+                node.get("request"),
+                node.get("keyword"),
+                node.get("searchRequest"),
+            ]
+            text_value = next((normalize_text(x) for x in text_candidates if normalize_text(x)), "")
+            count_candidates = [
+                node.get("shows"),
+                node.get("count"),
+                node.get("value"),
+                node.get("freq"),
+                node.get("frequency"),
+                node.get("requests"),
+            ]
+            count_value = next((safe_float(x) for x in count_candidates if safe_float(x) != 0), 0.0)
 
-    df = pd.DataFrame(rows).drop_duplicates()
-    if df.empty:
-        return pd.DataFrame(columns=["Источник фраза", "Запрос", "Показы", "Тип", "Регион"])
-    df["Запрос"] = df["Запрос"].map(normalize_text)
-    df["Показы"] = df["Показы"].map(safe_float)
-    df = df[df["Запрос"] != ""].copy()
-    return df.sort_values(["Источник фраза", "Показы", "Запрос"], ascending=[True, False, True]).reset_index(drop=True)
+            if text_value:
+                rows.append(
+                    {
+                        "Исходная фраза WB": phrase,
+                        "Ранг исходной фразы": source_phrase_rank,
+                        "Yandex запрос": text_value,
+                        "Yandex запрос norm": normalize_query(text_value),
+                        "Показатель": count_value,
+                        "Путь": path,
+                    }
+                )
 
+            for k, v in node.items():
+                walk(v, f"{path}/{k}" if path else str(k))
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{path}[{i}]")
 
-def extract_yandex_dynamics_records(response_json: dict[str, Any], source_phrase: str) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for item in recursive_find_dicts(response_json):
-        dt_value = item.get("date") or item.get("period") or item.get("month") or item.get("time")
-        freq_value = (
-            item.get("shows")
-            or item.get("count")
-            or item.get("value")
-            or item.get("freq")
-            or item.get("searches")
-            or item.get("frequency")
-        )
-        if dt_value is None or freq_value is None:
-            continue
+    walk(data)
+    dedup = pd.DataFrame(rows)
+    if dedup.empty:
+        return rows
 
-        rows.append({
-            "Источник фраза": source_phrase,
-            "Период": normalize_text(dt_value),
-            "Частотность": safe_float(freq_value),
-        })
-
-    df = pd.DataFrame(rows).drop_duplicates()
-    if df.empty:
-        return pd.DataFrame(columns=["Источник фраза", "Период", "Частотность"])
-    return df.sort_values(["Источник фраза", "Период"]).reset_index(drop=True)
+    dedup = (
+        dedup.sort_values(["Показатель", "Yandex запрос"], ascending=[False, True])
+        .drop_duplicates(subset=["Исходная фраза WB", "Yandex запрос norm", "Путь"], keep="first")
+    )
+    return dedup.to_dict("records")
 
 
-def load_yandex_wordstat(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_yandex_top_by_wb_phrases(phrases: list[str], cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not cfg.yandex_api_key or not cfg.yandex_folder_id:
-        log("Yandex API секреты не заданы — блок Yandex пропускаем")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        log("Yandex: пропущено, потому что не заданы YANDEX_API_KEY / YANDEX_FOLDER_ID")
+        return pd.DataFrame(), pd.DataFrame()
 
+    rows: list[dict[str, Any]] = []
     raw_rows: list[dict[str, Any]] = []
-    top_frames: list[pd.DataFrame] = []
-    dyn_frames: list[pd.DataFrame] = []
 
-    for phrase in cfg.yandex_phrases:
-        phrase = phrase.strip()
-        if not phrase:
-            continue
+    for idx, phrase in enumerate(phrases, start=1):
+        payload: dict[str, Any] = {
+            "folderId": cfg.yandex_folder_id,
+            "phrase": phrase,
+            "numPhrases": 30,
+        }
+        if cfg.yandex_region_id:
+            payload["regions"] = [str(cfg.yandex_region_id)]
 
         try:
             log(f"Yandex Wordstat: GetTop по фразе '{phrase}'")
-            top_payload = build_yandex_payload(cfg, phrase, for_dynamics=False)
-            top_json = yandex_post(cfg.yandex_top_url, top_payload, cfg)
-            raw_rows.append({"Метод": "top", "Фраза": phrase, "JSON": json.dumps(top_json, ensure_ascii=False)})
-            top_df = extract_yandex_top_records(top_json, phrase)
-            if not top_df.empty:
-                top_frames.append(top_df)
-        except Exception as exc:
-            raw_rows.append({"Метод": "top_error", "Фраза": phrase, "JSON": json.dumps({"error": str(exc)}, ensure_ascii=False)})
-            log(f"Yandex Wordstat: ошибка GetTop по фразе '{phrase}': {exc}")
+            data = yandex_post(cfg.yandex_top_url, payload, cfg)
+            raw_rows.append({"Исходная фраза WB": phrase, "JSON": json.dumps(data, ensure_ascii=False)})
+            rows.extend(flatten_top_items(data, phrase=phrase, source_phrase_rank=idx))
+        except Exception as e:
+            raw_rows.append({"Исходная фраза WB": phrase, "JSON": f"ERROR: {e}"})
+            log(f"Yandex Wordstat: ошибка GetTop по фразе '{phrase}': {e}")
 
-        try:
-            log(f"Yandex Wordstat: GetDynamics по фразе '{phrase}'")
-            dyn_json = try_yandex_dynamics(cfg, phrase)
-            raw_rows.append({"Метод": "dynamics", "Фраза": phrase, "JSON": json.dumps(dyn_json, ensure_ascii=False)})
-            dyn_df = extract_yandex_dynamics_records(dyn_json, phrase)
-            if not dyn_df.empty:
-                dyn_frames.append(dyn_df)
-        except Exception as exc:
-            raw_rows.append({"Метод": "dynamics_error", "Фраза": phrase, "JSON": json.dumps({"error": str(exc)}, ensure_ascii=False)})
-            log(f"Yandex Wordstat: ошибка GetDynamics по фразе '{phrase}': {exc}")
-
-    top_all = pd.concat(top_frames, ignore_index=True) if top_frames else pd.DataFrame()
-    dyn_all = pd.concat(dyn_frames, ignore_index=True) if dyn_frames else pd.DataFrame()
+    top_df = pd.DataFrame(rows)
     raw_df = pd.DataFrame(raw_rows)
 
-    if not top_all.empty:
-        top_all = (
-            top_all.groupby(["Запрос"], as_index=False)
-            .agg({
-                "Показы": "max",
-                "Источник фраза": lambda s: ", ".join(sorted(set(map(str, s)))),
-                "Тип": lambda s: ", ".join(sorted({x for x in map(str, s) if x and x != 'nan'})),
-                "Регион": lambda s: ", ".join(sorted({x for x in map(str, s) if x and x != 'nan'})),
-            })
-            .sort_values(["Показы", "Запрос"], ascending=[False, True])
+    if not top_df.empty:
+        # убираем слишком технические / пустые дубль-строки
+        top_df = top_df[top_df["Yandex запрос"].astype(str).str.len() > 0].copy()
+        top_df = (
+            top_df.sort_values(["Исходная фраза WB", "Показатель", "Yandex запрос"], ascending=[True, False, True])
+            .drop_duplicates(subset=["Исходная фраза WB", "Yandex запрос norm"], keep="first")
             .reset_index(drop=True)
         )
-    return top_all, dyn_all, raw_df
+
+    return top_df, raw_df
 
 
-def build_yandex_weekly_table(yandex_dyn_df: pd.DataFrame) -> pd.DataFrame:
-    if yandex_dyn_df is None or yandex_dyn_df.empty:
-        return pd.DataFrame(columns=["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя", "Частотность"])
+def make_wb_weekly_summary(wb_weekly_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if wb_weekly_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df = yandex_dyn_df.copy()
-    df["Дата периода"] = df["Период"].map(parse_possible_date)
-    df = df[df["Дата периода"].notna()].copy()
-    if df.empty:
-        return pd.DataFrame(columns=["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя", "Частотность"])
-
-    iso = df["Дата периода"].dt.isocalendar()
-    df["ISO год"] = iso["year"].astype(int)
-    df["ISO неделя"] = iso["week"].astype(int)
-    df["Неделя"] = df["ISO год"].astype(str) + "-W" + df["ISO неделя"].astype(str).str.zfill(2)
-
-    return (
-        df.groupby(["Источник фраза", "Дата периода", "ISO год", "ISO неделя", "Неделя"], as_index=False)["Частотность"]
-        .sum()
-        .sort_values(["Источник фраза", "Дата периода"])
+    summary = (
+        wb_weekly_df.groupby(["Неделя"], as_index=False)
+        .agg(
+            Брендовых_запросов=("query_norm", "nunique"),
+            Частота_за_неделю=("Частота за неделю", "sum"),
+            Переходы=("Переходы в карточку", "sum"),
+            Корзины=("Добавления в корзину", "sum"),
+            Заказы=("Заказы", "sum"),
+        )
+        .sort_values("Неделя")
         .reset_index(drop=True)
     )
 
-def build_yandex_last_full_week(yandex_weekly_df: pd.DataFrame) -> pd.DataFrame:
-    if yandex_weekly_df is None or yandex_weekly_df.empty:
-        return pd.DataFrame(columns=[
-            "Источник фраза", "Последняя полная неделя", "Предыдущая неделя",
-            "Частотность последняя неделя", "Частотность предыдущая неделя", "Δ", "Δ %"
-        ])
+    latest_week = summary["Неделя"].dropna().iloc[-1] if not summary.empty else ""
+    prev_week = summary["Неделя"].dropna().iloc[-2] if len(summary) > 1 else ""
 
-    completed = yandex_weekly_df.sort_values(["Источник фраза", "Дата периода"]).copy()
-    rows: list[dict[str, Any]] = []
-    for phrase, grp in completed.groupby("Источник фраза"):
-        grp = grp.sort_values("Дата периода").reset_index(drop=True)
-        if grp.empty:
-            continue
-        last = grp.iloc[-1]
-        prev = grp.iloc[-2] if len(grp) >= 2 else None
-        last_val = safe_float(last.get("Частотность"))
-        prev_val = safe_float(prev.get("Частотность")) if prev is not None else 0.0
-        delta = last_val - prev_val
-        delta_pct = (delta / prev_val * 100.0) if prev_val else None
-        rows.append({
-            "Источник фраза": phrase,
-            "Последняя полная неделя": last.get("Неделя"),
-            "Предыдущая неделя": prev.get("Неделя") if prev is not None else "",
-            "Частотность последняя неделя": last_val,
-            "Частотность предыдущая неделя": prev_val,
-            "Δ": delta,
-            "Δ %": round(delta_pct, 2) if delta_pct is not None else None,
-        })
-    return pd.DataFrame(rows).sort_values("Источник фраза").reset_index(drop=True)
+    latest_queries = pd.DataFrame()
+    wow = pd.DataFrame()
 
-def build_yandex_top_30_summary(yandex_top_df: pd.DataFrame) -> pd.DataFrame:
-    if yandex_top_df is None or yandex_top_df.empty:
-        return pd.DataFrame(columns=["Показатель", "Значение"])
+    if latest_week:
+        latest_queries = (
+            wb_weekly_df[wb_weekly_df["Неделя"] == latest_week]
+            .sort_values(["Частота за неделю", "Заказы"], ascending=[False, False])
+            .reset_index(drop=True)
+        )
 
-    total_shows = safe_float(yandex_top_df["Показы"].sum()) if "Показы" in yandex_top_df.columns else 0.0
-    return pd.DataFrame([
-        {"Показатель": "Уникальных запросов за последние 30 дней", "Значение": int(len(yandex_top_df))},
-        {"Показатель": "Сумма показов за последние 30 дней", "Значение": round(total_shows, 2)},
-        {"Показатель": "Топ-1 запрос", "Значение": normalize_text(yandex_top_df.iloc[0]["Запрос"])},
-        {"Показатель": "Топ-1 показы", "Значение": round(safe_float(yandex_top_df.iloc[0]["Показы"]), 2)},
-    ])
+    if latest_week and prev_week:
+        cur = wb_weekly_df[wb_weekly_df["Неделя"] == latest_week].copy()
+        prv = wb_weekly_df[wb_weekly_df["Неделя"] == prev_week].copy()
 
-# =========================
-# Excel / Telegram / S3
-# =========================
+        cur = cur.rename(
+            columns={
+                "Частота за неделю": "Частота текущая",
+                "Переходы в карточку": "Переходы текущие",
+                "Добавления в корзину": "Корзины текущие",
+                "Заказы": "Заказы текущие",
+            }
+        )
+        prv = prv.rename(
+            columns={
+                "Частота за неделю": "Частота предыдущая",
+                "Переходы в карточку": "Переходы предыдущие",
+                "Добавления в корзину": "Корзины предыдущие",
+                "Заказы": "Заказы предыдущие",
+            }
+        )
 
-def autofit_worksheet(ws) -> None:
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.font = Font(name=FONT_NAME, size=FONT_SIZE)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.border = BORDER_THIN
+        cols_cur = ["query_norm", "Поисковый запрос (WB)", "Частота текущая", "Переходы текущие", "Корзины текущие", "Заказы текущие"]
+        cols_prv = ["query_norm", "Частота предыдущая", "Переходы предыдущие", "Корзины предыдущие", "Заказы предыдущие"]
 
-    for cell in ws[1]:
-        cell.fill = FILL_HEADER
-        cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True)
+        wow = cur[cols_cur].merge(prv[cols_prv], on="query_norm", how="outer")
+        wow["Поисковый запрос (WB)"] = wow["Поисковый запрос (WB)"].fillna(wow["query_norm"])
+        for col in [
+            "Частота текущая",
+            "Переходы текущие",
+            "Корзины текущие",
+            "Заказы текущие",
+            "Частота предыдущая",
+            "Переходы предыдущие",
+            "Корзины предыдущие",
+            "Заказы предыдущие",
+        ]:
+            wow[col] = wow[col].fillna(0)
 
-    for col_cells in ws.columns:
-        max_len = 0
-        col_letter = col_cells[0].column_letter
-        for cell in col_cells:
-            value = "" if cell.value is None else str(cell.value)
-            max_len = max(max_len, len(value))
-        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 45)
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+        wow["Δ Частота"] = wow["Частота текущая"] - wow["Частота предыдущая"]
+        wow["Δ Переходы"] = wow["Переходы текущие"] - wow["Переходы предыдущие"]
+        wow["Δ Заказы"] = wow["Заказы текущие"] - wow["Заказы предыдущие"]
+        wow["Новая фраза"] = ((wow["Частота предыдущая"] == 0) & (wow["Частота текущая"] > 0)).map({True: "Да", False: ""})
+        wow["Исчезла"] = ((wow["Частота предыдущая"] > 0) & (wow["Частота текущая"] == 0)).map({True: "Да", False: ""})
+
+        wow = wow.sort_values(["Δ Частота", "Частота текущая"], ascending=[False, False]).reset_index(drop=True)
+
+    return summary, latest_queries, wow
 
 
-def save_report(path: Path, sheets: dict[str, pd.DataFrame]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for sheet_name, df in sheets.items():
-            if df is None or df.empty:
-                pd.DataFrame({"Пусто": ["Нет данных"]}).to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            else:
-                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+def make_yandex_summary(yandex_top_df: pd.DataFrame, seeds: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if yandex_top_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-    wb = load_workbook(path)
-    for ws in wb.worksheets:
-        autofit_worksheet(ws)
-    wb.save(path)
-
-
-def upload_report(storage: S3Storage, cfg: Config, path: Path) -> str:
-    key = f"{cfg.output_prefix}{path.name}"
-    with open(path, "rb") as f:
-        storage.write_bytes(key, f.read(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    log(f"Файл загружен в Object Storage: {key}")
-    return key
-
-
-def send_to_telegram(cfg: Config, path: Path, summary_df: pd.DataFrame, detected_variants: list[str], yandex_top_df: pd.DataFrame) -> None:
-    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
-        log("Telegram env не заданы — отправку пропускаем")
-        return
-
-    wb_last = summary_df.tail(1).to_dict(orient="records")
-    wb_prev = summary_df.tail(2).head(1).to_dict(orient="records")
-    wb_last = wb_last[0] if wb_last else {}
-    wb_prev = wb_prev[0] if wb_prev else {}
-
-    current_queries = int(wb_last.get("Уникальных брендовых запросов", 0) or 0)
-    prev_queries = int(wb_prev.get("Уникальных брендовых запросов", 0) or 0)
-    delta_queries = current_queries - prev_queries
-
-    yandex_count = int(len(yandex_top_df)) if yandex_top_df is not None and not yandex_top_df.empty else 0
-    variants_text = ", ".join(detected_variants[:12]) if detected_variants else "не найдены"
-
-    caption = (
-        f"🔎 Брендовый отчёт по запросам {cfg.store_name}\n"
-        f"Дата: {cfg.run_date.strftime('%Y-%m-%d')}\n"
-        f"WB брендовых запросов: {current_queries} ({delta_queries:+d} к прошлой неделе)\n"
-        f"Yandex запросов: {yandex_count}\n"
-        f"Варианты бренда: {variants_text}"
+    top_by_source = (
+        yandex_top_df.groupby(["Исходная фраза WB"], as_index=False)
+        .agg(
+            Уникальных_Yandex_запросов=("Yandex запрос norm", "nunique"),
+            Сумма_показателя=("Показатель", "sum"),
+        )
+        .sort_values(["Сумма_показателя", "Уникальных_Yandex_запросов"], ascending=[False, False])
+        .reset_index(drop=True)
     )
+
+    branded = yandex_top_df[yandex_top_df["Yandex запрос norm"].apply(lambda x: contains_brand(x, seeds))].copy()
+    branded = (
+        branded.groupby(["Yandex запрос norm"], as_index=False)
+        .agg(
+            Yandex_запрос=("Yandex запрос", "first"),
+            Сумма_показателя=("Показатель", "sum"),
+            Источники_WB=("Исходная фраза WB", lambda s: ", ".join(sorted(set(map(str, s))))),
+        )
+        .sort_values(["Сумма_показателя", "Yandex_запрос"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    return top_by_source, branded
+
+
+def send_file_to_telegram(path: str, caption: str, cfg: Config) -> None:
+    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+        log("Telegram: пропущено, потому что не заданы TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        return
 
     url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendDocument"
     with open(path, "rb") as f:
         resp = requests.post(
             url,
             data={"chat_id": cfg.telegram_chat_id, "caption": caption},
-            files={"document": (path.name, f)},
-            timeout=120,
+            files={"document": f},
+            timeout=180,
         )
-    resp.raise_for_status()
-    log("Отчёт отправлен в Telegram")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Telegram API {resp.status_code}: {resp.text[:1000]}")
 
 
-# =========================
-# Сводка
-# =========================
+def should_send_report(cfg: Config) -> bool:
+    if cfg.force_send:
+        return True
+    event_name = os.getenv("GITHUB_EVENT_NAME", "").strip().lower()
+    if cfg.send_on_manual and event_name == "workflow_dispatch":
+        return True
+    return cfg.run_date.weekday() == 0  # понедельник
 
-def build_summary_sheet(
-    cfg: Config,
-    wb_summary: pd.DataFrame,
-    detected_variants: list[str],
-    wb_keys: list[str],
+
+def format_excel(path: str) -> None:
+    wb = load_workbook(path)
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.font = Font(name=FONT_NAME, size=FONT_SIZE)
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = BORDER_THIN
+
+        if ws.max_row >= 1:
+            for cell in ws[1]:
+                cell.fill = FILL_HEADER
+                cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True)
+
+        # Автоширина колонок
+        for col_cells in ws.columns:
+            max_len = 0
+            col_letter = col_cells[0].column_letter
+            for cell in col_cells[:300]:
+                value = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(value))
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 45)
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    wb.save(path)
+
+
+def save_report(
+    wb_weekly_df: pd.DataFrame,
+    wb_archive_df: pd.DataFrame,
+    wb_phrase_pool_df: pd.DataFrame,
+    wb_weekly_summary_df: pd.DataFrame,
+    wb_latest_week_df: pd.DataFrame,
+    wb_wow_df: pd.DataFrame,
     yandex_top_df: pd.DataFrame,
-    yandex_last_week_df: pd.DataFrame,
-) -> pd.DataFrame:
-    rows = [
-        {"Параметр": "Магазин", "Значение": cfg.store_name},
-        {"Параметр": "Дата запуска", "Значение": cfg.run_date.strftime("%Y-%m-%d")},
-        {"Параметр": "Префикс WB weekly файлов", "Значение": cfg.wb_keywords_prefix},
-        {"Параметр": "Обработано weekly файлов WB", "Значение": len(wb_keys)},
-        {"Параметр": "Yandex фразы", "Значение": ", ".join(cfg.yandex_phrases)},
-        {"Параметр": "Варианты бренда в WB", "Значение": ", ".join(detected_variants)},
-    ]
+    yandex_top_summary_df: pd.DataFrame,
+    yandex_brand_df: pd.DataFrame,
+    yandex_raw_df: pd.DataFrame,
+    output_path: str,
+) -> None:
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        def write(df: pd.DataFrame, sheet_name: str) -> None:
+            if df is None or df.empty:
+                pd.DataFrame({"Пусто": []}).to_excel(writer, sheet_name=sheet_name, index=False)
+            else:
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    if not wb_summary.empty:
-        last = wb_summary.iloc[-1].to_dict()
-        rows.extend([
-            {"Параметр": "Последняя неделя WB", "Значение": last.get("Неделя", "")},
-            {"Параметр": "WB уникальных брендовых запросов", "Значение": int(last.get("Уникальных брендовых запросов", 0))},
-            {"Параметр": "WB уникальных артикулов", "Значение": int(last.get("Уникальных артикулов", 0))},
-            {"Параметр": "WB сумма частотности за неделю", "Значение": round(safe_float(last.get("Сумма частотности за неделю")), 2)},
-            {"Параметр": "WB переходы в карточку", "Значение": round(safe_float(last.get("Переходы в карточку")), 2)},
-            {"Параметр": "WB заказы", "Значение": round(safe_float(last.get("Заказы")), 2)},
-        ])
+        write(wb_weekly_summary_df, "WB_Summary_Weekly")
+        write(wb_latest_week_df, "WB_Last_Week")
+        write(wb_wow_df, "WB_Week_over_Week")
+        write(wb_phrase_pool_df, "WB_Phrases_for_Yandex")
+        write(wb_weekly_df, "WB_Brand_Weekly_All")
+        write(wb_archive_df, "WB_Brand_Archive")
+        write(yandex_top_summary_df, "Yandex_Top_30d_Summary")
+        write(yandex_brand_df, "Yandex_Brand_30d")
+        write(yandex_top_df, "Yandex_Top_30d")
+        write(yandex_raw_df, "Yandex_Raw")
 
-    rows.append({"Параметр": "Yandex уникальных запросов за 30 дней", "Значение": int(len(yandex_top_df)) if not yandex_top_df.empty else 0})
-    if yandex_last_week_df is not None and not yandex_last_week_df.empty:
-        rows.append({"Параметр": "Yandex последняя полная неделя", "Значение": ", ".join(sorted(set(map(str, yandex_last_week_df["Последняя полная неделя"].dropna().tolist()))))})
-        rows.append({"Параметр": "Yandex частотность последняя полная неделя", "Значение": round(float(yandex_last_week_df["Частотность последняя неделя"].sum()), 2)})
-        rows.append({"Параметр": "Yandex частотность предыдущая неделя", "Значение": round(float(yandex_last_week_df["Частотность предыдущая неделя"].sum()), 2)})
-    return pd.DataFrame(rows)
+    format_excel(output_path)
 
 
-def build_top_wb_queries(wb_brand_df: pd.DataFrame, top_n: int = 200) -> pd.DataFrame:
-    if wb_brand_df.empty:
-        return pd.DataFrame()
-    return (
-        wb_brand_df.groupby("Поисковый запрос", as_index=False)
-        .agg({
-            "Частота запросов": "sum",
-            "Частота за неделю": "sum",
-            "Переходы в карточку": "sum",
-            "Добавления в корзину": "sum",
-            "Заказы": "sum",
-            "Артикул WB": pd.Series.nunique,
-        })
-        .rename(columns={"Артикул WB": "Уникальных артикулов"})
-        .sort_values(["Частота за неделю", "Заказы"], ascending=[False, False])
-        .head(top_n)
-        .reset_index(drop=True)
-    )
-
-
-def run() -> Path:
-    cfg = get_config()
+def run() -> None:
+    cfg = build_config()
     storage = S3Storage(cfg)
-    brand_regex = build_brand_regex(cfg.brand_variants)
 
-    wb_brand_df, wb_keys = load_wb_brand_data(storage, cfg, brand_regex)
-    detected_variants = extract_detected_variants(wb_brand_df if not wb_brand_df.empty else pd.DataFrame({"Поисковый запрос": []}), brand_regex)
+    wb_weekly_df = load_wb_weekly_brand_queries(storage, cfg)
+    wb_archive_df = load_wb_archive_brand_queries(storage, cfg)
 
-    wb_summary = build_wb_weekly_summary(wb_brand_df)
-    wb_compare, wb_growth, wb_decline = build_wb_compare_tables(wb_brand_df)
-    wb_top = build_top_wb_queries(wb_brand_df)
+    wb_phrase_pool_df, yandex_phrases, expanded_seeds = build_phrase_pool_from_wb(wb_weekly_df, wb_archive_df, cfg)
+    wb_weekly_summary_df, wb_latest_week_df, wb_wow_df = make_wb_weekly_summary(wb_weekly_df)
 
-    yandex_top_df, yandex_dyn_df, yandex_raw_df = load_yandex_wordstat(cfg)
-    yandex_weekly_df = build_yandex_weekly_table(yandex_dyn_df)
-    yandex_last_week_df = build_yandex_last_full_week(yandex_weekly_df)
-    yandex_top_summary_df = build_yandex_top_30_summary(yandex_top_df)
+    yandex_top_df, yandex_raw_df = load_yandex_top_by_wb_phrases(yandex_phrases, cfg)
+    yandex_top_summary_df, yandex_brand_df = make_yandex_summary(yandex_top_df, expanded_seeds)
 
-    summary_df = build_summary_sheet(
-        cfg=cfg,
-        wb_summary=wb_summary,
-        detected_variants=detected_variants,
-        wb_keys=wb_keys,
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"Брендовые_запросы_{cfg.store_name}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
+    output_path = output_dir / filename
+
+    save_report(
+        wb_weekly_df=wb_weekly_df,
+        wb_archive_df=wb_archive_df,
+        wb_phrase_pool_df=wb_phrase_pool_df,
+        wb_weekly_summary_df=wb_weekly_summary_df,
+        wb_latest_week_df=wb_latest_week_df,
+        wb_wow_df=wb_wow_df,
         yandex_top_df=yandex_top_df,
-        yandex_last_week_df=yandex_last_week_df,
+        yandex_top_summary_df=yandex_top_summary_df,
+        yandex_brand_df=yandex_brand_df,
+        yandex_raw_df=yandex_raw_df,
+        output_path=str(output_path),
     )
+    log(f"Отчёт сохранён: {output_path}")
 
-    report_name = f"Брендовые_запросы_{cfg.store_name}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
-    report_path = Path("output") / report_name
-
-    sheets = {
-        "Сводка": summary_df,
-        "WB_Недели": wb_summary,
-        "WB_Топ_запросы": wb_top,
-        "WB_Сравнение": wb_compare,
-        "WB_Рост": wb_growth,
-        "WB_Падение": wb_decline,
-        "WB_Сырые_бренд": wb_brand_df,
-        "Yandex_Last_Full_Week": yandex_last_week_df,
-        "Yandex_Weekly_Dynamics": yandex_weekly_df,
-        "Yandex_Top_30d_Summary": yandex_top_summary_df,
-        "Yandex_Top_30d": yandex_top_df,
-        "Yandex_Dynamics_Raw": yandex_dyn_df,
-        "Yandex_Raw": yandex_raw_df,
-    }
-    save_report(report_path, sheets)
-    log(f"Отчёт сохранён: {report_path}")
-
-    upload_report(storage, cfg, report_path)
+    out_key = f"{cfg.output_prefix.rstrip('/')}/{filename}"
+    with open(output_path, "rb") as f:
+        storage.write_bytes(
+            out_key,
+            f.read(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    log(f"Файл загружен в Object Storage: {out_key}")
 
     if should_send_report(cfg):
-        send_to_telegram(cfg, report_path, wb_summary, detected_variants, yandex_top_df)
+        caption = f"Брендовый отчёт по поисковым запросам {cfg.store_name} за {cfg.run_date.strftime('%d.%m.%Y')}"
+        send_file_to_telegram(str(output_path), caption, cfg)
+        log("Отчёт отправлен в Telegram")
     else:
-        log("Сегодня не понедельник — отправка в Telegram пропущена")
-
-    return report_path
+        log("Сегодня не понедельник и не ручной запуск — отправка в Telegram пропущена")
 
 
 if __name__ == "__main__":
