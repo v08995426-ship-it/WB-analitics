@@ -1,0 +1,49 @@
+name: Brand Search Report
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: brand-search-report-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-brand-search-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl boto3 requests xlsxwriter
+
+      - name: Run brand search report
+        env:
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          YANDEX_API_KEY: ${{ secrets.YANDEX_API_KEY }}
+          YANDEX_FOLDER_ID: ${{ secrets.YANDEX_FOLDER_ID }}
+          YANDEX_REGION_ID: ${{ secrets.YANDEX_REGION_ID }}
+          STORE_NAME: ${{ vars.STORE_NAME }}
+          WB_KEYWORDS_PREFIX: ${{ vars.WB_KEYWORDS_PREFIX }}
+          BRAND_REPORT_OUTPUT_PREFIX: ${{ vars.BRAND_REPORT_OUTPUT_PREFIX }}
+          BRAND_VARIANTS: ${{ vars.BRAND_VARIANTS }}
+          YANDEX_PHRASES: ${{ vars.YANDEX_PHRASES }}
+        run: |
+          python brand_search_report.py
