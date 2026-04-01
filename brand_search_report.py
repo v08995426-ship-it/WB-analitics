@@ -157,7 +157,7 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
 
 def parse_weekly_wb_file(data: bytes, key: str, brand_re: re.Pattern) -> pd.DataFrame:
     df = read_excel_any(data)
-    if "Поисковый запрос" not in df.columns:
+    if "Поисковый запрос" not in df.columns or "Частота запросов" not in df.columns:
         return pd.DataFrame()
 
     work = df.copy()
@@ -168,13 +168,27 @@ def parse_weekly_wb_file(data: bytes, key: str, brand_re: re.Pattern) -> pd.Data
     if work.empty:
         return pd.DataFrame()
 
-    freq_col = "Частота за неделю" if "Частота за неделю" in work.columns else "Частота запросов"
-    work["WB_количество"] = coerce_numeric(work[freq_col])
+    # Берём именно ежедневную "Частота запросов" и суммируем её за неделю.
+    # Но внутри одного дня один и тот же запрос может повторяться по нескольким карточкам/артикулам,
+    # поэтому сначала схлопываем до одного значения на пару (Дата, Поисковый запрос) через max,
+    # а уже потом суммируем по неделе.
+    work["Дата"] = pd.to_datetime(work.get("Дата"), errors="coerce").dt.date
+    work = work[work["Дата"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    work["WB_частота_день"] = coerce_numeric(work["Частота запросов"])
     work["Неделя"] = extract_week_code_from_key(key)
 
-    out = (
-        work.groupby(["Неделя", "Поисковый запрос"], as_index=False)["WB_количество"]
+    daily_unique = (
+        work.groupby(["Неделя", "Дата", "Поисковый запрос"], as_index=False)["WB_частота_день"]
         .max()
+    )
+
+    out = (
+        daily_unique.groupby(["Неделя", "Поисковый запрос"], as_index=False)["WB_частота_день"]
+        .sum()
+        .rename(columns={"WB_частота_день": "WB_количество"})
         .sort_values(["Неделя", "WB_количество"], ascending=[True, False])
     )
     return out
