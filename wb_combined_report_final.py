@@ -766,7 +766,8 @@ class MetricsBuilder:
         df["code"] = df["supplier_article"].map(extract_code)
         latest_week = sorted(df[week_col].dropna().astype(str).unique())[-1]
         latest = df[df[week_col].astype(str) == latest_week].copy()
-        latest["buyout_rate"] = pd.to_numeric(latest[find_col(latest, ["Процент выкупа"]),], errors="coerce") / 100.0 if find_col(latest, ["Процент выкупа"]) else 0.8
+        buyout_col = find_col(latest, ["Процент выкупа"])
+        latest["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0 if buyout_col else 0.8
         # Normalize columns
         mapping = {
             "avg_sale_price_week": ["Средняя цена продажи"],
