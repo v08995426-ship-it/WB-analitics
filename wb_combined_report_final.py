@@ -3,7 +3,22 @@
 
 """
 WB Combined Report for TOPFACE.
-(полный код, исправленный)
+
+Builds a user-friendly Excel report and a calculation log using prepared reports
+stored either locally or in Yandex Object Storage (S3-compatible).
+
+Main outputs go to:
+    Отчёты/Объединенный отчет/TOPFACE/
+
+Design goals:
+- Daily diagnostic of orders and approximate gross profit using latest unit economics
+- Weekly retrospective with root-cause analysis
+- Monthly retrospective and forecast for incomplete month
+- Simple business-oriented layout: subject sheets, code sheets, narrative on the right,
+  raw calculations in a separate log workbook
+
+This script intentionally does not call WB APIs. It relies on already prepared reports.
+To fetch/update reports, run your updater separately.
 """
 
 from __future__ import annotations
@@ -189,7 +204,7 @@ def read_excel_normalized(data: bytes, filename: str, sheet_name=0) -> pd.DataFr
 
 
 # -------------------------
-# Storage abstraction (без изменений)
+# Storage abstraction
 # -------------------------
 
 class BaseStorage:
@@ -296,7 +311,7 @@ def make_storage(root: str) -> BaseStorage:
 
 
 # -------------------------
-# Loaders (без изменений, кроме мелких правок)
+# Loaders
 # -------------------------
 
 @dataclass
@@ -500,7 +515,7 @@ def explode_week_rows_to_months(df: pd.DataFrame, start_col: str = "week_start",
 
 
 # -------------------------
-# Metrics builders (ИСПРАВЛЕННЫЙ)
+# Metrics builders
 # -------------------------
 
 class MetricsBuilder:
@@ -755,7 +770,10 @@ class MetricsBuilder:
         latest_week = sorted(df[week_col].dropna().astype(str).unique())[-1]
         latest = df[df[week_col].astype(str) == latest_week].copy()
         buyout_col = find_col(latest, ["Процент выкупа"])
-        latest["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0 if buyout_col else 0.8
+        if buyout_col:
+            latest["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0
+        else:
+            latest["buyout_rate"] = 0.8  # значение по умолчанию
         mapping = {
             "avg_sale_price_week": ["Средняя цена продажи"],
             "avg_buyer_price_week": ["Средняя цена покупателя"],
@@ -821,7 +839,12 @@ class MetricsBuilder:
             "acceptance_rub_unit", "penalties_rub_unit", "ads_rub_unit", "other_rub_unit", "cost_rub_unit"
         ]
         df["fixed_costs_per_unit"] = df[fixed_cols].fillna(0).sum(axis=1)
-        df["expected_sales_day"] = df["orders_day"] * df["buyout_rate"].fillna(0)
+        # Проверяем наличие buyout_rate
+        if "buyout_rate" in df.columns:
+            buyout = df["buyout_rate"].fillna(0.8)
+        else:
+            buyout = 0.8
+        df["expected_sales_day"] = df["orders_day"] * buyout
         df["gross_profit_unit_est"] = (
             df["avg_price_with_disc_day"].fillna(0)
             * (1 - df["commission_rate"].fillna(0) - df["acquiring_rate"].fillna(0) - df["vat_rate"].fillna(0))
@@ -1073,7 +1096,6 @@ class MetricsBuilder:
         out["forecast_vs_prev_month_pct"] = out.apply(lambda r: pct_delta(r["forecast_month_gp_adjusted"], r["prev_month_gp"]), axis=1)
         return out
 
-    # ИСПРАВЛЕННЫЙ build_weekly_entry_sku
     def build_weekly_entry_sku(self) -> pd.DataFrame:
         df = self.data.entry_points_sku.copy()
         if df.empty:
@@ -1089,16 +1111,11 @@ class MetricsBuilder:
         cart = find_col(df, ["Добавили в корзину", "Добавили в корзину"])
         conv_cart = find_col(df, ["Конверсия в корзину"])
         conv_order = find_col(df, ["Конверсия в заказ"])
-        # Обязательные колонки: артикул продавца, неделя
         if not art:
             log("Entry points SKU: column 'Артикул продавца' not found, skipping")
             return pd.DataFrame()
-        # Если нет колонок week_code, week_start, week_end – попробуем взять из индекса или оставить пустыми
         week_code_col = find_col(df, ["week_code"])
-        week_start_col = find_col(df, ["week_start"])
-        week_end_col = find_col(df, ["week_end"])
         if not week_code_col:
-            # Может быть, неделя кодируется в другой колонке? Если нет – пропускаем
             log("Entry points SKU: week columns not found, skipping")
             return pd.DataFrame()
 
@@ -1110,8 +1127,10 @@ class MetricsBuilder:
         for c in [clicks, shows, ctr, orders, cart, conv_cart, conv_order]:
             if c:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        # Формируем выходной DataFrame
+
         out_cols = [week_code_col, "supplier_article", "subject", "code", "entry_section", "entry_point"]
+        week_start_col = find_col(df, ["week_start"])
+        week_end_col = find_col(df, ["week_end"])
         if week_start_col:
             out_cols.append(week_start_col)
         if week_end_col:
@@ -1121,7 +1140,6 @@ class MetricsBuilder:
                           (orders, "entry_orders"), (conv_order, "entry_conv_order")]:
             if src:
                 out_cols.append(src)
-        # Оставляем только существующие колонки
         out_cols = [c for c in out_cols if c in df.columns]
         out = df[out_cols].copy()
         rename = {}
@@ -1196,7 +1214,7 @@ def compose_weekly_reason(weekly_row: pd.Series, abc_prev: Optional[pd.Series], 
 
 
 # -------------------------
-# Report writer (без изменений)
+# Report writer
 # -------------------------
 
 class ReportWriter:
