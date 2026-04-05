@@ -242,6 +242,17 @@ def safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+def get_series(df: pd.DataFrame, col: str, default: Any = None) -> pd.Series:
+    """Возвращает одну Series даже если в DataFrame есть дублирующиеся имена колонок."""
+    if col in df.columns:
+        data = df.loc[:, col]
+        if isinstance(data, pd.DataFrame):
+            s = data.iloc[:, 0]
+        else:
+            s = data
+        return s.copy()
+    return pd.Series([default] * len(df), index=df.index)
+
 def canonical_subject(v: Any) -> str:
     return str(v or "").strip().lower()
 
@@ -930,12 +941,18 @@ def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master
     universe = master[["supplier_article", "product_root", "nmId", "rating_reviews", "subject"]].dropna(subset=["supplier_article", "nmId"]).drop_duplicates().copy()
     if not order_stats.empty:
         universe = universe.merge(order_stats, on="supplier_article", how="left")
-    universe["total_orders_60"] = pd.to_numeric(universe.get("total_orders_60"), errors="coerce").fillna(0)
-    universe["revenue_60"] = pd.to_numeric(universe.get("revenue_60"), errors="coerce").fillna(0)
-    universe["rating_reviews"] = pd.to_numeric(universe.get("rating_reviews"), errors="coerce").fillna(0)
+    universe["total_orders_60"] = pd.to_numeric(get_series(universe, "total_orders_60", 0), errors="coerce").fillna(0)
+    universe["revenue_60"] = pd.to_numeric(get_series(universe, "revenue_60", 0), errors="coerce").fillna(0)
+    universe["rating_reviews"] = pd.to_numeric(get_series(universe, "rating_reviews", 0), errors="coerce").fillna(0)
 
-    control_drr = product_metrics[["control_key", "blended_drr", "subject_norm"]].drop_duplicates().copy()
-    control_drr["blended_drr"] = pd.to_numeric(control_drr.get("blended_drr"), errors="coerce").fillna(0)
+    pm = product_metrics.copy()
+    if pm.columns.duplicated().any():
+        pm = pm.loc[:, ~pm.columns.duplicated()].copy()
+    need_cols = [c for c in ["control_key", "blended_drr", "subject_norm"] if c in pm.columns]
+    control_drr = pm[need_cols].drop_duplicates().copy() if need_cols else pd.DataFrame(columns=["control_key", "blended_drr", "subject_norm"])
+    if "blended_drr" not in control_drr.columns:
+        control_drr["blended_drr"] = 0.0
+    control_drr["blended_drr"] = pd.to_numeric(get_series(control_drr, "blended_drr", 0), errors="coerce").fillna(0)
 
     for advert_id, g in portfolio.groupby("id_campaign"):
         current = g.iloc[0]
@@ -1586,7 +1603,9 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
 
     orders_60 = orders[(orders["date"] >= as_of_date - timedelta(days=60)) & (orders["date"] <= as_of_date) & (~orders["isCancel"])].copy() if not orders.empty else pd.DataFrame()
     shade_portfolio = build_shade_portfolio(campaigns, master, orders_60)
-    shade_actions, shade_tests = build_shade_actions(campaigns, shade_portfolio, master, orders_60, product_metrics.rename(columns={"Товар":"control_key","Предмет код":"subject_norm","Общий ДРР товара, %":"blended_drr"}), api_key=os.getenv("WB_PROMO_KEY_TOPFACE",""))
+    shade_metrics = product_metrics[[c for c in ["Товар", "Предмет код", "blended_drr"] if c in product_metrics.columns]].copy()
+    shade_metrics = shade_metrics.rename(columns={"Товар":"control_key","Предмет код":"subject_norm"})
+    shade_actions, shade_tests = build_shade_actions(campaigns, shade_portfolio, master, orders_60, shade_metrics, api_key=os.getenv("WB_PROMO_KEY_TOPFACE",""))
     if shade_actions.empty:
         shade_actions = pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
 
