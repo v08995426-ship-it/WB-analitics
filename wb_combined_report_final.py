@@ -67,6 +67,7 @@ SUBJECT_ORDER = [
     "Блески",
 ]
 
+# Regions service map can be extended over time.
 MOSCOW_CLUSTER = {"Коледино", "Электросталь", "Подольск", "Белые Столбы"}
 REGION_CLUSTER_MAP = {
     "Москва": "MOSCOW_CLUSTER",
@@ -481,6 +482,7 @@ def parse_entry_period_from_name(filename: str) -> Tuple[Optional[date], Optiona
 
 
 def explode_week_rows_to_months(df: pd.DataFrame, start_col: str = "week_start", end_col: str = "week_end") -> pd.DataFrame:
+    """Split weekly rows across months by overlap days."""
     if df.empty or start_col not in df.columns or end_col not in df.columns:
         return df.copy()
     rows = []
@@ -536,17 +538,14 @@ class MetricsBuilder:
         cancel_col = find_col(df, ["isCancel", "Отмена заказа"])
         region_col = find_col(df, ["regionName", "Регион"])
 
-        if not date_col or not article_col:
-            return pd.DataFrame()
-
         df["day"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
         df["supplier_article"] = df[article_col].map(clean_article)
-        df["nm_id"] = df[nm_col].astype(str) if nm_col else ""
-        df["subject"] = df[subject_col].astype(str) if subject_col else ""
+        df["nm_id"] = df[nm_col].astype(str)
+        df["subject"] = df[subject_col].astype(str)
         df["code"] = df["supplier_article"].map(extract_code)
-        df["finished_price"] = pd.to_numeric(df[finished_col], errors="coerce") if finished_col else 0.0
-        df["price_with_disc"] = pd.to_numeric(df[pwd_col], errors="coerce") if pwd_col else 0.0
-        df["spp"] = pd.to_numeric(df[spp_col], errors="coerce") if spp_col else 0.0
+        df["finished_price"] = pd.to_numeric(df[finished_col], errors="coerce")
+        df["price_with_disc"] = pd.to_numeric(df[pwd_col], errors="coerce")
+        df["spp"] = pd.to_numeric(df[spp_col], errors="coerce")
         if cancel_col:
             df["is_cancel"] = df[cancel_col].astype(str).str.lower().isin(["true", "1", "да"])
         else:
@@ -763,17 +762,20 @@ class MetricsBuilder:
         week_col = find_col(df, ["Неделя", "week"])
         if not article_col or not week_col:
             return pd.DataFrame()
+
         df["supplier_article"] = df[article_col].map(clean_article)
         df["nm_id"] = df[nm_col].astype(str) if nm_col else ""
         df["subject"] = df[subject_col].astype(str) if subject_col else ""
         df["code"] = df["supplier_article"].map(extract_code)
-        latest_week = sorted(df[week_col].dropna().astype(str).unique())[-1]
+
+        week_values = sorted(df[week_col].dropna().astype(str).unique())
+        if not week_values:
+            return pd.DataFrame()
+        latest_week = week_values[-1]
         latest = df[df[week_col].astype(str) == latest_week].copy()
-        buyout_col = find_col(latest, ["Процент выкупа"])
-        if buyout_col:
-            latest["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0
-        else:
-            latest["buyout_rate"] = 0.8  # значение по умолчанию
+        if latest.empty:
+            return pd.DataFrame()
+
         mapping = {
             "avg_sale_price_week": ["Средняя цена продажи"],
             "avg_buyer_price_week": ["Средняя цена покупателя"],
@@ -797,11 +799,21 @@ class MetricsBuilder:
             "returns_units_week": ["Возвраты, шт"],
             "net_sales_units_week": ["Чистые продажи, шт"],
         }
+
         out = latest[[c for c in ["supplier_article", "nm_id", "subject", "code"] if c in latest.columns]].copy()
         out["week_code"] = latest_week
+
+        buyout_col = find_col(latest, ["Процент выкупа"])
+        if buyout_col:
+            out["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(80.0) / 100.0
+        else:
+            out["buyout_rate"] = 0.8
+
         for dst, cands in mapping.items():
             col = find_col(latest, cands)
             out[dst] = pd.to_numeric(latest[col], errors="coerce").fillna(0) if col else 0.0
+
+        out["buyout_rate"] = pd.to_numeric(out.get("buyout_rate", 0.8), errors="coerce").fillna(0.8)
         out["commission_rate"] = out.apply(lambda r: safe_div(r["commission_rub_unit"], r["avg_sale_price_week"]), axis=1)
         out["acquiring_rate"] = out.apply(lambda r: safe_div(r["acquiring_rub_unit"], r["avg_sale_price_week"]), axis=1)
         out["vat_rate"] = out.apply(lambda r: safe_div(r["vat_rub_unit"], r["avg_sale_price_week"]), axis=1)
@@ -810,6 +822,8 @@ class MetricsBuilder:
     def build_daily_localization(self, orders_region: pd.DataFrame, stocks_daily: pd.DataFrame) -> pd.DataFrame:
         if orders_region.empty or stocks_daily.empty:
             return pd.DataFrame()
+        cluster_rows = []
+        # aggregate stocks per cluster/day/sku
         stocks = stocks_daily.copy()
         stocks["cluster"] = stocks["warehouse"].map(lambda w: "MOSCOW_CLUSTER" if w in MOSCOW_CLUSTER else w)
         cluster_stock = stocks.groupby(["day", "supplier_article", "cluster"], dropna=False)["stock_qty"].sum().reset_index()
@@ -831,24 +845,49 @@ class MetricsBuilder:
         return agg
 
     def build_daily_profit_estimate(self, daily_orders: pd.DataFrame, econ_latest: pd.DataFrame) -> pd.DataFrame:
-        if daily_orders.empty or econ_latest.empty:
+        if daily_orders.empty:
             return pd.DataFrame()
-        df = daily_orders.merge(econ_latest, on=["supplier_article", "nm_id", "subject", "code"], how="left")
+        if econ_latest.empty:
+            df = daily_orders.copy()
+            df["expected_sales_day"] = df["orders_day"] * 0.8
+            df["gross_profit_unit_est"] = 0.0
+            df["gross_profit_day_est"] = 0.0
+            return df[[
+                "day", "supplier_article", "nm_id", "subject", "code",
+                "orders_day", "expected_sales_day", "avg_finished_price_day", "avg_price_with_disc_day", "avg_spp_day",
+                "gross_profit_unit_est", "gross_profit_day_est"
+            ]].copy()
+
+        # merge by supplier_article first to avoid losing economics due to unstable nm_id/subject values
+        econ = econ_latest.copy()
+        dedup_cols = [c for c in ["supplier_article", "buyout_rate", "commission_rate", "acquiring_rate", "vat_rate",
+                                  "logistics_direct_rub_unit", "logistics_reverse_rub_unit", "storage_rub_unit",
+                                  "acceptance_rub_unit", "penalties_rub_unit", "ads_rub_unit", "other_rub_unit", "cost_rub_unit"]
+                     if c in econ.columns]
+        econ = econ[dedup_cols].drop_duplicates(subset=["supplier_article"], keep="first")
+
+        df = daily_orders.merge(econ, on=["supplier_article"], how="left")
+        if "buyout_rate" not in df.columns:
+            df["buyout_rate"] = 0.8
+        df["buyout_rate"] = pd.to_numeric(df["buyout_rate"], errors="coerce").fillna(0.8)
+
         fixed_cols = [
             "logistics_direct_rub_unit", "logistics_reverse_rub_unit", "storage_rub_unit",
             "acceptance_rub_unit", "penalties_rub_unit", "ads_rub_unit", "other_rub_unit", "cost_rub_unit"
         ]
-        df["fixed_costs_per_unit"] = df[fixed_cols].fillna(0).sum(axis=1)
-        # Проверяем наличие buyout_rate
-        if "buyout_rate" in df.columns:
-            buyout = df["buyout_rate"].fillna(0.8)
-        else:
-            buyout = 0.8
-        df["expected_sales_day"] = df["orders_day"] * buyout
+        for c in fixed_cols + ["commission_rate", "acquiring_rate", "vat_rate"]:
+            if c not in df.columns:
+                df[c] = 0.0
+        df[fixed_cols] = df[fixed_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+        for c in ["commission_rate", "acquiring_rate", "vat_rate"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+        df["fixed_costs_per_unit"] = df[fixed_cols].sum(axis=1)
+        df["expected_sales_day"] = df["orders_day"] * df["buyout_rate"]
         df["gross_profit_unit_est"] = (
             df["avg_price_with_disc_day"].fillna(0)
-            * (1 - df["commission_rate"].fillna(0) - df["acquiring_rate"].fillna(0) - df["vat_rate"].fillna(0))
-            - df["fixed_costs_per_unit"].fillna(0)
+            * (1 - df["commission_rate"] - df["acquiring_rate"] - df["vat_rate"])
+            - df["fixed_costs_per_unit"]
         )
         df["gross_profit_day_est"] = df["expected_sales_day"] * df["gross_profit_unit_est"]
         return df[[
@@ -862,13 +901,12 @@ class MetricsBuilder:
             return pd.DataFrame()
         df = daily_current.copy()
         df["weekday"] = pd.to_datetime(df["day"]).dt.weekday
-        possible_metrics = [
+        metrics = [
             "orders_day", "gross_profit_day_est", "search_frequency", "search_clicks", "search_capture_share",
             "avg_position", "visibility_pct", "open_card_count", "add_to_cart_count", "funnel_orders",
             "conv_to_cart", "conv_to_order", "conv_cart_to_order", "ad_impressions", "ad_clicks",
             "ad_ctr", "ad_cr", "ad_spend", "localization_index", "avg_finished_price_day", "avg_price_with_disc_day", "avg_spp_day"
         ]
-        metrics = [m for m in possible_metrics if m in df.columns]
         rows = []
         for (sku, wd), sub in df.groupby(["supplier_article", "weekday"], dropna=False):
             row = {
@@ -880,6 +918,8 @@ class MetricsBuilder:
                 "days_count": len(sub),
             }
             for m in metrics:
+                if m not in sub.columns:
+                    continue
                 vals = pd.to_numeric(sub[m], errors="coerce").dropna()
                 if vals.empty:
                     row[f"base_{m}"] = np.nan
@@ -922,29 +962,21 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["week_code"] = pd.to_datetime(daily["day"]).dt.date.map(week_code_from_date)
-        group_cols = [c for c in ["week_code", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
-        agg_dict = {}
-        metric_map = {
-            "orders_week": ("orders_day", "sum"),
-            "gp_est_week": ("gross_profit_day_est", "sum"),
-            "finished_price_week": ("avg_finished_price_day", "mean"),
-            "pwd_week": ("avg_price_with_disc_day", "mean"),
-            "spp_week": ("avg_spp_day", "mean"),
-            "search_freq_week": ("search_frequency", "sum"),
-            "search_clicks_week": ("search_clicks", "sum"),
-            "search_capture_share_week": ("search_capture_share", "mean"),
-            "position_week": ("avg_position", "mean"),
-            "visibility_week": ("visibility_pct", "mean"),
-            "localization_week": ("localization_index", "mean"),
-            "ad_clicks_week": ("ad_clicks", "sum"),
-            "ad_spend_week": ("ad_spend", "sum"),
-        }
-        for new_col, (src_col, how) in metric_map.items():
-            if src_col in daily.columns:
-                agg_dict[new_col] = (src_col, how)
-        if not agg_dict:
-            return pd.DataFrame()
-        agg = daily.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
+        agg = daily.groupby(["week_code", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
+            orders_week=("orders_day", "sum"),
+            gp_est_week=("gross_profit_day_est", "sum"),
+            finished_price_week=("avg_finished_price_day", "mean"),
+            pwd_week=("avg_price_with_disc_day", "mean"),
+            spp_week=("avg_spp_day", "mean"),
+            search_freq_week=("search_frequency", "sum"),
+            search_clicks_week=("search_clicks", "sum"),
+            search_capture_share_week=("search_capture_share", "mean"),
+            position_week=("avg_position", "mean"),
+            visibility_week=("visibility_pct", "mean"),
+            localization_week=("localization_index", "mean"),
+            ad_clicks_week=("ad_clicks", "sum"),
+            ad_spend_week=("ad_spend", "sum"),
+        ).reset_index()
         return agg
 
     def build_monthly_daily(self) -> pd.DataFrame:
@@ -952,23 +984,15 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["month_key"] = pd.to_datetime(daily["day"]).dt.to_period("M").astype(str)
-        group_cols = [c for c in ["month_key", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
-        agg_dict = {}
-        metric_map = {
-            "orders_mtd": ("orders_day", "sum"),
-            "gp_est_mtd": ("gross_profit_day_est", "sum"),
-            "avg_finished_price": ("avg_finished_price_day", "mean"),
-            "avg_pwd": ("avg_price_with_disc_day", "mean"),
-            "avg_spp": ("avg_spp_day", "mean"),
-            "avg_localization": ("localization_index", "mean"),
-            "avg_search_capture_share": ("search_capture_share", "mean"),
-        }
-        for new_col, (src_col, how) in metric_map.items():
-            if src_col in daily.columns:
-                agg_dict[new_col] = (src_col, how)
-        if not agg_dict:
-            return pd.DataFrame()
-        agg = daily.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
+        agg = daily.groupby(["month_key", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
+            orders_mtd=("orders_day", "sum"),
+            gp_est_mtd=("gross_profit_day_est", "sum"),
+            avg_finished_price=("avg_finished_price_day", "mean"),
+            avg_pwd=("avg_price_with_disc_day", "mean"),
+            avg_spp=("avg_spp_day", "mean"),
+            avg_localization=("localization_index", "mean"),
+            avg_search_capture_share=("search_capture_share", "mean"),
+        ).reset_index()
         return agg
 
     def build_monthly_abc(self) -> pd.DataFrame:
@@ -1111,14 +1135,6 @@ class MetricsBuilder:
         cart = find_col(df, ["Добавили в корзину", "Добавили в корзину"])
         conv_cart = find_col(df, ["Конверсия в корзину"])
         conv_order = find_col(df, ["Конверсия в заказ"])
-        if not art:
-            log("Entry points SKU: column 'Артикул продавца' not found, skipping")
-            return pd.DataFrame()
-        week_code_col = find_col(df, ["week_code"])
-        if not week_code_col:
-            log("Entry points SKU: week columns not found, skipping")
-            return pd.DataFrame()
-
         df["supplier_article"] = df[art].map(clean_article)
         df["subject"] = df[sub].astype(str) if sub else ""
         df["code"] = df["supplier_article"].map(extract_code)
@@ -1127,30 +1143,15 @@ class MetricsBuilder:
         for c in [clicks, shows, ctr, orders, cart, conv_cart, conv_order]:
             if c:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-
-        out_cols = [week_code_col, "supplier_article", "subject", "code", "entry_section", "entry_point"]
-        week_start_col = find_col(df, ["week_start"])
-        week_end_col = find_col(df, ["week_end"])
-        if week_start_col:
-            out_cols.append(week_start_col)
-        if week_end_col:
-            out_cols.append(week_end_col)
-        for src, dst in [(shows, "entry_shows"), (clicks, "entry_clicks"), (ctr, "entry_ctr"),
-                          (cart, "entry_cart"), (conv_cart, "entry_conv_cart"),
-                          (orders, "entry_orders"), (conv_order, "entry_conv_order")]:
-            if src:
-                out_cols.append(src)
-        out_cols = [c for c in out_cols if c in df.columns]
-        out = df[out_cols].copy()
-        rename = {}
-        if shows: rename[shows] = "entry_shows"
-        if clicks: rename[clicks] = "entry_clicks"
-        if ctr: rename[ctr] = "entry_ctr"
-        if cart: rename[cart] = "entry_cart"
-        if conv_cart: rename[conv_cart] = "entry_conv_cart"
-        if orders: rename[orders] = "entry_orders"
-        if conv_order: rename[conv_order] = "entry_conv_order"
-        out = out.rename(columns=rename)
+        out = df[[
+            "week_code", "week_start", "week_end", "supplier_article", "subject", "code",
+            "entry_section", "entry_point",
+            shows, clicks, ctr, cart, conv_cart, orders, conv_order
+        ]].copy()
+        out = out.rename(columns={
+            shows: "entry_shows", clicks: "entry_clicks", ctr: "entry_ctr",
+            cart: "entry_cart", conv_cart: "entry_conv_cart", orders: "entry_orders", conv_order: "entry_conv_order"
+        })
         return out
 
 
@@ -1363,6 +1364,7 @@ class CombinedReport:
         ws[6][1] = "Валовая прибыль, оценка"
         ws[6][2] = float(total_gp)
 
+        # top negatives / positives by month forecast and current GP
         if not self.monthly_forecast.empty:
             cur_month = sorted(self.monthly_forecast["month_key"].unique())[-1]
             mf = self.monthly_forecast[self.monthly_forecast["month_key"] == cur_month].copy()
@@ -1371,6 +1373,7 @@ class CombinedReport:
             writer.add_df_sheet("Топ_месяц_вниз", top_down)
             writer.add_df_sheet("Топ_месяц_вверх", top_up)
 
+        # Show current biggest losers / winners by estimated GP vs target orders
         summary_rows = []
         for _, row in current.iterrows():
             tgt = self._target_for_row(row)
@@ -1414,7 +1417,8 @@ class CombinedReport:
                 localization_index=("localization_index", "mean"),
                 search_capture_share=("search_capture_share", "mean"),
             ).reset_index().sort_values("orders_day", ascending=False)
-            writer.add_df_sheet(safe_sheet_name(subject + "_codes_tmp"), by_code)
+            writer.add_df_sheet(safe_sheet_name(subject + "_codes_tmp"), by_code)  # temp helper sheet to keep data accessible in log-like manner
+            # rewrite pretty on subject sheet
             rows = []
             for _, r in by_code.iterrows():
                 rows.append((r["code"], r["sku_count"], r["orders_day"], r["gross_profit_day_est"], r["avg_finished_price_day"], r["localization_index"], r["search_capture_share"]))
@@ -1446,6 +1450,7 @@ class CombinedReport:
         title_suffix = "позиции" if is_brush_subject(subject) else "оттенки"
         writer.write_title(ws, f"{subject} / код {code} / {title_suffix}", row=1, end_col=8)
 
+        # overall current vs target at code level
         current_row = code_df.groupby(["subject", "code"], dropna=False).agg(
             orders_day=("orders_day", "sum"),
             gross_profit_day_est=("gross_profit_day_est", "sum"),
@@ -1464,6 +1469,7 @@ class CombinedReport:
             ad_ctr=("ad_ctr", "mean"),
         ).reset_index().iloc[0]
 
+        # aggregate target from member SKUs
         targets = []
         for _, sku_row in code_df.iterrows():
             tgt = self._target_for_row(sku_row)
@@ -1491,6 +1497,7 @@ class CombinedReport:
         ]
         end_row = writer.write_kv_table(ws, start_row=3, data=kv_data, title="Целевые и текущие показатели")
 
+        # positions/shades table sorted by clicks from latest ABC or funnel opens
         latest_week = None
         if not self.data.abc.empty:
             latest_week = self.data.abc["week_start"].dropna().max()
@@ -1534,6 +1541,7 @@ class CombinedReport:
             for j, val in enumerate(row, start=1):
                 ws.cell(row=i, column=j, value=None if pd.isna(val) else val).border = THIN_BORDER
 
+        # Narrative
         lead_row = code_df.sort_values("orders_day", ascending=False).iloc[0]
         tgt = self._target_for_row(lead_row)
         narrative = compose_daily_reason(lead_row, tgt)
@@ -1560,6 +1568,7 @@ class CombinedReport:
                 narrative += "\n\nWeekly: " + weekly_reason
         writer.write_narrative_box(ws, start_row=3, start_col=8, text=narrative, width_cols=7, height_rows=20)
 
+        # ABC weekly block
         if not self.data.abc.empty:
             abc = self.data.abc.copy()
             art = find_col(abc, ["Артикул продавца"])
