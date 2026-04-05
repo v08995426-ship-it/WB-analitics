@@ -446,7 +446,7 @@ def load_bid_history(provider: BaseProvider) -> pd.DataFrame:
         return df
 
     df["run_ts"] = pd.to_datetime(df["run_ts"], errors="coerce")
-    df["date"] = df["run_ts"].dt.normalize()
+    df["date"] = df["run_ts"].dt.normalize().astype("datetime64[ns]")
 
     search_col = pd.to_numeric(df.get("Ставка поиск, коп", 0), errors="coerce") if "Ставка поиск, коп" in df.columns else pd.Series(0, index=df.index, dtype=float)
     reco_col = pd.to_numeric(df.get("Ставка рекомендации, коп", 0), errors="coerce") if "Ставка рекомендации, коп" in df.columns else pd.Series(0, index=df.index, dtype=float)
@@ -833,23 +833,60 @@ def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master
 def apply_shade_actions(actions_df: pd.DataFrame, api_key: str, dry_run: bool) -> pd.DataFrame:
     if actions_df.empty or "Действие API" not in actions_df.columns:
         return pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
-    add_rows = actions_df[(actions_df["Действие API"] == "add") & (actions_df["Минимальная ставка WB, ₽"].notna())].copy()
+
+    add_rows = actions_df[actions_df["Действие API"] == "add"].copy()
+    add_rows["ID кампании"] = pd.to_numeric(add_rows.get("ID кампании"), errors="coerce")
+    add_rows["Артикул WB"] = pd.to_numeric(add_rows.get("Артикул WB"), errors="coerce")
+    add_rows = add_rows.dropna(subset=["ID кампании", "Артикул WB"]).copy()
+
     if add_rows.empty:
-        return pd.DataFrame([{"Комментарий":"Нет оттенков с подтверждённой минимальной ставкой WB"}])
+        return pd.DataFrame([{"Комментарий":"Нет валидных оттенков для добавления"}])
+
     logs = []
     headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
+
     for advert_id, g in add_rows.groupby("ID кампании"):
-        payload = {"nms":[{"advert_id": safe_int(advert_id), "nms": {"add": [safe_int(x) for x in g["Артикул WB"].tolist()], "delete": []}}]}
+        nm_ids = sorted({safe_int(x) for x in g["Артикул WB"].tolist() if safe_int(x) > 0})
+        if not nm_ids:
+            continue
+        payload = {
+            "nms": [
+                {
+                    "advert_id": safe_int(advert_id),
+                    "nms": {"add": nm_ids, "delete": []},
+                }
+            ]
+        }
         if dry_run:
-            logs.append({"ID кампании": advert_id, "Статус":"dry-run", "Ответ": json.dumps(payload, ensure_ascii=False)})
+            logs.append({
+                "ID кампании": safe_int(advert_id),
+                "Статус": "dry-run",
+                "Метод": "PATCH /adv/v0/auction/nms",
+                "Количество nmId": len(nm_ids),
+                "Ответ": json.dumps(payload, ensure_ascii=False),
+            })
             continue
         try:
             resp = requests.patch(WB_NMS_URL, headers=headers, json=payload, timeout=120)
-            logs.append({"ID кампании": advert_id, "Статус":"ok" if resp.status_code == 200 else "failed", "Ответ": resp.text[:1000]})
+            logs.append({
+                "ID кампании": safe_int(advert_id),
+                "Статус": "ok" if resp.status_code == 200 else "failed",
+                "Метод": "PATCH /adv/v0/auction/nms",
+                "Количество nmId": len(nm_ids),
+                "Код ответа": resp.status_code,
+                "Ответ": resp.text[:4000],
+            })
         except Exception as e:
-            logs.append({"ID кампании": advert_id, "Статус":"failed", "Ответ": str(e)})
+            logs.append({
+                "ID кампании": safe_int(advert_id),
+                "Статус": "failed",
+                "Метод": "PATCH /adv/v0/auction/nms",
+                "Количество nmId": len(nm_ids),
+                "Ответ": str(e),
+            })
         time.sleep(1.05)
-    return pd.DataFrame(logs)
+
+    return pd.DataFrame(logs) if logs else pd.DataFrame([{"Комментарий":"Нет оттенков для применения"}])
 
 def build_efficiency_history(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, keywords_daily: pd.DataFrame, master: pd.DataFrame, bid_history: pd.DataFrame, as_of_date: date) -> Dict[str, pd.DataFrame]:
     if ads_daily.empty:
@@ -861,7 +898,7 @@ def build_efficiency_history(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, k
     hist["current_bid_rub"] = hist["current_bid_rub"].map(safe_float)
     hist["id_campaign"] = pd.to_numeric(hist.get("id_campaign"), errors="coerce")
     hist["nmId"] = pd.to_numeric(hist.get("nmId"), errors="coerce")
-    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.normalize()
+    hist["date"] = pd.to_datetime(hist["date"], errors="coerce").dt.normalize().astype("datetime64[ns]")
     hist = hist.dropna(subset=["date", "id_campaign", "nmId"]).copy()
     hist["id_campaign"] = hist["id_campaign"].astype("int64")
     hist["nmId"] = hist["nmId"].astype("int64")
@@ -871,7 +908,7 @@ def build_efficiency_history(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, k
         events = bid_history[["id_campaign","nmId","date","bid_rub"]].copy()
         events["id_campaign"] = pd.to_numeric(events.get("id_campaign"), errors="coerce")
         events["nmId"] = pd.to_numeric(events.get("nmId"), errors="coerce")
-        events["date"] = pd.to_datetime(events["date"], errors="coerce").dt.normalize()
+        events["date"] = pd.to_datetime(events["date"], errors="coerce").dt.normalize().astype("datetime64[ns]")
         events["bid_rub"] = pd.to_numeric(events.get("bid_rub"), errors="coerce")
         events = events.dropna(subset=["id_campaign", "nmId", "date", "bid_rub"]).copy()
         if not events.empty:
