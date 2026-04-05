@@ -856,12 +856,14 @@ class MetricsBuilder:
             return pd.DataFrame()
         df = daily_current.copy()
         df["weekday"] = pd.to_datetime(df["day"]).dt.weekday
-        metrics = [
+        # Список метрик, которые реально существуют в daily_current
+        possible_metrics = [
             "orders_day", "gross_profit_day_est", "search_frequency", "search_clicks", "search_capture_share",
             "avg_position", "visibility_pct", "open_card_count", "add_to_cart_count", "funnel_orders",
             "conv_to_cart", "conv_to_order", "conv_cart_to_order", "ad_impressions", "ad_clicks",
             "ad_ctr", "ad_cr", "ad_spend", "localization_index", "avg_finished_price_day", "avg_price_with_disc_day", "avg_spp_day"
         ]
+        metrics = [m for m in possible_metrics if m in df.columns]
         rows = []
         for (sku, wd), sub in df.groupby(["supplier_article", "weekday"], dropna=False):
             row = {
@@ -873,8 +875,6 @@ class MetricsBuilder:
                 "days_count": len(sub),
             }
             for m in metrics:
-                if m not in sub.columns:
-                    continue
                 vals = pd.to_numeric(sub[m], errors="coerce").dropna()
                 if vals.empty:
                     row[f"base_{m}"] = np.nan
@@ -917,21 +917,31 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["week_code"] = pd.to_datetime(daily["day"]).dt.date.map(week_code_from_date)
-        agg = daily.groupby(["week_code", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
-            orders_week=("orders_day", "sum"),
-            gp_est_week=("gross_profit_day_est", "sum"),
-            finished_price_week=("avg_finished_price_day", "mean"),
-            pwd_week=("avg_price_with_disc_day", "mean"),
-            spp_week=("avg_spp_day", "mean"),
-            search_freq_week=("search_frequency", "sum"),
-            search_clicks_week=("search_clicks", "sum"),
-            search_capture_share_week=("search_capture_share", "mean"),
-            position_week=("avg_position", "mean"),
-            visibility_week=("visibility_pct", "mean"),
-            localization_week=("localization_index", "mean"),
-            ad_clicks_week=("ad_clicks", "sum"),
-            ad_spend_week=("ad_spend", "sum"),
-        ).reset_index()
+        # Определяем доступные колонки для группировки
+        group_cols = [c for c in ["week_code", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
+        # Определяем доступные метрики для агрегации
+        agg_dict = {}
+        metric_map = {
+            "orders_day": ("orders_day", "sum"),
+            "gp_est_week": ("gross_profit_day_est", "sum"),
+            "finished_price_week": ("avg_finished_price_day", "mean"),
+            "pwd_week": ("avg_price_with_disc_day", "mean"),
+            "spp_week": ("avg_spp_day", "mean"),
+            "search_freq_week": ("search_frequency", "sum"),
+            "search_clicks_week": ("search_clicks", "sum"),
+            "search_capture_share_week": ("search_capture_share", "mean"),
+            "position_week": ("avg_position", "mean"),
+            "visibility_week": ("visibility_pct", "mean"),
+            "localization_week": ("localization_index", "mean"),
+            "ad_clicks_week": ("ad_clicks", "sum"),
+            "ad_spend_week": ("ad_spend", "sum"),
+        }
+        for new_col, (src_col, how) in metric_map.items():
+            if src_col in daily.columns:
+                agg_dict[new_col] = (src_col, how)
+        if not agg_dict:
+            return pd.DataFrame()
+        agg = daily.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
         return agg
 
     def build_monthly_daily(self) -> pd.DataFrame:
@@ -939,15 +949,24 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["month_key"] = pd.to_datetime(daily["day"]).dt.to_period("M").astype(str)
-        agg = daily.groupby(["month_key", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
-            orders_mtd=("orders_day", "sum"),
-            gp_est_mtd=("gross_profit_day_est", "sum"),
-            avg_finished_price=("avg_finished_price_day", "mean"),
-            avg_pwd=("avg_price_with_disc_day", "mean"),
-            avg_spp=("avg_spp_day", "mean"),
-            avg_localization=("localization_index", "mean"),
-            avg_search_capture_share=("search_capture_share", "mean"),
-        ).reset_index()
+        # Доступные колонки для агрегации
+        group_cols = [c for c in ["month_key", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
+        agg_dict = {}
+        metric_map = {
+            "orders_mtd": ("orders_day", "sum"),
+            "gp_est_mtd": ("gross_profit_day_est", "sum"),
+            "avg_finished_price": ("avg_finished_price_day", "mean"),
+            "avg_pwd": ("avg_price_with_disc_day", "mean"),
+            "avg_spp": ("avg_spp_day", "mean"),
+            "avg_localization": ("localization_index", "mean"),
+            "avg_search_capture_share": ("search_capture_share", "mean"),
+        }
+        for new_col, (src_col, how) in metric_map.items():
+            if src_col in daily.columns:
+                agg_dict[new_col] = (src_col, how)
+        if not agg_dict:
+            return pd.DataFrame()
+        agg = daily.groupby(group_cols, dropna=False).agg(**agg_dict).reset_index()
         return agg
 
     def build_monthly_abc(self) -> pd.DataFrame:
