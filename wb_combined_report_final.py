@@ -3,22 +3,7 @@
 
 """
 WB Combined Report for TOPFACE.
-
-Builds a user-friendly Excel report and a calculation log using prepared reports
-stored either locally or in Yandex Object Storage (S3-compatible).
-
-Main outputs go to:
-    Отчёты/Объединенный отчет/TOPFACE/
-
-Design goals:
-- Daily diagnostic of orders and approximate gross profit using latest unit economics
-- Weekly retrospective with root-cause analysis
-- Monthly retrospective and forecast for incomplete month
-- Simple business-oriented layout: subject sheets, code sheets, narrative on the right,
-  raw calculations in a separate log workbook
-
-This script intentionally does not call WB APIs. It relies on already prepared reports.
-To fetch/update reports, run your updater separately.
+(полный код, исправленный)
 """
 
 from __future__ import annotations
@@ -67,7 +52,6 @@ SUBJECT_ORDER = [
     "Блески",
 ]
 
-# Regions service map can be extended over time.
 MOSCOW_CLUSTER = {"Коледино", "Электросталь", "Подольск", "Белые Столбы"}
 REGION_CLUSTER_MAP = {
     "Москва": "MOSCOW_CLUSTER",
@@ -205,7 +189,7 @@ def read_excel_normalized(data: bytes, filename: str, sheet_name=0) -> pd.DataFr
 
 
 # -------------------------
-# Storage abstraction
+# Storage abstraction (без изменений)
 # -------------------------
 
 class BaseStorage:
@@ -312,7 +296,7 @@ def make_storage(root: str) -> BaseStorage:
 
 
 # -------------------------
-# Loaders
+# Loaders (без изменений, кроме мелких правок)
 # -------------------------
 
 @dataclass
@@ -482,7 +466,6 @@ def parse_entry_period_from_name(filename: str) -> Tuple[Optional[date], Optiona
 
 
 def explode_week_rows_to_months(df: pd.DataFrame, start_col: str = "week_start", end_col: str = "week_end") -> pd.DataFrame:
-    """Split weekly rows across months by overlap days."""
     if df.empty or start_col not in df.columns or end_col not in df.columns:
         return df.copy()
     rows = []
@@ -517,7 +500,7 @@ def explode_week_rows_to_months(df: pd.DataFrame, start_col: str = "week_start",
 
 
 # -------------------------
-# Metrics builders
+# Metrics builders (ИСПРАВЛЕННЫЙ)
 # -------------------------
 
 class MetricsBuilder:
@@ -538,14 +521,17 @@ class MetricsBuilder:
         cancel_col = find_col(df, ["isCancel", "Отмена заказа"])
         region_col = find_col(df, ["regionName", "Регион"])
 
+        if not date_col or not article_col:
+            return pd.DataFrame()
+
         df["day"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
         df["supplier_article"] = df[article_col].map(clean_article)
-        df["nm_id"] = df[nm_col].astype(str)
-        df["subject"] = df[subject_col].astype(str)
+        df["nm_id"] = df[nm_col].astype(str) if nm_col else ""
+        df["subject"] = df[subject_col].astype(str) if subject_col else ""
         df["code"] = df["supplier_article"].map(extract_code)
-        df["finished_price"] = pd.to_numeric(df[finished_col], errors="coerce")
-        df["price_with_disc"] = pd.to_numeric(df[pwd_col], errors="coerce")
-        df["spp"] = pd.to_numeric(df[spp_col], errors="coerce")
+        df["finished_price"] = pd.to_numeric(df[finished_col], errors="coerce") if finished_col else 0.0
+        df["price_with_disc"] = pd.to_numeric(df[pwd_col], errors="coerce") if pwd_col else 0.0
+        df["spp"] = pd.to_numeric(df[spp_col], errors="coerce") if spp_col else 0.0
         if cancel_col:
             df["is_cancel"] = df[cancel_col].astype(str).str.lower().isin(["true", "1", "да"])
         else:
@@ -760,6 +746,8 @@ class MetricsBuilder:
         nm_col = find_col(df, ["Артикул WB", "nmId"])
         subject_col = find_col(df, ["Предмет", "subject"])
         week_col = find_col(df, ["Неделя", "week"])
+        if not article_col or not week_col:
+            return pd.DataFrame()
         df["supplier_article"] = df[article_col].map(clean_article)
         df["nm_id"] = df[nm_col].astype(str) if nm_col else ""
         df["subject"] = df[subject_col].astype(str) if subject_col else ""
@@ -768,7 +756,6 @@ class MetricsBuilder:
         latest = df[df[week_col].astype(str) == latest_week].copy()
         buyout_col = find_col(latest, ["Процент выкупа"])
         latest["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0 if buyout_col else 0.8
-        # Normalize columns
         mapping = {
             "avg_sale_price_week": ["Средняя цена продажи"],
             "avg_buyer_price_week": ["Средняя цена покупателя"],
@@ -794,8 +781,6 @@ class MetricsBuilder:
         }
         out = latest[[c for c in ["supplier_article", "nm_id", "subject", "code"] if c in latest.columns]].copy()
         out["week_code"] = latest_week
-        buyout_col = find_col(latest, ["Процент выкупа"])
-        out["buyout_rate"] = pd.to_numeric(latest[buyout_col], errors="coerce").fillna(0) / 100.0 if buyout_col else 0.8
         for dst, cands in mapping.items():
             col = find_col(latest, cands)
             out[dst] = pd.to_numeric(latest[col], errors="coerce").fillna(0) if col else 0.0
@@ -807,8 +792,6 @@ class MetricsBuilder:
     def build_daily_localization(self, orders_region: pd.DataFrame, stocks_daily: pd.DataFrame) -> pd.DataFrame:
         if orders_region.empty or stocks_daily.empty:
             return pd.DataFrame()
-        cluster_rows = []
-        # aggregate stocks per cluster/day/sku
         stocks = stocks_daily.copy()
         stocks["cluster"] = stocks["warehouse"].map(lambda w: "MOSCOW_CLUSTER" if w in MOSCOW_CLUSTER else w)
         cluster_stock = stocks.groupby(["day", "supplier_article", "cluster"], dropna=False)["stock_qty"].sum().reset_index()
@@ -856,7 +839,6 @@ class MetricsBuilder:
             return pd.DataFrame()
         df = daily_current.copy()
         df["weekday"] = pd.to_datetime(df["day"]).dt.weekday
-        # Список метрик, которые реально существуют в daily_current
         possible_metrics = [
             "orders_day", "gross_profit_day_est", "search_frequency", "search_clicks", "search_capture_share",
             "avg_position", "visibility_pct", "open_card_count", "add_to_cart_count", "funnel_orders",
@@ -917,12 +899,10 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["week_code"] = pd.to_datetime(daily["day"]).dt.date.map(week_code_from_date)
-        # Определяем доступные колонки для группировки
         group_cols = [c for c in ["week_code", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
-        # Определяем доступные метрики для агрегации
         agg_dict = {}
         metric_map = {
-            "orders_day": ("orders_day", "sum"),
+            "orders_week": ("orders_day", "sum"),
             "gp_est_week": ("gross_profit_day_est", "sum"),
             "finished_price_week": ("avg_finished_price_day", "mean"),
             "pwd_week": ("avg_price_with_disc_day", "mean"),
@@ -949,7 +929,6 @@ class MetricsBuilder:
         if daily.empty:
             return daily
         daily["month_key"] = pd.to_datetime(daily["day"]).dt.to_period("M").astype(str)
-        # Доступные колонки для агрегации
         group_cols = [c for c in ["month_key", "supplier_article", "nm_id", "subject", "code"] if c in daily.columns]
         agg_dict = {}
         metric_map = {
@@ -1094,6 +1073,7 @@ class MetricsBuilder:
         out["forecast_vs_prev_month_pct"] = out.apply(lambda r: pct_delta(r["forecast_month_gp_adjusted"], r["prev_month_gp"]), axis=1)
         return out
 
+    # ИСПРАВЛЕННЫЙ build_weekly_entry_sku
     def build_weekly_entry_sku(self) -> pd.DataFrame:
         df = self.data.entry_points_sku.copy()
         if df.empty:
@@ -1109,6 +1089,19 @@ class MetricsBuilder:
         cart = find_col(df, ["Добавили в корзину", "Добавили в корзину"])
         conv_cart = find_col(df, ["Конверсия в корзину"])
         conv_order = find_col(df, ["Конверсия в заказ"])
+        # Обязательные колонки: артикул продавца, неделя
+        if not art:
+            log("Entry points SKU: column 'Артикул продавца' not found, skipping")
+            return pd.DataFrame()
+        # Если нет колонок week_code, week_start, week_end – попробуем взять из индекса или оставить пустыми
+        week_code_col = find_col(df, ["week_code"])
+        week_start_col = find_col(df, ["week_start"])
+        week_end_col = find_col(df, ["week_end"])
+        if not week_code_col:
+            # Может быть, неделя кодируется в другой колонке? Если нет – пропускаем
+            log("Entry points SKU: week columns not found, skipping")
+            return pd.DataFrame()
+
         df["supplier_article"] = df[art].map(clean_article)
         df["subject"] = df[sub].astype(str) if sub else ""
         df["code"] = df["supplier_article"].map(extract_code)
@@ -1117,15 +1110,29 @@ class MetricsBuilder:
         for c in [clicks, shows, ctr, orders, cart, conv_cart, conv_order]:
             if c:
                 df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        out = df[[
-            "week_code", "week_start", "week_end", "supplier_article", "subject", "code",
-            "entry_section", "entry_point",
-            shows, clicks, ctr, cart, conv_cart, orders, conv_order
-        ]].copy()
-        out = out.rename(columns={
-            shows: "entry_shows", clicks: "entry_clicks", ctr: "entry_ctr",
-            cart: "entry_cart", conv_cart: "entry_conv_cart", orders: "entry_orders", conv_order: "entry_conv_order"
-        })
+        # Формируем выходной DataFrame
+        out_cols = [week_code_col, "supplier_article", "subject", "code", "entry_section", "entry_point"]
+        if week_start_col:
+            out_cols.append(week_start_col)
+        if week_end_col:
+            out_cols.append(week_end_col)
+        for src, dst in [(shows, "entry_shows"), (clicks, "entry_clicks"), (ctr, "entry_ctr"),
+                          (cart, "entry_cart"), (conv_cart, "entry_conv_cart"),
+                          (orders, "entry_orders"), (conv_order, "entry_conv_order")]:
+            if src:
+                out_cols.append(src)
+        # Оставляем только существующие колонки
+        out_cols = [c for c in out_cols if c in df.columns]
+        out = df[out_cols].copy()
+        rename = {}
+        if shows: rename[shows] = "entry_shows"
+        if clicks: rename[clicks] = "entry_clicks"
+        if ctr: rename[ctr] = "entry_ctr"
+        if cart: rename[cart] = "entry_cart"
+        if conv_cart: rename[conv_cart] = "entry_conv_cart"
+        if orders: rename[orders] = "entry_orders"
+        if conv_order: rename[conv_order] = "entry_conv_order"
+        out = out.rename(columns=rename)
         return out
 
 
@@ -1189,7 +1196,7 @@ def compose_weekly_reason(weekly_row: pd.Series, abc_prev: Optional[pd.Series], 
 
 
 # -------------------------
-# Report writer
+# Report writer (без изменений)
 # -------------------------
 
 class ReportWriter:
@@ -1338,7 +1345,6 @@ class CombinedReport:
         ws[6][1] = "Валовая прибыль, оценка"
         ws[6][2] = float(total_gp)
 
-        # top negatives / positives by month forecast and current GP
         if not self.monthly_forecast.empty:
             cur_month = sorted(self.monthly_forecast["month_key"].unique())[-1]
             mf = self.monthly_forecast[self.monthly_forecast["month_key"] == cur_month].copy()
@@ -1347,7 +1353,6 @@ class CombinedReport:
             writer.add_df_sheet("Топ_месяц_вниз", top_down)
             writer.add_df_sheet("Топ_месяц_вверх", top_up)
 
-        # Show current biggest losers / winners by estimated GP vs target orders
         summary_rows = []
         for _, row in current.iterrows():
             tgt = self._target_for_row(row)
@@ -1391,8 +1396,7 @@ class CombinedReport:
                 localization_index=("localization_index", "mean"),
                 search_capture_share=("search_capture_share", "mean"),
             ).reset_index().sort_values("orders_day", ascending=False)
-            writer.add_df_sheet(safe_sheet_name(subject + "_codes_tmp"), by_code)  # temp helper sheet to keep data accessible in log-like manner
-            # rewrite pretty on subject sheet
+            writer.add_df_sheet(safe_sheet_name(subject + "_codes_tmp"), by_code)
             rows = []
             for _, r in by_code.iterrows():
                 rows.append((r["code"], r["sku_count"], r["orders_day"], r["gross_profit_day_est"], r["avg_finished_price_day"], r["localization_index"], r["search_capture_share"]))
@@ -1424,7 +1428,6 @@ class CombinedReport:
         title_suffix = "позиции" if is_brush_subject(subject) else "оттенки"
         writer.write_title(ws, f"{subject} / код {code} / {title_suffix}", row=1, end_col=8)
 
-        # overall current vs target at code level
         current_row = code_df.groupby(["subject", "code"], dropna=False).agg(
             orders_day=("orders_day", "sum"),
             gross_profit_day_est=("gross_profit_day_est", "sum"),
@@ -1443,7 +1446,6 @@ class CombinedReport:
             ad_ctr=("ad_ctr", "mean"),
         ).reset_index().iloc[0]
 
-        # aggregate target from member SKUs
         targets = []
         for _, sku_row in code_df.iterrows():
             tgt = self._target_for_row(sku_row)
@@ -1471,7 +1473,6 @@ class CombinedReport:
         ]
         end_row = writer.write_kv_table(ws, start_row=3, data=kv_data, title="Целевые и текущие показатели")
 
-        # positions/shades table sorted by clicks from latest ABC or funnel opens
         latest_week = None
         if not self.data.abc.empty:
             latest_week = self.data.abc["week_start"].dropna().max()
@@ -1515,7 +1516,6 @@ class CombinedReport:
             for j, val in enumerate(row, start=1):
                 ws.cell(row=i, column=j, value=None if pd.isna(val) else val).border = THIN_BORDER
 
-        # Narrative
         lead_row = code_df.sort_values("orders_day", ascending=False).iloc[0]
         tgt = self._target_for_row(lead_row)
         narrative = compose_daily_reason(lead_row, tgt)
@@ -1542,7 +1542,6 @@ class CombinedReport:
                 narrative += "\n\nWeekly: " + weekly_reason
         writer.write_narrative_box(ws, start_row=3, start_col=8, text=narrative, width_cols=7, height_rows=20)
 
-        # ABC weekly block
         if not self.data.abc.empty:
             abc = self.data.abc.copy()
             art = find_col(abc, ["Артикул продавца"])
