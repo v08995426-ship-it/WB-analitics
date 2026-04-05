@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import OrderedDict
 
 import boto3
 import pandas as pd
@@ -51,6 +52,8 @@ OUT_SHADE_ACTIONS = SERVICE_ROOT + "Рекомендации_по_оттенка
 OUT_SHADE_PORTFOLIO = SERVICE_ROOT + "Состав_кампаний_по_оттенкам.xlsx"
 OUT_SHADE_TESTS = SERVICE_ROOT + "Тесты_оттенков.xlsx"
 OUT_BENCHMARK = SERVICE_ROOT + "Сравнение_с_сильными_РК.xlsx"
+OUT_REPORT = SERVICE_ROOT + "Отчёт_по_управлению_рекламой.xlsx"
+OUT_API_LOG = SERVICE_ROOT + "Лог_API.xlsx"
 
 MIN_RATING_SHADE = 4.6
 MATURE_START_OFFSET = 7
@@ -151,6 +154,63 @@ def style_workbook(path: Path) -> None:
         wb.save(path)
     except Exception:
         pass
+
+def trim_text(value: Any, limit: int = 4000) -> str:
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit] + "…"
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return trim_text(value)
+
+def append_api_log(api_log: Optional[List[Dict[str, Any]]], entry: Dict[str, Any]) -> None:
+    if api_log is None:
+        return
+    api_log.append(entry)
+
+def wb_api_request(
+    api_log: Optional[List[Dict[str, Any]]],
+    method: str,
+    url: str,
+    api_key: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: int = 120,
+    rate_sleep: float = 0.0,
+) -> requests.Response:
+    headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
+    started = datetime.now()
+    error_text = ""
+    response_text = ""
+    status_code: Optional[int] = None
+    try:
+        resp = requests.request(method=method.upper(), url=url, headers=headers, json=json_body, timeout=timeout)
+        status_code = resp.status_code
+        response_text = trim_text(resp.text, 12000)
+        return resp
+    except Exception as exc:
+        error_text = trim_text(repr(exc), 4000)
+        raise
+    finally:
+        finished = datetime.now()
+        append_api_log(api_log, {
+            "Время": started.strftime("%Y-%m-%d %H:%M:%S"),
+            "Метод": method.upper(),
+            "URL": url,
+            "HTTP статус": status_code if status_code is not None else "",
+            "Длительность, сек": round((finished - started).total_seconds(), 3),
+            "Запрос": trim_text(json_dumps_safe(json_body), 12000),
+            "Ответ": response_text,
+            "Ошибка": error_text,
+        })
+        if rate_sleep > 0:
+            time.sleep(rate_sleep)
+
+def chunked(seq: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i+size]
 
 class BaseProvider:
     def read_excel(self, key: str, sheet_name: Any = 0) -> pd.DataFrame:
@@ -722,26 +782,112 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
         return "Снизить", max(new_bid, 4.0 if str(row.get("payment_type")) == "cpc" else 80.0), "Проблема в карточке / воронке или рост заказов слабый", rate_limit
     return "Без изменений", current_bid, "Без изменений", rate_limit
 
-def fetch_wb_min_bids(api_key: str, advert_id: int, nm_ids: List[int], payment_type: str, placement_types: List[str]) -> Dict[int, float]:
+def fetch_wb_min_bids(api_key: str, advert_id: int, nm_ids: List[int], payment_type: str, placement_types: List[str], api_log: Optional[List[Dict[str, Any]]] = None) -> Dict[int, float]:
     if not api_key or not nm_ids:
         return {}
-    headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
-    body = {"advert_id": advert_id, "nm_ids": nm_ids[:100], "payment_type": payment_type, "placement_types": placement_types}
+    body = {"advert_id": advert_id, "nm_ids": [safe_int(x) for x in nm_ids[:100] if safe_int(x) > 0], "payment_type": payment_type, "placement_types": placement_types}
+    if not body["nm_ids"]:
+        return {}
     try:
-        resp = requests.post(WB_BIDS_MIN_URL, headers=headers, json=body, timeout=60)
+        resp = wb_api_request(api_log, "POST", WB_BIDS_MIN_URL, api_key, json_body=body, timeout=60, rate_sleep=3.05)
         if resp.status_code != 200:
             return {}
         data = resp.json()
         out: Dict[int, float] = {}
-        for item in data.get("bids", []):
+        for item in data.get("bids", []) or []:
             nm = safe_int(item.get("nm_id"))
             bids = item.get("bids", []) or []
             vals = [safe_float(x.get("value")) / 100.0 for x in bids if safe_float(x.get("value")) > 0]
-            if vals:
+            if vals and nm > 0:
                 out[nm] = min(vals)
         return out
     except Exception:
         return {}
+
+def collect_min_bids(decisions_df: pd.DataFrame, shade_actions: pd.DataFrame, api_key: str, api_log: Optional[List[Dict[str, Any]]] = None) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    if not api_key:
+        return pd.DataFrame([{"Комментарий": "WB API ключ не задан: минимальные ставки не запрошены"}])
+
+    request_rows: List[Dict[str, Any]] = []
+    if decisions_df is not None and not decisions_df.empty:
+        changed = decisions_df.copy()
+        changed["payment_type"] = changed["Тип кампании"].astype(str).str.lower().map(lambda s: "cpc" if "cpc" in s else "cpm")
+        changed["placement_type"] = changed["Плейсмент"].astype(str)
+        changed = changed[changed["Артикул WB"].map(safe_int) > 0]
+        for _, r in changed.iterrows():
+            request_rows.append({
+                "Источник": "Ставки",
+                "ID кампании": safe_int(r["ID кампании"]),
+                "Артикул WB": safe_int(r["Артикул WB"]),
+                "Артикул продавца": r.get("Артикул продавца", ""),
+                "Тип кампании": r.get("Тип кампании", ""),
+                "payment_type": r["payment_type"],
+                "placement_type": r["placement_type"],
+            })
+    if shade_actions is not None and not shade_actions.empty and "Артикул WB" in shade_actions.columns:
+        tmp = shade_actions[shade_actions["Действие"].astype(str).eq("Добавить тестовый оттенок")].copy() if "Действие" in shade_actions.columns else pd.DataFrame()
+        if not tmp.empty:
+            tmp["payment_type"] = tmp["Тип кампании"].astype(str).str.lower().map(lambda s: "cpc" if "cpc" in s else "cpm")
+            def _shade_placement(v: str) -> str:
+                s = str(v).lower()
+                if "combined" in s:
+                    return "combined"
+                if "recommendation" in s:
+                    return "recommendation"
+                return "search"
+            tmp["placement_type"] = tmp["Тип кампании"].map(_shade_placement)
+            for _, r in tmp.iterrows():
+                request_rows.append({
+                    "Источник": "Оттенки",
+                    "ID кампании": safe_int(r["ID кампании"]),
+                    "Артикул WB": safe_int(r["Артикул WB"]),
+                    "Артикул продавца": r.get("Новый оттенок", ""),
+                    "Тип кампании": r.get("Тип кампании", ""),
+                    "payment_type": r["payment_type"],
+                    "placement_type": r["placement_type"],
+                })
+    if not request_rows:
+        return pd.DataFrame([{"Комментарий": "Нет строк для запроса минимальных ставок"}])
+
+    req_df = pd.DataFrame(request_rows).drop_duplicates()
+    for (advert_id, payment_type, placement_type), g in req_df.groupby(["ID кампании", "payment_type", "placement_type"]):
+        placement_types = [placement_type]
+        nm_ids = [safe_int(x) for x in g["Артикул WB"].tolist() if safe_int(x) > 0]
+        for batch in chunked(nm_ids, 100):
+            min_map = fetch_wb_min_bids(api_key, safe_int(advert_id), batch, payment_type, placement_types, api_log=api_log)
+            for _, row in g[g["Артикул WB"].isin(batch)].iterrows():
+                nm = safe_int(row["Артикул WB"] )
+                rows.append({
+                    "Источник": row["Источник"],
+                    "ID кампании": safe_int(advert_id),
+                    "Артикул WB": nm,
+                    "Артикул продавца": row["Артикул продавца"],
+                    "Тип кампании": row["Тип кампании"],
+                    "Плейсмент": placement_type,
+                    "Минимальная ставка WB, ₽": round(safe_float(min_map.get(nm)), 2) if nm in min_map else None,
+                    "Статус": "ok" if nm in min_map else "нет данных",
+                })
+    return pd.DataFrame(rows) if rows else pd.DataFrame([{"Комментарий": "Не удалось получить минимальные ставки"}])
+
+def apply_min_bid_floor(decisions_df: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
+    if decisions_df is None or decisions_df.empty or min_bids_df is None or min_bids_df.empty or "Минимальная ставка WB, ₽" not in min_bids_df.columns:
+        return decisions_df
+    out = decisions_df.copy()
+    floors = min_bids_df[["ID кампании", "Артикул WB", "Плейсмент", "Минимальная ставка WB, ₽"]].dropna(subset=["Минимальная ставка WB, ₽"]).drop_duplicates()
+    if floors.empty:
+        return out
+    out = out.merge(floors, on=["ID кампании", "Артикул WB", "Плейсмент"], how="left")
+    out["Причина"] = out["Причина"].fillna("")
+    for idx, r in out.iterrows():
+        floor = safe_float(r.get("Минимальная ставка WB, ₽"))
+        new_bid = safe_float(r.get("Новая ставка, ₽"))
+        if floor > 0 and new_bid > 0 and new_bid < floor and str(r.get("Действие")) in {"Повысить", "Снизить", "Тест роста"}:
+            out.at[idx, "Новая ставка, ₽"] = round(floor, 2)
+            reason = str(r.get("Причина", ""))
+            addon = f"; скорректировано до минимальной ставки WB {floor:.2f} ₽"
+            out.at[idx, "Причина"] = (reason + addon).strip("; ")
+    return out
 
 def build_shade_portfolio(campaigns: pd.DataFrame, master: pd.DataFrame, orders_60: pd.DataFrame) -> pd.DataFrame:
     if campaigns.empty:
@@ -761,38 +907,41 @@ def build_shade_portfolio(campaigns: pd.DataFrame, master: pd.DataFrame, orders_
         core_rows.append(g)
     return pd.concat(core_rows, ignore_index=True) if core_rows else pd.DataFrame()
 
-def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master: pd.DataFrame, orders_60: pd.DataFrame, product_metrics: pd.DataFrame, api_key: str = "") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master: pd.DataFrame, orders_60: pd.DataFrame, product_metrics: pd.DataFrame, api_key: str = "", api_log: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if campaigns.empty or portfolio.empty:
         return pd.DataFrame([{"Комментарий":"Нет подходящих кампаний для анализа оттенков"}]), pd.DataFrame([{"Комментарий":"Нет активных тестов оттенков"}])
     actions = []
     tests_rows = []
-    ord_map = orders_60.groupby("supplier_article", as_index=False).agg(
-        total_orders_60=("nmId","count"),
-        revenue_60=("finishedPrice","sum"),
-        nmId=("nmId","first"),
-        subject=("subject","first"),
-    )
-    ord_map["product_root"] = ord_map["supplier_article"].map(product_root_from_supplier_article)
-    bench_rating = master[["supplier_article","rating_reviews","product_root","nmId"]].drop_duplicates()
-    universe = ord_map.merge(bench_rating, on=["supplier_article","product_root","nmId"], how="left")
-    control_drr = product_metrics[["control_key","blended_drr","subject_norm"]].drop_duplicates()
+    orders_map = pd.DataFrame()
+    if orders_60 is not None and not orders_60.empty:
+        orders_map = orders_60.groupby(["supplier_article","product_root"], as_index=False).agg(
+            total_orders_60=("nmId","count"),
+            revenue_60=("finishedPrice","sum"),
+        )
+    universe = master[["nmId","supplier_article","product_root","subject","subject_norm","rating_reviews","rating_card"]].drop_duplicates().copy()
+    if not orders_map.empty:
+        universe = universe.merge(orders_map, on=["supplier_article","product_root"], how="left")
+    universe["total_orders_60"] = universe.get("total_orders_60", 0).fillna(0)
+    universe["revenue_60"] = universe.get("revenue_60", 0).fillna(0)
+
+    control_drr = product_metrics.copy() if product_metrics is not None else pd.DataFrame()
 
     for advert_id, g in portfolio.groupby("id_campaign"):
         current = g.iloc[0]
         product_root = current["product_root"]
         subject_norm = current["subject_norm"]
-        control = control_drr[control_drr["control_key"] == product_root]
+        control = control_drr[control_drr["control_key"] == product_root] if not control_drr.empty and "control_key" in control_drr.columns else pd.DataFrame()
         blended = safe_float(control["blended_drr"].iloc[0]) if not control.empty else 0.0
         if blended > 0.15:
             actions.append({"ID кампании": advert_id, "Товар": product_root, "Действие":"Нет действий", "Причина":"Общий ДРР товара выше 15%, новые оттенки не добавляем"})
             continue
         used = set(g["supplier_article"].dropna().astype(str))
         cand = universe[(universe["product_root"] == product_root) & (~universe["supplier_article"].isin(used))].copy()
-        cand = cand[cand["rating_reviews"].fillna(0) > MIN_RATING_SHADE]
+        cand = cand[cand["rating_reviews"].fillna(0) >= MIN_RATING_SHADE]
         if cand.empty:
-            actions.append({"ID кампании": advert_id, "Товар": product_root, "Действие":"Нет действий", "Причина":"Нет подходящих оттенков с рейтингом > 4.6"})
+            actions.append({"ID кампании": advert_id, "Товар": product_root, "Действие":"Нет действий", "Причина":"Нет подходящих оттенков с рейтингом >= 4.6"})
             continue
-        cand = cand.sort_values(["total_orders_60","rating_reviews"], ascending=[False, False])
+        cand = cand.sort_values(["total_orders_60","rating_reviews","revenue_60"], ascending=[False, False, False])
         best = cand.iloc[0]
         actions.append({
             "ID кампании": advert_id,
@@ -801,25 +950,49 @@ def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master
             "Текущий CORE": current["supplier_article"],
             "Новый оттенок": best["supplier_article"],
             "Артикул WB": safe_int(best["nmId"]),
+            "Рейтинг": round(safe_float(best.get("rating_reviews")), 2),
+            "Заказы 60 дней": safe_int(best.get("total_orders_60")),
             "Действие":"Добавить тестовый оттенок",
             "Минимальная ставка WB, ₽": None,
-            "Причина":"Расширяем охват товара новым оттенком, старт с минимальной ставки WB",
+            "Причина":"Добавляем оттенок в тест: API WB автоматически ставит текущую минимальную ставку при добавлении",
             "Действие API":"add",
-            "Статус применения":"ожидает",
+            "Статус применения":"готово к применению",
             "Тип кампании": f'{current["payment_type"]}_{current["placement"]}',
+        })
+        tests_rows.append({
+            "ID кампании": advert_id,
+            "Товар": product_root,
+            "Оттенок": best["supplier_article"],
+            "Артикул WB": safe_int(best["nmId"]),
+            "Рейтинг": round(safe_float(best.get("rating_reviews")), 2),
+            "Заказы 60 дней": safe_int(best.get("total_orders_60")),
+            "Статус": "к добавлению",
         })
     actions_df = pd.DataFrame(actions)
     if actions_df.empty:
         actions_df = pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
-    if api_key and not actions_df.empty and "Артикул WB" in actions_df.columns:
-        for idx, r in actions_df[actions_df["Действие"].eq("Добавить тестовый оттенок")].iterrows():
-            mins = fetch_wb_min_bids(api_key, safe_int(r["ID кампании"]), [safe_int(r["Артикул WB"])], "cpm" if "cpm" in str(r.get("Тип кампании","")) else "cpc", ["combined" if "combined" in str(r.get("Тип кампании","")) else ("search" if "search" in str(r.get("Тип кампании","")) else "recommendation")])
-            if mins:
-                actions_df.at[idx, "Минимальная ставка WB, ₽"] = list(mins.values())[0]
-                actions_df.at[idx, "Статус применения"] = "готово к применению"
-    return actions_df, pd.DataFrame([{"Комментарий":"История тестов оттенков начнёт копиться после первого успешного добавления"}])
+    return actions_df, (pd.DataFrame(tests_rows) if tests_rows else pd.DataFrame([{"Комментарий":"Нет активных тестов оттенков"}]))
 
-def apply_shade_actions(actions_df: pd.DataFrame, api_key: str, dry_run: bool) -> pd.DataFrame:
+def apply_shade_actions(actions_df: pd.DataFrame, api_key: str, dry_run: bool, api_log: Optional[List[Dict[str, Any]]] = None) -> pd.DataFrame:
+    if actions_df.empty or "Действие API" not in actions_df.columns:
+        return pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
+    add_rows = actions_df[(actions_df["Действие API"] == "add")].copy()
+    if add_rows.empty:
+        return pd.DataFrame([{"Комментарий":"Нет оттенков для применения"}])
+    logs = []
+    for advert_id, g in add_rows.groupby("ID кампании"):
+        payload = {"nms":[{"advert_id": safe_int(advert_id), "nms": {"add": [safe_int(x) for x in g["Артикул WB"].tolist() if safe_int(x) > 0], "delete": []}}]}
+        if dry_run:
+            logs.append({"ID кампании": advert_id, "Статус":"dry-run", "Ответ": json_dumps_safe(payload)})
+            continue
+        try:
+            resp = wb_api_request(api_log, "PATCH", WB_NMS_URL, api_key, json_body=payload, timeout=120, rate_sleep=1.05)
+            logs.append({"ID кампании": advert_id, "Статус":"ok" if resp.status_code == 200 else "failed", "HTTP статус": resp.status_code, "Ответ": trim_text(resp.text, 1000)})
+        except Exception as e:
+            logs.append({"ID кампании": advert_id, "Статус":"failed", "HTTP статус": "", "Ответ": trim_text(str(e), 1000)})
+    return pd.DataFrame(logs)
+
+def build_efficiency_history(actions_df: pd.DataFrame, api_key: str, dry_run: bool) -> pd.DataFrame:
     if actions_df.empty or "Действие API" not in actions_df.columns:
         return pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
     add_rows = actions_df[(actions_df["Действие API"] == "add") & (actions_df["Минимальная ставка WB, ₽"].notna())].copy()
@@ -1175,23 +1348,95 @@ def decisions_to_payload(decisions_df: pd.DataFrame) -> Dict[str, Any]:
         out.append({"advert_id": advert, "payment_type": payment_type, "nm_bids": items})
     return {"bids": out}
 
-def send_payload(payload: Dict[str, Any], api_key: str, dry_run: bool) -> pd.DataFrame:
+def send_payload(payload: Dict[str, Any], api_key: str, dry_run: bool, api_log: Optional[List[Dict[str, Any]]] = None) -> pd.DataFrame:
     logs = []
-    headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
     for block in payload.get("bids", []):
         advert_id = safe_int(block["advert_id"])
         body = {"bids": [{"advert_id": advert_id, "nm_bids": block["nm_bids"]}]}
         if dry_run:
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"dry-run", "http_status":"", "response":json.dumps(body, ensure_ascii=False)})
+            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"dry-run", "http_status":"", "response":json_dumps_safe(body)})
             continue
         try:
-            resp = requests.post(WB_BIDS_URL, headers=headers, json=body, timeout=120)
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"ok" if resp.status_code == 200 else "failed", "http_status":resp.status_code, "response":resp.text[:1000]})
+            resp = wb_api_request(api_log, "PATCH", WB_BIDS_URL, api_key, json_body=body, timeout=120, rate_sleep=0.25)
+            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"ok" if resp.status_code == 200 else "failed", "http_status":resp.status_code, "response":trim_text(resp.text, 1000)})
         except Exception as e:
-            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"failed", "http_status":"", "response":str(e)})
+            logs.append({"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "advert_id": advert_id, "status":"failed", "http_status":"", "response":trim_text(str(e), 1000)})
     return pd.DataFrame(logs)
 
-def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame], history_append: pd.DataFrame) -> None:
+def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame], history_append: pd.DataFrame, min_bids_df: Optional[pd.DataFrame] = None, api_log_df: Optional[pd.DataFrame] = None) -> None:
+    decisions = results["decisions"]
+    consolidated_sheets = OrderedDict()
+    consolidated_sheets["Решения"] = decisions
+    consolidated_sheets["Минимальные ставки WB"] = min_bids_df if min_bids_df is not None else pd.DataFrame([{"Комментарий":"Нет данных по минимальным ставкам"}])
+    consolidated_sheets["Расчёт логики"] = results["rows"]
+    consolidated_sheets["Метрики по товарам"] = results["product_metrics"]
+    consolidated_sheets["Слабые позиции"] = results["weak"] if not results["weak"].empty else pd.DataFrame([{"Комментарий":"Нет слабых позиций"}])
+    consolidated_sheets["Рекомендации по оттенкам"] = results["shade_actions"]
+    consolidated_sheets["Состав кампаний по оттенкам"] = results["shade_portfolio"]
+    consolidated_sheets["Тесты оттенков"] = results["shade_tests"]
+    consolidated_sheets["Сравнение с сильными РК"] = results["bench_cmp"]
+    consolidated_sheets["Эффект изменений"] = results["effects"]
+    consolidated_sheets["Лог API"] = api_log_df if api_log_df is not None and not api_log_df.empty else pd.DataFrame([{"Комментарий":"API-лог пуст"}])
+    consolidated_sheets["Отправка ставок"] = bid_send_log if bid_send_log is not None and not bid_send_log.empty else pd.DataFrame([{"Комментарий":"Изменения ставок не отправлялись"}])
+    consolidated_sheets["Применение оттенков"] = shade_apply_log if shade_apply_log is not None and not shade_apply_log.empty else pd.DataFrame([{"Комментарий":"Оттенки не применялись"}])
+    consolidated_sheets["Окно анализа"] = pd.DataFrame([{
+            "Текущее окно с": results["window"]["cur_start"],
+            "Текущее окно по": results["window"]["cur_end"],
+            "База с": results["window"]["base_start"],
+            "База по": results["window"]["base_end"],
+            "Режим": run_mode,
+        }])
+    provider.write_excel(OUT_REPORT, consolidated_sheets)
+
+    # legacy outputs for backward compatibility
+    preview_sheets = OrderedDict()
+    for k, v in consolidated_sheets.items():
+        preview_sheets[k] = v
+    provider.write_excel(OUT_PREVIEW, preview_sheets)
+    provider.write_excel(OUT_PRODUCT, {"Метрики_по_товарам": results["product_metrics"]})
+    provider.write_excel(OUT_LIMITS, {"Минимальные_ставки_WB": consolidated_sheets["Минимальные ставки WB"]})
+    provider.write_excel(OUT_WEAK, {"Слабые_позиции": consolidated_sheets["Слабые позиции"]})
+    provider.write_excel(OUT_EFFECTS, {"Эффект_изменений": results["effects"]})
+    provider.write_excel(OUT_SHADE_ACTIONS, {"Рекомендации_по_оттенкам": results["shade_actions"]})
+    provider.write_excel(OUT_SHADE_PORTFOLIO, {"Состав_кампаний_по_оттенкам": results["shade_portfolio"]})
+    provider.write_excel(OUT_SHADE_TESTS, {"Тесты_оттенков": results["shade_tests"]})
+    provider.write_excel(OUT_BENCHMARK, {"Сравнение_с_сильными_РК": results["bench_cmp"]})
+    provider.write_excel(OUT_EFF, results["eff_history_sheets"])
+    if api_log_df is not None:
+        provider.write_excel(OUT_API_LOG, {"Лог_API": api_log_df})
+    # append archive and bid history
+    try:
+        old_archive = provider.read_excel(OUT_ARCHIVE)
+    except Exception:
+        old_archive = pd.DataFrame()
+    new_archive = pd.concat([old_archive, decisions], ignore_index=True)
+    provider.write_excel(OUT_ARCHIVE, {"Архив_решений": new_archive})
+
+    if history_append is not None and not history_append.empty:
+        try:
+            old_hist = provider.read_excel(OUT_BID_HISTORY)
+        except Exception:
+            old_hist = pd.DataFrame()
+        hist = pd.concat([old_hist, history_append], ignore_index=True)
+        provider.write_excel(OUT_BID_HISTORY, {"История_ставок": hist})
+
+    summary = {
+        "mode": run_mode,
+        "generated_at": datetime.now().isoformat(),
+        "recommendations_count": int(len(decisions)),
+        "changed_count": int(len(decisions[(decisions["Действие"].isin(["Повысить","Снизить","Тест роста"])) & (decisions["Текущая ставка, ₽"] != decisions["Новая ставка, ₽"])])),
+        "limit_reached_count": int((decisions["Действие"] == "Предел эффективности ставки").sum()),
+        "weak_positions_count": int(len(results["weak"])),
+        "shade_actions_count": 0 if results["shade_actions"].empty else int((results["shade_actions"].get("Действие") == "Добавить тестовый оттенок").sum()) if "Действие" in results["shade_actions"].columns else 0,
+        "shade_add_test_count": 0 if results["shade_actions"].empty else int((results["shade_actions"].get("Действие") == "Добавить тестовый оттенок").sum()) if "Действие" in results["shade_actions"].columns else 0,
+        "shade_remove_count": 0,
+        "bid_send_blocks": 0 if bid_send_log is None or bid_send_log.empty else int(len(bid_send_log)),
+        "shade_apply_blocks": 0 if shade_apply_log is None or shade_apply_log.empty else int(len(shade_apply_log)),
+        "api_calls_count": 0 if api_log_df is None or api_log_df.empty else int(len(api_log_df)),
+    }
+    provider.write_text(OUT_SUMMARY, json.dumps(summary, ensure_ascii=False, indent=2))
+
+def run_manager(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame], history_append: pd.DataFrame) -> None:
     decisions = results["decisions"]
     preview_sheets = {
         "Решения_по_ставкам": decisions,
@@ -1257,7 +1502,12 @@ def run_manager(args: argparse.Namespace) -> None:
     provider = choose_provider(args.local_data_dir)
     as_of_date = datetime.strptime(args.as_of_date, "%Y-%m-%d").date() if args.as_of_date else datetime.now().date()
     cfg = Config()
+    api_log: List[Dict[str, Any]] = []
     results = prepare_metrics(provider, cfg, as_of_date)
+
+    api_key = os.getenv("WB_PROMO_KEY_TOPFACE","").strip()
+    min_bids_df = collect_min_bids(results["decisions"], results["shade_actions"], api_key, api_log=api_log)
+    results["decisions"] = apply_min_bid_floor(results["decisions"], min_bids_df)
 
     decisions = results["decisions"].copy()
     log(f"✅ Всего строк решений: {len(decisions)}")
@@ -1267,14 +1517,13 @@ def run_manager(args: argparse.Namespace) -> None:
     if not changed.empty:
         print(changed[["Товар","Артикул продавца","Предмет","ID кампании","Плейсмент","Текущая ставка, ₽","Новая ставка, ₽","Действие","Причина"]].head(20).to_string(index=False), flush=True)
 
-    api_key = os.getenv("WB_PROMO_KEY_TOPFACE","").strip()
     bid_send_log = pd.DataFrame()
     shade_apply_log = pd.DataFrame()
     history_append = pd.DataFrame()
 
     if args.mode == "run":
         payload = decisions_to_payload(decisions)
-        bid_send_log = send_payload(payload, api_key, dry_run=not bool(api_key))
+        bid_send_log = send_payload(payload, api_key, dry_run=not bool(api_key), api_log=api_log)
         log(f"📤 Отправлено блоков в WB: {len(payload.get('bids', []))}")
         if not changed.empty:
             history_append = pd.DataFrame({
@@ -1285,15 +1534,16 @@ def run_manager(args: argparse.Namespace) -> None:
                 "Тип кампании": changed["Тип кампании"],
                 "Ставка поиск, коп": changed["Новая ставка, ₽"].map(lambda x: int(round(safe_float(x)*100))),
                 "Ставка рекомендации, коп": 0,
-                "Стратегия": "STABLE_V1",
+                "Стратегия": "STABLE_V2",
             })
         if args.apply_shades:
-            shade_apply_log = apply_shade_actions(results["shade_actions"], api_key, dry_run=not bool(api_key))
+            shade_apply_log = apply_shade_actions(results["shade_actions"], api_key, dry_run=not bool(api_key), api_log=api_log)
             log(f"🎨 Блоков оттенков к применению: {0 if shade_apply_log.empty else len(shade_apply_log)}")
     else:
         log("🧪 Preview-режим: ставки не отправлялись")
 
-    save_outputs(provider, results, args.mode, bid_send_log, shade_apply_log, history_append)
+    api_log_df = pd.DataFrame(api_log) if api_log else pd.DataFrame()
+    save_outputs(provider, results, args.mode, bid_send_log, shade_apply_log, history_append, min_bids_df=min_bids_df, api_log_df=api_log_df)
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Стабильный менеджер ставок WB для TOPFACE")
