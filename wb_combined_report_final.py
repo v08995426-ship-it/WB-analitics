@@ -11,6 +11,7 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -19,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import boto3
 import numpy as np
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -206,36 +207,64 @@ def read_excel_flexible(
     header_candidates: Iterable[int] = (0, 1, 2),
     expected_aliases: Optional[Dict[str, List[str]]] = None,
 ) -> Tuple[pd.DataFrame, str, int]:
+    """Fast header detection: preview only first rows, then read sheet once."""
     bio = io.BytesIO(data)
-    xl = pd.ExcelFile(bio)
-    sheet = pick_best_sheet(xl.sheet_names, preferred_sheets or [])
-    best_df: Optional[pd.DataFrame] = None
+    wb = load_workbook(bio, read_only=True, data_only=True)
+    sheet = pick_best_sheet(list(wb.sheetnames), preferred_sheets or [])
+    ws = wb[sheet]
+
+    preview_max_row = max(tuple(header_candidates) or (0,)) + 4
+    preview_rows: List[List[str]] = []
+    for row in ws.iter_rows(min_row=1, max_row=preview_max_row, values_only=True):
+        preview_rows.append([normalize_text(v) for v in row])
+
     best_header = 0
     best_score = -10**9
+    best_columns: List[str] = []
 
     for header in header_candidates:
-        try:
-            df = xl.parse(sheet_name=sheet, header=header, dtype=object)
-        except Exception:
+        if header >= len(preview_rows):
             continue
-        df = df.copy()
-        df.columns = dedupe_columns(df.columns)
-        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        if df.empty:
-            score = -1000
-        else:
-            score = len([c for c in df.columns if normalize_text(c)])
-            if expected_aliases:
-                score += required_score(df.columns, expected_aliases) * 100
+        raw_cols = preview_rows[header]
+        cols = dedupe_columns(raw_cols)
+        non_empty = [c for c in cols if normalize_text(c) and not c.startswith("unnamed")]
+        score = len(non_empty)
+        if expected_aliases:
+            score += required_score(cols, expected_aliases) * 100
         if score > best_score:
             best_score = score
-            best_df = df
             best_header = header
+            best_columns = cols
 
-    if best_df is None:
-        raise ValueError(f"Не удалось прочитать Excel: {filename}")
-    best_df.columns = dedupe_columns(best_df.columns)
-    return best_df, str(sheet), best_header
+    selected_cols: Optional[List[str]] = None
+    if expected_aliases and best_columns:
+        norm_to_actual: Dict[str, str] = {}
+        for col in best_columns:
+            if normalize_text(col):
+                norm_to_actual.setdefault(norm_key(col), col)
+        selected: List[str] = []
+        for aliases in expected_aliases.values():
+            for alias in aliases:
+                key = norm_key(alias)
+                if key in norm_to_actual:
+                    selected.append(norm_to_actual[key])
+                    break
+        selected = unique_preserve([c for c in selected if normalize_text(c)])
+        if len(selected) >= 2:
+            selected_cols = selected
+
+    bio2 = io.BytesIO(data)
+    df = pd.read_excel(
+        bio2,
+        sheet_name=sheet,
+        header=best_header,
+        dtype=object,
+        usecols=selected_cols,
+    )
+    df.columns = dedupe_columns(df.columns)
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    wb.close()
+    return df, str(sheet), best_header
 
 
 def rename_using_aliases(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> Tuple[pd.DataFrame, Dict[str, Optional[str]]]:
@@ -545,6 +574,7 @@ class DataLoader:
             self._prefix("Заказы", self.store, "Недельные"),
             self._prefix("Заказы", self.store),
         ])
+        files = files[-14:]
         dfs = []
         alias_map = {
             **COMMON_ALIASES,
@@ -552,6 +582,7 @@ class DataLoader:
         }
         for path in files:
             try:
+                log(f"  orders file: {Path(path).name}")
                 df = self._read_and_standardize("orders", path, None, (0, 1, 2), alias_map)
                 week_code = parse_week_code_from_name(Path(path).name)
                 start, end = week_bounds_from_code(week_code) if week_code else (None, None)
@@ -772,6 +803,7 @@ class DataLoader:
 
     def load_abc(self) -> pd.DataFrame:
         files = self._list_under([self._prefix("ABC")], must_contain=["wb_abc_report_goods__"])
+        files = [f for f in files if (lambda p: (lambda s,e: (s is not None and e is not None and (e - s).days <= 8))(*parse_abc_period_from_name(Path(p).name)))(f)]
         files = files[-16:]
         dfs = []
         for path in files:
@@ -1031,13 +1063,13 @@ class MetricsBuilder:
         return out
 
     def build_daily_current(self) -> pd.DataFrame:
-        parts = []
-
+        log("  deriving: daily_current")
         # funnel by day
+        funnel_agg = pd.DataFrame()
         if not self.data.funnel.empty:
             f = self.data.funnel.copy()
             f = f[f["day"].notna()].copy()
-            grp = f.groupby(["day", "nm_id"], dropna=False).agg(
+            funnel_agg = f.groupby(["day", "nm_id"], dropna=False, observed=True).agg(
                 open_card_count=("open_card_count", "sum"),
                 cart_count=("cart", "sum"),
                 orders_day=("orders", "sum"),
@@ -1046,27 +1078,23 @@ class MetricsBuilder:
                 conv_to_cart=("conv_cart", "mean"),
                 conv_cart_to_order=("conv_order", "mean"),
             ).reset_index()
-            parts.append(grp)
 
-        # orders by day
         orders_agg = pd.DataFrame()
         if not self.data.orders.empty:
             o = self.data.orders.copy()
             o = o[o["day"].notna()].copy()
-            grp = o.groupby(["day", "nm_id", "supplier_article"], dropna=False).agg(
+            orders_agg = o.groupby(["day", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 orders_from_orders=("orders", "sum"),
                 avg_finished_price_day=("finished_price", "mean"),
                 avg_price_with_disc_day=("price_with_disc", "mean"),
                 avg_spp_day=("spp", "mean"),
             ).reset_index()
-            orders_agg = grp
 
-        # ads by day
         ads_agg = pd.DataFrame()
         if not self.data.ads_daily.empty:
             a = self.data.ads_daily.copy()
             a = a[a["day"].notna()].copy()
-            grp = a.groupby(["day", "nm_id"], dropna=False).agg(
+            ads_agg = a.groupby(["day", "nm_id"], dropna=False, observed=True).agg(
                 ad_impressions=("impressions", "sum"),
                 ad_clicks=("clicks", "sum"),
                 ad_orders=("orders", "sum"),
@@ -1074,89 +1102,75 @@ class MetricsBuilder:
                 ad_ctr=("ctr", "mean"),
                 ad_cpc=("cpc", "mean"),
             ).reset_index()
-            ads_agg = grp
 
-        # search by day
         search_agg = pd.DataFrame()
         if not self.data.search.empty:
             s = self.data.search.copy()
             s = s[s["day"].notna()].copy()
-            grp = s.groupby(["day", "nm_id", "supplier_article"], dropna=False).agg(
+            search_agg = s.groupby(["day", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 search_frequency=("frequency", "sum"),
                 search_frequency_week=("frequency_week", "sum"),
                 median_position=("median_position", "median"),
                 visibility_pct=("visibility_pct", "mean"),
                 search_queries_count=("query", "nunique"),
             ).reset_index()
-            search_agg = grp
 
-        # merge all keys
-        all_keys = []
-        for df in [orders_agg, ads_agg, search_agg]:
+        key_frames = []
+        for df in [orders_agg, search_agg]:
             if not df.empty:
-                all_keys.append(df[[c for c in ["day", "nm_id", "supplier_article"] if c in df.columns]].copy())
-        if parts:
-            base = parts[0]
-        else:
-            base = pd.concat(all_keys, ignore_index=True) if all_keys else pd.DataFrame(columns=["day", "nm_id", "supplier_article"])
-            base = base.drop_duplicates()
+                key_frames.append(df[["day", "nm_id", "supplier_article"]].copy())
+        for df in [ads_agg, funnel_agg]:
+            if not df.empty:
+                tmp = df[["day", "nm_id"]].copy()
+                tmp["supplier_article"] = ""
+                key_frames.append(tmp)
 
-        if parts:
-            cur = base
-        else:
-            cur = base
+        if not key_frames:
+            return pd.DataFrame()
 
-        # if funnel exists and base is funnel aggregate
-        if not parts and cur.empty:
-            return cur
+        cur = pd.concat(key_frames, ignore_index=True).drop_duplicates()
 
         if not orders_agg.empty:
-            cur = cur.merge(orders_agg, on=[c for c in ["day", "nm_id", "supplier_article"] if c in cur.columns and c in orders_agg.columns], how="outer")
-        if not ads_agg.empty:
-            cur = cur.merge(ads_agg, on=[c for c in ["day", "nm_id"] if c in cur.columns and c in ads_agg.columns], how="outer")
+            cur = cur.merge(orders_agg, on=["day", "nm_id", "supplier_article"], how="left")
         if not search_agg.empty:
-            cur = cur.merge(search_agg, on=[c for c in ["day", "nm_id", "supplier_article"] if c in cur.columns and c in search_agg.columns], how="outer")
-
-        if parts:
-            # merge funnel aggregate at end
-            cur = cur.merge(parts[0], on=[c for c in ["day", "nm_id"] if c in cur.columns and c in parts[0].columns], how="outer")
+            cur = cur.merge(search_agg, on=["day", "nm_id", "supplier_article"], how="left")
+        if not ads_agg.empty:
+            cur = cur.merge(ads_agg, on=["day", "nm_id"], how="left")
+        if not funnel_agg.empty:
+            cur = cur.merge(funnel_agg, on=["day", "nm_id"], how="left")
 
         cur = self._attach_master(cur)
 
-        # latest stock snapshot
         if not self.data.stocks.empty:
             stocks = self.data.stocks.copy()
-            stocks = stocks.sort_values(["week_end"]).copy()
             latest_week = stocks["week_end"].max()
-            x = stocks[stocks["week_end"] == latest_week].copy()
-            x = x.groupby(["nm_id", "supplier_article"], dropna=False).agg(
+            x = stocks[stocks["week_end"] == latest_week].groupby(["nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 stock_available_now=("stock_available", "sum"),
                 stock_total_now=("stock_total", "sum"),
                 stock_warehouses=("warehouse", "nunique"),
             ).reset_index()
-            cur = cur.merge(x, on=[c for c in ["nm_id", "supplier_article"] if c in cur.columns and c in x.columns], how="left")
+            cur = cur.merge(x, on=["nm_id", "supplier_article"], how="left")
 
-        # latest abc economics
         if not self.data.abc.empty:
             abc = self.data.abc.copy()
-            abc = abc.sort_values(["week_end"]).copy()
             latest_week = abc["week_end"].max()
             x = abc[abc["week_end"] == latest_week].copy()
-            x["gross_profit_per_order"] = x.apply(lambda r: safe_div(r.get("gross_profit"), r.get("orders")), axis=1)
-            x = x.groupby(["nm_id", "supplier_article"], dropna=False).agg(
+            x["gross_profit_per_order"] = x["gross_profit"] / x["orders"].replace({0: np.nan})
+            x = x.groupby(["nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 abc_class=("abc_class", "first"),
                 drr_pct_latest=("drr_pct", "mean"),
                 margin_pct_latest=("margin_pct", "mean"),
                 gross_profit_per_order=("gross_profit_per_order", "mean"),
                 gross_profit_week_latest=("gross_profit", "sum"),
             ).reset_index()
-            cur = cur.merge(x, on=[c for c in ["nm_id", "supplier_article"] if c in cur.columns and c in x.columns], how="left")
+            cur = cur.merge(x, on=["nm_id", "supplier_article"], how="left")
 
-        # estimate gp
         if "orders_day" not in cur.columns:
-            cur["orders_day"] = cur["orders_from_orders"].fillna(0)
-        cur["orders_day"] = cur["orders_day"].fillna(cur.get("orders_from_orders", np.nan)).fillna(0)
-        cur["gross_profit_day_est"] = cur["orders_day"] * cur["gross_profit_per_order"].fillna(0)
+            cur["orders_day"] = np.nan
+        if "orders_from_orders" not in cur.columns:
+            cur["orders_from_orders"] = np.nan
+        cur["orders_day"] = to_numeric(cur["orders_day"]).fillna(to_numeric(cur["orders_from_orders"])).fillna(0)
+        cur["gross_profit_day_est"] = cur["orders_day"] * to_numeric(cur.get("gross_profit_per_order", np.nan)).fillna(0)
 
         for c in [
             "open_card_count", "cart_count", "orders_day", "buyouts_day", "cancel_day",
@@ -1173,99 +1187,103 @@ class MetricsBuilder:
                 cur[c] = np.nan
             cur[c] = to_numeric(cur[c])
 
-        if "day" in cur.columns:
-            cur["weekday"] = pd.to_datetime(cur["day"], errors="coerce").dt.weekday
-
+        cur["weekday"] = pd.to_datetime(cur["day"], errors="coerce").dt.weekday
         cur["supplier_article"] = cur["supplier_article"].map(clean_article)
         cur["subject"] = cur["subject"].map(normalize_text)
         cur["brand"] = cur["brand"].map(normalize_text)
         cur["code"] = cur["supplier_article"].map(extract_code)
-        cur = cur.sort_values(["day", "subject", "supplier_article", "nm_id"])
+        cur = cur.sort_values(["day", "subject", "supplier_article", "nm_id"], kind="stable")
+        log(f"    daily_current rows: {len(cur)}")
         return cur
 
     def build_daily_targets(self, daily_current: pd.DataFrame) -> pd.DataFrame:
-        if daily_current.empty:
+        log("  deriving: daily_targets")
+        if daily_current.empty or "day" not in daily_current.columns:
             return pd.DataFrame()
         df = daily_current.copy()
-        if "day" not in df.columns:
+        df["day"] = pd.to_datetime(df["day"], errors="coerce")
+        df = df[df["day"].notna()].copy()
+        if df.empty:
             return pd.DataFrame()
-        df["weekday"] = pd.to_datetime(df["day"], errors="coerce").dt.weekday
-        # last 90 days best-sustained proxy: avg of rows above median for each weekday and sku
+
+        cutoff = df["day"].max() - pd.Timedelta(days=89)
+        df = df[df["day"] >= cutoff].copy()
+        df["weekday"] = df["day"].dt.weekday
+
         metric_cols = [
             "orders_day", "gross_profit_day_est", "open_card_count", "ad_impressions",
             "search_frequency", "stock_available_now", "conv_to_cart", "conv_cart_to_order",
             "avg_finished_price_day",
         ]
-        rows = []
         group_cols = ["supplier_article", "nm_id", "weekday"]
-        for keys, g in df.groupby(group_cols, dropna=False):
-            row: Dict[str, Any] = {
-                "supplier_article": keys[0],
-                "nm_id": keys[1],
-                "weekday": keys[2],
-            }
-            g = g.sort_values("day").tail(90)
-            if g.empty:
-                continue
-            for m in metric_cols:
-                s = to_numeric(g[m])
-                med = s.median()
-                strong = s[s >= med]
-                row[f"target_{m}"] = strong.mean() if not strong.empty else s.mean()
-            rows.append(row)
-        out = pd.DataFrame(rows)
+
+        base = df[group_cols].drop_duplicates().copy()
+        base_idx = pd.MultiIndex.from_frame(base[group_cols])
+        grouped = df.groupby(group_cols, dropna=False, observed=True)
+
+        out = base.copy()
+        for m in metric_cols:
+            s = to_numeric(df[m])
+            df[m] = s
+            med = grouped[m].transform("median")
+            strong = df[s >= med]
+            strong_mean = strong.groupby(group_cols, dropna=False, observed=True)[m].mean()
+            all_mean = grouped[m].mean()
+            strong_aligned = strong_mean.reindex(base_idx)
+            all_aligned = all_mean.reindex(base_idx)
+            out[f"target_{m}"] = strong_aligned.fillna(all_aligned).to_numpy()
+
         out = self._attach_master(out)
+        log(f"    daily_targets rows: {len(out)}")
         return out
 
     def build_weekly_summary(self) -> pd.DataFrame:
-        frames = []
+        log("  deriving: weekly_summary")
+        weekly = pd.DataFrame()
 
         if not self.data.funnel.empty:
             f = self.data.funnel.copy()
             f["week_code"] = f["day"].map(week_code_from_date)
-            g = f.groupby(["week_code", "nm_id"], dropna=False).agg(
+            weekly = f.groupby(["week_code", "nm_id"], dropna=False, observed=True).agg(
                 open_card_count=("open_card_count", "sum"),
                 cart_count=("cart", "sum"),
                 orders_count=("orders", "sum"),
                 buyouts_count=("buyouts_count", "sum"),
                 cancel_count=("cancel_count", "sum"),
             ).reset_index()
-            frames.append(g)
-
-        weekly = frames[0] if frames else pd.DataFrame(columns=["week_code", "nm_id"])
 
         if not self.data.search.empty:
             s = self.data.search.copy()
-            g = s.groupby(["week_code", "nm_id", "supplier_article"], dropna=False).agg(
+            g = s.groupby(["week_code", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 search_frequency=("frequency", "sum"),
                 median_position=("median_position", "median"),
                 visibility_pct=("visibility_pct", "mean"),
                 search_queries_count=("query", "nunique"),
             ).reset_index()
-            weekly = weekly.merge(g, on=[c for c in ["week_code", "nm_id", "supplier_article"] if c in weekly.columns and c in g.columns], how="outer") if not weekly.empty else g
+            weekly = weekly.merge(g, on=["week_code", "nm_id"], how="outer") if not weekly.empty else g
 
         if not self.data.ads_daily.empty:
             a = self.data.ads_daily.copy()
-            g = a.groupby(["week_code", "nm_id"], dropna=False).agg(
+            g = a.groupby(["week_code", "nm_id"], dropna=False, observed=True).agg(
                 ad_impressions=("impressions", "sum"),
                 ad_clicks=("clicks", "sum"),
                 ad_orders=("orders", "sum"),
                 ad_spend=("spend", "sum"),
             ).reset_index()
-            weekly = weekly.merge(g, on=[c for c in ["week_code", "nm_id"] if c in weekly.columns and c in g.columns], how="outer") if not weekly.empty else g
+            weekly = weekly.merge(g, on=["week_code", "nm_id"], how="outer") if not weekly.empty else g
 
         if not self.data.entry_points_sku.empty:
             e = self.data.entry_points_sku.copy()
-            g = e.groupby(["week_code", "nm_id", "supplier_article"], dropna=False).agg(
+            g = e.groupby(["week_code", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 entry_impressions=("impressions", "sum"),
                 entry_clicks=("clicks", "sum"),
                 entry_orders=("orders", "sum"),
             ).reset_index()
-            weekly = weekly.merge(g, on=[c for c in ["week_code", "nm_id", "supplier_article"] if c in weekly.columns and c in g.columns], how="outer") if not weekly.empty else g
+            weekly = weekly.merge(g, on=["week_code", "nm_id", "supplier_article"], how="outer") if not weekly.empty else g
 
         if not self.data.abc.empty:
             a = self.data.abc.copy()
-            g = a.groupby(["week_code", "nm_id", "supplier_article"], dropna=False).agg(
+            g = a.groupby(["week_code", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 abc_class=("abc_class", "first"),
                 gross_profit=("gross_profit", "sum"),
                 gross_revenue=("gross_revenue", "sum"),
@@ -1274,16 +1292,16 @@ class MetricsBuilder:
                 margin_pct=("margin_pct", "mean"),
                 profitability_pct=("profitability_pct", "mean"),
             ).reset_index()
-            weekly = weekly.merge(g, on=[c for c in ["week_code", "nm_id", "supplier_article"] if c in weekly.columns and c in g.columns], how="outer") if not weekly.empty else g
+            weekly = weekly.merge(g, on=["week_code", "nm_id", "supplier_article"], how="outer") if not weekly.empty else g
 
         if not self.data.orders.empty:
             o = self.data.orders.copy()
-            g = o.groupby(["week_code", "nm_id", "supplier_article"], dropna=False).agg(
+            g = o.groupby(["week_code", "nm_id", "supplier_article"], dropna=False, observed=True).agg(
                 orders_from_orders=("orders", "sum"),
                 avg_finished_price=("finished_price", "mean"),
                 avg_price_with_disc=("price_with_disc", "mean"),
             ).reset_index()
-            weekly = weekly.merge(g, on=[c for c in ["week_code", "nm_id", "supplier_article"] if c in weekly.columns and c in g.columns], how="outer") if not weekly.empty else g
+            weekly = weekly.merge(g, on=["week_code", "nm_id", "supplier_article"], how="outer") if not weekly.empty else g
 
         if weekly.empty:
             return weekly
@@ -1291,8 +1309,10 @@ class MetricsBuilder:
         weekly = self._attach_master(weekly)
         weekly["week_start"] = weekly["week_code"].map(lambda x: week_bounds_from_code(x)[0] if x else None)
         weekly["week_end"] = weekly["week_code"].map(lambda x: week_bounds_from_code(x)[1] if x else None)
-        weekly["gross_profit_per_order"] = weekly.apply(lambda r: safe_div(r.get("gross_profit"), r.get("abc_orders")), axis=1)
-        return weekly.sort_values(["week_code", "subject", "supplier_article", "nm_id"])
+        weekly["gross_profit_per_order"] = to_numeric(weekly.get("gross_profit", np.nan)) / to_numeric(weekly.get("abc_orders", np.nan)).replace({0: np.nan})
+        weekly = weekly.sort_values(["week_code", "subject", "supplier_article", "nm_id"], kind="stable")
+        log(f"    weekly_summary rows: {len(weekly)}")
+        return weekly
 
     def build_monthly_summary(self, daily_current: pd.DataFrame) -> pd.DataFrame:
         if daily_current.empty:
@@ -1309,6 +1329,7 @@ class MetricsBuilder:
         return out
 
     def build_monthly_forecast(self, daily_current: pd.DataFrame) -> pd.DataFrame:
+        log("  deriving: monthly_forecast")
         if daily_current.empty:
             return pd.DataFrame()
         df = daily_current.copy()
@@ -1316,60 +1337,60 @@ class MetricsBuilder:
         df = df[df["day"].notna()].copy()
         if df.empty:
             return pd.DataFrame()
+
         df["month_key"] = df["day"].dt.to_period("M").astype(str)
-
         latest_month = max(df["month_key"])
-        cur = df[df["month_key"] == latest_month].copy()
-        if cur.empty:
-            return pd.DataFrame()
-
         year = int(latest_month.split("-")[0])
         month = int(latest_month.split("-")[1])
         last_day_of_month = calendar.monthrange(year, month)[1]
 
-        result_rows = []
-        prev_month_key = (pd.Period(latest_month) - 1).strftime("%Y-%m")
-
         monthly = self.build_monthly_summary(daily_current)
-        prev_map = monthly[monthly["month_key"] == prev_month_key].set_index(["nm_id", "supplier_article"])
+        if monthly.empty:
+            return pd.DataFrame()
 
-        for keys, g in cur.groupby(["nm_id", "supplier_article", "subject", "brand", "code"], dropna=False):
-            days_elapsed = g["day"].dt.day.nunique()
-            orders_fact = g["orders_day"].sum()
-            gp_fact = g["gross_profit_day_est"].sum()
-            run_rate_orders = safe_div(orders_fact, days_elapsed)
-            run_rate_gp = safe_div(gp_fact, days_elapsed)
-            forecast_orders = run_rate_orders * last_day_of_month if pd.notna(run_rate_orders) else np.nan
-            forecast_gp = run_rate_gp * last_day_of_month if pd.notna(run_rate_gp) else np.nan
+        cur = monthly[monthly["month_key"] == latest_month].copy()
+        if cur.empty:
+            return pd.DataFrame()
 
-            prev_orders = np.nan
-            prev_gp = np.nan
-            prev_key = (keys[0], keys[1])
-            if prev_key in prev_map.index:
-                prev_row = prev_map.loc[prev_key]
-                if isinstance(prev_row, pd.DataFrame):
-                    prev_row = prev_row.iloc[0]
-                prev_orders = prev_row.get("orders_day", np.nan)
-                prev_gp = prev_row.get("gross_profit_day_est", np.nan)
+        cur_days = (
+            df[df["month_key"] == latest_month]
+            .groupby(["nm_id", "supplier_article"], dropna=False, observed=True)["day"]
+            .nunique()
+            .rename("days_elapsed")
+            .reset_index()
+        )
+        cur = cur.merge(cur_days, on=["nm_id", "supplier_article"], how="left")
 
-            result_rows.append({
-                "month_key": latest_month,
-                "nm_id": keys[0],
-                "supplier_article": keys[1],
-                "subject": keys[2],
-                "brand": keys[3],
-                "code": keys[4],
-                "days_elapsed": days_elapsed,
-                "orders_fact_mtd": orders_fact,
-                "gross_profit_fact_mtd": gp_fact,
-                "forecast_orders_month": forecast_orders,
-                "forecast_gross_profit_month": forecast_gp,
-                "prev_month_orders": prev_orders,
-                "prev_month_gross_profit": prev_gp,
-                "forecast_vs_prev_month_abs": forecast_gp - prev_gp if pd.notna(forecast_gp) and pd.notna(prev_gp) else np.nan,
-                "forecast_vs_prev_month_pct": pct_delta(forecast_gp, prev_gp),
-            })
-        return pd.DataFrame(result_rows)
+        cur["orders_fact_mtd"] = cur["orders_day"]
+        cur["gross_profit_fact_mtd"] = cur["gross_profit_day_est"]
+        cur["forecast_orders_month"] = cur["orders_fact_mtd"] / cur["days_elapsed"].replace({0: np.nan}) * last_day_of_month
+        cur["forecast_gross_profit_month"] = cur["gross_profit_fact_mtd"] / cur["days_elapsed"].replace({0: np.nan}) * last_day_of_month
+
+        prev_month_key = (pd.Period(latest_month) - 1).strftime("%Y-%m")
+        prev = monthly[monthly["month_key"] == prev_month_key][["nm_id", "supplier_article", "orders_day", "gross_profit_day_est"]].copy()
+        prev = prev.rename(columns={
+            "orders_day": "prev_month_orders",
+            "gross_profit_day_est": "prev_month_gross_profit",
+        })
+        cur = cur.merge(prev, on=["nm_id", "supplier_article"], how="left")
+
+        cur["forecast_vs_prev_month_abs"] = cur["forecast_gross_profit_month"] - cur["prev_month_gross_profit"]
+        cur["forecast_vs_prev_month_pct"] = np.where(
+            cur["prev_month_gross_profit"].notna() & (cur["prev_month_gross_profit"] != 0),
+            (cur["forecast_gross_profit_month"] - cur["prev_month_gross_profit"]) / cur["prev_month_gross_profit"],
+            np.nan,
+        )
+
+        out_cols = [
+            "month_key", "nm_id", "supplier_article", "subject", "brand", "code",
+            "days_elapsed", "orders_fact_mtd", "gross_profit_fact_mtd",
+            "forecast_orders_month", "forecast_gross_profit_month",
+            "prev_month_orders", "prev_month_gross_profit",
+            "forecast_vs_prev_month_abs", "forecast_vs_prev_month_pct",
+        ]
+        out = cur[out_cols].copy()
+        log(f"    monthly_forecast rows: {len(out)}")
+        return out
 
     def build_source_summary(self) -> pd.DataFrame:
         rows = []
@@ -1483,11 +1504,28 @@ class CombinedReport:
 
         log("Building derived tables")
         self.sku_master = self.mb.sku_master
+        log(f"  sku_master rows: {len(self.sku_master)}")
+
+        t0 = time.perf_counter()
         self.daily_current = self.mb.build_daily_current()
+        log(f"  done daily_current in {time.perf_counter() - t0:.1f}s")
+
+        t0 = time.perf_counter()
         self.daily_targets = self.mb.build_daily_targets(self.daily_current)
+        log(f"  done daily_targets in {time.perf_counter() - t0:.1f}s")
+
+        t0 = time.perf_counter()
         self.weekly_summary = self.mb.build_weekly_summary()
+        log(f"  done weekly_summary in {time.perf_counter() - t0:.1f}s")
+
+        t0 = time.perf_counter()
         self.monthly_summary = self.mb.build_monthly_summary(self.daily_current)
+        log(f"  done monthly_summary in {time.perf_counter() - t0:.1f}s")
+
+        t0 = time.perf_counter()
         self.monthly_forecast = self.mb.build_monthly_forecast(self.daily_current)
+        log(f"  done monthly_forecast in {time.perf_counter() - t0:.1f}s")
+
         self.source_summary = self.mb.build_source_summary()
 
     def build_main_report(self) -> Workbook:
