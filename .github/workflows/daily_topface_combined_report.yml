@@ -2,19 +2,26 @@ name: Daily TOPFACE Combined Report
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/daily_topface_combined_report.yml'
+      - 'wb_combined_report_final.py'
   schedule:
-    - cron: "10 6 * * *"
+    - cron: '10 6 * * *'
+
+permissions:
+  contents: read
 
 jobs:
   build-combined-report:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      USE_S3: "1"
-      PYTHONIOENCODING: "utf-8"
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      PYTHONUNBUFFERED: '1'
+      PYTHONIOENCODING: 'utf-8'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,40 +29,38 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 python-dateutil numpy
 
-      - name: Verify repository files
+      - name: Validate repository files
         run: |
-          echo "Current directory: $(pwd)"
-          echo "Repository root content:"
+          pwd
           ls -la
-          echo
-          echo ".github/workflows content:"
-          ls -la .github/workflows || true
-          echo
-          if [ ! -f wb_combined_report_final.py ]; then
-            echo "ERROR: File wb_combined_report_final.py not found in repository root"
-            exit 1
-          fi
-          python - <<'PY'
-from pathlib import Path
-p = Path('wb_combined_report_final.py')
-print('Script found:', p.resolve())
-print('Size:', p.stat().st_size)
-PY
+          test -f wb_combined_report_final.py
 
-      - name: Check script syntax
+      - name: Choose storage mode
+        shell: bash
         run: |
-          python -m py_compile wb_combined_report_final.py
+          if [[ -n "$YC_BUCKET_NAME" && -n "$YC_ACCESS_KEY_ID" && -n "$YC_SECRET_ACCESS_KEY" ]]; then
+            echo "USE_S3=1" >> "$GITHUB_ENV"
+            echo "Storage mode: S3"
+          else
+            echo "USE_S3=0" >> "$GITHUB_ENV"
+            echo "Storage mode: local"
+          fi
 
       - name: Run combined report
         run: |
-          python wb_combined_report_final.py
+          python wb_combined_report_final.py --root .
+
+      - name: Show generated files
+        if: always()
+        run: |
+          find . -maxdepth 6 -type f | sort | grep -E 'Объединенный отчет|combined|xlsx' || true
 
       - name: Upload generated reports as artifact
         if: always()
@@ -63,6 +68,5 @@ PY
         with:
           name: topface-combined-report
           path: |
-            Отчёты/Объединенный отчет/TOPFACE/**/*.xlsx
-            Отчёты/Объединенный отчет/TOPFACE/**/*.log
+            Отчёты/Объединенный отчет/TOPFACE
           if-no-files-found: warn
