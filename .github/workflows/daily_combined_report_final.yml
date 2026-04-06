@@ -1,45 +1,42 @@
-name: Daily TOPFACE Combined Report
+name: Daily TOPFACE Combined Report (Build 2026-04-06)
 
 on:
   workflow_dispatch:
   schedule:
-    # Every day at 06:10 UTC
     - cron: "10 6 * * *"
 
 jobs:
   build-combined-report:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     env:
       USE_S3: "1"
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 python-dateutil numpy
-
+      - name: Verify build version
+        run: |
+          ls -l wb_combined_report_build_20260406.py
+          grep -n "def build_weekly_orders\|ensure_columns" wb_combined_report_build_20260406.py | sed -n '1,20p'
       - name: Run combined report
         run: |
-          python wb_combined_report_final.py
-
+          python wb_combined_report_build_20260406.py
       - name: Upload generated reports as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-combined-report
+          name: topface-combined-report-build-20260406
           path: |
             Отчёты/Объединенный отчет/TOPFACE/**/*.xlsx
             Отчёты/Объединенный отчет/TOPFACE/**/*.log
