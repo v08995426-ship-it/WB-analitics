@@ -35,7 +35,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import boto3
+try:
+    import boto3
+except Exception:
+    boto3 = None
+
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
@@ -311,17 +315,27 @@ class S3Storage(BaseStorage):
 
 
 def make_storage(root: str) -> BaseStorage:
-    use_s3 = os.getenv("USE_S3", "0") == "1"
+    needed = ["YC_BUCKET_NAME", "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY"]
+    creds_present = all(os.getenv(k) for k in needed)
+    use_s3_env = os.getenv("USE_S3")
+
+    if use_s3_env is None:
+        use_s3 = creds_present
+    else:
+        use_s3 = use_s3_env == "1"
+
     if use_s3:
-        needed = ["YC_BUCKET_NAME", "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY"]
         missing = [k for k in needed if not os.getenv(k)]
         if missing:
-            raise RuntimeError(f"Missing S3 env vars: {missing}")
+            raise RuntimeError(f"USE_S3=1, but missing S3 env vars: {missing}")
+        log("Using Yandex Object Storage (S3)")
         return S3Storage(
             bucket=os.environ["YC_BUCKET_NAME"],
             access_key=os.environ["YC_ACCESS_KEY_ID"],
             secret_key=os.environ["YC_SECRET_ACCESS_KEY"],
         )
+
+    log(f"Using local storage from root: {Path(root).resolve()}")
     return LocalStorage(root)
 
 
