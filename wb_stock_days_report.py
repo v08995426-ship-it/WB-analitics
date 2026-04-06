@@ -30,6 +30,20 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
+DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
+DEFAULT_REDISTRIBUTION_MIN_TRANSFER = 8
+
+MANAGER_OVERRIDE_BY_SELLER_ARTICLE = {
+    "PT901.F25": "",
+    "PT901.F26": "",
+    "PT901.F27": "",
+    "PT901.F28": "",
+    "PT901.SET-1": "",
+    "PT810.001": "Игорь",
+    "PT811.001": "Игорь",
+    "PT554.007K": "Игорь",
+    "PT567.001K": "Юлия",
+}
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -106,27 +120,6 @@ WAREHOUSE_ZONE: dict[str, str] = {
 }
 
 
-MP_STOCK_FORMULA_WEIGHTS: dict[str, float] = {
-    "Адресный склад": 1.0,
-    'Оптовый склад Луганск- ООО "Хайлер"': 0.5,
-    'Основной склад - ООО "Хайлер"': 0.5,
-}
-
-MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
-    "PT901.F25": "",
-    "PT901.F26": "",
-    "PT901.F27": "",
-    "PT901.F28": "",
-    "PT901.SET-1": "",
-    "PT810.001": "Игорь",
-    "PT811.001": "Игорь",
-    "PT554.007K": "Игорь",
-    "PT567.001K": "Юлия",
-}
-
-DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
-
-
 
 @dataclass
 class Config:
@@ -145,6 +138,7 @@ class Config:
     send_redistribution_always: bool
     redistribution_days: int
     redistribution_target_days: int
+    redistribution_min_transfer: int
 
 
 class S3Storage:
@@ -289,6 +283,7 @@ def get_config() -> Config:
         send_redistribution_always=(os.getenv("WB_SEND_REDISTRIBUTION_ALWAYS", "false").strip().lower() == "true"),
         redistribution_days=max(int(os.getenv("WB_REDISTRIBUTION_LOOKBACK_DAYS", "14") or 14), 1),
         redistribution_target_days=max(int(os.getenv("WB_REDISTRIBUTION_TARGET_DAYS", "21") or 21), 1),
+        redistribution_min_transfer=max(int(os.getenv("WB_REDISTRIBUTION_MIN_TRANSFER", str(DEFAULT_REDISTRIBUTION_MIN_TRANSFER)) or DEFAULT_REDISTRIBUTION_MIN_TRANSFER), 1),
     )
 
 
@@ -319,9 +314,9 @@ def load_article_map(storage: S3Storage) -> dict[str, str]:
     return mapping
 
 
-
 def load_stocks_1c(storage: S3Storage) -> pd.DataFrame:
     df = storage.read_excel(STOCKS_1C_KEY)
+    df = df.loc[:, ~pd.isna(df.columns)].copy()
     article_col = choose_existing_column(df, ["Артикул", "АРТ", "Артикул 1С"], "Артикул 1С")
 
     legacy_stock_col = try_choose_column(df, ["Остатки МП", "Остатки МП (Липецк), шт", "Остатки МП(Липецк), шт"])
@@ -329,31 +324,36 @@ def load_stocks_1c(storage: S3Storage) -> pd.DataFrame:
         stock_series = pd.to_numeric(df[legacy_stock_col], errors="coerce").fillna(0)
         log(f"1С остатки МП взяты из legacy-колонки: {legacy_stock_col}")
     else:
-        selected_columns: list[tuple[str, float]] = []
-        missing_columns: list[str] = []
-        for column_name, weight in MP_STOCK_FORMULA_WEIGHTS.items():
-            resolved = try_choose_column(df, [column_name])
-            if resolved is None:
-                missing_columns.append(column_name)
-                continue
-            selected_columns.append((resolved, weight))
+        address_col = try_choose_column(df, ["Адресный склад"])
+        lugansk_col = try_choose_column(df, [
+            'Оптовый склад Луганск- ООО "Хайлер"',
+            'Оптовый склад Луганск - ООО "Хайлер"',
+            'Оптовый склад Луганск-ООО "Хайлер"',
+        ])
+        main_hailer_col = try_choose_column(df, [
+            'Основной склад - ООО "Хайлер"',
+            'Основной склад ООО "Хайлер"',
+        ])
 
-        if not selected_columns:
+        if address_col is None and lugansk_col is None and main_hailer_col is None:
             raise KeyError(
-                "Не найдены колонки для расчёта 'Остатки МП' по формуле. "
+                "Не найдены колонки для расчёта остатков МП по новой формуле. "
                 f"Доступные колонки: {list(df.columns)}"
             )
 
-        stock_series = pd.Series(0.0, index=df.index)
-        for col_name, weight in selected_columns:
-            stock_series = stock_series.add(
-                pd.to_numeric(df[col_name], errors="coerce").fillna(0) * float(weight),
-                fill_value=0,
-            )
+        def as_num(col_name: str | None) -> pd.Series:
+            if col_name is None:
+                return pd.Series(0.0, index=df.index)
+            return pd.to_numeric(df[col_name], errors="coerce").fillna(0)
+
+        stock_series = (
+            as_num(address_col)
+            + as_num(lugansk_col) * 0.5
+            + as_num(main_hailer_col) * 0.5
+        )
         log(
             "1С остатки МП собраны по формуле: "
-            + " + ".join([f"{col}*{weight:g}" for col, weight in selected_columns])
-            + (f" | отсутствуют колонки: {missing_columns}" if missing_columns else "")
+            f"{address_col or '0'}*1 + {lugansk_col or '0'}*0.5 + {main_hailer_col or '0'}*0.5"
         )
 
     temp = pd.DataFrame({
@@ -363,6 +363,7 @@ def load_stocks_1c(storage: S3Storage) -> pd.DataFrame:
     temp = temp[temp["Артикул 1С"] != ""]
     temp = temp.groupby("Артикул 1С", as_index=False, dropna=False)["Остатки МП (Липецк), шт"].sum()
     return temp
+
 
 def load_rrc(storage: S3Storage) -> pd.DataFrame:
     df = storage.read_excel(RRC_KEY)
@@ -392,11 +393,25 @@ def load_abc_managers(storage: S3Storage) -> pd.DataFrame:
             "Артикул WB продавца": df[seller_col].map(normalize_text),
             "Менеджер": df[mgr_col].map(normalize_text),
         })
+        temp = apply_manual_manager_overrides(temp)
         temp = temp[temp["Менеджер"] != ""]
         return temp.drop_duplicates(subset=["Артикул WB", "Артикул WB продавца"], keep="first")
     except Exception as exc:
         log(f"ABC-отчёт не загружен: {exc}")
         return pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Менеджер"])
+
+
+
+def apply_manual_manager_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Артикул WB продавца" not in df.columns:
+        return df
+    result = df.copy()
+    seller_norm = result["Артикул WB продавца"].map(normalize_key)
+    for seller_article, manager_name in MANAGER_OVERRIDE_BY_SELLER_ARTICLE.items():
+        mask = seller_norm == normalize_key(seller_article)
+        if mask.any():
+            result.loc[mask, "Менеджер"] = manager_name
+    return result
 
 
 def load_latest_wb_stocks(storage: S3Storage) -> tuple[pd.DataFrame, str]:
@@ -478,123 +493,76 @@ def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
     return metrics, keys
 
 
-
-def parse_inbound_base_date(filename: str) -> Optional[date]:
-    for pattern, dt_format in (
-        (r"(\d{2}-\d{2}-\d{4})", "%d-%m-%Y"),
-        (r"(\d{2}-\d{2}-\d{2})(?!\d)", "%d-%m-%y"),
-    ):
-        m = re.search(pattern, filename)
-        if m:
-            try:
-                return datetime.strptime(m.group(1), dt_format).date()
-            except ValueError:
-                continue
-    return None
-
-
-def detect_inbound_mp_column(df: pd.DataFrame) -> tuple[Optional[str], int]:
-    direct = try_choose_column(df, ["Заказ МП", "ЗаказМП"])
-    if direct is not None:
-        return direct, 0
-
-    target = "ЗАКАЗМП"
-    scan_rows = min(len(df), 5)
-    for row_idx in range(scan_rows):
-        for col in df.columns:
-            cell_value = normalize_text(df.iloc[row_idx][col]).upper().replace(" ", "")
-            if cell_value == target:
-                return str(col), row_idx + 1
-    return None, 0
-
-
 def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
-    keys = [
-        k for k in storage.list_keys(INBOUND_PREFIX)
-        if k.lower().endswith(".xlsx") and "в пути" in os.path.basename(k).lower()
-    ]
+    keys = [k for k in storage.list_keys(INBOUND_PREFIX) if k.lower().endswith(".xlsx") and "в пути" in os.path.basename(k).lower()]
     frames: list[pd.DataFrame] = []
-
     for key in keys:
         fname = os.path.basename(key)
-        base_date = parse_inbound_base_date(fname)
-        if base_date is None:
-            log(f"Файл 'В пути' пропущен: не смогли распознать дату в имени {fname}")
+        m = re.search(r"(\d{2})-(\d{2})-(\d{2,4})", fname)
+        if not m:
+            continue
+        date_token = m.group(0)
+        try:
+            if len(m.group(3)) == 2:
+                base_date = datetime.strptime(date_token, "%d-%m-%y").date()
+            else:
+                base_date = datetime.strptime(date_token, "%d-%m-%Y").date()
+        except Exception:
             continue
 
         arrival_date = base_date + timedelta(days=14)
         df = storage.read_excel(key)
-        if df.empty:
+        if df.empty or "CODES" not in df.columns:
             continue
 
-        code_col = try_choose_column(df, ["CODES", "Артикул 1С", "Артикул"])
-        if code_col is None:
-            log(f"Файл 'В пути' пропущен: не найдена колонка артикула в {fname}")
-            continue
-
-        qty_col, data_start_row = detect_inbound_mp_column(df)
+        qty_col = try_choose_column(df, ["Заказ МП", "ЗаказМП", "Заказ МП ", "Unnamed: 6"])
         if qty_col is None:
-            log(f"Файл 'В пути' пропущен: не найдена колонка 'Заказ МП' в {fname}")
             continue
 
         temp = pd.DataFrame({
-            "Артикул 1С": df[code_col].map(normalize_text),
+            "Артикул 1С": df["CODES"].map(normalize_text),
             "qty_raw": df[qty_col],
         })
-        if data_start_row > 0:
-            temp = temp.iloc[data_start_row:].copy()
-
-        temp = temp[
-            (~temp["Артикул 1С"].str.upper().isin({"CODES", "КОДЫ"}))
-            & (temp["Артикул 1С"] != "")
-        ].copy()
-        temp["Партия в пути, шт"] = pd.to_numeric(temp["qty_raw"], errors="coerce").fillna(0).map(round_int)
-        temp = temp[temp["Партия в пути, шт"] > 0].copy()
+        temp["qty"] = pd.to_numeric(temp["qty_raw"], errors="coerce").fillna(0).map(round_int)
+        temp = temp[(temp["Артикул 1С"] != "") & (temp["qty"] > 0)]
         if temp.empty:
             continue
 
-        temp = temp[["Артикул 1С", "Партия в пути, шт"]].copy()
-        temp["Дата поступления"] = pd.to_datetime(arrival_date)
+        temp = temp[["Артикул 1С", "qty"]].copy()
+        temp["Дата поступления"] = arrival_date
         temp["Дней до поступления"] = max((arrival_date - run_date).days, 0)
-        temp["Файл в пути"] = fname
         frames.append(temp)
 
     if not frames:
-        return pd.DataFrame(
-            columns=[
-                "Артикул 1С",
-                "Товары в пути, шт",
-                "Ближайшее поступление, шт",
-                "Дата поступления",
-                "Дней до поступления",
-                "Партий в пути, шт",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "Артикул 1С",
+            "Товары в пути, шт",
+            "Товары в пути до ближайшего поступления, шт",
+            "Дата поступления",
+            "Дней до поступления",
+        ])
 
     all_inbound = pd.concat(frames, ignore_index=True)
-    all_inbound["Дата поступления"] = pd.to_datetime(all_inbound["Дата поступления"], errors="coerce")
-    all_inbound = all_inbound.sort_values(["Артикул 1С", "Дата поступления", "Файл в пути"]).reset_index(drop=True)
+    qty_total = all_inbound.groupby("Артикул 1С", as_index=False)["qty"].sum().rename(columns={"qty": "Товары в пути, шт"})
 
-    total_qty = (
-        all_inbound.groupby("Артикул 1С", as_index=False)["Партия в пути, шт"]
-        .sum()
-        .rename(columns={"Партия в пути, шт": "Товары в пути, шт"})
-    )
-
-    nearest_rows = []
+    nearest_rows: list[pd.DataFrame] = []
     for article, part in all_inbound.groupby("Артикул 1С", dropna=False):
-        nearest_date = part["Дата поступления"].min()
-        nearest_part = part[part["Дата поступления"] == nearest_date]
-        nearest_rows.append({
-            "Артикул 1С": article,
-            "Ближайшее поступление, шт": int(nearest_part["Партия в пути, шт"].sum()),
-            "Дата поступления": nearest_date,
-            "Дней до поступления": int(nearest_part["Дней до поступления"].min()),
-            "Партий в пути, шт": int(part["Дата поступления"].nunique()),
-        })
+        part = part.sort_values(["Дата поступления", "qty"], ascending=[True, False]).reset_index(drop=True)
+        nearest_date = part.loc[0, "Дата поступления"]
+        nearest_days = int(part.loc[0, "Дней до поступления"])
+        nearest_qty = int(part.loc[part["Дата поступления"] == nearest_date, "qty"].sum())
+        nearest_rows.append(pd.DataFrame({
+            "Артикул 1С": [article],
+            "Товары в пути до ближайшего поступления, шт": [nearest_qty],
+            "Дата поступления": [nearest_date],
+            "Дней до поступления": [nearest_days],
+        }))
 
-    nearest_df = pd.DataFrame(nearest_rows)
-    return total_qty.merge(nearest_df, on="Артикул 1С", how="left")
+    nearest_df = pd.concat(nearest_rows, ignore_index=True) if nearest_rows else pd.DataFrame(columns=[
+        "Артикул 1С", "Товары в пути до ближайшего поступления, шт", "Дата поступления", "Дней до поступления"
+    ])
+    return qty_total.merge(nearest_df, on="Артикул 1С", how="left")
+
 
 def load_current_month_zero_days(storage: S3Storage, zero_articles: set[str], avg7_map: dict[str, float], run_date: date) -> dict[str, int]:
     if not zero_articles:
@@ -640,7 +608,6 @@ def compute_coef_rrc(price: int, rrc: int) -> str:
     return f"{price / rrc:.2f}".replace(".", ",") + "_РРЦ"
 
 
-
 def build_report_dataframe(
     wb_stocks: pd.DataFrame,
     sales: pd.DataFrame,
@@ -674,26 +641,19 @@ def build_report_dataframe(
     df["Остатки МП (Липецк), шт"] = df["Остатки МП (Липецк), шт"].fillna(0).map(ceil_int)
 
     df = df.merge(inbound_df, on="Артикул 1С", how="left")
-    for col in ["Товары в пути, шт", "Ближайшее поступление, шт", "Партий в пути, шт"]:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = df[col].fillna(0).map(round_int)
+    df["Товары в пути, шт"] = df["Товары в пути, шт"].fillna(0).map(round_int)
+    if "Товары в пути до ближайшего поступления, шт" not in df.columns:
+        df["Товары в пути до ближайшего поступления, шт"] = 0
+    df["Товары в пути до ближайшего поступления, шт"] = df["Товары в пути до ближайшего поступления, шт"].fillna(0).map(round_int)
     df["Дней до поступления"] = pd.to_numeric(df.get("Дней до поступления"), errors="coerce")
-    df["Дата поступления"] = pd.to_datetime(df.get("Дата поступления"), errors="coerce")
-    no_inbound_mask = df["Товары в пути, шт"] <= 0
-    df.loc[no_inbound_mask, "Дней до поступления"] = pd.NA
-    df.loc[no_inbound_mask, "Дата поступления"] = pd.NaT
-    df.loc[no_inbound_mask, "Ближайшее поступление, шт"] = 0
-    df.loc[no_inbound_mask, "Партий в пути, шт"] = 0
+    df.loc[df["Товары в пути до ближайшего поступления, шт"] <= 0, "Дней до поступления"] = pd.NA
+    df.loc[df["Товары в пути до ближайшего поступления, шт"] <= 0, "Дата поступления"] = pd.NaT
 
     df = df.merge(abc_df, on=["Артикул WB", "Артикул WB продавца"], how="left")
     if "Менеджер" not in df.columns:
         df["Менеджер"] = ""
     df["Менеджер"] = df["Менеджер"].fillna("")
-    df["Менеджер"] = df.apply(
-        lambda r: MANAGER_OVERRIDES_BY_ARTICLE_1C.get(normalize_text(r.get("Артикул 1С")), normalize_text(r.get("Менеджер"))),
-        axis=1,
-    )
+    df = apply_manual_manager_overrides(df)
 
     df["Продажи 7 дней, шт"] = df["sales_7d"].map(round_int)
     df["Продажи 60 дней, шт"] = df["sales_60d"].map(round_int)
@@ -709,46 +669,21 @@ def build_report_dataframe(
         return avg7
 
     df["Расчётный спрос в день, шт"] = df.apply(daily_demand, axis=1)
-    df["WB хватит, дней"] = df.apply(
-        lambda r: safe_float(r["Остаток WB, шт"]) / safe_float(r["Расчётный спрос в день, шт"])
-        if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0,
-        axis=1,
-    )
-    df["WB + Липецк, дней"] = df.apply(
-        lambda r: (safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"])) / safe_float(r["Расчётный спрос в день, шт"])
-        if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0,
-        axis=1,
-    )
-    df["После ближайшего поступления, дней"] = df.apply(
-        lambda r: (
-            safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"]) + safe_float(r["Ближайшее поступление, шт"])
-        ) / safe_float(r["Расчётный спрос в день, шт"])
-        if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0,
-        axis=1,
-    )
-    df["WB + Липецк + в пути, дней"] = df.apply(
-        lambda r: (
-            safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"]) + safe_float(r["Товары в пути, шт"])
-        ) / safe_float(r["Расчётный спрос в день, шт"])
-        if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0,
-        axis=1,
-    )
+    df["WB хватит, дней"] = df.apply(lambda r: safe_float(r["Остаток WB, шт"]) / safe_float(r["Расчётный спрос в день, шт"]) if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0, axis=1)
+    df["WB + Липецк, дней"] = df.apply(lambda r: (safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"])) / safe_float(r["Расчётный спрос в день, шт"]) if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0, axis=1)
+    df["WB + Липецк + в пути, дней"] = df.apply(lambda r: (safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"]) + safe_float(r["Товары в пути, шт"])) / safe_float(r["Расчётный спрос в день, шт"]) if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0, axis=1)
+    df["WB + Липецк + до ближайшего поступления, дней"] = df.apply(lambda r: (safe_float(r["Остаток WB, шт"]) + safe_float(r["Остатки МП (Липецк), шт"]) + safe_float(r["Товары в пути до ближайшего поступления, шт"])) / safe_float(r["Расчётный спрос в день, шт"]) if safe_float(r["Расчётный спрос в день, шт"]) > 0 else 0.0, axis=1)
 
     def enough_to_arrival(row: pd.Series) -> str:
         if pd.isna(row["Дней до поступления"]):
             return ""
         if safe_float(row["Расчётный спрос в день, шт"]) <= 0:
             return "Да"
-        current_cover = (
-            safe_float(row["Остаток WB, шт"]) + safe_float(row["Остатки МП (Липецк), шт"])
-        ) / safe_float(row["Расчётный спрос в день, шт"])
-        return "Да" if current_cover >= safe_float(row["Дней до поступления"]) else "Нет"
+        return "Да" if safe_float(row["WB + Липецк, дней"]) >= safe_float(row["Дней до поступления"]) else "Нет"
 
     df["Хватит до поступления"] = df.apply(enough_to_arrival, axis=1)
     df["Out of stock, days"] = df["WB + Липецк + в пути, дней"].map(lambda x: round_int(max(60 - safe_float(x), 0)))
-    df["Хватит на 60 дней"] = df["WB + Липецк + в пути, дней"].map(
-        lambda x: "Да" if safe_float(x) >= 60 else f"Дефицит {round_int(60 - safe_float(x))} дн."
-    )
+    df["Хватит на 60 дней"] = df["WB + Липецк + в пути, дней"].map(lambda x: "Да" if safe_float(x) >= 60 else f"Дефицит {round_int(60 - safe_float(x))} дн.")
 
     df["Дней без остатка WB в текущем месяце"] = df["Артикул WB"].map(zero_days_map).fillna(0).astype(int)
     df.loc[df["Остаток WB, шт"] > 0, "Дней без остатка WB в текущем месяце"] = 0
@@ -757,28 +692,15 @@ def build_report_dataframe(
     df = df.merge(rrc_df, on="Артикул 1С", how="left")
     df["РРЦ"] = df["РРЦ"].fillna(0).map(round_int)
     df["Цена покупателя"] = df["Цена покупателя"].fillna(0).map(round_int)
-    df["Коэффициент"] = df.apply(
-        lambda r: compute_coef_rrc(round_int(r["Цена покупателя"]), round_int(r["РРЦ"])),
-        axis=1,
-    )
+    df["Коэффициент"] = df.apply(lambda r: compute_coef_rrc(round_int(r["Цена покупателя"]), round_int(r["РРЦ"])), axis=1)
 
+    # глобальный фильтр: продажи за 60 дней >= 20 во всех листах/расчётах
     df = df[df["Продажи 60 дней, шт"] >= 20].copy()
 
-    for col in [
-        "Среднесуточные продажи 7д",
-        "Среднесуточные продажи 60д",
-        "Расчётный спрос в день, шт",
-        "WB хватит, дней",
-        "WB + Липецк, дней",
-        "После ближайшего поступления, дней",
-        "WB + Липецк + в пути, дней",
-    ]:
+    for col in ["Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Расчётный спрос в день, шт", "WB хватит, дней", "WB + Липецк, дней", "WB + Липецк + в пути, дней"]:
         df[col] = df[col].map(round_int)
 
-    return df.sort_values(
-        by="Артикул 1С",
-        key=lambda s: s.map(lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(x))]),
-    ).reset_index(drop=True)
+    return df.sort_values(by="Артикул 1С", key=lambda s: s.map(lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(x))])).reset_index(drop=True)
 
 
 def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -794,38 +716,34 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     )
     critical = critical[[
         "Артикул 1С", "Продажи 60 дней, шт", "WB хватит, дней", "Out of stock, days", "WB + Липецк, дней",
-        "Товары в пути, шт", "Ближайшее поступление, шт", "Дней до поступления",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце",
+        "Товары в пути, шт", "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце",
         "Комментарий", "Менеджер", "Delist",
     ]].copy()
 
     calc = report_df[[
         "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Остаток WB, шт",
-        "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
-        "Дата поступления", "Дней до поступления", "Партий в пути, шт",
+        "Остатки МП (Липецк), шт", "Товары в пути, шт", "Дата поступления", "Дней до поступления",
         "Продажи 7 дней, шт", "Продажи 60 дней, шт", "Среднесуточные продажи 7д", "Среднесуточные продажи 60д",
-        "Расчётный спрос в день, шт", "WB хватит, дней", "WB + Липецк, дней",
-        "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
-        "Хватит до поступления", "Out of stock, days", "Хватит на 60 дней",
-        "Дней без остатка WB в текущем месяце", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
+        "Расчётный спрос в день, шт", "WB хватит, дней", "WB + Липецк, дней", "WB + Липецк + в пути, дней",
+        "Хватит до поступления", "Out of stock, days", "Хватит на 60 дней", "Дней без остатка WB в текущем месяце",
+        "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
     ]].copy()
 
     dead = report_df[report_df["WB + Липецк + в пути, дней"] > 120].copy()
     dead = dead[[
-        "Артикул 1С", "Менеджер", "WB хватит, дней", "WB + Липецк, дней",
-        "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
-        "Продажи 60 дней, шт", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
+        "Артикул 1С", "Менеджер", "WB хватит, дней", "WB + Липецк, дней", "WB + Липецк + в пути, дней",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Товары в пути, шт", "Продажи 60 дней, шт",
+        "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
     ]].copy()
 
     monitor = report_df[report_df["Delist"] != "Delist"].copy()
     monitor = monitor[[
         "Артикул 1С", "Продажи 60 дней, шт", "Out of stock, days", "Хватит на 60 дней",
-        "WB + Липецк, дней", "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
-        "Товары в пути, шт", "Ближайшее поступление, шт", "Хватит до поступления",
+        "WB + Липецк, дней", "WB + Липецк + в пути, дней", "Товары в пути, шт", "Хватит до поступления",
         "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце", "Менеджер",
     ]].copy()
     return critical, calc, dead, monitor
+
 
 def auto_fit_columns(ws) -> None:
     widths: dict[int, int] = {}
@@ -1023,12 +941,12 @@ def resolve_redistribution_template(cfg: Config, storage: S3Storage) -> Path:
             target.write_bytes(obj["Body"].read())
             log(f"Шаблон перераспределения скачан из S3: {s3_key}")
             return target
-        except Exception as exc:
-            log(f"Не удалось взять шаблон перераспределения по ключу '{s3_key}': {exc}")
+        except Exception:
+            continue
 
     raise FileNotFoundError(
         "Не найден шаблон перераспределения. "
-        f"Проверены локальные пути и ключ S3 '{DEFAULT_REDISTRIBUTION_TEMPLATE_KEY}'."
+        f"Проверены пути: local={cfg.redistribution_template_local or '-'}, s3={s3_candidates}"
     )
 
 
@@ -1218,10 +1136,11 @@ def donor_rank_for_recipient(donor: str, recipient: str, donor_surplus: int) -> 
     return (3, -donor_surplus, donor)
 
 
-def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_transfer_plan(balance_df: pd.DataFrame, min_transfer_qty: int = DEFAULT_REDISTRIBUTION_MIN_TRANSFER) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     plan_rows: list[dict[str, object]] = []
     unresolved_rows: list[dict[str, object]] = []
     route_rows: list[dict[str, object]] = []
+    min_transfer_qty = max(int(min_transfer_qty or DEFAULT_REDISTRIBUTION_MIN_TRANSFER), 1)
 
     if balance_df.empty:
         empty_cols = ["Артикул WB", "Артикул WB продавца", "Артикул 1С", "Склад откуда", "Склад куда", "Количество"]
@@ -1239,7 +1158,7 @@ def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
         donors = {
             str(row["Склад"]): int(row["Излишек, шт"])
             for _, row in part.iterrows()
-            if round_int(row["Излишек, шт"]) > 0
+            if round_int(row["Излишек, шт"]) >= min_transfer_qty
         }
         recipients = [
             {
@@ -1247,30 +1166,36 @@ def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
                 "deficit": int(row["Дефицит, шт"]),
             }
             for _, row in part.iterrows()
-            if round_int(row["Дефицит, шт"]) > 0
+            if round_int(row["Дефицит, шт"]) >= min_transfer_qty
         ]
+
+        # Сначала закрываем крупные дефициты
         recipients.sort(key=lambda x: (-x["deficit"], x["warehouse"]))
 
         for recipient in recipients:
             need = recipient["deficit"]
-            if need <= 0:
+            if need < min_transfer_qty:
                 continue
 
             donor_candidates = sorted(
                 [
                     donor for donor, surplus in donors.items()
-                    if surplus > 0 and donor != recipient["warehouse"]
+                    if surplus >= min_transfer_qty and donor != recipient["warehouse"]
                 ],
                 key=lambda donor: donor_rank_for_recipient(donor, recipient["warehouse"], donors[donor]),
             )
 
             for donor in donor_candidates:
-                if need <= 0:
+                if need < min_transfer_qty:
                     break
-                available = donors.get(donor, 0)
-                if available <= 0:
+                available = int(donors.get(donor, 0))
+                if available < min_transfer_qty:
                     continue
+
                 qty = min(available, need)
+                if qty < min_transfer_qty:
+                    continue
+
                 plan_rows.append({
                     "Артикул WB": article_wb,
                     "Артикул WB продавца": seller_article,
@@ -1282,7 +1207,7 @@ def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
                 donors[donor] = available - qty
                 need -= qty
 
-            if need > 0:
+            if need >= min_transfer_qty:
                 unresolved_rows.append({
                     "Артикул WB": article_wb,
                     "Артикул WB продавца": seller_article,
@@ -1298,13 +1223,17 @@ def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
             ["Артикул WB", "Артикул WB продавца", "Артикул 1С", "Склад откуда", "Склад куда"],
             as_index=False,
         )["Количество"].sum()
-        plan_df = plan_df.sort_values(["Артикул WB", "Склад куда", "Склад откуда"]).reset_index(drop=True)
+        plan_df = plan_df[plan_df["Количество"].map(round_int) >= min_transfer_qty].copy()
+        plan_df = plan_df.sort_values(["Артикул WB", "Количество", "Склад куда", "Склад откуда"], ascending=[True, False, True, True]).reset_index(drop=True)
     else:
         plan_df = pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Артикул 1С", "Склад откуда", "Склад куда", "Количество"])
 
     unresolved_df = pd.DataFrame(unresolved_rows)
     if unresolved_df.empty:
         unresolved_df = pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Артикул 1С", "Склад откуда", "Склад куда", "Количество"])
+    else:
+        unresolved_df = unresolved_df[unresolved_df["Количество"].map(round_int) >= min_transfer_qty].copy()
+        unresolved_df = unresolved_df.sort_values(["Артикул WB", "Количество", "Склад куда"], ascending=[True, False, True]).reset_index(drop=True)
 
     routes_df = pd.DataFrame(route_rows).sort_values(["Склад куда", "Приоритет", "Склад откуда"]).reset_index(drop=True)
     return plan_df, unresolved_df, routes_df
@@ -1451,7 +1380,7 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
         lookback_days=cfg.redistribution_days,
         target_days=cfg.redistribution_target_days,
     )
-    plan_df, unresolved_df, routes_df = build_transfer_plan(balance_df)
+    plan_df, unresolved_df, routes_df = build_transfer_plan(balance_df, min_transfer_qty=cfg.redistribution_min_transfer)
 
     calc_path = Path(OUT_DIR) / f"Перераспределение_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
     template_out_path = Path(OUT_DIR) / f"Шаблон_перераспределения_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
@@ -1470,6 +1399,7 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
     log(f"Файл расчёта перераспределения сохранён: {calc_path}")
     log(f"Заполненный шаблон перераспределения сохранён: {template_out_path}")
     log(f"Источники перераспределения | остатки: {stock_source}")
+    log(f"Порог минимального перемещения: {cfg.redistribution_min_transfer} шт")
     log(f"Источники перераспределения | заказы: {', '.join(order_sources)}")
     if not unmapped_regions_df.empty:
         log(f"Регионов без сопоставления: {len(unmapped_regions_df)} строк (см. лист 'Не_смогли_сопоставить')")
