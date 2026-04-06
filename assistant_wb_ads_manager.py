@@ -1168,6 +1168,14 @@ def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master
     if campaigns.empty or portfolio.empty:
         return pd.DataFrame([{"Комментарий":"Нет подходящих кампаний для анализа оттенков"}]), pd.DataFrame([{"Комментарий":"Нет активных тестов оттенков"}])
 
+    def _ensure_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series([default] * len(df), index=df.index, dtype="float64")
+        data = df[col]
+        if isinstance(data, pd.DataFrame):
+            data = data.iloc[:, 0]
+        return pd.to_numeric(data, errors="coerce").fillna(default)
+
     actions: List[Dict[str, Any]] = []
 
     order_stats = pd.DataFrame()
@@ -1185,7 +1193,7 @@ def build_shade_actions(campaigns: pd.DataFrame, portfolio: pd.DataFrame, master
     universe["rating_reviews"] = pd.to_numeric(universe.get("rating_reviews"), errors="coerce").fillna(0)
 
     control_drr = product_metrics[["control_key", "blended_drr", "subject_norm"]].drop_duplicates().copy()
-    control_drr["blended_drr"] = pd.to_numeric(control_drr.get("blended_drr"), errors="coerce").fillna(0)
+    control_drr["blended_drr"] = _ensure_series(control_drr, "blended_drr", 0.0)
 
     for advert_id, g in portfolio.groupby("id_campaign"):
         current = g.iloc[0]
@@ -1862,7 +1870,11 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
 
     orders_60 = orders[(orders["date"] >= as_of_date - timedelta(days=60)) & (orders["date"] <= as_of_date) & (~orders["isCancel"])].copy() if not orders.empty else pd.DataFrame()
     shade_portfolio = build_shade_portfolio(campaigns, master, orders_60)
-    shade_actions, shade_tests = build_shade_actions(campaigns, shade_portfolio, master, orders_60, product_metrics.rename(columns={"Товар":"control_key","Предмет код":"subject_norm","Общий ДРР товара, %":"blended_drr"}), api_key=os.getenv("WB_PROMO_KEY_TOPFACE",""))
+    shade_product_metrics = product_metrics[["Товар", "Предмет код", "blended_drr"]].drop_duplicates().rename(columns={
+        "Товар": "control_key",
+        "Предмет код": "subject_norm",
+    })
+    shade_actions, shade_tests = build_shade_actions(campaigns, shade_portfolio, master, orders_60, shade_product_metrics, api_key=os.getenv("WB_PROMO_KEY_TOPFACE",""))
     if shade_actions.empty:
         shade_actions = pd.DataFrame([{"Комментарий":"Нет действий по оттенкам"}])
 
