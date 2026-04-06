@@ -124,6 +124,8 @@ MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
     "PT567.001K": "Юлия",
 }
 
+DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
+
 
 
 @dataclass
@@ -282,7 +284,7 @@ def get_config() -> Config:
         stop_articles_raw=os.getenv("WB_STOP_LIST_KEY", ""),
         force_send=(os.getenv("WB_FORCE_SEND", "false").strip().lower() == "true"),
         run_date=date.today(),
-        redistribution_template_key=(os.getenv("WB_REDISTRIBUTION_TEMPLATE_KEY") or "").strip(),
+        redistribution_template_key=(os.getenv("WB_REDISTRIBUTION_TEMPLATE_KEY") or DEFAULT_REDISTRIBUTION_TEMPLATE_KEY).strip(),
         redistribution_template_local=(os.getenv("WB_REDISTRIBUTION_TEMPLATE_LOCAL") or "").strip(),
         send_redistribution_always=(os.getenv("WB_SEND_REDISTRIBUTION_ALWAYS", "false").strip().lower() == "true"),
         redistribution_days=max(int(os.getenv("WB_REDISTRIBUTION_LOOKBACK_DAYS", "14") or 14), 1),
@@ -1007,17 +1009,26 @@ def resolve_redistribution_template(cfg: Config, storage: S3Storage) -> Path:
             log(f"Шаблон перераспределения взят локально: {candidate}")
             return candidate
 
+    s3_candidates: list[str] = []
     if cfg.redistribution_template_key:
-        target = Path(OUT_DIR) / Path(cfg.redistribution_template_key).name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        obj = storage.client.get_object(Bucket=storage.bucket, Key=cfg.redistribution_template_key)
-        target.write_bytes(obj["Body"].read())
-        log(f"Шаблон перераспределения скачан из S3: {cfg.redistribution_template_key}")
-        return target
+        s3_candidates.append(cfg.redistribution_template_key)
+    if DEFAULT_REDISTRIBUTION_TEMPLATE_KEY not in s3_candidates:
+        s3_candidates.append(DEFAULT_REDISTRIBUTION_TEMPLATE_KEY)
+
+    for s3_key in s3_candidates:
+        try:
+            target = Path(OUT_DIR) / Path(s3_key).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            obj = storage.client.get_object(Bucket=storage.bucket, Key=s3_key)
+            target.write_bytes(obj["Body"].read())
+            log(f"Шаблон перераспределения скачан из S3: {s3_key}")
+            return target
+        except Exception as exc:
+            log(f"Не удалось взять шаблон перераспределения по ключу '{s3_key}': {exc}")
 
     raise FileNotFoundError(
         "Не найден шаблон перераспределения. "
-        "Укажи WB_REDISTRIBUTION_TEMPLATE_LOCAL или WB_REDISTRIBUTION_TEMPLATE_KEY."
+        f"Проверены локальные пути и ключ S3 '{DEFAULT_REDISTRIBUTION_TEMPLATE_KEY}'."
     )
 
 
