@@ -679,6 +679,12 @@ class Config:
     max_up_step: float = 0.08
     test_up_step: float = 0.05
     down_step: float = 0.08
+    hard_down_step: float = 0.20
+    critical_drr: float = 0.20
+    extreme_drr: float = 0.30
+    cpc_priority_enabled: bool = True
+    cpc_priority_cpm_click_share: float = 0.55
+    cpc_priority_down_step: float = 0.12
 
 def compute_analysis_window(as_of_date: date) -> Dict[str, date]:
     cur_end = as_of_date - timedelta(days=MATURE_END_OFFSET)
@@ -1046,11 +1052,64 @@ def compute_bid_limits(row: pd.Series, subject_benchmarks: pd.DataFrame) -> Tupl
     experiment_bid = round(min(max_bid * 1.15, max_bid), 2)
     return round(comfort_bid, 2), round(max_bid, 2), round(experiment_bid, 2), limit_type
 
+def build_channel_priority_features(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    df = rows.copy()
+    df["payment_type_norm"] = df.get("payment_type", "").map(canonical_payment_type)
+    stats: List[Dict[str, Any]] = []
+    for control_key, g in df.groupby("control_key", dropna=False):
+        gg = g.copy()
+        gg["current_bid_rub"] = pd.to_numeric(get_series(gg, "current_bid_rub"), errors="coerce").fillna(0.0)
+        gg["max_bid_rub"] = pd.to_numeric(get_series(gg, "max_bid_rub"), errors="coerce").fillna(0.0)
+        gg["Клики"] = pd.to_numeric(get_series(gg, "Клики"), errors="coerce").fillna(0.0)
+        gg["Заказы"] = pd.to_numeric(get_series(gg, "Заказы"), errors="coerce").fillna(0.0)
+        gg["Расход"] = pd.to_numeric(get_series(gg, "Расход"), errors="coerce").fillna(0.0)
+        cpc = gg[gg["payment_type_norm"].eq("cpc")].copy()
+        cpm = gg[gg["payment_type_norm"].eq("cpm")].copy()
+        total_clicks = float(gg["Клики"].sum())
+        total_orders = float(gg["Заказы"].sum())
+        total_spend = float(gg["Расход"].sum())
+        cpc_clicks = float(cpc["Клики"].sum()) if not cpc.empty else 0.0
+        cpm_clicks = float(cpm["Клики"].sum()) if not cpm.empty else 0.0
+        cpc_orders = float(cpc["Заказы"].sum()) if not cpc.empty else 0.0
+        cpc_spend = float(cpc["Расход"].sum()) if not cpc.empty else 0.0
+        cpc_can_raise_any = False
+        cpc_at_limit_all = False
+        cpc_headroom_max = 0.0
+        cpc_current_max = 0.0
+        cpc_max_max = 0.0
+        if not cpc.empty:
+            cpc["headroom_rub"] = (cpc["max_bid_rub"] - cpc["current_bid_rub"]).clip(lower=0)
+            cpc["rate_limit"] = cpc.apply(lambda r: safe_float(r.get("max_bid_rub")) > 0 and safe_float(r.get("current_bid_rub")) >= safe_float(r.get("max_bid_rub")) * 0.95, axis=1)
+            cpc_can_raise_any = bool((cpc["headroom_rub"] > 0.01).any())
+            cpc_at_limit_all = bool(((cpc["headroom_rub"] <= 0.01) | cpc["rate_limit"]).all())
+            cpc_headroom_max = float(cpc["headroom_rub"].max())
+            cpc_current_max = float(cpc["current_bid_rub"].max())
+            cpc_max_max = float(cpc["max_bid_rub"].max())
+        stats.append({
+            "control_key": control_key,
+            "has_cpc_sibling": bool(not cpc.empty),
+            "cpc_campaigns": int(len(cpc)),
+            "cpc_can_raise_any": cpc_can_raise_any,
+            "cpc_at_limit_all": cpc_at_limit_all,
+            "cpc_headroom_max_rub": round(cpc_headroom_max, 2),
+            "cpc_current_bid_max_rub": round(cpc_current_max, 2),
+            "cpc_max_bid_max_rub": round(cpc_max_max, 2),
+            "cpc_click_share": (cpc_clicks / total_clicks) if total_clicks > 0 else 0.0,
+            "cpm_click_share": (cpm_clicks / total_clicks) if total_clicks > 0 else 0.0,
+            "cpc_order_share": (cpc_orders / total_orders) if total_orders > 0 else 0.0,
+            "cpc_spend_share": (cpc_spend / total_spend) if total_spend > 0 else 0.0,
+        })
+    features = pd.DataFrame(stats)
+    return df.merge(features, on="control_key", how="left")
+
 def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool]:
     subject_norm = row["subject_norm"]
+    payment_type = canonical_payment_type(row.get("payment_type") or row.get("Тип кампании"))
     current_bid = safe_float(row["current_bid_rub"])
-    comfort_bid = row.get("comfort_bid_rub")
-    max_bid = row.get("max_bid_rub")
+    comfort_bid = safe_float(row.get("comfort_bid_rub"))
+    max_bid = safe_float(row.get("max_bid_rub"))
     total_orders = safe_float(row.get("total_orders"))
     ad_orders = safe_float(row.get("Заказы"))
     blended_drr = safe_float(row.get("blended_drr"))
@@ -1064,56 +1123,125 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
     weak_card = bool(row.get("card_issue"))
     weak_eff = safe_float(row.get("eff_index_click")) < 0.7 if pd.notna(row.get("eff_index_click")) else False
     growth = subject_norm in GROWTH_SUBJECTS
-    rate_limit = False
+    floor_bid = 4.0 if payment_type == "cpc" else 80.0
+    safe_max_bid = max_bid if max_bid > 0 else 0.0
+    safe_comfort_bid = comfort_bid if comfort_bid > 0 else safe_max_bid
+    hard_cap_bid = safe_max_bid if safe_max_bid > 0 else safe_comfort_bid
+    rate_limit = current_bid >= safe_max_bid * 0.95 if safe_max_bid > 0 else False
+    has_cpc_sibling = parse_bool(row.get("has_cpc_sibling"))
+    cpc_can_raise_any = parse_bool(row.get("cpc_can_raise_any"))
+    cpc_at_limit_all = parse_bool(row.get("cpc_at_limit_all"))
+    cpc_headroom_max_rub = safe_float(row.get("cpc_headroom_max_rub"))
+    cpc_click_share = safe_float(row.get("cpc_click_share"))
+    cpm_click_share = safe_float(row.get("cpm_click_share"))
+    cpc_order_share = safe_float(row.get("cpc_order_share"))
 
-    if pd.notna(max_bid) and safe_float(max_bid) > 0:
-        rate_limit = current_bid >= safe_float(max_bid) * 0.95
+    def finalize_bid(value: float) -> float:
+        return round(max(value, floor_bid), 2)
 
     # If no reliable limits and no sales, collect data only
-    if (pd.isna(max_bid) or safe_float(max_bid) <= 0) and total_orders <= 0 and ad_orders <= 0:
+    if hard_cap_bid <= 0 and total_orders <= 0 and ad_orders <= 0:
         return "Без изменений", current_bid, "Недостаточно данных для расчёта лимитов, собираем статистику", rate_limit
 
-    # Final hard filter by blended DRR > 15%
+    # Critical branch: high blended DRR must lead to real lowering, not freeze.
     if blended_drr > cfg.max_drr:
-        if rate_limit or weak_eff:
-            return "Предел эффективности ставки", current_bid, f"Общий ДРР {blended_drr*100:.1f}% выше 15%: дальше ставкой расти нецелесообразно", True
-        if current_bid > 0 and order_growth < required_growth:
-            new_bid = round(current_bid * (1 - cfg.down_step), 2)
-            return "Снизить", max(new_bid, 4.0 if str(row.get("payment_type")) == "cpc" else 80.0), f"Общий ДРР {blended_drr*100:.1f}% выше 15% и рост заказов слабый", rate_limit
-        return "Без изменений", current_bid, f"Общий ДРР {blended_drr*100:.1f}% выше 15%: рост запрещён финальным фильтром", rate_limit
+        reasons: List[str] = [f"Общий ДРР {blended_drr*100:.1f}% выше лимита {cfg.max_drr*100:.0f}%"]
+        target = current_bid
+        bad_growth = order_growth < required_growth
+        materially_over_cap = hard_cap_bid > 0 and current_bid > hard_cap_bid + 0.01
 
-    if gp_realized <= 0 or rating and rating < 4.5 or buyout and buyout < 0.70:
-        if growth:
-            return "Без изменений", current_bid, "Локальная экономика слабая: для growth-товара не режем автоматически, наблюдаем", rate_limit
+        if materially_over_cap:
+            target = min(target, hard_cap_bid)
+            reasons.append(f"текущая ставка {current_bid:.2f} ₽ выше расчётного max {hard_cap_bid:.2f} ₽")
+
+        if blended_drr >= cfg.extreme_drr:
+            target = min(target, current_bid * (1 - cfg.hard_down_step))
+            reasons.append("ДРР экстремально высокий: режем ставку ускоренно")
+        elif blended_drr >= cfg.critical_drr:
+            target = min(target, current_bid * (1 - max(cfg.down_step, 0.12)))
+            reasons.append("ДРР критически высокий: режем сильнее базового шага")
+        elif bad_growth or weak_eff or weak_card:
+            target = min(target, current_bid * (1 - cfg.down_step))
+            reasons.append("рост заказов слабый / эффективность ставки низкая")
+
+        if hard_cap_bid > 0 and bad_growth:
+            target = min(target, hard_cap_bid)
+            reasons.append("при слабом росте заказов возвращаемся к расчётному потолку")
+
+        target = finalize_bid(target)
+        if target < current_bid - 0.01:
+            return "Снизить", target, "; ".join(dict.fromkeys(reasons)), target >= hard_cap_bid - 0.01 if hard_cap_bid > 0 else rate_limit
+
+        if materially_over_cap and hard_cap_bid > 0:
+            fallback = finalize_bid(hard_cap_bid)
+            if fallback < current_bid - 0.01:
+                return "Снизить", fallback, "; ".join(dict.fromkeys(reasons)), True
+
+        return "Предел эффективности ставки", current_bid, "; ".join(dict.fromkeys(reasons + ["ставку выше не держим и не повышаем"])), True
+
+    if gp_realized <= 0 or (rating and rating < 4.5) or (buyout and buyout < 0.70):
         if current_bid > 0:
-            new_bid = round(current_bid * (1 - cfg.down_step), 2)
-            return "Снизить", max(new_bid, 4.0 if str(row.get("payment_type")) == "cpc" else 80.0), "Негативная экономика / рейтинг / выкуп", rate_limit
+            target = hard_cap_bid if hard_cap_bid > 0 else current_bid * (1 - cfg.down_step)
+            target = finalize_bid(min(current_bid * (1 - cfg.down_step), target if target > 0 else current_bid))
+            if target < current_bid - 0.01:
+                return "Снизить", target, "Негативная экономика / рейтинг / выкуп", rate_limit
+        if growth:
+            return "Без изменений", current_bid, "Локальная экономика слабая: наблюдаем до накопления данных", rate_limit
         return "Без изменений", current_bid, "Негативная экономика / рейтинг / выкуп", rate_limit
 
     weak_position = position <= 0 or position > 15
     demand_high = demand >= 3000
-    can_raise = pd.notna(max_bid) and safe_float(max_bid) > current_bid + 0.01
+    can_raise = safe_max_bid > current_bid + 0.01
+
+    # CPC-first logic: do not grow expensive CPM while CPC still has headroom.
+    if cfg.cpc_priority_enabled and payment_type == "cpm" and has_cpc_sibling:
+        priority_reason = (
+            f"Сначала отрабатываем CPC: по товару ещё есть запас по CPC до лимита "
+            f"{cpc_headroom_max_rub:.2f} ₽; доля кликов CPC {cpc_click_share*100:.1f}%, CPM {cpm_click_share*100:.1f}%"
+        )
+        cpm_overweight = cpm_click_share >= cfg.cpc_priority_cpm_click_share and cpc_click_share < cpm_click_share
+        if cpc_can_raise_any and not cpc_at_limit_all:
+            target = current_bid
+            should_reduce = False
+            if safe_comfort_bid > 0 and current_bid > safe_comfort_bid + 0.01:
+                target = min(target, safe_comfort_bid)
+                should_reduce = True
+            if hard_cap_bid > 0 and current_bid > hard_cap_bid + 0.01:
+                target = min(target, hard_cap_bid)
+                should_reduce = True
+            if cpm_overweight and current_bid > floor_bid + 0.01:
+                target = min(target, current_bid * (1 - max(cfg.cpc_priority_down_step, cfg.down_step)))
+                should_reduce = True
+            if weak_eff or order_growth < required_growth or blended_drr > cfg.comfort_drr_max:
+                target = min(target, current_bid * (1 - max(cfg.cpc_priority_down_step, cfg.down_step)))
+                should_reduce = True
+            target = finalize_bid(target)
+            if should_reduce and target < current_bid - 0.01:
+                return "Снизить", target, priority_reason + "; дорогой CPM не должен забирать трафик, пока CPC не исчерпан", (hard_cap_bid > 0 and target >= hard_cap_bid - 0.01) or rate_limit
+            return "Без изменений", current_bid, priority_reason + "; до упора по CPC не наращиваем полки/CPM", rate_limit
 
     # Strong sign that ставка уже не помогает
     if weak_eff and rate_limit and weak_position:
+        if hard_cap_bid > 0 and hard_cap_bid < current_bid - 0.01:
+            return "Снизить", finalize_bid(hard_cap_bid), "Ставка близка к пределу эффективности и выше расчётного max", True
         return "Предел эффективности ставки", current_bid, "Ставка близка к максимуму, а трафик/позиция не улучшаются", True
 
     if growth:
-        # default to HOLD for growth categories
         if weak_position and demand_high and can_raise and not weak_card:
             step = cfg.test_up_step if blended_drr >= cfg.comfort_drr_max else cfg.max_up_step
             proposed = round(current_bid * (1 + step), 2)
-            new_bid = min(round(safe_float(max_bid), 2), proposed)
+            new_bid = min(round(safe_max_bid, 2), proposed)
             if blended_drr <= cfg.comfort_drr_max:
                 return "Повысить", new_bid, "Есть запас по max-ставке и потенциал роста позиции", rate_limit
             return "Тест роста", new_bid, "Запускаем осторожный тест роста в зоне 12–15%", rate_limit
         if weak_card and order_growth < required_growth:
+            if hard_cap_bid > 0 and hard_cap_bid < current_bid - 0.01:
+                return "Снизить", finalize_bid(hard_cap_bid), "Проблема в карточке / воронке и ставка выше расчётного max", True
             return "Предел эффективности ставки", current_bid, "Проблема в карточке / воронке: ставкой дальше не лечится", True
-        if current_bid > safe_float(max_bid) > 0 and order_growth < required_growth:
-            return "Без изменений", current_bid, "Ставка выше расчётного max, но товар ростовый: не режем автоматически", rate_limit
+        if current_bid > safe_max_bid > 0 and order_growth < required_growth:
+            return "Снизить", finalize_bid(safe_max_bid), "Ростовый товар, но ставка выше расчётного max и роста заказов нет", True
         return "Без изменений", current_bid, "Growth-товар: удерживаем ставку, пока нет сильного сигнала на снижение", rate_limit
 
-    # Brushes and others
     severe = 0
     severe += 1 if weak_card else 0
     severe += 1 if weak_eff else 0
@@ -1122,10 +1250,13 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
 
     if weak_position and demand_high and can_raise and order_growth >= 0:
         proposed = round(current_bid * (1 + cfg.max_up_step), 2)
-        return "Повысить", min(round(safe_float(max_bid), 2), proposed), "Слабая позиция: подтягиваем ставку к комфортной", rate_limit
+        return "Повысить", min(round(safe_max_bid, 2), proposed), "Слабая позиция: подтягиваем ставку к комфортной", rate_limit
     if severe >= 3 and current_bid > 0:
-        new_bid = round(current_bid * (1 - cfg.down_step), 2)
-        return "Снизить", max(new_bid, 4.0 if str(row.get("payment_type")) == "cpc" else 80.0), "Проблема в карточке / воронке или рост заказов слабый", rate_limit
+        target = safe_max_bid if safe_max_bid > 0 else current_bid * (1 - cfg.down_step)
+        target = finalize_bid(min(current_bid * (1 - cfg.down_step), target if target > 0 else current_bid))
+        return "Снизить", target, "Проблема в карточке / воронке или рост заказов слабый", rate_limit
+    if hard_cap_bid > 0 and current_bid > hard_cap_bid + 0.01 and order_growth < required_growth:
+        return "Снизить", finalize_bid(hard_cap_bid), "Ставка выше расчётного max, а рост заказов не подтверждает удержание", True
     return "Без изменений", current_bid, "Без изменений", rate_limit
 
 def build_shade_portfolio(campaigns: pd.DataFrame, master: pd.DataFrame, orders_60: pd.DataFrame) -> pd.DataFrame:
@@ -1791,6 +1922,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     # limits and decisions
     limits = rows.apply(lambda r: pd.Series(compute_bid_limits(r, subject_benchmarks), index=["comfort_bid_rub","max_bid_rub","experiment_bid_rub","limit_type"]), axis=1)
     rows = pd.concat([rows, limits], axis=1)
+    rows = build_channel_priority_features(rows)
     decisions = []
     for _, r in rows.iterrows():
         action, new_bid, reason, rate_limit = determine_action(r, cfg)
@@ -1831,6 +1963,12 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
             "Индекс эффективности ставки по кликам": round(safe_float(r["eff_index_click"]), 4),
             "Предел эффективности": "Да" if rate_limit or action == "Предел эффективности ставки" else "Нет",
             "Проблема карточки": "Да" if bool(r["card_issue"]) else "Нет",
+            "Есть CPC по товару": "Да" if parse_bool(r.get("has_cpc_sibling")) else "Нет",
+            "CPC ещё можно растить": "Да" if parse_bool(r.get("cpc_can_raise_any")) else "Нет",
+            "CPC упёрся в лимит": "Да" if parse_bool(r.get("cpc_at_limit_all")) else "Нет",
+            "Запас CPC до лимита, ₽": round(safe_float(r.get("cpc_headroom_max_rub")), 2),
+            "Доля кликов CPC, %": round(safe_float(r.get("cpc_click_share")) * 100, 2),
+            "Доля кликов CPM, %": round(safe_float(r.get("cpm_click_share")) * 100, 2),
         })
     decisions_df = pd.DataFrame(decisions)
     # weak positions simple
@@ -2049,6 +2187,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     changed_recommended = decisions[(decisions["Действие"].isin(["Повысить","Снизить","Тест роста"])) & (decisions["Новая ставка, ₽"] != decisions["Текущая ставка, ₽"])].copy()
     shade_actions_df = results.get("shade_actions", pd.DataFrame()).copy()
     shade_add_mask = shade_actions_df["Действие API"].astype(str).eq("add") if (not shade_actions_df.empty and "Действие API" in shade_actions_df.columns) else pd.Series(False, index=shade_actions_df.index if not shade_actions_df.empty else [])
+    applied_bids_df = build_actual_bid_changes_sheet(decisions, bid_send_log)
     bid_success = 0 if bid_send_log is None or bid_send_log.empty else int((bid_send_log["status"].astype(str) == "ok").sum())
     bid_failed = 0 if bid_send_log is None or bid_send_log.empty else int((bid_send_log["status"].astype(str) == "failed").sum())
     shade_success = int((get_series(shade_actions_df, "Статус применения").astype(str) == "успешно").sum()) if (not shade_actions_df.empty and "Статус применения" in shade_actions_df.columns) else 0
@@ -2110,6 +2249,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
         "Тесты оттенков": results["shade_tests"] if not results["shade_tests"].empty else pd.DataFrame([{"Комментарий":"Нет данных"}]),
         "Сравнение с сильными РК": results["bench_cmp"] if not results["bench_cmp"].empty else pd.DataFrame([{"Комментарий":"Нет данных"}]),
         "Эффект изменений": results["effects"] if not results["effects"].empty else pd.DataFrame([{"Комментарий":"Нет данных"}]),
+        "Фактически изменённые ставки": applied_bids_df,
         "Эффективность ставки": pd.DataFrame([{"Комментарий":"См. листы ниже по истории эффективности"}]),
         "Лог API": api_log_df if not api_log_df.empty else pd.DataFrame([{"Комментарий":"API-вызовы в этом запуске не выполнялись"}]),
         "Архив решений": new_archive,
@@ -2151,6 +2291,85 @@ def build_history_append(changed: pd.DataFrame, as_of_date: date) -> pd.DataFram
         })
     return pd.DataFrame(rows)
 
+
+def build_actual_bid_changes_sheet(decisions: pd.DataFrame, bid_send_log: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if bid_send_log is None or bid_send_log.empty:
+        return pd.DataFrame([{"Комментарий": "Изменения ставок в WB в этом запуске не отправлялись"}])
+
+    success_logs = bid_send_log[bid_send_log["status"].astype(str) == "ok"].copy()
+    if success_logs.empty:
+        return pd.DataFrame([{"Комментарий": "В этом запуске WB не подтвердил ни одного изменения ставок"}])
+
+    rows: List[Dict[str, Any]] = []
+    for _, log_row in success_logs.iterrows():
+        request_body = log_row.get("request_body")
+        try:
+            payload = json.loads(request_body) if isinstance(request_body, str) and request_body else request_body
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+        for block in payload.get("bids", []) or []:
+            advert_id = safe_int(block.get("advert_id"))
+            for nm_bid in block.get("nm_bids", []) or []:
+                nm_id = safe_int(nm_bid.get("nm_id"))
+                placement = normalize_internal_placement(nm_bid.get("placement") or log_row.get("placement"))
+                bid_kop = safe_int(nm_bid.get("bid_kopecks"))
+                bid_rub = round(bid_kop / 100.0, 2) if bid_kop else 0.0
+                mask = (
+                    decisions["ID кампании"].map(safe_int).eq(advert_id)
+                    & decisions["Артикул WB"].map(safe_int).eq(nm_id)
+                    & decisions["Плейсмент"].astype(str).map(normalize_internal_placement).eq(placement)
+                )
+                match = decisions[mask].head(1)
+                if match.empty and placement == "recommendation":
+                    mask = (
+                        decisions["ID кампании"].map(safe_int).eq(advert_id)
+                        & decisions["Артикул WB"].map(safe_int).eq(nm_id)
+                        & decisions["Плейсмент"].astype(str).map(normalize_internal_placement).eq("combined")
+                    )
+                    match = decisions[mask].head(1)
+                if match.empty and placement == "search":
+                    mask = (
+                        decisions["ID кампании"].map(safe_int).eq(advert_id)
+                        & decisions["Артикул WB"].map(safe_int).eq(nm_id)
+                        & decisions["Плейсмент"].astype(str).map(normalize_internal_placement).isin(["search", "combined"])
+                    )
+                    match = decisions[mask].head(1)
+                if not match.empty:
+                    m = match.iloc[0]
+                    rows.append({
+                        "Дата": log_row.get("timestamp"),
+                        "ID кампании": advert_id,
+                        "Артикул WB": nm_id,
+                        "Артикул продавца": m.get("Артикул продавца", ""),
+                        "Товар": m.get("Товар", ""),
+                        "Плейсмент": placement,
+                        "Старая ставка, ₽": m.get("Текущая ставка, ₽"),
+                        "Новая ставка, ₽": bid_rub,
+                        "Действие": m.get("Действие", ""),
+                        "Причина": m.get("Причина", ""),
+                        "Статус": "успешно применено",
+                    })
+                else:
+                    rows.append({
+                        "Дата": log_row.get("timestamp"),
+                        "ID кампании": advert_id,
+                        "Артикул WB": nm_id,
+                        "Артикул продавца": "",
+                        "Товар": "",
+                        "Плейсмент": placement,
+                        "Старая ставка, ₽": None,
+                        "Новая ставка, ₽": bid_rub,
+                        "Действие": "",
+                        "Причина": "Не удалось сопоставить с листом решений",
+                        "Статус": "успешно применено",
+                    })
+
+    if not rows:
+        return pd.DataFrame([{"Комментарий": "В логе WB нет пригодных данных по фактически изменённым ставкам"}])
+    return pd.DataFrame(rows).drop_duplicates()
+
 def run_manager(args: argparse.Namespace) -> None:
     API_CALL_LOGS.clear()
     MIN_BID_ROWS.clear()
@@ -2167,7 +2386,9 @@ def run_manager(args: argparse.Namespace) -> None:
     decisions = results["decisions"].copy()
     log(f"✅ Всего строк решений: {len(decisions)}")
     changed = decisions[(decisions["Действие"].isin(["Повысить","Снизить","Тест роста"])) & (decisions["Текущая ставка, ₽"] != decisions["Новая ставка, ₽"])].copy()
+    lowered = changed[changed["Действие"].astype(str) == "Снизить"] if not changed.empty else pd.DataFrame()
     log(f"🔁 Изменённых ставок: {len(changed)}")
+    log(f"📉 Из них понижений: {0 if lowered.empty else len(lowered)}")
     log(f"📊 Разбивка по действиям: {dict(decisions['Действие'].value_counts())}")
     if not changed.empty:
         print(changed[["Товар","Артикул продавца","Предмет","ID кампании","Плейсмент","Текущая ставка, ₽","Новая ставка, ₽","Действие","Причина"]].head(20).to_string(index=False), flush=True)
