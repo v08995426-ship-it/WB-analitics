@@ -961,25 +961,7 @@ class MetricsBuilder:
         daily = self.build_daily_current()
         if daily.empty:
             return daily
-        daily = daily.copy()
-        for col, default in {
-            "orders_day": 0,
-            "gross_profit_day_est": 0.0,
-            "avg_finished_price_day": np.nan,
-            "avg_price_with_disc_day": np.nan,
-            "avg_spp_day": np.nan,
-            "search_frequency": 0.0,
-            "search_clicks": 0.0,
-            "search_capture_share": np.nan,
-            "avg_position": np.nan,
-            "visibility_pct": np.nan,
-            "localization_index": np.nan,
-            "ad_clicks": 0.0,
-            "ad_spend": 0.0,
-        }.items():
-            if col not in daily.columns:
-                daily[col] = default
-        daily["week_code"] = pd.to_datetime(daily["day"], errors="coerce").dt.date.map(week_code_from_date)
+        daily["week_code"] = pd.to_datetime(daily["day"]).dt.date.map(week_code_from_date)
         agg = daily.groupby(["week_code", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
             orders_week=("orders_day", "sum"),
             gp_est_week=("gross_profit_day_est", "sum"),
@@ -1001,19 +983,7 @@ class MetricsBuilder:
         daily = self.build_daily_current()
         if daily.empty:
             return daily
-        daily = daily.copy()
-        for col, default in {
-            "orders_day": 0,
-            "gross_profit_day_est": 0.0,
-            "avg_finished_price_day": np.nan,
-            "avg_price_with_disc_day": np.nan,
-            "avg_spp_day": np.nan,
-            "localization_index": np.nan,
-            "search_capture_share": np.nan,
-        }.items():
-            if col not in daily.columns:
-                daily[col] = default
-        daily["month_key"] = pd.to_datetime(daily["day"], errors="coerce").dt.to_period("M").astype(str)
+        daily["month_key"] = pd.to_datetime(daily["day"]).dt.to_period("M").astype(str)
         agg = daily.groupby(["month_key", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
             orders_mtd=("orders_day", "sum"),
             gp_est_mtd=("gross_profit_day_est", "sum"),
