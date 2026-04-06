@@ -11,6 +11,7 @@ jobs:
     timeout-minutes: 60
     env:
       USE_S3: "1"
+      PYTHONIOENCODING: "utf-8"
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
@@ -28,16 +29,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 python-dateutil numpy
 
-      - name: Verify script exists
+      - name: Verify repository files
         run: |
-          pwd
+          echo "Current directory: $(pwd)"
+          echo "Repository root content:"
           ls -la
+          echo
+          echo ".github/workflows content:"
+          ls -la .github/workflows || true
+          echo
+          if [ ! -f wb_combined_report_final.py ]; then
+            echo "ERROR: File wb_combined_report_final.py not found in repository root"
+            exit 1
+          fi
           python - <<'PY'
 from pathlib import Path
 p = Path('wb_combined_report_final.py')
-print('exists:', p.exists())
-print('size:', p.stat().st_size if p.exists() else 'missing')
+print('Script found:', p.resolve())
+print('Size:', p.stat().st_size)
 PY
+
+      - name: Check script syntax
+        run: |
+          python -m py_compile wb_combined_report_final.py
 
       - name: Run combined report
         run: |
