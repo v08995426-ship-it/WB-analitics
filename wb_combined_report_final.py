@@ -199,6 +199,20 @@ def find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+
+
+def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFrame:
+    """Return a copy of df that contains all requested columns.
+
+    Missing columns are added with the provided default values.
+    Existing columns are left unchanged.
+    """
+    out = df.copy()
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    return out
+
 def read_excel_normalized(data: bytes, filename: str, sheet_name=0) -> pd.DataFrame:
     bio = io.BytesIO(data)
     return pd.read_excel(bio, sheet_name=sheet_name)
