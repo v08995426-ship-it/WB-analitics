@@ -8,14 +8,11 @@ on:
 jobs:
   build-combined-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
     env:
-      USE_S3: "1"
-      PYTHONIOENCODING: "utf-8"
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      PYTHONUNBUFFERED: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,42 +25,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl boto3 python-dateutil numpy
+          pip install pandas openpyxl boto3 numpy
 
-      - name: Verify repository files
+      - name: Verify files
         run: |
-          echo "Current directory: $(pwd)"
-          echo "Repository root content:"
+          pwd
           ls -la
-          echo
-          echo ".github/workflows content:"
-          ls -la .github/workflows || true
-          echo
-          if [ ! -f wb_combined_report_final.py ]; then
-            echo "ERROR: File wb_combined_report_final.py not found in repository root"
-            exit 1
-          fi
-          python - <<'PY'
-from pathlib import Path
-p = Path('wb_combined_report_final.py')
-print('Script found:', p.resolve())
-print('Size:', p.stat().st_size)
-PY
-
-      - name: Check script syntax
-        run: |
-          python -m py_compile wb_combined_report_final.py
+          test -f wb_combined_report_final.py
 
       - name: Run combined report
         run: |
           python wb_combined_report_final.py --root .
 
-      - name: Upload generated reports as artifact
+      - name: Upload generated reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: topface-combined-report
           path: |
             Отчёты/Объединенный отчет/TOPFACE/**/*.xlsx
-            Отчёты/Объединенный отчет/TOPFACE/**/*.log
           if-no-files-found: warn
