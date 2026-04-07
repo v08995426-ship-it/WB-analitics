@@ -24,6 +24,7 @@ import requests
 from botocore.client import Config as BotoConfig
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 
 
 def env_bool(name: str, default: bool = False) -> bool:
