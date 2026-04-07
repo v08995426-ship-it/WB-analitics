@@ -1,14 +1,26 @@
-name: WB Supply Calculator Supplier
+name: WB Supply Calculator
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Режим расчёта'
+        required: true
+        default: 'supply'
+        type: choice
+        options:
+          - supply
+          - supplier
       run_date:
         description: 'Дата расчёта YYYY-MM-DD. Если пусто — берётся текущая дата.'
         required: false
         default: ''
+      season_coeff:
+        description: 'Коэффициент сезонности для режима supply'
+        required: false
+        default: '1.0'
       supplier_default_coeff:
-        description: 'Коэффициент по умолчанию для SKU вне плана'
+        description: 'Коэффициент по умолчанию для SKU вне плана в режиме supplier'
         required: false
         default: '1.0'
       supplier_lead_days:
@@ -27,11 +39,19 @@ on:
         description: 'Месяц ABC в формате YYYY-MM'
         required: false
         default: '2026-03'
+      strategy_mode:
+        description: 'Стратегия для режима supply'
+        required: false
+        default: 'default'
+        type: choice
+        options:
+          - default
+          - economy
   schedule:
     - cron: '0 3 * * *'
 
 jobs:
-  run-supplier-calculation:
+  run-calculation:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -49,18 +69,51 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy openpyxl boto3 botocore requests
 
-      - name: Prepare run date
+      - name: Prepare parameters
         id: prep
         shell: bash
         run: |
           INPUT_RUN_DATE="${{ github.event.inputs.run_date }}"
+          INPUT_MODE="${{ github.event.inputs.mode }}"
+          INPUT_SEASON_COEFF="${{ github.event.inputs.season_coeff }}"
+          INPUT_SUPPLIER_DEFAULT_COEFF="${{ github.event.inputs.supplier_default_coeff }}"
+          INPUT_SUPPLIER_LEAD_DAYS="${{ github.event.inputs.supplier_lead_days }}"
+          INPUT_SUPPLIER_COVERAGE_DAYS="${{ github.event.inputs.supplier_coverage_days }}"
+          INPUT_SUPPLIER_BREAKTHROUGH_THRESHOLD="${{ github.event.inputs.supplier_breakthrough_threshold }}"
+          INPUT_ABC_TARGET_MONTH="${{ github.event.inputs.abc_target_month }}"
+          INPUT_STRATEGY_MODE="${{ github.event.inputs.strategy_mode }}"
+
           if [ -n "$INPUT_RUN_DATE" ]; then
-            echo "run_date=$INPUT_RUN_DATE" >> "$GITHUB_OUTPUT"
+            RUN_DATE="$INPUT_RUN_DATE"
           else
-            echo "run_date=$(date +%F)" >> "$GITHUB_OUTPUT"
+            RUN_DATE="$(date +%F)"
           fi
 
-      - name: Run supplier calculation
+          if [ -n "$INPUT_MODE" ]; then
+            MODE="$INPUT_MODE"
+          else
+            MODE="supply"
+          fi
+
+          if [ -z "$INPUT_SEASON_COEFF" ]; then INPUT_SEASON_COEFF='1.0'; fi
+          if [ -z "$INPUT_SUPPLIER_DEFAULT_COEFF" ]; then INPUT_SUPPLIER_DEFAULT_COEFF='1.0'; fi
+          if [ -z "$INPUT_SUPPLIER_LEAD_DAYS" ]; then INPUT_SUPPLIER_LEAD_DAYS='80'; fi
+          if [ -z "$INPUT_SUPPLIER_COVERAGE_DAYS" ]; then INPUT_SUPPLIER_COVERAGE_DAYS='60'; fi
+          if [ -z "$INPUT_SUPPLIER_BREAKTHROUGH_THRESHOLD" ]; then INPUT_SUPPLIER_BREAKTHROUGH_THRESHOLD='1.5'; fi
+          if [ -z "$INPUT_ABC_TARGET_MONTH" ]; then INPUT_ABC_TARGET_MONTH='2026-03'; fi
+          if [ -z "$INPUT_STRATEGY_MODE" ]; then INPUT_STRATEGY_MODE='default'; fi
+
+          echo "run_date=$RUN_DATE" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "season_coeff=$INPUT_SEASON_COEFF" >> "$GITHUB_OUTPUT"
+          echo "supplier_default_coeff=$INPUT_SUPPLIER_DEFAULT_COEFF" >> "$GITHUB_OUTPUT"
+          echo "supplier_lead_days=$INPUT_SUPPLIER_LEAD_DAYS" >> "$GITHUB_OUTPUT"
+          echo "supplier_coverage_days=$INPUT_SUPPLIER_COVERAGE_DAYS" >> "$GITHUB_OUTPUT"
+          echo "supplier_breakthrough_threshold=$INPUT_SUPPLIER_BREAKTHROUGH_THRESHOLD" >> "$GITHUB_OUTPUT"
+          echo "abc_target_month=$INPUT_ABC_TARGET_MONTH" >> "$GITHUB_OUTPUT"
+          echo "strategy_mode=$INPUT_STRATEGY_MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Run WB supply calculator
         env:
           WB_S3_BUCKET: ${{ secrets.WB_S3_BUCKET }}
           WB_S3_ACCESS_KEY: ${{ secrets.WB_S3_ACCESS_KEY }}
@@ -73,20 +126,22 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         shell: bash
         run: |
-          python "wb_supply_calculator (1).py" \
-            --mode supplier \
+          python wb_supply_calculator.py \
+            --mode "${{ steps.prep.outputs.mode }}" \
             --run-date "${{ steps.prep.outputs.run_date }}" \
-            --supplier-default-coeff "${{ github.event.inputs.supplier_default_coeff || '1.0' }}" \
-            --supplier-lead-days "${{ github.event.inputs.supplier_lead_days || '80' }}" \
-            --supplier-coverage-days "${{ github.event.inputs.supplier_coverage_days || '60' }}" \
-            --supplier-breakthrough-threshold "${{ github.event.inputs.supplier_breakthrough_threshold || '1.5' }}" \
-            --abc-target-month "${{ github.event.inputs.abc_target_month || '2026-03' }}"
+            --season-coeff "${{ steps.prep.outputs.season_coeff }}" \
+            --supplier-default-coeff "${{ steps.prep.outputs.supplier_default_coeff }}" \
+            --supplier-lead-days "${{ steps.prep.outputs.supplier_lead_days }}" \
+            --supplier-coverage-days "${{ steps.prep.outputs.supplier_coverage_days }}" \
+            --supplier-breakthrough-threshold "${{ steps.prep.outputs.supplier_breakthrough_threshold }}" \
+            --abc-target-month "${{ steps.prep.outputs.abc_target_month }}" \
+            --strategy-mode "${{ steps.prep.outputs.strategy_mode }}"
 
       - name: Upload output artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wb-supply-calculator-supplier-output
+          name: wb-supply-calculator-output
           path: |
             output/*.xlsx
             output/*.xlsm
