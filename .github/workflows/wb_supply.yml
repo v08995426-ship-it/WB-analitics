@@ -1,106 +1,94 @@
-name: WB Supply Calculation
+name: WB Supply Calculator Supplier
 
 on:
   workflow_dispatch:
     inputs:
-      store_name:
-        description: "Магазин: TOPFACE или MISS_TAIS"
-        required: true
-        default: "TOPFACE"
-        type: string
-
-      season_coeff:
-        description: "Коэффициент сезонности"
-        required: true
-        default: "1.0"
-        type: string
-
-      strategy_mode:
-        description: "Режим расчёта"
-        required: true
-        default: "default"
-        type: choice
-        options:
-          - default
-          - economy
-
       run_date:
-        description: "Дата расчёта YYYY-MM-DD. Если пусто — берётся сегодняшняя дата"
+        description: 'Дата расчёта YYYY-MM-DD. Если пусто — берётся текущая дата.'
         required: false
-        default: ""
-        type: string
+        default: ''
+      supplier_default_coeff:
+        description: 'Коэффициент по умолчанию для SKU вне плана'
+        required: false
+        default: '1.0'
+      supplier_lead_days:
+        description: 'Срок поставки от производителя, дней'
+        required: false
+        default: '80'
+      supplier_coverage_days:
+        description: 'Покрытие после приезда, дней'
+        required: false
+        default: '60'
+      supplier_breakthrough_threshold:
+        description: 'Порог статуса Прорыв'
+        required: false
+        default: '1.5'
+      abc_target_month:
+        description: 'Месяц ABC в формате YYYY-MM'
+        required: false
+        default: '2026-03'
+  schedule:
+    - cron: '0 3 * * *'
 
 jobs:
-  wb-supply:
+  run-supplier-calculation:
     runs-on: ubuntu-latest
-
-    env:
-      WB_S3_BUCKET: ${{ secrets.YC_BUCKET_NAME }}
-      WB_S3_ACCESS_KEY: ${{ secrets.YC_ACCESS_KEY_ID }}
-      WB_S3_SECRET_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      WB_S3_ENDPOINT: https://storage.yandexcloud.net
-      WB_S3_REGION: ru-central1
-
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-      WB_TEMPLATE_KEY: "Служебные файлы/Согласование поставки WB.xlsm"
-
-      WB_UPLOAD_RESULT_TO_S3: "1"
-      WB_OUTPUT_DIR: "output"
-      WB_SEND_TELEGRAM: "1"
-
-      WB_STORE: ${{ github.event.inputs.store_name }}
-      WB_SEASON_COEFF: ${{ github.event.inputs.season_coeff }}
-      WB_STRATEGY_MODE: ${{ github.event.inputs.strategy_mode }}
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set run date
-        shell: bash
-        run: |
-          if [ -n "${{ github.event.inputs.run_date }}" ]; then
-            echo "WB_RUN_DATE=${{ github.event.inputs.run_date }}" >> $GITHUB_ENV
-          else
-            echo "WB_RUN_DATE=$(date +%F)" >> $GITHUB_ENV
-          fi
-
-      - name: Check env presence
-        shell: bash
-        run: |
-          if [ -z "$WB_S3_BUCKET" ]; then echo "WB_S3_BUCKET is EMPTY"; else echo "WB_S3_BUCKET is set"; fi
-          if [ -z "$WB_S3_ACCESS_KEY" ]; then echo "WB_S3_ACCESS_KEY is EMPTY"; else echo "WB_S3_ACCESS_KEY is set"; fi
-          if [ -z "$WB_S3_SECRET_KEY" ]; then echo "WB_S3_SECRET_KEY is EMPTY"; else echo "WB_S3_SECRET_KEY is set"; fi
-          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo "TELEGRAM_BOT_TOKEN is EMPTY"; else echo "TELEGRAM_BOT_TOKEN is set"; fi
-          if [ -z "$TELEGRAM_CHAT_ID" ]; then echo "TELEGRAM_CHAT_ID is EMPTY"; else echo "TELEGRAM_CHAT_ID is set"; fi
-          echo "WB_STORE=$WB_STORE"
-          echo "WB_SEASON_COEFF=$WB_SEASON_COEFF"
-          echo "WB_STRATEGY_MODE=$WB_STRATEGY_MODE"
-          echo "WB_RUN_DATE=$WB_RUN_DATE"
-          echo "WB_TEMPLATE_KEY=$WB_TEMPLATE_KEY"
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          cat requirements.txt
-          pip install -r requirements.txt
+          pip install pandas numpy openpyxl boto3 botocore requests
 
-      - name: Run WB supply calculation
+      - name: Prepare run date
+        id: prep
         shell: bash
         run: |
-          python wb_supply_calculator.py
+          INPUT_RUN_DATE="${{ github.event.inputs.run_date }}"
+          if [ -n "$INPUT_RUN_DATE" ]; then
+            echo "run_date=$INPUT_RUN_DATE" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_date=$(date +%F)" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Upload artifacts
+      - name: Run supplier calculation
+        env:
+          WB_S3_BUCKET: ${{ secrets.WB_S3_BUCKET }}
+          WB_S3_ACCESS_KEY: ${{ secrets.WB_S3_ACCESS_KEY }}
+          WB_S3_SECRET_KEY: ${{ secrets.WB_S3_SECRET_KEY }}
+          WB_S3_ENDPOINT: ${{ secrets.WB_S3_ENDPOINT }}
+          WB_S3_REGION: ${{ secrets.WB_S3_REGION }}
+          WB_STORE: TOPFACE
+          WB_SEND_TELEGRAM: 'true'
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        shell: bash
+        run: |
+          python "wb_supply_calculator (1).py" \
+            --mode supplier \
+            --run-date "${{ steps.prep.outputs.run_date }}" \
+            --supplier-default-coeff "${{ github.event.inputs.supplier_default_coeff || '1.0' }}" \
+            --supplier-lead-days "${{ github.event.inputs.supplier_lead_days || '80' }}" \
+            --supplier-coverage-days "${{ github.event.inputs.supplier_coverage_days || '60' }}" \
+            --supplier-breakthrough-threshold "${{ github.event.inputs.supplier_breakthrough_threshold || '1.5' }}" \
+            --abc-target-month "${{ github.event.inputs.abc_target_month || '2026-03' }}"
+
+      - name: Upload output artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wb-supply-${{ github.event.inputs.store_name }}
-          path: output/*
-          if-no-files-found: error
+          name: wb-supply-calculator-supplier-output
+          path: |
+            output/*.xlsx
+            output/*.xlsm
+            output/*.csv
+          if-no-files-found: warn
