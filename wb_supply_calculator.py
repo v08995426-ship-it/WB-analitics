@@ -33,13 +33,51 @@ def env_bool(name: str, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def first_env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return default
+
+
 @dataclass
 class AppConfig:
-    bucket_name: str = os.getenv("WB_S3_BUCKET", "")
-    access_key: str = os.getenv("WB_S3_ACCESS_KEY", "")
-    secret_key: str = os.getenv("WB_S3_SECRET_KEY", "")
-    endpoint_url: str = os.getenv("WB_S3_ENDPOINT", "https://storage.yandexcloud.net")
-    region_name: str = os.getenv("WB_S3_REGION", "ru-central1")
+    bucket_name: str = field(default_factory=lambda: first_env(
+        "WB_S3_BUCKET",
+        "YC_BUCKET_NAME",
+        "YC_BUCKET",
+        "CLOUD_RU_BUCKET_NAME",
+        "CLOUD_RU_BUCKET",
+        default="",
+    ))
+    access_key: str = field(default_factory=lambda: first_env(
+        "WB_S3_ACCESS_KEY",
+        "YC_ACCESS_KEY_ID",
+        "CLOUD_RU_ACCESS_KEY_ID",
+        "CLOUD_RU_ACCESS_KEY",
+        default="",
+    ))
+    secret_key: str = field(default_factory=lambda: first_env(
+        "WB_S3_SECRET_KEY",
+        "YC_SECRET_ACCESS_KEY",
+        "CLOUD_RU_SECRET_ACCESS_KEY",
+        "CLOUD_RU_SECRET_KEY",
+        default="",
+    ))
+    endpoint_url: str = field(default_factory=lambda: first_env(
+        "WB_S3_ENDPOINT",
+        "YC_ENDPOINT_URL",
+        "YC_S3_ENDPOINT",
+        "CLOUD_RU_ENDPOINT_URL",
+        default="https://storage.yandexcloud.net",
+    ))
+    region_name: str = field(default_factory=lambda: first_env(
+        "WB_S3_REGION",
+        "YC_REGION",
+        "CLOUD_RU_REGION",
+        default="ru-central1",
+    ))
 
     store_name: str = os.getenv("WB_STORE", "TOPFACE").strip()
     run_date: datetime = datetime.strptime(
@@ -420,7 +458,7 @@ def largest_remainder_allocation(total: int, weights: Dict[str, float], minimum_
 class S3Storage:
     def __init__(self, cfg: AppConfig):
         if not cfg.bucket_name or not cfg.access_key or not cfg.secret_key:
-            raise ValueError("Не заданы параметры Object Storage. Нужны env: WB_S3_BUCKET, WB_S3_ACCESS_KEY, WB_S3_SECRET_KEY.")
+            raise ValueError("Не заданы параметры Object Storage. Поддерживаются env: WB_S3_BUCKET/WB_S3_ACCESS_KEY/WB_S3_SECRET_KEY или YC_BUCKET_NAME/YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY.")
 
         self.bucket = cfg.bucket_name
         self.s3 = boto3.client(
