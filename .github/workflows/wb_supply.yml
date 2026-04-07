@@ -115,11 +115,14 @@ jobs:
 
       - name: Run WB supply calculator
         env:
-          WB_S3_BUCKET: ${{ secrets.WB_S3_BUCKET }}
-          WB_S3_ACCESS_KEY: ${{ secrets.WB_S3_ACCESS_KEY }}
-          WB_S3_SECRET_KEY: ${{ secrets.WB_S3_SECRET_KEY }}
-          WB_S3_ENDPOINT: ${{ secrets.WB_S3_ENDPOINT }}
-          WB_S3_REGION: ${{ secrets.WB_S3_REGION }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          WB_S3_BUCKET: ${{ secrets.YC_BUCKET_NAME }}
+          WB_S3_ACCESS_KEY: ${{ secrets.YC_ACCESS_KEY_ID }}
+          WB_S3_SECRET_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          WB_S3_ENDPOINT: https://storage.yandexcloud.net
+          WB_S3_REGION: ru-central1
           WB_STORE: TOPFACE
           WB_SEND_TELEGRAM: 'true'
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
