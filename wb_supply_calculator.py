@@ -255,6 +255,12 @@ ONE_C_STOCK_COLUMNS: List[str] = [
     'Основной склад - ИП Куканянц И.Ю.',
 ]
 
+ONE_C_LOCAL_STOCK_COMPONENTS: List[Tuple[Tuple[str, ...], float, str]] = [
+    (('Адресный склад',), 1.0, 'Адресный склад'),
+    (('Оптовый склад Луганск- ООО "Хайлер"', 'Оптовый склад Луганск - ООО "Хайлер"'), 0.5, 'Оптовый склад Луганск- ООО "Хайлер"'),
+    (('Основной склад - ООО "Хайлер"', 'Основной склад ООО "Хайлер"'), 0.5, 'Основной склад - ООО "Хайлер"'),
+]
+
 
 def build_region_to_group() -> Dict[str, str]:
     mapping: Dict[str, str] = {}
@@ -352,7 +358,7 @@ def end_of_month(dt: datetime) -> datetime:
 
 
 def parse_ddmmyy_date(text_value: str) -> Optional[datetime]:
-    match = re.search(r"(\d{2})-(\d{2})-(\d{2})", text_value)
+    match = re.search(r"(\d{2})-(\d{2})-(\d{2,4})", text_value)
     if not match:
         return None
     day, month, year = map(int, match.groups())
@@ -361,6 +367,58 @@ def parse_ddmmyy_date(text_value: str) -> Optional[datetime]:
         return datetime(year, month, day)
     except ValueError:
         return None
+
+
+def read_transit_sheet(storage: S3Storage, key: str) -> pd.DataFrame:
+    file_bytes = storage.read_bytes(key)
+
+    try:
+        workbook = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, header=None)
+    except Exception as exc:
+        raise ValueError(f"Не удалось прочитать файл транзита {key}: {exc}") from exc
+
+    if isinstance(workbook, dict):
+        if "Основной заказ" in workbook:
+            raw = workbook["Основной заказ"]
+        else:
+            raw = next(iter(workbook.values()))
+    else:
+        raw = workbook
+
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    def build_headers(row_a: pd.Series, row_b: pd.Series) -> List[str]:
+        headers: List[str] = []
+        for a, b in zip(row_a.tolist(), row_b.tolist()):
+            a_text = normalize_text(a)
+            b_text = normalize_text(b)
+            if a_text and b_text:
+                headers.append(f"{a_text} | {b_text}")
+            elif b_text:
+                headers.append(b_text)
+            elif a_text:
+                headers.append(a_text)
+            else:
+                headers.append("")
+        return headers
+
+    has_second_header = False
+    if len(raw) >= 2:
+        second_row_values = [normalize_text(x).lower() for x in raw.iloc[1].tolist()]
+        transit_markers = ("заказ мп", "заказ опт", "заказ ритейл", "заказ магнит", "pcs")
+        has_second_header = any(any(marker in value for marker in transit_markers) for value in second_row_values)
+
+    if has_second_header:
+        headers = build_headers(raw.iloc[0], raw.iloc[1])
+        df = raw.iloc[2:].copy()
+        df.columns = headers
+    else:
+        df = raw.copy()
+        df.columns = [normalize_text(c) or f"col_{idx}" for idx, c in enumerate(df.columns)]
+
+    df = df.dropna(how="all").copy()
+    return df
 
 
 def parse_ddmmyyyy_range_from_key(key: str) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -1132,6 +1190,24 @@ def calculate_supply_plan(
 
 
 
+def resolve_1c_column_name(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    raw_columns = [normalize_text(col) for col in df.columns]
+    lower_map = {col.casefold(): col for col in raw_columns if col}
+    compact_map = {re.sub(r"\s+", " ", col).replace(" - ", "-").casefold(): col for col in raw_columns if col}
+
+    for candidate in candidates:
+        candidate_norm = normalize_text(candidate)
+        if not candidate_norm:
+            continue
+        direct = lower_map.get(candidate_norm.casefold())
+        if direct:
+            return direct
+        compact = compact_map.get(re.sub(r"\s+", " ", candidate_norm).replace(" - ", "-").casefold())
+        if compact:
+            return compact
+    return None
+
+
 def build_network_stock_summary(current_stock_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     if current_stock_df.empty:
         return {}
@@ -1149,13 +1225,33 @@ def build_network_stock_summary(current_stock_df: pd.DataFrame) -> Dict[str, Dic
 def build_local_stock_map(df_1c_stocks: pd.DataFrame) -> Dict[str, float]:
     if df_1c_stocks.empty or "Артикул" not in df_1c_stocks.columns:
         return {}
+
     df = df_1c_stocks.copy()
-    for col in ONE_C_STOCK_COLUMNS:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df.columns = [normalize_text(col) for col in df.columns]
     df["Артикул"] = df["Артикул"].map(normalize_text)
-    df["local_stock_total"] = df[ONE_C_STOCK_COLUMNS].sum(axis=1)
+
+    component_totals: List[str] = []
+    weighted_cols: List[str] = []
+
+    for aliases, weight, label in ONE_C_LOCAL_STOCK_COMPONENTS:
+        resolved_col = resolve_1c_column_name(df, aliases)
+        tmp_col = f"__local_component__{label}"
+        if resolved_col is None:
+            df[tmp_col] = 0.0
+            component_totals.append(f"{label}=0 (колонка не найдена)")
+        else:
+            source_values = pd.to_numeric(df[resolved_col], errors="coerce").fillna(0.0)
+            weighted_values = source_values * float(weight)
+            df[tmp_col] = weighted_values
+            component_totals.append(
+                f"{label}={round(source_values.sum()):,} × {weight:g} = {round(weighted_values.sum()):,}"
+            )
+        weighted_cols.append(tmp_col)
+
+    df["local_stock_total"] = df[weighted_cols].sum(axis=1)
+    total_local = round(float(df["local_stock_total"].sum()))
+    log("Остатки Липецк считаем как: " + " + ".join(component_totals) + f". Итого={total_local:,}")
+
     return (
         df.groupby("Артикул", as_index=False)["local_stock_total"]
         .sum()
@@ -1166,56 +1262,60 @@ def build_local_stock_map(df_1c_stocks: pd.DataFrame) -> Dict[str, float]:
 
 def load_transit_stock_map(storage: S3Storage, cfg: AppConfig, arrival_date: datetime) -> Dict[str, float]:
     keys = storage.list_keys(cfg.one_c_aux_prefix)
-    transit_keys = [k for k in keys if re.search(r"/В пути \d{2}-\d{2}-\d{2}\.xlsx$", k)]
+    transit_keys = [k for k in keys if re.search(r"/В пути \d{2}-\d{2}-(?:\d{2}|\d{4})\.xlsx$", k)]
     if not transit_keys:
+        log("⚠️ Не найдены файлы 'В пути ...xlsx' для расчёта транзита")
         return {}
 
     transit_map: Dict[str, float] = defaultdict(float)
+    included_files: List[Tuple[str, datetime, datetime]] = []
     for key in transit_keys:
         file_date = parse_ddmmyy_date(Path(key).name)
         if file_date is None:
+            log(f"⚠️ Не удалось распознать дату в файле транзита: {key}")
             continue
         available_date = file_date + timedelta(days=14)
         if available_date > arrival_date:
             continue
 
         try:
-            df = storage.read_excel(key, sheet_name="Основной заказ")
-            if isinstance(df, dict):
-                df = df.get("Основной заказ", next(iter(df.values())))
-        except Exception:
-            try:
-                df = storage.read_excel(key)
-                if isinstance(df, dict):
-                    df = df.get("Основной заказ", next(iter(df.values())))
-            except Exception as exc:
-                log(f"⚠️ Не удалось прочитать файл в пути {key}: {exc}")
-                continue
+            df = read_transit_sheet(storage, key)
+        except Exception as exc:
+            log(f"⚠️ Не удалось прочитать файл в пути {key}: {exc}")
+            continue
 
         if df is None or df.empty:
             continue
 
-        code_col = None
-        for col in df.columns:
-            col_str = str(col).strip()
-            if "CODE" in col_str.upper() or col_str == "CODES":
-                code_col = col
-                break
+        code_col = first_present_column(df, ["codes", "артикул 1с", "артикул", "code"])
         if code_col is None:
             code_col = df.columns[0]
 
-        qty_col = first_present_column(df, ["распределение мп", "количество", "qty", "шт"])
-        if qty_col is None and len(df.columns) > 6:
-            qty_col = df.columns[6]
+        qty_col = first_present_column(df, ["заказ мп", "распределение мп", "количество", "qty", "шт"])
         if qty_col is None:
-            log(f"⚠️ В файле {key} не найдена колонка количества для транзита")
+            qty_col = first_present_column(df, ["order | pcs", "order pcs", "order"])
+        if qty_col is None:
+            log(f"⚠️ В файле {key} не найдена колонка количества для транзита. Колонки: {list(df.columns)}")
             continue
 
+        file_qty_total = 0.0
         for _, row in df.iterrows():
             article_1c = normalize_text(row.get(code_col))
             qty = pd.to_numeric(row.get(qty_col), errors="coerce")
             if article_1c and pd.notna(qty):
-                transit_map[article_1c] += float(qty)
+                qty_value = float(qty)
+                transit_map[article_1c] += qty_value
+                file_qty_total += qty_value
+
+        included_files.append((Path(key).name, file_date, available_date))
+        log(
+            f"Транзит учтён из {Path(key).name}: колонка '{qty_col}', строк SKU={len(df)}, сумма={round(file_qty_total):,}, доступно с {available_date:%Y-%m-%d}"
+        )
+
+    if not transit_map:
+        log("⚠️ После чтения файлов транзита карта 'Товары в пути' пустая")
+    else:
+        log(f"Итого товаров в пути до приезда: {round(sum(transit_map.values())):,} шт. по {len(transit_map):,} артикулам 1С")
 
     return dict(transit_map)
 
@@ -1498,10 +1598,10 @@ def build_supplier_order_report(
                 "Артикул продавца": supplier_article,
                 "Артикул 1С": article_1c,
                 "Предмет": subject,
-                "Среднесуточные продажи 90д": round(float(sku["daily_base_avg90"]), 4),
-                "Среднесуточные продажи 14д": round(float(sku["daily_base_avg14"]), 4),
-                "Среднесуточные продажи расчетные": round(float(sku["daily_demand_base"]), 4),
-                "Среднесуточные продажи итоговые": round(daily_used, 4),
+                "Среднесуточные продажи 90д": round(float(sku["daily_base_avg90"]), 2),
+                "Среднесуточные продажи 14д": round(float(sku["daily_base_avg14"]), 2),
+                "Среднесуточные продажи расчетные": round(float(sku["daily_demand_base"]), 2),
+                "Среднесуточные продажи итоговые": round(daily_used, 2),
                 "Остаток WB доступный, шт": round(network_available),
                 "Остаток WB полный, шт": round(network_full),
                 "Остатки Липецк, шт": round(local_stock),
@@ -1537,7 +1637,7 @@ def build_supplier_order_report(
                     "Дней в сегменте": part["days"],
                     "Коэффициент": part["coeff"],
                     "Источник коэффициента": part["coeff_source"],
-                    "Среднесуточные после коэффициента": round(part["daily_after_coeff"], 4),
+                    "Среднесуточные после коэффициента": round(part["daily_after_coeff"], 2),
                     "Прогноз, шт": round(part["units"], 4),
                 }
             )
@@ -1553,7 +1653,7 @@ def build_supplier_order_report(
                     "Дней в сегменте": part["days"],
                     "Коэффициент": part["coeff"],
                     "Источник коэффициента": part["coeff_source"],
-                    "Среднесуточные после коэффициента": round(part["daily_after_coeff"], 4),
+                    "Среднесуточные после коэффициента": round(part["daily_after_coeff"], 2),
                     "Прогноз, шт": round(part["units"], 4),
                 }
             )
@@ -1591,6 +1691,16 @@ def style_supplier_workbook(path: str) -> None:
         wb.save(path)
         wb.close()
         return
+
+    for sheet_name in ["Заказ в Турцию", "Помесячный расчет"]:
+        if sheet_name not in wb.sheetnames:
+            continue
+        sheet = wb[sheet_name]
+        for col_idx in range(1, sheet.max_column + 1):
+            header_value = normalize_text(sheet.cell(1, col_idx).value)
+            if "Среднесуточные" in header_value:
+                for row_idx in range(2, sheet.max_row + 1):
+                    sheet.cell(row_idx, col_idx).number_format = "0.00"
 
     ws = wb["Заказ в Турцию"]
     header_map = {normalize_text(ws.cell(1, col).value): col for col in range(1, ws.max_column + 1)}
@@ -1667,7 +1777,7 @@ def run_supplier_mode(
     style_supplier_workbook(output_path)
     style_supplier_workbook(debug_path)
 
-    files_to_send = [output_path, debug_path, stocks_1c_local]
+    files_to_send = [output_path]
     send_results_to_telegram(cfg, files_to_send)
 
     log(f"Сохранён supplier-файл: {output_path}")
