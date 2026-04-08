@@ -43,6 +43,7 @@ KEYWORDS_WEEKLY_PREFIX = f"Отчёты/Поисковые запросы/{STORE
 
 SERVICE_ROOT = f"Служебные файлы/Ассистент WB/{STORE_NAME}/"
 OUT_PREVIEW = SERVICE_ROOT + "Предпросмотр_последнего_запуска.xlsx"
+OUT_LATEST = SERVICE_ROOT + "Итог_последнего_запуска.xlsx"
 OUT_SUMMARY = SERVICE_ROOT + "Сводка_последнего_запуска.json"
 OUT_ARCHIVE = SERVICE_ROOT + "Архив_решений.xlsx"
 OUT_BID_HISTORY = SERVICE_ROOT + "История_ставок.xlsx"
@@ -57,7 +58,7 @@ OUT_SHADE_TESTS = SERVICE_ROOT + "Тесты_оттенков.xlsx"
 OUT_BENCHMARK = SERVICE_ROOT + "Сравнение_с_сильными_РК.xlsx"
 
 # Единый итоговый файл. Все отчёты пишем только сюда.
-OUT_SINGLE_REPORT = OUT_PREVIEW
+OUT_SINGLE_REPORT = OUT_LATEST
 
 MIN_RATING_SHADE = 4.6
 MATURE_START_OFFSET = 7
@@ -1198,29 +1199,77 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
     cpc_gp_after = safe_float(row.get("ВП после рекламы CPC, ₽"))
     cpm_gp_after = safe_float(row.get("ВП после рекламы Полок, ₽"))
 
-    # Strategic override: when CPC is the more efficient channel, shift budget from expensive shelves into search.
-    if has_cpc and has_cpm and cpc_preferred:
-        if payment_type == "cpm":
-            target = finalize_bid(cfg.cpm_floor_bid)
+    # Strategic channel allocation: do not force shelves to a fixed base; compare channels by CPO, orders and GP.
+    if has_cpc and has_cpm:
+        cpo_adv = max(cfg.channel_cpo_advantage, 0.05)
+        cpc_has_cpo = cpc_cpo > 0
+        cpm_has_cpo = cpm_cpo > 0
+        cpc_profitable = cpc_gp_after > 0
+        cpm_profitable = cpm_gp_after > 0
+        cpc_better = cpc_preferred or (
+            (cpc_has_cpo and cpm_has_cpo and cpc_cpo <= cpm_cpo * (1 - cpo_adv))
+            or (cpc_profitable and cpc_gp_after >= max(cpm_gp_after, 0) * 1.05)
+        )
+        cpm_better = cpm_preferred or (
+            (cpc_has_cpo and cpm_has_cpo and cpm_cpo <= cpc_cpo * (1 - cpo_adv))
+            or (cpm_profitable and cpm_gp_after >= max(cpc_gp_after, 0) * 1.05)
+        )
+        cpm_ok_to_hold = cpm_profitable and (
+            (not cpc_has_cpo)
+            or (not cpm_has_cpo)
+            or cpm_cpo <= cpc_cpo * (1 + cpo_adv)
+        )
+
+        if payment_type == "cpm" and cpc_better and not cpm_better:
             reason = (
-                f"Перераспределяем бюджет из дорогих Полок в CPC: CPO CPC {cpc_cpo:.2f} ₽, Полки {cpm_cpo:.2f} ₽; "
+                f"CPC выигрывает по весам: CPO CPC {cpc_cpo:.2f} ₽, Полки {cpm_cpo:.2f} ₽; "
+                f"ВП CPC {cpc_gp_after:.2f} ₽, Полки {cpm_gp_after:.2f} ₽; "
                 f"ДРР CPC {cpc_drr_pct:.2f}%, Полки {cpm_drr_pct:.2f}%"
             )
-            if current_bid > target + 0.01:
-                return "Снизить", target, reason + "; Полки держим на базовой ставке", True
-            return "Без изменений", current_bid, reason + "; Полки уже на базовой ставке", True
+            if (not cpm_ok_to_hold) or blended_drr > cfg.max_drr or cpm_gp_after <= 0:
+                target = current_bid
+                if hard_cap_bid > 0:
+                    target = min(target, hard_cap_bid)
+                target = min(target, current_bid * (1 - cfg.down_step))
+                target = finalize_bid(target)
+                if target < current_bid - 0.01:
+                    return "Снизить", target, reason + "; Полки ослабляем, чтобы не покупать дорогой заказ", True
+            return "Без изменений", current_bid, reason + "; Полки прибыльны, рост Полок тормозим и сначала тестируем рост CPC", rate_limit
 
-        if payment_type == "cpc" and cpc_can_scale and safe_max_bid > current_bid + 0.01:
+        if payment_type == "cpc" and cpc_better and cpc_can_scale and safe_max_bid > current_bid + 0.01:
             step = cfg.cpc_shift_up_step if blended_drr <= cfg.max_drr else cfg.test_up_step
             proposed = max(current_bid + 1.0, round(current_bid * (1 + step), 2))
             new_bid = min(round(safe_max_bid, 2), proposed)
             if new_bid > current_bid + 0.01:
                 reason = (
-                    f"После снижения дорогих Полок усиливаем CPC: CPO CPC {cpc_cpo:.2f} ₽, Полки {cpm_cpo:.2f} ₽; "
-                    f"ВП CPC {cpc_gp_after:.2f} ₽ >= Полки {cpm_gp_after:.2f} ₽"
+                    f"Даём новый трафик каналу с лучшими весами: CPO CPC {cpc_cpo:.2f} ₽, Полки {cpm_cpo:.2f} ₽; "
+                    f"ВП CPC {cpc_gp_after:.2f} ₽, Полки {cpm_gp_after:.2f} ₽"
                 )
                 action = "Тест роста" if blended_drr > cfg.comfort_drr_max else "Повысить"
                 return action, new_bid, reason, False
+
+        if payment_type == "cpm" and cpm_better and safe_max_bid > current_bid + 0.01 and cpm_profitable and order_growth >= -cfg.unclear_band_pct:
+            proposed = max(current_bid + 1.0, round(current_bid * (1 + (cfg.test_up_step if blended_drr > cfg.comfort_drr_max else cfg.max_up_step)), 2))
+            new_bid = min(round(safe_max_bid, 2), proposed)
+            if new_bid > current_bid + 0.01:
+                reason = (
+                    f"Полки сейчас выигрывают по весам: CPO Полок {cpm_cpo:.2f} ₽ против CPC {cpc_cpo:.2f} ₽; "
+                    f"ВП Полок {cpm_gp_after:.2f} ₽, CPC {cpc_gp_after:.2f} ₽"
+                )
+                action = "Тест роста" if blended_drr > cfg.comfort_drr_max else "Повысить"
+                return action, new_bid, reason, rate_limit
+
+        if payment_type == "cpc" and cpm_better and blended_drr > cfg.max_drr and cpc_has_cpo and cpm_has_cpo and cpc_cpo >= cpm_cpo * (1 + cpo_adv):
+            target = current_bid
+            if hard_cap_bid > 0:
+                target = min(target, hard_cap_bid)
+            target = finalize_bid(min(target, current_bid * (1 - cfg.down_step)))
+            if target < current_bid - 0.01:
+                reason = (
+                    f"Полки лучше по весам, а общий ДРР уже высокий: CPO CPC {cpc_cpo:.2f} ₽, Полки {cpm_cpo:.2f} ₽; "
+                    f"ВП CPC {cpc_gp_after:.2f} ₽, Полки {cpm_gp_after:.2f} ₽"
+                )
+                return "Снизить", target, reason, rate_limit
 
     # If no reliable limits and no sales, collect data only
     if hard_cap_bid <= 0 and total_orders <= 0 and ad_orders <= 0:
@@ -2208,6 +2257,45 @@ def _load_previous_decision_sheets(provider: BaseProvider) -> Dict[str, pd.DataF
 
 
 def _extract_last_change_state(old_sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    hist = old_sheets.get("История ставок", pd.DataFrame()).copy()
+    rows: List[Dict[str, Any]] = []
+
+    if not hist.empty and any(c in hist.columns for c in ["Плейсмент", "new_bid_rub", "Новая ставка, ₽"]):
+        hist["Дата запуска"] = pd.to_datetime(hist.get("Дата запуска"), errors="coerce")
+        hist["ID кампании"] = pd.to_numeric(hist.get("ID кампании"), errors="coerce")
+        hist["Артикул WB"] = pd.to_numeric(hist.get("Артикул WB"), errors="coerce")
+        hist["Плейсмент"] = hist.get("Плейсмент", "").astype(str)
+        hist["prev_bid_rub"] = pd.to_numeric(hist.get("prev_bid_rub", hist.get("Текущая ставка, ₽")), errors="coerce")
+        hist["new_bid_rub"] = pd.to_numeric(hist.get("new_bid_rub", hist.get("Новая ставка, ₽")), errors="coerce")
+        hist["prev_action"] = hist.get("prev_action", hist.get("Действие", "")).astype(str)
+        hist = hist.dropna(subset=["ID кампании", "Артикул WB", "Дата запуска"]).copy()
+        hist = hist[(hist["new_bid_rub"].round(2) != hist["prev_bid_rub"].round(2))].copy()
+        if not hist.empty:
+            hist["direction"] = np.where(hist["new_bid_rub"] > hist["prev_bid_rub"], "up", "down")
+            hist = hist.sort_values(["ID кампании", "Артикул WB", "Плейсмент", "Дата запуска"]).copy()
+            for (cid, nmid, placement), grp in hist.groupby(["ID кампании", "Артикул WB", "Плейсмент"], dropna=False):
+                grp = grp.sort_values("Дата запуска")
+                last = grp.iloc[-1]
+                same = 1
+                last_dir = last["direction"]
+                for i in range(len(grp)-2, -1, -1):
+                    if grp.iloc[i]["direction"] == last_dir:
+                        same += 1
+                    else:
+                        break
+                rows.append({
+                    "ID кампании": int(cid),
+                    "Артикул WB": int(nmid),
+                    "Плейсмент": placement,
+                    "last_change_date": pd.to_datetime(last["Дата запуска"], errors="coerce"),
+                    "prev_bid_rub": safe_float(last["prev_bid_rub"]),
+                    "last_applied_bid_rub": safe_float(last["new_bid_rub"]),
+                    "prev_action": str(last["prev_action"]),
+                    "prev_direction": last_dir,
+                    "same_direction_steps": same,
+                })
+            return pd.DataFrame(rows)
+
     archive = old_sheets.get("Архив решений", old_sheets.get("Архив_решений", pd.DataFrame())).copy()
     if archive.empty:
         return pd.DataFrame(columns=["ID кампании","Артикул WB","Плейсмент","last_change_date","prev_bid_rub","prev_action","same_direction_steps"])
@@ -2272,7 +2360,7 @@ def apply_experiment_state(decisions_df: pd.DataFrame, window: Dict[str, date], 
         out["prev_direction"] = ""
         out["same_direction_steps"] = 0
 
-    out["days_since_last_change"] = out["last_change_date"].apply(lambda x: (window["cur_end"] - x.date()).days if pd.notna(x) else np.nan)
+    out["days_since_last_change"] = out["last_change_date"].apply(lambda x: max((window["cur_end"] - min(x.date(), window["cur_end"])).days, 0) if pd.notna(x) else np.nan)
     out["planned_direction"] = np.where(out["Новая ставка, ₽"] > out["Текущая ставка, ₽"], "up", np.where(out["Новая ставка, ₽"] < out["Текущая ставка, ₽"], "down", "flat"))
     out["Оценка последнего изменения"] = "Нет активного теста"
     out["Статус решения по ставке"] = "Готово к действию"
@@ -2589,28 +2677,71 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     eff_sheets = results.get("eff_history_sheets", {}) or {}
 
     provider.write_excel(OUT_SINGLE_REPORT, single_report_sheets)
+    # Legacy compatibility: keep the old preview filename updated too, but mode inside the file is factual.
+    if OUT_SINGLE_REPORT != OUT_PREVIEW:
+        provider.write_excel(OUT_PREVIEW, single_report_sheets)
     if eff_sheets:
         provider.write_excel(OUT_EFF, eff_sheets)
 
 
-def build_history_append(changed: pd.DataFrame, as_of_date: date) -> pd.DataFrame:
-    if changed.empty:
+def build_history_append_from_success(decisions: pd.DataFrame, bid_send_log: Optional[pd.DataFrame], as_of_date: date) -> pd.DataFrame:
+    if bid_send_log is None or bid_send_log.empty:
         return pd.DataFrame()
-    rows = []
+
+    success_logs = bid_send_log[bid_send_log["status"].astype(str) == "ok"].copy()
+    if success_logs.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
     week = f"{as_of_date.isocalendar().year}-W{as_of_date.isocalendar().week:02d}"
-    for _, r in changed.iterrows():
-        placement = normalize_internal_placement(r.get("Плейсмент"))
-        bid_kop = normalize_bid_for_wb(r.get("Новая ставка, ₽"), "cpc" if "cpc" in str(r.get("Тип кампании", "")).lower() else "cpm", placement)
-        rows.append({
-            "Дата запуска": now_ts(),
-            "Неделя": week,
-            "ID кампании": safe_int(r.get("ID кампании")),
-            "Артикул WB": safe_int(r.get("Артикул WB")),
-            "Тип кампании": r.get("Тип кампании"),
-            "Ставка поиск, коп": bid_kop if placement in {"search", "combined"} else 0,
-            "Ставка рекомендации, коп": bid_kop if placement in {"recommendation", "combined"} else 0,
-            "Стратегия": "STABLE_V2",
-        })
+
+    for _, log_row in success_logs.iterrows():
+        request_body = log_row.get("request_body")
+        try:
+            payload = json.loads(request_body) if isinstance(request_body, str) and request_body else request_body
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            continue
+
+        for block in payload.get("bids", []) or []:
+            advert = safe_int(block.get("advert_id"))
+            for nm_bid in block.get("nm_bids", []) or []:
+                nm_id = safe_int(nm_bid.get("nm_id"))
+                placement = normalize_internal_placement(nm_bid.get("placement") or log_row.get("placement"))
+                bid_kop = safe_int(nm_bid.get("bid_kopecks"))
+                bid_rub = round(bid_kop / 100.0, 2) if bid_kop else 0.0
+                mask = (
+                    decisions["ID кампании"].map(safe_int).eq(advert)
+                    & decisions["Артикул WB"].map(safe_int).eq(nm_id)
+                    & decisions["Плейсмент"].astype(str).map(normalize_internal_placement).eq(placement)
+                )
+                match = decisions[mask].head(1)
+                if match.empty and placement in {"search", "recommendation"}:
+                    mask = (
+                        decisions["ID кампании"].map(safe_int).eq(advert)
+                        & decisions["Артикул WB"].map(safe_int).eq(nm_id)
+                        & decisions["Плейсмент"].astype(str).map(normalize_internal_placement).eq("combined")
+                    )
+                    match = decisions[mask].head(1)
+                if match.empty:
+                    continue
+                src = match.iloc[0]
+                rows.append({
+                    "Дата запуска": now_ts(),
+                    "Неделя": week,
+                    "ID кампании": advert,
+                    "Артикул WB": nm_id,
+                    "Плейсмент": placement,
+                    "Тип кампании": src.get("Тип кампании"),
+                    "prev_bid_rub": round(safe_float(src.get("Текущая ставка, ₽")), 2),
+                    "new_bid_rub": bid_rub,
+                    "prev_action": src.get("Действие"),
+                    "direction": "up" if bid_rub > safe_float(src.get("Текущая ставка, ₽")) else ("down" if bid_rub < safe_float(src.get("Текущая ставка, ₽")) else "flat"),
+                    "Ставка поиск, коп": bid_kop if placement in {"search", "combined"} else 0,
+                    "Ставка рекомендации, коп": bid_kop if placement in {"recommendation", "combined"} else 0,
+                    "Стратегия": "STABLE_V3",
+                })
     return pd.DataFrame(rows)
 
 
@@ -2692,6 +2823,18 @@ def build_actual_bid_changes_sheet(decisions: pd.DataFrame, bid_send_log: Option
         return pd.DataFrame([{"Комментарий": "В логе WB нет пригодных данных по фактически изменённым ставкам"}])
     return pd.DataFrame(rows).drop_duplicates()
 
+def resolve_mode(raw_mode: Optional[str]) -> str:
+    ci = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
+    allow_preview_ci = os.getenv("WB_ALLOW_PREVIEW_ON_CI", "").strip().lower() in {"1", "true", "yes", "y"}
+    mode = (raw_mode or "").strip().lower()
+    if mode not in {"preview", "run"}:
+        return "run" if ci else "preview"
+    if ci and mode == "preview" and not allow_preview_ci:
+        log("⚠️ GitHub Actions detected: preview принудительно заменён на run. Для preview в CI задайте WB_ALLOW_PREVIEW_ON_CI=1")
+        return "run"
+    return mode
+
+
 def run_manager(args: argparse.Namespace) -> None:
     API_CALL_LOGS.clear()
     MIN_BID_ROWS.clear()
@@ -2725,7 +2868,7 @@ def run_manager(args: argparse.Namespace) -> None:
         payload = decisions_to_payload(decisions)
         bid_send_log = send_payload(payload, api_key, dry_run=not bool(api_key))
         log(f"📤 Отправлено блоков в WB: {len(payload.get('bids', []))}")
-        history_append = build_history_append(changed, as_of_date)
+        history_append = build_history_append_from_success(decisions, bid_send_log, as_of_date)
 
         if apply_shades_flag:
             shade_apply_log, updated_shade_actions, tests_df = apply_shade_actions(results["shade_actions"], api_key, dry_run=not bool(api_key))
@@ -2744,7 +2887,7 @@ def run_manager(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Стабильный менеджер ставок WB для TOPFACE")
-    p.add_argument("mode", choices=["preview","run"], help="preview = только рекомендации, run = применить ставки")
+    p.add_argument("mode", nargs="?", choices=["preview","run"], default=None, help="preview = только рекомендации, run = применить ставки; в GitHub Actions по умолчанию будет run")
     p.add_argument("--apply-shades", dest="apply_shades", action="store_true", default=None, help="Применить рекомендации по оттенкам через API")
     p.add_argument("--skip-shades", dest="apply_shades", action="store_false", help="Не применять рекомендации по оттенкам")
     p.add_argument("--local-data-dir", default="", help="Локальная папка с файлами")
