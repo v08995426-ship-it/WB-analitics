@@ -47,8 +47,6 @@ on:
         options:
           - default
           - economy
-  schedule:
-    - cron: '0 3 * * *'
 
 jobs:
   run-calculation:
