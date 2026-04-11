@@ -1,0 +1,77 @@
+name: ALOR BR 5m Intraday Robot
+
+on:
+  schedule:
+    - cron: '*/5 * * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: alor-br-5m-robot
+  cancel-in-progress: false
+
+jobs:
+  run-robot:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests pyarrow
+
+      - name: Run robot
+        shell: pwsh
+        env:
+          ALOR_TR_ENV: ${{ secrets.ALOR_TR_ENV }}
+          ALOR_TR_REFRESH_TOKEN: ${{ secrets.ALOR_TR_REFRESH_TOKEN }}
+          ALOR_TR_PORTFOLIO: ${{ secrets.ALOR_TR_PORTFOLIO }}
+          ALOR_TR_EXCHANGE: ${{ secrets.ALOR_TR_EXCHANGE }}
+          ALOR_TR_INSTRUMENT_GROUP: ${{ secrets.ALOR_TR_INSTRUMENT_GROUP }}
+          ALOR_TR_BASE_SYMBOL: ${{ secrets.ALOR_TR_BASE_SYMBOL }}
+          ALOR_TR_DATA_DIR: ${{ secrets.ALOR_TR_DATA_DIR }}
+          ALOR_TR_TIMEZONE: ${{ secrets.ALOR_TR_TIMEZONE }}
+          ALOR_TR_ENABLE_TRADING: ${{ secrets.ALOR_TR_ENABLE_TRADING }}
+          ALOR_TR_ORDER_QTY: ${{ secrets.ALOR_TR_ORDER_QTY }}
+          ALOR_TR_CANDLE_LOOKBACK_DAYS: ${{ secrets.ALOR_TR_CANDLE_LOOKBACK_DAYS }}
+          ALOR_TR_BREAKOUT_LOOKBACK: ${{ secrets.ALOR_TR_BREAKOUT_LOOKBACK }}
+          ALOR_TR_EMA_FAST: ${{ secrets.ALOR_TR_EMA_FAST }}
+          ALOR_TR_EMA_MID: ${{ secrets.ALOR_TR_EMA_MID }}
+          ALOR_TR_EMA_SLOW: ${{ secrets.ALOR_TR_EMA_SLOW }}
+          ALOR_TR_RSI_LEN: ${{ secrets.ALOR_TR_RSI_LEN }}
+          ALOR_TR_ATR_LEN: ${{ secrets.ALOR_TR_ATR_LEN }}
+          ALOR_TR_MIN_RSI_LONG: ${{ secrets.ALOR_TR_MIN_RSI_LONG }}
+          ALOR_TR_MAX_RSI_LONG: ${{ secrets.ALOR_TR_MAX_RSI_LONG }}
+          ALOR_TR_MIN_RSI_SHORT: ${{ secrets.ALOR_TR_MIN_RSI_SHORT }}
+          ALOR_TR_MAX_RSI_SHORT: ${{ secrets.ALOR_TR_MAX_RSI_SHORT }}
+          ALOR_TR_MIN_VOL_RATIO: ${{ secrets.ALOR_TR_MIN_VOL_RATIO }}
+          ALOR_TR_MIN_ATR_TICKS: ${{ secrets.ALOR_TR_MIN_ATR_TICKS }}
+          ALOR_TR_MAX_ATR_TICKS: ${{ secrets.ALOR_TR_MAX_ATR_TICKS }}
+          ALOR_TR_MAX_SPREAD_TICKS: ${{ secrets.ALOR_TR_MAX_SPREAD_TICKS }}
+          ALOR_TR_MAX_SIGNAL_BAR_TICKS: ${{ secrets.ALOR_TR_MAX_SIGNAL_BAR_TICKS }}
+          ALOR_TR_MIN_OB_IMBALANCE_LONG: ${{ secrets.ALOR_TR_MIN_OB_IMBALANCE_LONG }}
+          ALOR_TR_MAX_OB_IMBALANCE_SHORT: ${{ secrets.ALOR_TR_MAX_OB_IMBALANCE_SHORT }}
+          ALOR_TR_TAKE_TICKS: ${{ secrets.ALOR_TR_TAKE_TICKS }}
+          ALOR_TR_STOP_TICKS: ${{ secrets.ALOR_TR_STOP_TICKS }}
+          ALOR_TR_BREAKEVEN_TICKS: ${{ secrets.ALOR_TR_BREAKEVEN_TICKS }}
+          ALOR_TR_NO_ENTRY_LAST_MINUTES: ${{ secrets.ALOR_TR_NO_ENTRY_LAST_MINUTES }}
+          ALOR_TR_FORCE_EXIT_LAST_MINUTES: ${{ secrets.ALOR_TR_FORCE_EXIT_LAST_MINUTES }}
+          ALOR_TR_SESSION_WARMUP_MINUTES: ${{ secrets.ALOR_TR_SESSION_WARMUP_MINUTES }}
+          ALOR_TR_DAY_SESSION_START: ${{ secrets.ALOR_TR_DAY_SESSION_START }}
+          ALOR_TR_DAY_SESSION_END: ${{ secrets.ALOR_TR_DAY_SESSION_END }}
+          ALOR_TR_EVENING_SESSION_START: ${{ secrets.ALOR_TR_EVENING_SESSION_START }}
+          ALOR_TR_EVENING_SESSION_END: ${{ secrets.ALOR_TR_EVENING_SESSION_END }}
+          ALOR_TR_ORDER_ESTIMATE_REQUIRED: ${{ secrets.ALOR_TR_ORDER_ESTIMATE_REQUIRED }}
+          ALOR_TR_ALLOW_MARGIN: ${{ secrets.ALOR_TR_ALLOW_MARGIN }}
+          ALOR_TR_REQUEST_SLEEP_SEC: ${{ secrets.ALOR_TR_REQUEST_SLEEP_SEC }}
+          ALOR_TR_READ_TIMEOUT_SEC: ${{ secrets.ALOR_TR_READ_TIMEOUT_SEC }}
+        run: |
+          python alor_br_5m_intraday_robot_fixed.py
