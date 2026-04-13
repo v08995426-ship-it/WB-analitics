@@ -2441,7 +2441,7 @@ def run_manager(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Стабильный менеджер ставок WB для TOPFACE")
-    p.add_argument("mode", choices=["preview","run"], help="preview = только рекомендации, run = применить ставки")
+    p.add_argument("mode", nargs="?", default="run", choices=["preview","run"], help="preview = только рекомендации, run = применить ставки")
     p.add_argument("--apply-shades", dest="apply_shades", action="store_true", default=None, help="Применить рекомендации по оттенкам через API")
     p.add_argument("--skip-shades", dest="apply_shades", action="store_false", help="Не применять рекомендации по оттенкам")
     p.add_argument("--local-data-dir", default="", help="Локальная папка с файлами")
