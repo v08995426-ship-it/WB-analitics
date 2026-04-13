@@ -36,13 +36,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WB_STOP_LIST_KEY: ${{ secrets.WB_STOP_LIST_KEY }}
-
           WB_FORCE_SEND: ${{ github.event_name == 'workflow_dispatch' }}
-        run: python wb_stock_days_report.py
-
-      - name: Upload report artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wb-stock-days-report
-          path: output/*.xlsx
-          if-no-files-found: error
+        run: python wb_stock_days_report.py run
