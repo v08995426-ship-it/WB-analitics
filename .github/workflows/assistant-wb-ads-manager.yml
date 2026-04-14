@@ -1,105 +1,64 @@
-name: assistant_wb_ads_manager
+name: Daily TOPFACE Ads Manager
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Режим запуска'
-        required: true
-        type: choice
-        default: preview
-        options:
-          - preview
-          - run
-      confirm_live:
-        description: 'Подтвердить live-отправку ставок (нужно только для mode=run)'
-        required: false
-        type: boolean
-        default: false
-      as_of_date:
-        description: 'Дата запуска в формате YYYY-MM-DD (необязательно)'
-        required: false
-        type: string
-        default: ''
   schedule:
-    # 03:15 UTC = 06:15 Москва
-    - cron: '15 3 * * *'
-
-concurrency:
-  group: assistant-wb-ads-manager-topface
-  cancel-in-progress: false
+    - cron: '15 6 * * *'
 
 jobs:
-  preview_daily:
-    if: github.event_name == 'schedule'
+  run-topface-ads-manager:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
+    timeout-minutes: 90
+
     env:
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      PYTHONUNBUFFERED: '1'
+      PYTHONUNBUFFERED: "1"
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 pandas openpyxl requests botocore
+          pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy
 
-      - name: Run preview (scheduled safe mode)
+      - name: Verify required secrets
         run: |
-          python assistant_wb_ads_manager.py preview
+          python - <<'PY'
+          import os, sys
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+          missing = [k for k in required if not os.getenv(k)]
+          if missing:
+              print("Missing required secrets:", ", ".join(missing))
+              sys.exit(1)
+          print("All required secrets are present.")
+          PY
 
-  manual_run:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      PYTHONUNBUFFERED: '1'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Run TOPFACE Ads Manager (LIVE)
+        run: |
+          python assistant_wb_ads_manager.py run
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install boto3 pandas openpyxl requests botocore
-
-      - name: Validate live confirmation
-        if: ${{ inputs.mode == 'run' && inputs.confirm_live != true }}
-        run: |
-          echo 'Для mode=run нужно поставить confirm_live=true'
-          exit 1
-
-      - name: Run selected mode without as_of_date
-        if: ${{ inputs.as_of_date == '' }}
-        run: |
-          python assistant_wb_ads_manager.py ${{ inputs.mode }}
-
-      - name: Run selected mode with as_of_date
-        if: ${{ inputs.as_of_date != '' }}
-        run: |
-          python assistant_wb_ads_manager.py ${{ inputs.mode }} --as-of-date "${{ inputs.as_of_date }}"
+          name: topface-ads-manager-results
+          path: |
+            *.xlsx
+            *.json
+          if-no-files-found: warn
+          retention-days: 14
