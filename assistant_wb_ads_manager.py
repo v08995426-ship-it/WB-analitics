@@ -235,6 +235,35 @@ def safe_float(v: Any, default: float = 0.0) -> float:
     except Exception:
         return default
 
+
+
+def ensure_business_keys(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    out = df.copy()
+    if 'nmId' not in out.columns:
+        for c in ['Артикул WB', 'nm_id', 'nmID']:
+            if c in out.columns:
+                out['nmId'] = out[c]
+                break
+    if 'supplier_article' not in out.columns:
+        for c in ['Артикул продавца', 'supplier_article_x', 'supplier_article_y', 'supplierArticle', 'supplierArticle_x', 'supplierArticle_y', 'control_key']:
+            if c in out.columns:
+                out['supplier_article'] = out[c]
+                break
+    if 'subject' not in out.columns:
+        for c in ['Предмет', 'subject_norm']:
+            if c in out.columns:
+                out['subject'] = out[c]
+                break
+    if 'Артикул WB' not in out.columns and 'nmId' in out.columns:
+        out['Артикул WB'] = out['nmId']
+    if 'Артикул продавца' not in out.columns and 'supplier_article' in out.columns:
+        out['Артикул продавца'] = out['supplier_article']
+    if 'Предмет' not in out.columns and 'subject' in out.columns:
+        out['Предмет'] = out['subject']
+    return out
+
 def safe_int(v: Any, default: int = 0) -> int:
     try:
         if pd.isna(v):
@@ -2825,6 +2854,7 @@ def build_daily_item_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, funn
         'query_freq':'Частота запросов','median_position':'Медианная позиция','visibility_pct':'Видимость, %',
         'addToCartConversion':'Конверсия в корзину, %','cartToOrderConversion':'Конверсия в заказ, %','buyout_rate':'% выкупа'
     })
+    out = ensure_business_keys(out)
     wanted = ['Дата','Товар','Артикул WB','Артикул продавца','Предмет','Заказы','Сумма_заказов','% выкупа','Расходы_РК','Валовая прибыль после рекламы, ₽','Клики','CPO, ₽','Прогнозная чистая прибыль, ₽','Показы','Заказы_РК','Выручка_РК','ДРР, доля','Конверсия в корзину, %','Конверсия в заказ, %','Частота запросов','Медианная позиция','Видимость, %','День зрелый']
     for c in wanted:
         if c not in out.columns:
@@ -2856,6 +2886,7 @@ def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFram
     if 'subject' not in df.columns:
         df['subject'] = df.get('subject_norm', '')
     df = df.rename(columns={'date':'Дата','nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет','id_campaign':'ID кампании','current_bid_rub':'Ставка, ₽','placement':'Плейсмент'})
+    df = ensure_business_keys(df)
     wanted = ['Дата','ID кампании','Артикул WB','Артикул продавца','Предмет','Тип','Плейсмент','Ставка, ₽','Показы','Клики','Заказы_РК','Выручка_РК','Расходы_РК','ДРР кампании, доля','ВП кампании после рекламы, ₽','ROI кампании','CPO кампании, ₽','День зрелый']
     for c in wanted:
         if c not in df.columns:
@@ -3037,24 +3068,28 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     ) if not ads_daily.empty else pd.DataFrame(columns=['id_campaign','nmId','base_Показы','base_Клики','base_Заказы','base_Расход','base_Сумма_заказов'])
 
     rows = campaigns_base.merge(cur, on=['id_campaign','nmId'], how='left').merge(base, on=['id_campaign','nmId'], how='left').fillna(0)
+    rows = ensure_business_keys(rows)
     if 'supplier_article' not in rows.columns:
-        for c in ['supplier_article_x','supplier_article_y','supplierArticle','supplierArticle_x','supplierArticle_y']:
-            if c in rows.columns:
-                rows['supplier_article'] = rows[c]
-                break
-        if 'supplier_article' not in rows.columns:
-            rows['supplier_article'] = ''
+        rows['supplier_article'] = ''
     rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
-    rows['Артикул продавца'] = rows['supplier_article']
-    rows['Артикул WB'] = rows['nmId']
     if 'subject' not in rows.columns:
         rows['subject'] = rows.get('subject_norm', '')
-    rows['Предмет'] = rows['subject'].fillna('').astype(str)
+    rows['subject'] = rows['subject'].fillna('').astype(str)
+    rows = ensure_business_keys(rows)
     rows = rows.merge(keywords_current[['nmId','supplier_article','demand_week','median_position','visibility_pct','keyword_orders','keyword_clicks']].drop_duplicates(), on=['nmId','supplier_article'], how='left')
     rows = rows.merge(funnel_item[['nmId','addToCartConversion','cartToOrderConversion','buyoutPercent']], on='nmId', how='left')
-    rows = rows.merge(build_item_current_metrics(daily_item, window['cur_start'], window['cur_end'], window['base_start'], window['base_end']), on='Артикул продавца', how='left') if not daily_item.empty and 'Комментарий' not in daily_item.columns else rows
+    if not daily_item.empty and 'Комментарий' not in daily_item.columns:
+        daily_item = ensure_business_keys(daily_item)
+        item_metrics = build_item_current_metrics(daily_item, window['cur_start'], window['cur_end'], window['base_start'], window['base_end'])
+        item_metrics = ensure_business_keys(item_metrics)
+        if 'Артикул продавца' in rows.columns and 'Артикул продавца' in item_metrics.columns:
+            rows = rows.merge(item_metrics, on='Артикул продавца', how='left')
+        elif 'supplier_article' in rows.columns and 'supplier_article' in item_metrics.columns:
+            rows = rows.merge(item_metrics, on='supplier_article', how='left')
     if not plan_df.empty and 'Комментарий' not in plan_df.columns:
-        rows = rows.merge(plan_df[['Артикул WB','Артикул продавца','План ВП MTD, ₽','Факт ВП MTD, ₽','Темп плана ВП, %','Причина плана']].drop_duplicates(), on=['Артикул WB','Артикул продавца'], how='left')
+        plan_df = ensure_business_keys(plan_df)
+        plan_cols = [c for c in ['Артикул WB','Артикул продавца','План ВП MTD, ₽','Факт ВП MTD, ₽','Темп плана ВП, %','Причина плана'] if c in plan_df.columns]
+        rows = rows.merge(plan_df[plan_cols].drop_duplicates(), on=[c for c in ['Артикул WB','Артикул продавца'] if c in plan_cols], how='left')
     else:
         rows['План ВП MTD, ₽'] = 0.0
         rows['Факт ВП MTD, ₽'] = 0.0
