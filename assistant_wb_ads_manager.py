@@ -792,9 +792,38 @@ def build_subject_benchmarks(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return pd.DataFrame(columns=["subject_norm","placement","bench_ctr","bench_capture_imp","bench_capture_click"])
     df = rows.copy()
-    df["capture_imp"] = df["capture_imp"].map(safe_float)
-    df["capture_click"] = df["capture_click"].map(safe_float)
-    df["ctr_pct"] = df["ctr_pct"].map(safe_float)
+    if "subject_norm" not in df.columns:
+        df["subject_norm"] = df.get("subject", "")
+    if "placement" not in df.columns:
+        df["placement"] = ""
+    if "ctr_pct" not in df.columns:
+        if "Показы" in df.columns and "Клики" in df.columns:
+            df["ctr_pct"] = np.where(pd.to_numeric(df["Показы"], errors="coerce").fillna(0) > 0,
+                                     pd.to_numeric(df["Клики"], errors="coerce").fillna(0) / pd.to_numeric(df["Показы"], errors="coerce").fillna(0) * 100.0,
+                                     0.0)
+        else:
+            df["ctr_pct"] = 0.0
+    if "capture_imp" not in df.columns:
+        if "Показы" in df.columns and "demand_week" in df.columns:
+            df["capture_imp"] = np.where(pd.to_numeric(df["demand_week"], errors="coerce").fillna(0) > 0,
+                                         pd.to_numeric(df["Показы"], errors="coerce").fillna(0) / pd.to_numeric(df["demand_week"], errors="coerce").fillna(0),
+                                         0.0)
+        else:
+            df["capture_imp"] = 0.0
+    if "capture_click" not in df.columns:
+        base = "keyword_clicks" if "keyword_clicks" in df.columns else ("demand_week" if "demand_week" in df.columns else None)
+        if "Клики" in df.columns and base:
+            df["capture_click"] = np.where(pd.to_numeric(df[base], errors="coerce").fillna(0) > 0,
+                                           pd.to_numeric(df["Клики"], errors="coerce").fillna(0) / pd.to_numeric(df[base], errors="coerce").fillna(0),
+                                           0.0)
+        else:
+            df["capture_click"] = 0.0
+    if "total_orders" not in df.columns:
+        df["total_orders"] = pd.to_numeric(df.get("Заказы", 0), errors="coerce").fillna(0.0)
+    df["capture_imp"] = pd.to_numeric(df["capture_imp"], errors="coerce").fillna(0.0)
+    df["capture_click"] = pd.to_numeric(df["capture_click"], errors="coerce").fillna(0.0)
+    df["ctr_pct"] = pd.to_numeric(df["ctr_pct"], errors="coerce").fillna(0.0)
+    df["total_orders"] = pd.to_numeric(df["total_orders"], errors="coerce").fillna(0.0)
     eligible = df[df["total_orders"] > 0].copy()
     if eligible.empty:
         eligible = df.copy()
