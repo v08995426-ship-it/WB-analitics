@@ -3037,6 +3037,19 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     ) if not ads_daily.empty else pd.DataFrame(columns=['id_campaign','nmId','base_Показы','base_Клики','base_Заказы','base_Расход','base_Сумма_заказов'])
 
     rows = campaigns_base.merge(cur, on=['id_campaign','nmId'], how='left').merge(base, on=['id_campaign','nmId'], how='left').fillna(0)
+    if 'supplier_article' not in rows.columns:
+        for c in ['supplier_article_x','supplier_article_y','supplierArticle','supplierArticle_x','supplierArticle_y']:
+            if c in rows.columns:
+                rows['supplier_article'] = rows[c]
+                break
+        if 'supplier_article' not in rows.columns:
+            rows['supplier_article'] = ''
+    rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
+    rows['Артикул продавца'] = rows['supplier_article']
+    rows['Артикул WB'] = rows['nmId']
+    if 'subject' not in rows.columns:
+        rows['subject'] = rows.get('subject_norm', '')
+    rows['Предмет'] = rows['subject'].fillna('').astype(str)
     rows = rows.merge(keywords_current[['nmId','supplier_article','demand_week','median_position','visibility_pct','keyword_orders','keyword_clicks']].drop_duplicates(), on=['nmId','supplier_article'], how='left')
     rows = rows.merge(funnel_item[['nmId','addToCartConversion','cartToOrderConversion','buyoutPercent']], on='nmId', how='left')
     rows = rows.merge(build_item_current_metrics(daily_item, window['cur_start'], window['cur_end'], window['base_start'], window['base_end']), on='Артикул продавца', how='left') if not daily_item.empty and 'Комментарий' not in daily_item.columns else rows
