@@ -3157,6 +3157,11 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         rows['category_gp_plan'] = 0.0
         rows['category_gp_growth_pct'] = 0.0
 
+    # ensure merge keys still exist after plan/item merges
+    rows = normalize_core_columns(rows)
+    if 'supplier_article' not in rows.columns:
+        rows['supplier_article'] = rows.get('Артикул продавца', rows.get('control_key', ''))
+    rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
     rows = rows.merge(build_channel_balance(ads_daily, campaigns, master, econ_latest, window, funnel), on='supplier_article', how='left')
     for c in ['cpo_cpc','cpo_cpm','drr_cpc','drr_cpm','gp_after_ads_cpc','gp_after_ads_cpm','orders_cpc','orders_cpm']:
         rows[c] = pd.to_numeric(rows.get(c), errors='coerce').fillna(0.0)
