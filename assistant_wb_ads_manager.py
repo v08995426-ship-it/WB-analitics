@@ -1934,82 +1934,163 @@ def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, mast
     return wide
 
 def build_daily_metrics_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, campaigns: pd.DataFrame, master: pd.DataFrame, econ_latest: pd.DataFrame, funnel: pd.DataFrame, keywords: pd.DataFrame, as_of_date: date, abc_plan: pd.DataFrame) -> pd.DataFrame:
-    meta = campaigns[["id_campaign","nmId","placement","payment_type","current_bid_rub"]].drop_duplicates() if not campaigns.empty else pd.DataFrame(columns=["id_campaign","nmId","placement","payment_type","current_bid_rub"])
-    m = master[["nmId","supplier_article","product_root","subject_norm","subject"]].drop_duplicates()
-    gp = econ_latest[["nmId","buyout_rate","gp_realized"]].drop_duplicates()
+    def series_from(df: pd.DataFrame, col: str, default: float | str = 0.0) -> pd.Series:
+        if col in df.columns:
+            s = df[col]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            return s
+        return pd.Series([default] * len(df), index=df.index)
+
+    meta_cols = [c for c in ["id_campaign", "nmId", "placement", "payment_type", "current_bid_rub"] if c in campaigns.columns]
+    meta = campaigns[meta_cols].drop_duplicates() if not campaigns.empty else pd.DataFrame(columns=["id_campaign", "nmId", "placement", "payment_type", "current_bid_rub"])
+    for c in ["id_campaign", "nmId", "placement", "payment_type", "current_bid_rub"]:
+        if c not in meta.columns:
+            meta[c] = np.nan
+
+    m_cols = [c for c in ["nmId", "supplier_article", "product_root", "subject_norm", "subject"] if c in master.columns]
+    m = master[m_cols].drop_duplicates() if not master.empty else pd.DataFrame(columns=["nmId", "supplier_article", "product_root", "subject_norm", "subject"])
+    for c in ["nmId", "supplier_article", "product_root", "subject_norm", "subject"]:
+        if c not in m.columns:
+            m[c] = ""
+
+    gp_cols = [c for c in ["nmId", "buyout_rate", "gp_realized"] if c in econ_latest.columns]
+    gp = econ_latest[gp_cols].drop_duplicates() if not econ_latest.empty else pd.DataFrame(columns=["nmId", "buyout_rate", "gp_realized"])
+    for c in ["nmId", "buyout_rate", "gp_realized"]:
+        if c not in gp.columns:
+            gp[c] = 0.0
+
     abc_small = pd.DataFrame()
     if not abc_plan.empty:
-        abc_small = abc_plan[["nmId","gp_per_buyout","buyout_rate"]].drop_duplicates()
-    ad = ads_daily.merge(meta, on=["id_campaign","nmId"], how="left").merge(m, on="nmId", how="left").merge(gp, on="nmId", how="left")
+        abc_keep = [c for c in ["nmId", "gp_per_buyout", "buyout_rate"] if c in abc_plan.columns]
+        abc_small = abc_plan[abc_keep].drop_duplicates()
+
+    ad = ads_daily.merge(meta, on=["id_campaign", "nmId"], how="left") if not ads_daily.empty else pd.DataFrame(columns=["date", "id_campaign", "nmId"])
+    ad = ad.merge(m, on="nmId", how="left")
+    ad = ad.merge(gp, on="nmId", how="left")
     if not abc_small.empty:
-        ad = ad.merge(abc_small.rename(columns={"buyout_rate":"abc_buyout_rate"}), on="nmId", how="left")
-    ords = orders[(~orders["isCancel"])].groupby(["date","nmId"], as_index=False).agg(
-        total_orders=("nmId","count"),
-        revenue_total=("finishedPrice","sum"),
-    ) if not orders.empty else pd.DataFrame(columns=["date","nmId","total_orders","revenue_total"])
-    hist = ad.merge(ords, on=["date","nmId"], how="left")
-    hist["total_orders"] = pd.to_numeric(hist.get("total_orders"), errors="coerce").fillna(0.0)
-    hist["revenue_total"] = pd.to_numeric(hist.get("revenue_total"), errors="coerce").fillna(0.0)
+        ad = ad.merge(abc_small.rename(columns={"buyout_rate": "abc_buyout_rate"}), on="nmId", how="left")
+
+    ords = orders[(~orders["isCancel"])].groupby(["date", "nmId"], as_index=False).agg(
+        total_orders=("nmId", "count"),
+        revenue_total=("finishedPrice", "sum"),
+    ) if not orders.empty else pd.DataFrame(columns=["date", "nmId", "total_orders", "revenue_total"])
+
+    hist = ad.merge(ords, on=["date", "nmId"], how="left")
+    hist["total_orders"] = pd.to_numeric(series_from(hist, "total_orders", 0.0), errors="coerce").fillna(0.0)
+    hist["revenue_total"] = pd.to_numeric(series_from(hist, "revenue_total", 0.0), errors="coerce").fillna(0.0)
+
     if not funnel.empty:
-        f = funnel.groupby(["date","nmId"], as_index=False).agg(
-            openCardCount=("openCardCount","sum"),
-            addToCartCount=("addToCartCount","sum"),
-            ordersCount=("ordersCount","sum"),
-            addToCartConversion=("addToCartConversion","mean"),
-            cartToOrderConversion=("cartToOrderConversion","mean"),
+        f = funnel.groupby(["date", "nmId"], as_index=False).agg(
+            openCardCount=("openCardCount", "sum"),
+            addToCartCount=("addToCartCount", "sum"),
+            ordersCount=("ordersCount", "sum"),
+            addToCartConversion=("addToCartConversion", "mean"),
+            cartToOrderConversion=("cartToOrderConversion", "mean"),
         )
-        hist = hist.merge(f, on=["date","nmId"], how="left")
+        hist = hist.merge(f, on=["date", "nmId"], how="left")
+
     if not keywords.empty:
-        kw = keywords.groupby(["date","nmId"], as_index=False).agg(
-            query_freq=("query_freq","sum"),
-            demand_week=("demand_week","sum"),
-            keyword_orders=("keyword_orders","sum"),
-            median_position=("median_position","median"),
-            visibility_pct=("visibility_pct","mean"),
-            keyword_clicks=("clicks_to_card","sum"),
+        kw = keywords.groupby(["date", "nmId"], as_index=False).agg(
+            query_freq=("query_freq", "sum"),
+            demand_week=("demand_week", "sum"),
+            keyword_orders=("keyword_orders", "sum"),
+            median_position=("median_position", "median"),
+            visibility_pct=("visibility_pct", "mean"),
+            keyword_clicks=("clicks_to_card", "sum"),
         )
-        hist = hist.merge(kw, on=["date","nmId"], how="left")
-    hist["control_key"] = hist.apply(lambda r: choose_control_key(r.get("subject_norm",""), r.get("supplier_article",""), r.get("product_root","")), axis=1)
-    hist["expected_buyout_orders"] = hist["total_orders"] * np.where(hist.get("abc_buyout_rate", 0).fillna(0) > 0, hist.get("abc_buyout_rate", 0).fillna(0), hist.get("buyout_rate", 0).fillna(0))
-    gp_unit_for_day = np.where(hist.get("gp_per_buyout", pd.Series(0, index=hist.index)).fillna(0) > 0, hist.get("gp_per_buyout", pd.Series(0, index=hist.index)).fillna(0), np.where(hist.get("buyout_rate", pd.Series(0, index=hist.index)).fillna(0) > 0, hist.get("gp_realized", pd.Series(0, index=hist.index)).fillna(0) / hist.get("buyout_rate", pd.Series(0, index=hist.index)).replace(0, np.nan), 0))
+        hist = hist.merge(kw, on=["date", "nmId"], how="left")
+
+    hist["supplier_article"] = series_from(hist, "supplier_article", "").fillna("")
+    hist["product_root"] = series_from(hist, "product_root", "").fillna("")
+    hist["subject_norm"] = series_from(hist, "subject_norm", "").fillna("")
+    hist["subject"] = series_from(hist, "subject", "").fillna(series_from(hist, "subject_norm", "")).fillna("")
+    hist["placement"] = series_from(hist, "placement", "").fillna("")
+    hist["payment_type"] = series_from(hist, "payment_type", "").fillna("")
+    hist["current_bid_rub"] = pd.to_numeric(series_from(hist, "current_bid_rub", 0.0), errors="coerce").fillna(0.0)
+    hist["control_key"] = hist.apply(lambda r: choose_control_key(r.get("subject_norm", ""), r.get("supplier_article", ""), r.get("product_root", "")), axis=1)
+
+    buyout_abc = pd.to_numeric(series_from(hist, "abc_buyout_rate", 0.0), errors="coerce").fillna(0.0)
+    buyout_econ = pd.to_numeric(series_from(hist, "buyout_rate", 0.0), errors="coerce").fillna(0.0)
+    buyout_used = np.where(buyout_abc > 0, buyout_abc, buyout_econ)
+    buyout_used = pd.Series(buyout_used, index=hist.index).fillna(0.0)
+
+    gp_per_buyout = pd.to_numeric(series_from(hist, "gp_per_buyout", 0.0), errors="coerce").fillna(0.0)
+    gp_realized = pd.to_numeric(series_from(hist, "gp_realized", 0.0), errors="coerce").fillna(0.0)
+    gp_unit_for_day = np.where(
+        gp_per_buyout > 0,
+        gp_per_buyout,
+        np.where(buyout_econ > 0, gp_realized / buyout_econ.replace(0, np.nan), 0.0),
+    )
     gp_unit_for_day = pd.to_numeric(pd.Series(gp_unit_for_day, index=hist.index), errors="coerce").fillna(0.0)
+
+    hist["expected_buyout_orders"] = hist["total_orders"] * buyout_used
     hist["gross_profit_before_ads"] = hist["expected_buyout_orders"] * gp_unit_for_day
-    hist["gp_after_ads"] = hist["gross_profit_before_ads"] - hist["Расход"].fillna(0.0)
+    hist["Расход"] = pd.to_numeric(series_from(hist, "Расход", 0.0), errors="coerce").fillna(0.0)
+    hist["Заказы"] = pd.to_numeric(series_from(hist, "Заказы", 0.0), errors="coerce").fillna(0.0)
+    hist["Показы"] = pd.to_numeric(series_from(hist, "Показы", 0.0), errors="coerce").fillna(0.0)
+    hist["Клики"] = pd.to_numeric(series_from(hist, "Клики", 0.0), errors="coerce").fillna(0.0)
+    hist["Сумма заказов"] = pd.to_numeric(series_from(hist, "Сумма заказов", 0.0), errors="coerce").fillna(0.0)
+    hist["gp_after_ads"] = hist["gross_profit_before_ads"] - hist["Расход"]
     hist["DRR, %"] = np.where(hist["revenue_total"] > 0, (hist["Расход"] / hist["revenue_total"]) * 100.0, 0.0)
     hist["CPO, ₽"] = np.where(hist["Заказы"] > 0, hist["Расход"] / hist["Заказы"], 0.0)
     hist["CTR, %"] = np.where(hist["Показы"] > 0, hist["Клики"] / hist["Показы"] * 100.0, 0.0)
-    hist["День зрелый"] = hist["date"] <= (as_of_date - timedelta(days=MATURE_END_OFFSET))
-    hist["Дата"] = pd.to_datetime(hist["date"]).dt.strftime("%Y-%m-%d")
-    hist["campaign_gross_profit_before_ads"] = hist["Заказы"].fillna(0.0) * gp_unit_for_day * np.where(hist.get("abc_buyout_rate", 0).fillna(0) > 0, hist.get("abc_buyout_rate", 0).fillna(0), hist.get("buyout_rate", 0).fillna(0))
-    hist["campaign_gp_after_ads"] = hist["campaign_gross_profit_before_ads"] - hist["Расход"].fillna(0.0)
-    out = hist[["Дата","date","id_campaign","nmId","supplier_article","control_key","subject","placement","payment_type","current_bid_rub","Показы","Клики","CTR, %","Заказы","Расход","Сумма заказов","campaign_gross_profit_before_ads","campaign_gp_after_ads","total_orders","revenue_total","gross_profit_before_ads","gp_after_ads","DRR, %","CPO, ₽","openCardCount","addToCartCount","ordersCount","addToCartConversion","cartToOrderConversion","query_freq","demand_week","keyword_orders","median_position","visibility_pct","День зрелый"]].copy()
+    hist["День зрелый"] = pd.to_datetime(series_from(hist, "date", pd.Timestamp(as_of_date)), errors="coerce").dt.date <= (as_of_date - timedelta(days=MATURE_END_OFFSET))
+    hist["Дата"] = pd.to_datetime(series_from(hist, "date", pd.Timestamp(as_of_date)), errors="coerce").dt.strftime("%Y-%m-%d")
+    hist["campaign_gross_profit_before_ads"] = hist["Заказы"] * gp_unit_for_day * buyout_used
+    hist["campaign_gp_after_ads"] = hist["campaign_gross_profit_before_ads"] - hist["Расход"]
+
+    required_defaults = {
+        "openCardCount": 0.0,
+        "addToCartCount": 0.0,
+        "ordersCount": 0.0,
+        "addToCartConversion": 0.0,
+        "cartToOrderConversion": 0.0,
+        "query_freq": 0.0,
+        "demand_week": 0.0,
+        "keyword_orders": 0.0,
+        "median_position": 0.0,
+        "visibility_pct": 0.0,
+    }
+    for col, default in required_defaults.items():
+        if col not in hist.columns:
+            hist[col] = default
+        hist[col] = pd.to_numeric(series_from(hist, col, default), errors="coerce").fillna(default)
+
+    select_cols = ["Дата", "date", "id_campaign", "nmId", "supplier_article", "control_key", "subject", "placement", "payment_type", "current_bid_rub", "Показы", "Клики", "CTR, %", "Заказы", "Расход", "Сумма заказов", "campaign_gross_profit_before_ads", "campaign_gp_after_ads", "total_orders", "revenue_total", "gross_profit_before_ads", "gp_after_ads", "DRR, %", "CPO, ₽", "openCardCount", "addToCartCount", "ordersCount", "addToCartConversion", "cartToOrderConversion", "query_freq", "demand_week", "keyword_orders", "median_position", "visibility_pct", "День зрелый"]
+    for col in select_cols:
+        if col not in hist.columns:
+            hist[col] = "" if col in {"Дата", "supplier_article", "control_key", "subject", "placement", "payment_type"} else 0.0
+
+    out = hist[select_cols].copy()
     out = out.rename(columns={
-        "id_campaign":"ID кампании",
-        "nmId":"Артикул WB",
-        "supplier_article":"Артикул продавца",
-        "control_key":"Товар",
-        "subject":"Предмет",
-        "placement":"Плейсмент",
-        "payment_type":"Тип оплаты",
-        "current_bid_rub":"Ставка, ₽",
-        "Расход":"Расходы РК, ₽",
-        "Сумма заказов":"Доход РК, ₽",
-        "campaign_gross_profit_before_ads":"Валовая прибыль кампании до рекламы, ₽",
-        "campaign_gp_after_ads":"Валовая прибыль кампании после рекламы, ₽",
-        "total_orders":"Все заказы товара",
-        "revenue_total":"Выручка товара, ₽",
-        "gross_profit_before_ads":"Валовая прибыль до рекламы, ₽",
-        "gp_after_ads":"Валовая прибыль после рекламы, ₽",
-        "addToCartConversion":"Конверсия в корзину, %",
-        "cartToOrderConversion":"Конверсия в заказ, %",
-        "query_freq":"Частотность ключей",
-        "demand_week":"Спрос по ключам",
-        "keyword_orders":"Заказы по ключам",
-        "median_position":"Медианная позиция",
-        "visibility_pct":"Видимость, %",
-        "День зрелый":"Данные зрелые",
+        "id_campaign": "ID кампании",
+        "nmId": "Артикул WB",
+        "supplier_article": "Артикул продавца",
+        "control_key": "Товар",
+        "subject": "Предмет",
+        "placement": "Плейсмент",
+        "payment_type": "Тип оплаты",
+        "current_bid_rub": "Ставка, ₽",
+        "Расход": "Расходы РК, ₽",
+        "Сумма заказов": "Доход РК, ₽",
+        "campaign_gross_profit_before_ads": "Валовая прибыль кампании до рекламы, ₽",
+        "campaign_gp_after_ads": "Валовая прибыль кампании после рекламы, ₽",
+        "total_orders": "Все заказы товара",
+        "revenue_total": "Выручка товара, ₽",
+        "gross_profit_before_ads": "Валовая прибыль до рекламы, ₽",
+        "gp_after_ads": "Валовая прибыль после рекламы, ₽",
+        "addToCartConversion": "Конверсия в корзину, %",
+        "cartToOrderConversion": "Конверсия в заказ, %",
+        "query_freq": "Частотность ключей",
+        "demand_week": "Спрос по ключам",
+        "keyword_orders": "Заказы по ключам",
+        "median_position": "Медианная позиция",
+        "visibility_pct": "Видимость, %",
+        "День зрелый": "Данные зрелые",
     })
-    return out.sort_values(["date","Артикул продавца","ID кампании"]).drop(columns=["date"])
+    return out.sort_values([c for c in ["date", "Артикул продавца", "ID кампании"] if c in out.columns]).drop(columns=["date"], errors="ignore")
+
 
 def build_plan_vs_fact(abc_plan: pd.DataFrame, keywords: pd.DataFrame, daily_history: pd.DataFrame, as_of_date: date, cur_end: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if abc_plan.empty:
