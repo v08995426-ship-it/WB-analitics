@@ -2818,11 +2818,18 @@ def build_daily_item_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, funn
     out['CPO, ₽'] = np.where(out['Заказы_РК'] > 0, out['Расходы_РК'] / out['Заказы_РК'], 0.0)
     out['Прогнозная чистая прибыль, ₽'] = out['Заказы'] * out['buyout_rate'] * out['np_unit']
     out['День зрелый'] = pd.to_datetime(out['date']).dt.date <= (datetime.now().date() - timedelta(days=MATURE_END_OFFSET))
+    if 'subject' not in out.columns:
+        out['subject'] = out.get('subject_norm', '')
     out = out.rename(columns={
-        'date':'Дата','query_freq':'Частота запросов','median_position':'Медианная позиция','visibility_pct':'Видимость, %',
+        'date':'Дата','nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет',
+        'query_freq':'Частота запросов','median_position':'Медианная позиция','visibility_pct':'Видимость, %',
         'addToCartConversion':'Конверсия в корзину, %','cartToOrderConversion':'Конверсия в заказ, %','buyout_rate':'% выкупа'
     })
-    return out[['Дата','Товар','Артикул WB','Артикул продавца','Предмет','Заказы','Сумма_заказов','% выкупа','Расходы_РК','Валовая прибыль после рекламы, ₽','Клики','CPO, ₽','Прогнозная чистая прибыль, ₽','Показы','Заказы_РК','Выручка_РК','ДРР, доля','Конверсия в корзину, %','Конверсия в заказ, %','Частота запросов','Медианная позиция','Видимость, %','День зрелый']].rename(columns={'nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет'})
+    wanted = ['Дата','Товар','Артикул WB','Артикул продавца','Предмет','Заказы','Сумма_заказов','% выкупа','Расходы_РК','Валовая прибыль после рекламы, ₽','Клики','CPO, ₽','Прогнозная чистая прибыль, ₽','Показы','Заказы_РК','Выручка_РК','ДРР, доля','Конверсия в корзину, %','Конверсия в заказ, %','Частота запросов','Медианная позиция','Видимость, %','День зрелый']
+    for c in wanted:
+        if c not in out.columns:
+            out[c] = 0 if c not in ['Дата','Товар','Артикул продавца','Предмет'] else ''
+    return out[wanted]
 
 
 def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, funnel: pd.DataFrame, econ: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
@@ -2846,7 +2853,14 @@ def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFram
     df['CPO кампании, ₽'] = np.where(df['Заказы_РК'] > 0, df['Расходы_РК'] / df['Заказы_РК'], 0.0)
     df['Тип'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'), 'Поиск', 'Полки')
     df['День зрелый'] = pd.to_datetime(df['date']).dt.date <= (datetime.now().date() - timedelta(days=MATURE_END_OFFSET))
-    return df.rename(columns={'date':'Дата','supplier_article':'Артикул продавца','subject':'Предмет','id_campaign':'ID кампании','current_bid_rub':'Ставка, ₽'})[['Дата','ID кампании','Артикул WB','Артикул продавца','Предмет','Тип','placement','Ставка, ₽','Показы','Клики','Заказы_РК','Выручка_РК','Расходы_РК','ДРР кампании, доля','ВП кампании после рекламы, ₽','ROI кампании','CPO кампании, ₽','День зрелый']]
+    if 'subject' not in df.columns:
+        df['subject'] = df.get('subject_norm', '')
+    df = df.rename(columns={'date':'Дата','nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет','id_campaign':'ID кампании','current_bid_rub':'Ставка, ₽','placement':'Плейсмент'})
+    wanted = ['Дата','ID кампании','Артикул WB','Артикул продавца','Предмет','Тип','Плейсмент','Ставка, ₽','Показы','Клики','Заказы_РК','Выручка_РК','Расходы_РК','ДРР кампании, доля','ВП кампании после рекламы, ₽','ROI кампании','CPO кампании, ₽','День зрелый']
+    for c in wanted:
+        if c not in df.columns:
+            df[c] = 0 if c not in ['Дата','Артикул продавца','Предмет','Тип','Плейсмент'] else ''
+    return df[wanted]
 
 
 def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, master: pd.DataFrame, econ_latest: pd.DataFrame, window: Dict[str, date], funnel: Optional[pd.DataFrame]=None) -> pd.DataFrame:
