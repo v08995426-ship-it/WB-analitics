@@ -127,7 +127,6 @@ MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
 DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
 
 
-
 @dataclass
 class Config:
     bucket: str
@@ -304,6 +303,30 @@ def should_send_redistribution(cfg: Config) -> bool:
     return cfg.run_date.weekday() == 0
 
 
+def is_first_monday_of_month(run_date: date) -> bool:
+    return run_date.weekday() == 0 and 1 <= run_date.day <= 7
+
+
+def filter_plan_for_template(plan_df: pd.DataFrame, run_date: date) -> pd.DataFrame:
+    if plan_df.empty:
+        return plan_df.copy()
+
+    work = plan_df.copy()
+    if "Количество" not in work.columns:
+        return work
+
+    work["Количество"] = work["Количество"].map(round_int)
+
+    if is_first_monday_of_month(run_date):
+        log("Это первый понедельник месяца — заявки < 8 шт оставляем в шаблоне")
+        return work
+
+    filtered = work[work["Количество"] >= 8].copy()
+    excluded = len(work) - len(filtered)
+    log(f"Это не первый понедельник месяца — из шаблона исключено мелких заявок < 8 шт: {excluded}")
+    return filtered
+
+
 def load_article_map(storage: S3Storage) -> dict[str, str]:
     df = storage.read_excel(ARTICLE_MAP_KEY)
     wb_col = df.columns[0]
@@ -317,7 +340,6 @@ def load_article_map(storage: S3Storage) -> dict[str, str]:
     mapping = dict(zip(temp["Артикул WB"], temp["Артикул 1С"]))
     log(f"Загружено соответствий WB -> 1С: {len(mapping)}")
     return mapping
-
 
 
 def load_stocks_1c(storage: S3Storage) -> pd.DataFrame:
@@ -363,6 +385,7 @@ def load_stocks_1c(storage: S3Storage) -> pd.DataFrame:
     temp = temp[temp["Артикул 1С"] != ""]
     temp = temp.groupby("Артикул 1С", as_index=False, dropna=False)["Остатки МП (Липецк), шт"].sum()
     return temp
+
 
 def load_rrc(storage: S3Storage) -> pd.DataFrame:
     df = storage.read_excel(RRC_KEY)
@@ -476,7 +499,6 @@ def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
     price_last["Цена покупателя"] = price_last["Цена покупателя"].map(round_int)
     metrics = metrics.merge(price_last, on=group_cols, how="left")
     return metrics, keys
-
 
 
 def parse_inbound_base_date(filename: str) -> Optional[date]:
@@ -596,6 +618,7 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
     nearest_df = pd.DataFrame(nearest_rows)
     return total_qty.merge(nearest_df, on="Артикул 1С", how="left")
 
+
 def load_current_month_zero_days(storage: S3Storage, zero_articles: set[str], avg7_map: dict[str, float], run_date: date) -> dict[str, int]:
     if not zero_articles:
         return {}
@@ -638,7 +661,6 @@ def compute_coef_rrc(price: int, rrc: int) -> str:
     if rrc <= 0 or price <= 0:
         return ""
     return f"{price / rrc:.2f}".replace(".", ",") + "_РРЦ"
-
 
 
 def build_report_dataframe(
@@ -827,6 +849,7 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]].copy()
     return critical, calc, dead, monitor
 
+
 def auto_fit_columns(ws) -> None:
     widths: dict[int, int] = {}
     for row in ws.iter_rows():
@@ -918,7 +941,6 @@ def send_document_to_telegram(cfg: Config, path: Path, caption: str) -> None:
 def send_to_telegram(cfg: Config, path: Path, critical_count: int, dead_count: int) -> None:
     caption = f"📦 Отчёт по остаткам WB {STORE_NAME}\nКритично: {critical_count}\nDead_Stock: {dead_count}"
     send_document_to_telegram(cfg, path, caption)
-
 
 
 def normalize_warehouse_redist(value: object) -> str:
@@ -1310,7 +1332,6 @@ def build_transfer_plan(balance_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
     return plan_df, unresolved_df, routes_df
 
 
-
 def _resolve_sheet_xml_path(xlsx_path: Path, sheet_name: str) -> str:
     ns_main = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     ns_rel_attr = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1452,6 +1473,7 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
         target_days=cfg.redistribution_target_days,
     )
     plan_df, unresolved_df, routes_df = build_transfer_plan(balance_df)
+    template_plan_df = filter_plan_for_template(plan_df, cfg.run_date)
 
     calc_path = Path(OUT_DIR) / f"Перераспределение_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
     template_out_path = Path(OUT_DIR) / f"Шаблон_перераспределения_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
@@ -1465,15 +1487,18 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
         routes_df=routes_df,
         unmapped_regions_df=unmapped_regions_df,
     )
-    fill_redistribution_template(template_path, template_out_path, plan_df)
+    fill_redistribution_template(template_path, template_out_path, template_plan_df)
 
     log(f"Файл расчёта перераспределения сохранён: {calc_path}")
     log(f"Заполненный шаблон перераспределения сохранён: {template_out_path}")
+    log(f"В полный расчёт попало строк: {len(plan_df)}")
+    log(f"В шаблон попало строк: {len(template_plan_df)}")
     log(f"Источники перераспределения | остатки: {stock_source}")
     log(f"Источники перераспределения | заказы: {', '.join(order_sources)}")
     if not unmapped_regions_df.empty:
         log(f"Регионов без сопоставления: {len(unmapped_regions_df)} строк (см. лист 'Не_смогли_сопоставить')")
     return calc_path, template_out_path
+
 
 def run() -> Path:
     cfg = get_config()
