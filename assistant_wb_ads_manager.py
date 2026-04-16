@@ -3240,7 +3240,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         })
     decisions_df = pd.DataFrame(decisions).drop_duplicates(['ID кампании','Артикул WB','Плейсмент'])
 
-    weak = decisions_df[(decisions_df['Действие'].isin(['Снизить','Предел эффективности ставки'])) | (pd.to_numeric(decisions_df.get('Статус риска'), errors='ignore').astype(str).eq('Критический'))].copy() if not decisions_df.empty else pd.DataFrame()
+    weak = decisions_df[(decisions_df['Действие'].isin(['Снизить','Предел эффективности ставки'])) | (decisions_df.get('Статус риска', '').astype(str).eq('Критический'))].copy() if not decisions_df.empty else pd.DataFrame()
     if not weak.empty:
         weak['Комментарий'] = weak['Причина']
         weak = weak[['Артикул продавца','Артикул WB','ID кампании','Тип кампании','Плейсмент','Действие','Комментарий']].drop_duplicates()
