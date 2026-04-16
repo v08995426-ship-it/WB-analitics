@@ -2921,32 +2921,19 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
 
     ads_window_subject = pd.DataFrame(columns=['subject_norm','Расходы рекламы окно, ₽'])
     if not ads_window.empty:
-        ads_window_subject = ads_window.copy()
-        if 'subject_norm' not in ads_window_subject.columns:
-            ads_window_subject['subject_norm'] = ads_window_subject['nmId'].map(nm_to_subject)
-        else:
-            ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].where(
-                ads_window_subject['subject_norm'].notna() & (ads_window_subject['subject_norm'].astype(str).str.strip() != ''),
-                ads_window_subject['nmId'].map(nm_to_subject),
-            )
-        ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].map(canonical_subject)
+        ads_window_subject = with_resolved_subject_norm(ads_window, nm_to_subject)
+        if 'Расход' not in ads_window_subject.columns:
+            ads_window_subject['Расход'] = 0.0
+        ads_window_subject['Расход'] = pd.to_numeric(ads_window_subject['Расход'], errors='coerce').fillna(0.0)
         ads_window_subject = ads_window_subject[ads_window_subject['subject_norm'].isin(TARGET_SUBJECTS)].groupby('subject_norm', as_index=False).agg(**{'Расходы рекламы окно, ₽': ('Расход','sum')})
 
     funnel_sales_col = find_matching_column(funnel_window, FUNNEL_SALES_CANDIDATES)
     funnel_window_subject = pd.DataFrame(columns=['subject_norm','Продажи воронка окно, ₽','Выкупленная выручка окно, ₽'])
     if not funnel_window.empty and funnel_sales_col:
-        fw = funnel_window.copy()
+        fw = with_resolved_subject_norm(funnel_window, nm_to_subject)
         fw['Продажи воронка строка, ₽'] = pd.to_numeric(fw.get(funnel_sales_col), errors='coerce').fillna(0.0)
         fw['buyout_rate_row'] = to_buyout_rate(fw.get('buyoutPercent', 0), default=0.0)
         fw['Выкупленная выручка строка, ₽'] = fw['Продажи воронка строка, ₽'] * fw['buyout_rate_row']
-        if 'subject_norm' not in fw.columns:
-            fw['subject_norm'] = fw['nmId'].map(nm_to_subject)
-        else:
-            fw['subject_norm'] = fw['subject_norm'].where(
-                fw['subject_norm'].notna() & (fw['subject_norm'].astype(str).str.strip() != ''),
-                fw['nmId'].map(nm_to_subject),
-            )
-        fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
         fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if not fw.empty:
             funnel_window_subject = fw.groupby('subject_norm', as_index=False).agg(
