@@ -102,6 +102,29 @@ def to_buyout_rate(series: pd.Series, default: float = 0.0) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
     s = np.where(pd.Series(s).fillna(0) > 1, pd.Series(s).fillna(0) / 100.0, pd.Series(s).fillna(0))
     return pd.Series(s).fillna(default).clip(lower=0.0, upper=1.0)
+
+
+def with_resolved_subject_norm(df: pd.DataFrame, nm_to_subject: Dict[Any, Any]) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        if "subject_norm" not in out.columns:
+            out["subject_norm"] = pd.Series(dtype="object")
+        return out
+
+    resolved = pd.Series([""] * len(out), index=out.index, dtype="object")
+
+    for col in ["subject_norm", "subject_norm_x", "subject_norm_y", "subject", "Предмет", "Название предмета"]:
+        if col in out.columns:
+            normalized = out[col].fillna("").astype(str).map(canonical_subject)
+            resolved = resolved.where(resolved.astype(str).str.strip() != "", normalized)
+
+    if "nmId" in out.columns and nm_to_subject:
+        nm_series = pd.to_numeric(out["nmId"], errors="coerce")
+        mapped = nm_series.map(nm_to_subject).fillna("").astype(str).map(canonical_subject)
+        resolved = resolved.where(resolved.astype(str).str.strip() != "", mapped)
+
+    out["subject_norm"] = resolved.fillna("").astype(str).map(canonical_subject)
+    return out
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
 WB_NMS_URL = "https://advert-api.wildberries.ru/adv/v0/auction/nms"
