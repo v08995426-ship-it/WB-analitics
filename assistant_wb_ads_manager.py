@@ -2885,7 +2885,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows = rows.merge(channel_balance, on="control_key", how="left")
     if not plan_vs_fact.empty and "Товар" in plan_vs_fact.columns:
         rows = rows.merge(plan_vs_fact[["Товар","План ВП MTD, ₽","Факт ВП MTD, ₽","Темп плана ВП, %","Проблема плана"]].rename(columns={"Товар":"control_key","Темп плана ВП, %":"plan_attainment_pct","Проблема плана":"plan_issue","План ВП MTD, ₽":"plan_gp_mtd","Факт ВП MTD, ₽":"fact_gp_mtd"}), on="control_key", how="left")
-    rows["plan_attainment_pct"] = pd.to_numeric(rows.get("plan_attainment_pct"), errors="coerce").fillna(100.0)
+    rows["plan_attainment_pct"] = numeric_series(rows, "plan_attainment_pct", 100.0)
     rows["gp_after_ads_cur"] = rows["total_orders"] * rows["gp_realized"] - rows["ad_spend"]
     rows["gp_after_ads_base"] = rows["base_total_orders"] * rows["gp_realized"] - rows["base_ad_spend"]
     rows["gp_growth_pct"] = rows.apply(lambda r: growth_pct(r["gp_after_ads_cur"], r["gp_after_ads_base"]), axis=1)
@@ -3784,10 +3784,10 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
 
     rows = campaigns_base.merge(cur, on=['id_campaign','nmId'], how='left').merge(base, on=['id_campaign','nmId'], how='left').fillna(0)
     rows = ensure_business_keys(rows)
-    rows['supplier_article'] = rows.get('supplier_article', '').fillna('').astype(str)
-    rows['subject'] = rows.get('subject', rows.get('subject_norm', '')).fillna('').astype(str)
-    rows['subject_norm'] = rows.get('subject_norm', rows['subject'].map(canonical_subject)).fillna('').astype(str).map(canonical_subject)
-    rows['campaign_status'] = rows.get('campaign_status', '').fillna('').astype(str)
+    rows['supplier_article'] = series_or_default(rows, 'supplier_article', '').fillna('').astype(str)
+    rows['subject'] = series_or_default(rows, 'subject', series_or_default(rows, 'subject_norm', '')).fillna('').astype(str)
+    rows['subject_norm'] = series_or_default(rows, 'subject_norm', rows['subject'].map(canonical_subject)).fillna('').astype(str).map(canonical_subject)
+    rows['campaign_status'] = series_or_default(rows, 'campaign_status', '').fillna('').astype(str)
     rows['campaign_is_active'] = rows['campaign_status'].map(is_active_campaign_status)
 
     rows = rows.merge(keywords_current[['nmId','supplier_article','demand_week','median_position','visibility_pct','keyword_orders','keyword_clicks']].drop_duplicates(), on=['nmId','supplier_article'], how='left')
@@ -3875,8 +3875,14 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         rows['category_demand_growth_pct'] = 0.0
         rows['category_limit_drr'] = rows['subject_norm'].map(get_category_drr_limit)
 
-    rows['category_limit_drr'] = pd.to_numeric(rows.get('category_limit_drr'), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
-    rows['category_plan_attainment_pct'] = pd.to_numeric(rows.get('category_plan_attainment_pct'), errors='coerce').fillna(np.where(pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').fillna(0.0) > 0, pd.to_numeric(rows.get('category_gp_mtd'), errors='coerce').fillna(0.0) / pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').replace(0, np.nan).fillna(1.0) * 100.0, 100.0))
+    rows['category_limit_drr'] = numeric_series(rows, 'category_limit_drr', np.nan).fillna(rows['subject_norm'].map(get_category_drr_limit))
+    _category_gp_plan = numeric_series(rows, 'category_gp_plan', 0.0)
+    _category_gp_mtd = numeric_series(rows, 'category_gp_mtd', 0.0)
+    _category_plan_att_default = pd.Series(
+        np.where(_category_gp_plan > 0, _category_gp_mtd / _category_gp_plan.replace(0, np.nan).fillna(1.0) * 100.0, 100.0),
+        index=rows.index,
+    )
+    rows['category_plan_attainment_pct'] = numeric_series(rows, 'category_plan_attainment_pct', np.nan).fillna(_category_plan_att_default)
 
     category_plan = category_diag.copy() if category_diag is not None else pd.DataFrame(columns=['subject_norm'])
     if category_plan is not None and not category_plan.empty:
@@ -3905,7 +3911,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
     rows = rows.merge(build_channel_balance(ads_daily, campaigns, master, econ_latest, window, funnel), on='supplier_article', how='left')
     for c in ['cpo_cpc','cpo_cpm','drr_cpc','drr_cpm','gp_after_ads_cpc','gp_after_ads_cpm','orders_cpc','orders_cpm']:
-        rows[c] = pd.to_numeric(rows.get(c), errors='coerce').fillna(0.0)
+        rows[c] = numeric_series(rows, c, 0.0)
     rows['plan_attainment_pct'] = numeric_series(rows, 'Темп плана ВП, %', 0.0)
 
     subject_benchmarks = build_subject_benchmarks(rows)
@@ -4236,13 +4242,13 @@ def load_latest_abc_reference(provider: BaseProvider) -> Tuple[pd.DataFrame, Dic
         df['nmId'] = pd.to_numeric(df['nmId'], errors='coerce')
     else:
         df['nmId'] = np.nan
-    df['supplier_article'] = df.get('supplier_article', '').fillna('').astype(str)
-    df['subject'] = df.get('subject', '').fillna('').astype(str)
+    df['supplier_article'] = series_or_default(df, 'supplier_article', '').fillna('').astype(str)
+    df['subject'] = series_or_default(df, 'subject', '').fillna('').astype(str)
     df['subject_norm'] = df['subject'].map(canonical_subject)
-    df['manager_category'] = df.get('manager_category', '').fillna('').astype(str).str.strip()
+    df['manager_category'] = series_or_default(df, 'manager_category', '').fillna('').astype(str).str.strip()
     df['manager_category'] = df['manager_category'].replace({'': 'Без менеджера'})
     df['buyout_pct'] = pd.to_numeric(df.get('buyout_pct'), errors='coerce')
-    df['orders_cnt'] = pd.to_numeric(df.get('orders_cnt'), errors='coerce').fillna(0.0)
+    df['orders_cnt'] = numeric_series(df, 'orders_cnt', 0.0)
     df['buyout_pct_clipped'] = df['buyout_pct'].clip(lower=0.0, upper=100.0)
 
     rates: Dict[str, float] = {}
@@ -4290,19 +4296,19 @@ def _normalize_funnel_subject_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     if 'subject' not in df.columns:
         return pd.DataFrame(columns=['supplier_article', 'nmId', 'subject', 'subject_norm', 'buyout_rate', 'orders_qty', 'orders_sum'])
     out = df.copy()
-    out['supplier_article'] = out.get('supplier_article', '').fillna('').astype(str).str.strip()
+    out['supplier_article'] = series_or_default(out, 'supplier_article', '').fillna('').astype(str).str.strip()
     out['nmId'] = pd.to_numeric(out.get('nmId'), errors='coerce')
-    out['subject'] = out.get('subject', '').fillna('').astype(str).str.strip()
+    out['subject'] = series_or_default(out, 'subject', '').fillna('').astype(str).str.strip()
     out['subject_norm'] = out['subject'].map(canonical_subject)
     direct_rate = to_buyout_rate(out.get('buyout_pct', pd.Series(index=out.index, dtype=float)), default=np.nan)
     if 'orders_sum' in out.columns and 'buyout_sum' in out.columns:
-        orders_sum = pd.to_numeric(out.get('orders_sum'), errors='coerce').fillna(0.0)
-        buyout_sum = pd.to_numeric(out.get('buyout_sum'), errors='coerce').fillna(0.0)
+        orders_sum = numeric_series(out, 'orders_sum', 0.0)
+        buyout_sum = numeric_series(out, 'buyout_sum', 0.0)
         ratio_sum = pd.Series(np.where(orders_sum > 0, buyout_sum / orders_sum, np.nan), index=out.index)
         direct_rate = direct_rate.where(~direct_rate.isna(), ratio_sum)
     out['buyout_rate'] = pd.to_numeric(direct_rate, errors='coerce').clip(lower=0.0, upper=1.0)
-    out['orders_qty'] = pd.to_numeric(out.get('orders_qty'), errors='coerce').fillna(0.0)
-    out['orders_sum'] = pd.to_numeric(out.get('orders_sum'), errors='coerce').fillna(0.0)
+    out['orders_qty'] = numeric_series(out, 'orders_qty', 0.0)
+    out['orders_sum'] = numeric_series(out, 'orders_sum', 0.0)
     out = out[out['subject_norm'].ne('') & out['buyout_rate'].notna()].copy()
     return out[['supplier_article', 'nmId', 'subject', 'subject_norm', 'buyout_rate', 'orders_qty', 'orders_sum']]
 
