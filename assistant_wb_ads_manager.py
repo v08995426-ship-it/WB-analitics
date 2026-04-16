@@ -377,6 +377,23 @@ def safe_int(v: Any, default: int = 0) -> int:
     except Exception:
         return default
 
+
+def series_or_default(df: pd.DataFrame, column: str, default: Any = 0.0) -> pd.Series:
+    if isinstance(df, pd.DataFrame) and column in df.columns:
+        return df[column]
+    if isinstance(default, pd.Series):
+        try:
+            return default.reindex(df.index)
+        except Exception:
+            return default
+    if isinstance(df, pd.DataFrame):
+        return pd.Series(default, index=df.index)
+    return pd.Series([default])
+
+
+def numeric_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    return pd.to_numeric(series_or_default(df, column, default), errors="coerce").fillna(default)
+
 def canonical_subject(v: Any) -> str:
     return str(v or "").strip().lower()
 
@@ -2134,7 +2151,9 @@ def build_daily_metrics_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, c
         )
         hist = hist.merge(kw, on=["date","nmId"], how="left")
     hist["control_key"] = hist.apply(lambda r: choose_control_key(r.get("subject_norm",""), r.get("supplier_article",""), r.get("product_root","")), axis=1)
-    hist["expected_buyout_orders"] = hist["total_orders"] * np.where(hist.get("abc_buyout_rate", 0).fillna(0) > 0, hist.get("abc_buyout_rate", 0).fillna(0), hist.get("buyout_rate", 0).fillna(0))
+    abc_buyout_rate = numeric_series(hist, "abc_buyout_rate", 0.0)
+    hist_buyout_rate = numeric_series(hist, "buyout_rate", 0.0)
+    hist["expected_buyout_orders"] = hist["total_orders"] * np.where(abc_buyout_rate > 0, abc_buyout_rate, hist_buyout_rate)
     gp_unit_for_day = np.where(hist.get("gp_per_buyout", pd.Series(0, index=hist.index)).fillna(0) > 0, hist.get("gp_per_buyout", pd.Series(0, index=hist.index)).fillna(0), np.where(hist.get("buyout_rate", pd.Series(0, index=hist.index)).fillna(0) > 0, hist.get("gp_realized", pd.Series(0, index=hist.index)).fillna(0) / hist.get("buyout_rate", pd.Series(0, index=hist.index)).replace(0, np.nan), 0))
     gp_unit_for_day = pd.to_numeric(pd.Series(gp_unit_for_day, index=hist.index), errors="coerce").fillna(0.0)
     hist["gross_profit_before_ads"] = hist["expected_buyout_orders"] * gp_unit_for_day
@@ -2144,7 +2163,7 @@ def build_daily_metrics_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, c
     hist["CTR, %"] = np.where(hist["Показы"] > 0, hist["Клики"] / hist["Показы"] * 100.0, 0.0)
     hist["День зрелый"] = hist["date"] <= (as_of_date - timedelta(days=MATURE_END_OFFSET))
     hist["Дата"] = pd.to_datetime(hist["date"]).dt.strftime("%Y-%m-%d")
-    hist["campaign_gross_profit_before_ads"] = hist["Заказы"].fillna(0.0) * gp_unit_for_day * np.where(hist.get("abc_buyout_rate", 0).fillna(0) > 0, hist.get("abc_buyout_rate", 0).fillna(0), hist.get("buyout_rate", 0).fillna(0))
+    hist["campaign_gross_profit_before_ads"] = hist["Заказы"].fillna(0.0) * gp_unit_for_day * np.where(abc_buyout_rate > 0, abc_buyout_rate, hist_buyout_rate)
     hist["campaign_gp_after_ads"] = hist["campaign_gross_profit_before_ads"] - hist["Расход"].fillna(0.0)
     out = hist[["Дата","date","id_campaign","nmId","supplier_article","control_key","subject","placement","payment_type","current_bid_rub","Показы","Клики","CTR, %","Заказы","Расход","Сумма заказов","campaign_gross_profit_before_ads","campaign_gp_after_ads","total_orders","revenue_total","gross_profit_before_ads","gp_after_ads","DRR, %","CPO, ₽","openCardCount","addToCartCount","ordersCount","addToCartConversion","cartToOrderConversion","query_freq","demand_week","keyword_orders","median_position","visibility_pct","День зрелый"]].copy()
     out = out.rename(columns={
@@ -3285,15 +3304,26 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['campaign_order_growth_pct'] = np.where(rows['base_Заказы'] > 0, (rows['Заказы'] / rows['base_Заказы'] - 1) * 100.0, np.where(rows['Заказы'] > 0, 100.0, 0.0))
     rows['campaign_cpo'] = np.where(rows['Заказы'] > 0, rows['Расход'] / rows['Заказы'], 0.0)
     rows['campaign_roi_cur'] = np.where(rows['Расход'] > 0, ((rows['Заказы'] * rows['buyout_rate'] * rows['np_unit']) - rows['Расход']) / rows['Расход'], 0.0)
-    rows['blended_drr'] = np.where(rows['item_revenue_cur'] * rows['buyout_rate'] > 0, rows['item_spend_cur'] / (rows['item_revenue_cur'] * rows['buyout_rate']), 0.0)
-    rows['total_orders'] = pd.to_numeric(rows.get('item_orders_cur'), errors='coerce').fillna(0.0)
-    rows['total_revenue'] = pd.to_numeric(rows.get('item_revenue_cur'), errors='coerce').fillna(0.0)
-    rows['ad_spend'] = pd.to_numeric(rows.get('item_spend_cur'), errors='coerce').fillna(0.0)
-    rows['ad_orders'] = pd.to_numeric(rows.get('Заказы'), errors='coerce').fillna(0.0)
-    rows['order_growth_pct'] = pd.to_numeric(rows.get('item_order_growth_pct'), errors='coerce').fillna(0.0)
-    rows['spend_growth_pct'] = np.where(pd.to_numeric(rows.get('base_item_spend_cur', 0), errors='coerce').fillna(0.0) > 0, (pd.to_numeric(rows.get('item_spend_cur'), errors='coerce').fillna(0.0) / pd.to_numeric(rows.get('base_item_spend_cur', 0), errors='coerce').replace(0, np.nan).fillna(1.0) - 1.0) * 100.0, 0.0)
+    item_revenue_cur = numeric_series(rows, 'item_revenue_cur', 0.0)
+    item_spend_cur = numeric_series(rows, 'item_spend_cur', 0.0)
+    item_orders_cur = numeric_series(rows, 'item_orders_cur', 0.0)
+    item_order_growth_pct = numeric_series(rows, 'item_order_growth_pct', 0.0)
+    base_item_spend_cur = numeric_series(rows, 'base_item_spend_cur', 0.0)
+    campaign_orders_cur = numeric_series(rows, 'Заказы', 0.0)
+    add_to_cart_conv = numeric_series(rows, 'addToCartConversion', 0.0)
+    subj_add_to_cart = numeric_series(rows, 'subj_addToCart', 0.0)
+    cart_to_order_conv = numeric_series(rows, 'cartToOrderConversion', 0.0)
+    subj_cart_to_order = numeric_series(rows, 'subj_cartToOrder', 0.0)
+
+    rows['blended_drr'] = np.where(item_revenue_cur * rows['buyout_rate'] > 0, item_spend_cur / (item_revenue_cur * rows['buyout_rate']), 0.0)
+    rows['total_orders'] = item_orders_cur
+    rows['total_revenue'] = item_revenue_cur
+    rows['ad_spend'] = item_spend_cur
+    rows['ad_orders'] = campaign_orders_cur
+    rows['order_growth_pct'] = item_order_growth_pct
+    rows['spend_growth_pct'] = np.where(base_item_spend_cur > 0, (item_spend_cur / base_item_spend_cur.replace(0, np.nan) - 1.0) * 100.0, 0.0)
     rows['required_growth_pct'] = rows.apply(lambda r: compute_required_growth(safe_float(r.get('campaign_drr_cur')), safe_float(r.get('spend_growth_pct')), str(r.get('subject_norm',''))), axis=1)
-    rows['card_issue'] = (pd.to_numeric(rows.get('addToCartConversion'), errors='coerce').fillna(0.0) < 0.5 * pd.to_numeric(rows.get('subj_addToCart', 0), errors='coerce').fillna(0.0)) | (pd.to_numeric(rows.get('cartToOrderConversion'), errors='coerce').fillna(0.0) < 0.5 * pd.to_numeric(rows.get('subj_cartToOrder', 0), errors='coerce').fillna(0.0)) if 'subj_addToCart' in rows.columns else False
+    rows['card_issue'] = ((add_to_cart_conv < 0.5 * subj_add_to_cart) | (cart_to_order_conv < 0.5 * subj_cart_to_order)) if 'subj_addToCart' in rows.columns else False
 
     if category_plan is not None and not category_plan.empty and 'subject_norm' in category_plan.columns:
         cat_cols = [c for c in ['subject_norm','ДРР категории, доля','Факт ВП MTD, ₽','План ВП MTD, ₽','Лимит ДРР категории, доля'] if c in category_plan.columns]
@@ -3308,7 +3338,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         rows['category_drr_cur'] = pd.to_numeric(rows.get('category_drr_cur'), errors='coerce').fillna(0.0)
         rows['category_gp_cur'] = pd.to_numeric(rows.get('category_gp_cur'), errors='coerce').fillna(0.0)
         rows['category_gp_plan'] = pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').fillna(0.0)
-        rows['category_limit_drr'] = pd.to_numeric(rows.get('category_limit_drr'), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
+        rows['category_limit_drr'] = pd.to_numeric(series_or_default(rows, 'category_limit_drr', np.nan), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
         rows['category_gp_growth_pct'] = np.where(rows['category_gp_plan'] != 0, (rows['category_gp_cur'] - rows['category_gp_plan']) / np.abs(rows['category_gp_plan']) * 100.0, 0.0)
     else:
         rows['category_drr_cur'] = 0.0
@@ -3324,14 +3354,16 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows = rows.merge(build_channel_balance(ads_daily, campaigns, master, econ_latest, window, funnel), on='supplier_article', how='left')
     for c in ['cpo_cpc','cpo_cpm','drr_cpc','drr_cpm','gp_after_ads_cpc','gp_after_ads_cpm','orders_cpc','orders_cpm']:
         rows[c] = pd.to_numeric(rows.get(c), errors='coerce').fillna(0.0)
-    rows['plan_attainment_pct'] = pd.to_numeric(rows.get('Темп плана ВП, %'), errors='coerce').fillna(0.0)
+    rows['plan_attainment_pct'] = numeric_series(rows, 'Темп плана ВП, %', 0.0)
 
     subject_benchmarks = build_subject_benchmarks(rows)
     rows = rows.merge(subject_benchmarks, on=['subject_norm','placement'], how='left')
     rows['capture_imp'] = np.where(rows['demand_week'] > 0, rows['Показы'] / rows['demand_week'], 0.0)
     rows['capture_click'] = np.where(rows['keyword_clicks'] > 0, rows['Клики'] / rows['keyword_clicks'], 0.0)
-    rows['eff_index_imp'] = np.where(pd.to_numeric(rows.get('bench_capture_imp'), errors='coerce').fillna(0) > 0, rows['capture_imp'] / pd.to_numeric(rows.get('bench_capture_imp'), errors='coerce').fillna(1), 1.0)
-    rows['eff_index_click'] = np.where(pd.to_numeric(rows.get('bench_capture_click'), errors='coerce').fillna(0) > 0, rows['capture_click'] / pd.to_numeric(rows.get('bench_capture_click'), errors='coerce').fillna(1), 1.0)
+    bench_capture_imp = numeric_series(rows, 'bench_capture_imp', 0.0)
+    rows['eff_index_imp'] = np.where(bench_capture_imp > 0, rows['capture_imp'] / bench_capture_imp.replace(0, np.nan), 1.0)
+    bench_capture_click = numeric_series(rows, 'bench_capture_click', 0.0)
+    rows['eff_index_click'] = np.where(bench_capture_click > 0, rows['capture_click'] / bench_capture_click.replace(0, np.nan), 1.0)
 
     limits = rows.apply(lambda r: pd.Series(compute_bid_limits(r, subject_benchmarks), index=['comfort_bid_rub','max_bid_rub','experiment_bid_rub','limit_type']), axis=1)
     rows = pd.concat([rows, limits], axis=1)
