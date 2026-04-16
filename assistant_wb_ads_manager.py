@@ -10,6 +10,7 @@ import math
 import os
 import re
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,13 @@ SUBJECT_DISPLAY_NAMES = {
     "косметические карандаши": "Косметические карандаши",
     "помады": "Помады",
     "блески": "Блески",
+}
+
+SUBJECT_FIXED_BUYOUT_RATES = {
+    "кисти косметические": 0.85,
+    "косметические карандаши": 0.95,
+    "помады": 0.93,
+    "блески": 0.90,
 }
 FUNNEL_SALES_CANDIDATES = [
     "ordersSumRub",
@@ -110,6 +118,142 @@ def get_category_drr_limit(subject_norm: Any) -> float:
 def get_subject_display_name(subject_norm: Any) -> str:
     norm = canonical_subject(subject_norm)
     return SUBJECT_DISPLAY_NAMES.get(norm, str(subject_norm or "").strip() or norm)
+
+
+def get_subject_buyout_rate(subject_norm: Any, default: float = 0.90) -> float:
+    return SUBJECT_FIXED_BUYOUT_RATES.get(canonical_subject(subject_norm), default)
+
+def get_bid_step_rub(payment_type: Any) -> float:
+    return 1.0 if canonical_payment_type(payment_type) == 'cpc' else 6.0
+
+def apply_bid_step(current_bid: float, payment_type: Any, direction: str, floor_bid: float, max_bid: float = 0.0) -> float:
+    current_bid = safe_float(current_bid)
+    step = get_bid_step_rub(payment_type)
+    if direction == 'up':
+        target = current_bid + step
+        if max_bid > 0:
+            target = min(target, max_bid)
+        return round(max(target, floor_bid), 2)
+    return round(max(current_bid - step, floor_bid), 2)
+
+def is_drop_explained_by_demand(order_growth_pct: float, demand_growth_pct: float, tolerance_pp: float = 5.0) -> bool:
+    order_growth_pct = safe_float(order_growth_pct)
+    demand_growth_pct = safe_float(demand_growth_pct)
+    if order_growth_pct >= 0 or demand_growth_pct >= 0:
+        return False
+    return demand_growth_pct <= order_growth_pct + tolerance_pp
+
+
+def build_category_window_diagnostics(
+    orders: pd.DataFrame,
+    ads_daily: pd.DataFrame,
+    funnel: pd.DataFrame,
+    keywords: pd.DataFrame,
+    master: pd.DataFrame,
+    econ_latest: pd.DataFrame,
+    window: Dict[str, date],
+) -> pd.DataFrame:
+    subjects = pd.DataFrame({'subject_norm': sorted(TARGET_SUBJECTS)})
+    key_map = master[['nmId', 'subject_norm']].drop_duplicates() if not master.empty else pd.DataFrame(columns=['nmId', 'subject_norm'])
+
+    def _orders_slice(start: date, end: date, suffix: str) -> pd.DataFrame:
+        if orders.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_orders_{suffix}', f'category_gp_before_ads_{suffix}'])
+        ords = orders[(orders['date'] >= start) & (orders['date'] <= end) & (~orders['isCancel'])].copy()
+        if ords.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_orders_{suffix}', f'category_gp_before_ads_{suffix}'])
+        gp_map = econ_latest[['nmId', 'gp_realized']].drop_duplicates() if not econ_latest.empty else pd.DataFrame(columns=['nmId', 'gp_realized'])
+        ords = ords.merge(key_map, on='nmId', how='left').merge(gp_map, on='nmId', how='left')
+        ords['subject_norm'] = ords['subject_norm'].map(canonical_subject)
+        ords['gp_realized'] = pd.to_numeric(ords.get('gp_realized'), errors='coerce').fillna(0.0)
+        ords = ords[ords['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+        if ords.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_orders_{suffix}', f'category_gp_before_ads_{suffix}'])
+        return ords.groupby('subject_norm', as_index=False).agg(
+            **{
+                f'category_orders_{suffix}': ('nmId', 'count'),
+                f'category_gp_before_ads_{suffix}': ('gp_realized', 'sum'),
+            }
+        )
+
+    def _spend_slice(start: date, end: date, suffix: str) -> pd.DataFrame:
+        if ads_daily.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_spend_{suffix}'])
+        ad = ads_daily[(ads_daily['date'] >= start) & (ads_daily['date'] <= end)].copy()
+        if ad.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_spend_{suffix}'])
+        ad = ad.merge(key_map, on='nmId', how='left')
+        ad['subject_norm'] = ad['subject_norm'].map(canonical_subject)
+        ad['Расход'] = pd.to_numeric(ad.get('Расход'), errors='coerce').fillna(0.0)
+        ad = ad[ad['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+        if ad.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_spend_{suffix}'])
+        return ad.groupby('subject_norm', as_index=False).agg(**{f'category_spend_{suffix}': ('Расход', 'sum')})
+
+    def _demand_slice(start: date, end: date, suffix: str) -> pd.DataFrame:
+        if keywords.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_demand_{suffix}'])
+        kw = keywords[(keywords['date'] >= start) & (keywords['date'] <= end)].copy()
+        if kw.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_demand_{suffix}'])
+        if 'subject_norm' not in kw.columns:
+            kw['subject_norm'] = kw.get('subject', '').map(canonical_subject)
+        kw['subject_norm'] = kw['subject_norm'].map(canonical_subject)
+        kw['demand_week'] = pd.to_numeric(kw.get('demand_week'), errors='coerce').fillna(0.0)
+        kw = kw[kw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+        if kw.empty:
+            return pd.DataFrame(columns=['subject_norm', f'category_demand_{suffix}'])
+        return kw.groupby('subject_norm', as_index=False).agg(**{f'category_demand_{suffix}': ('demand_week', 'sum')})
+
+    def _realized_sales_slice(start: date, end: date) -> pd.DataFrame:
+        if funnel.empty:
+            return pd.DataFrame(columns=['subject_norm', 'category_funnel_sales_cur', 'category_realized_sales_cur'])
+        fw = funnel[(funnel['date'] >= start) & (funnel['date'] <= end)].copy()
+        if fw.empty:
+            return pd.DataFrame(columns=['subject_norm', 'category_funnel_sales_cur', 'category_realized_sales_cur'])
+        sales_col = find_matching_column(fw, FUNNEL_SALES_CANDIDATES)
+        fw = fw.merge(key_map, on='nmId', how='left')
+        fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
+        fw['funnel_sales'] = pd.to_numeric(fw.get(sales_col if sales_col else 'ordersSumRub', 0), errors='coerce').fillna(0.0)
+        fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+        if fw.empty:
+            return pd.DataFrame(columns=['subject_norm', 'category_funnel_sales_cur', 'category_realized_sales_cur'])
+        fw['buyout_rate'] = fw['subject_norm'].map(get_subject_buyout_rate)
+        fw['realized_sales'] = fw['funnel_sales'] * fw['buyout_rate']
+        return fw.groupby('subject_norm', as_index=False).agg(
+            category_funnel_sales_cur=('funnel_sales', 'sum'),
+            category_realized_sales_cur=('realized_sales', 'sum'),
+        )
+
+    out = subjects
+    for df in [
+        _orders_slice(window['cur_start'], window['cur_end'], 'cur'),
+        _orders_slice(window['base_start'], window['base_end'], 'base'),
+        _spend_slice(window['cur_start'], window['cur_end'], 'cur'),
+        _spend_slice(window['base_start'], window['base_end'], 'base'),
+        _demand_slice(window['cur_start'], window['cur_end'], 'cur'),
+        _demand_slice(window['base_start'], window['base_end'], 'base'),
+        _realized_sales_slice(window['cur_start'], window['cur_end']),
+    ]:
+        out = out.merge(df, on='subject_norm', how='left')
+    for col in [
+        'category_orders_cur', 'category_gp_before_ads_cur', 'category_orders_base', 'category_gp_before_ads_base',
+        'category_spend_cur', 'category_spend_base', 'category_demand_cur', 'category_demand_base',
+        'category_funnel_sales_cur', 'category_realized_sales_cur'
+    ]:
+        if col not in out.columns:
+            out[col] = 0.0
+        out[col] = pd.to_numeric(out[col], errors='coerce').fillna(0.0)
+    out['category_gp_cur'] = out['category_gp_before_ads_cur'] - out['category_spend_cur']
+    out['category_gp_base'] = out['category_gp_before_ads_base'] - out['category_spend_base']
+    out['category_drr_cur'] = np.where(out['category_realized_sales_cur'] > 0, out['category_spend_cur'] / out['category_realized_sales_cur'], 0.0)
+    out['category_orders_growth_pct'] = np.where(out['category_orders_base'] > 0, (out['category_orders_cur'] / out['category_orders_base'] - 1.0) * 100.0, np.where(out['category_orders_cur'] > 0, 100.0, 0.0))
+    out['category_gp_growth_pct'] = np.where(out['category_gp_base'] != 0, (out['category_gp_cur'] - out['category_gp_base']) / np.abs(out['category_gp_base']) * 100.0, np.where(out['category_gp_cur'] > 0, 100.0, 0.0))
+    out['category_demand_growth_pct'] = np.where(out['category_demand_base'] > 0, (out['category_demand_cur'] / out['category_demand_base'] - 1.0) * 100.0, np.where(out['category_demand_cur'] > 0, 100.0, 0.0))
+    out['category_limit_drr'] = out['subject_norm'].map(get_category_drr_limit)
+    out['Категория'] = out['subject_norm'].map(get_subject_display_name)
+    out['Фиксированный % выкупа'] = out['subject_norm'].map(lambda x: round(get_subject_buyout_rate(x) * 100.0, 1))
+    return out
 
 def _normalize_name_for_match(value: Any) -> str:
     return re.sub(r"[^0-9a-zа-я]+", "", str(value or "").strip().lower())
@@ -881,7 +1025,7 @@ def load_economics(provider: BaseProvider) -> pd.DataFrame:
     gp_col = find_matching_column(df, ECON_GP_UNIT_CANDIDATES)
     np_col = find_matching_column(df, ECON_NP_UNIT_CANDIDATES)
 
-    df["buyout_rate"] = to_buyout_rate(df[buyout_col], default=0.85) if buyout_col else pd.Series(0.85, index=df.index)
+    df["buyout_rate"] = df["subject_norm"].map(get_subject_buyout_rate)
     df["gp_unit"] = pd.to_numeric(df[gp_col], errors="coerce").fillna(0.0) if gp_col else pd.Series(0.0, index=df.index)
     df["np_unit"] = pd.to_numeric(df[np_col], errors="coerce").fillna(0.0) if np_col else pd.Series(0.0, index=df.index)
     df["gp_realized"] = df["gp_unit"] * df["buyout_rate"].clip(lower=0, upper=1)
@@ -3165,8 +3309,10 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
         .merge(econ_latest, on='nmId', how='left', suffixes=('', '_econ'))
         .merge(traffic, on='supplier_article', how='left')
     )
+    subject_buyout_default = plan.get('subject_norm', pd.Series(index=plan.index, dtype=object)).map(get_subject_buyout_rate).fillna(0.90)
     for c in ['buyout_prev', 'buyout_cur']:
-        plan[c] = to_buyout_rate(plan.get(c, 0), default=0.85)
+        plan[c] = to_buyout_rate(plan.get(c, pd.Series(index=plan.index, dtype=float)), default=np.nan)
+        plan[c] = plan[c].where(plan[c].notna(), subject_buyout_default)
     for c in ['ad_spend_prev', 'ad_spend_cur', 'orders_cur', 'revenue_cur', 'np_unit', 'traffic_coeff', 'query_freq_cur', 'query_freq_prev_scaled', 'atc_cur', 'ord_conv_cur']:
         if c not in plan.columns:
             plan[c] = 0.0
@@ -3255,7 +3401,8 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
         fw = funnel_window.merge(key_map[['nmId', 'subject_norm']].drop_duplicates(), on='nmId', how='left')
         fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
         fw['Продажи воронка строка, ₽'] = pd.to_numeric(fw.get(funnel_sales_col if funnel_sales_col else 'ordersSumRub', 0), errors='coerce').fillna(0.0)
-        fw['buyout_rate_row'] = resolve_buyout_rate_from_funnel(fw, default=0.85)
+        fw['buyout_rate_row'] = resolve_buyout_rate_from_funnel(fw, default=np.nan)
+        fw['buyout_rate_row'] = fw['buyout_rate_row'].where(fw['buyout_rate_row'].notna(), fw['subject_norm'].map(get_subject_buyout_rate).fillna(0.90))
         fw['Выкупленная выручка строка, ₽'] = fw['Продажи воронка строка, ₽'] * fw['buyout_rate_row']
         fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if not fw.empty:
@@ -3303,18 +3450,16 @@ def build_daily_item_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, funn
         return pd.DataFrame([{'Комментарий': 'Нет данных для истории товара'}])
 
     key_map = master[['nmId', 'supplier_article', 'product_root', 'subject', 'subject_norm']].drop_duplicates() if not master.empty else pd.DataFrame(columns=['nmId', 'supplier_article', 'product_root', 'subject', 'subject_norm'])
+    econ_latest = latest_econ_rows(econ, ['nmId', 'gp_realized', 'np_unit']).copy() if not econ.empty else pd.DataFrame(columns=['nmId', 'gp_realized', 'np_unit'])
 
     ords = orders[~orders['isCancel']].copy() if not orders.empty else pd.DataFrame(columns=['date', 'nmId', 'supplier_article', 'finishedPrice'])
-    item_orders = ords.groupby(['date', 'nmId', 'supplier_article'], as_index=False).agg(
-        Заказы=('nmId', 'count'),
-        Сумма_заказов=('finishedPrice', 'sum'),
-    ) if not ords.empty else pd.DataFrame(columns=['date', 'nmId', 'supplier_article', 'Заказы', 'Сумма_заказов'])
+    item_orders = ords.groupby(['date', 'nmId', 'supplier_article'], as_index=False).agg(Заказы=('nmId', 'count'), Сумма_заказов=('finishedPrice', 'sum')) if not ords.empty else pd.DataFrame(columns=['date', 'nmId', 'supplier_article', 'Заказы', 'Сумма_заказов'])
 
     funnel_sales_col = find_matching_column(funnel, FUNNEL_SALES_CANDIDATES)
     if not funnel.empty:
         f = funnel.merge(key_map[['nmId', 'supplier_article', 'subject', 'subject_norm']].drop_duplicates(), on='nmId', how='left')
         f['Продажи_воронки'] = pd.to_numeric(f.get(funnel_sales_col if funnel_sales_col else 'ordersSumRub', 0), errors='coerce').fillna(0.0)
-        f['buyout_rate'] = resolve_buyout_rate_from_funnel(f, default=0.85)
+        f['buyout_rate'] = f['subject_norm'].map(get_subject_buyout_rate)
         funnel_item = f.groupby(['date', 'nmId', 'supplier_article'], as_index=False).agg(
             Продажи_воронки=('Продажи_воронки', 'sum'),
             buyout_rate=('buyout_rate', 'mean'),
@@ -3331,63 +3476,42 @@ def build_daily_item_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, funn
     base = base.merge(key_map, on=['nmId', 'supplier_article'], how='left')
     base['Товар'] = base['supplier_article']
 
-    e = latest_econ_rows(econ, ['nmId', 'np_unit']).copy() if not econ.empty else pd.DataFrame(columns=['nmId', 'np_unit'])
     ad = ads_daily.groupby(['date', 'nmId'], as_index=False).agg(
-        Расходы_РК=('Расход', 'sum'),
-        Клики=('Клики', 'sum'),
-        Показы=('Показы', 'sum'),
-        Заказы_РК=('Заказы', 'sum'),
-        Выручка_РК=('Сумма заказов', 'sum'),
+        Расходы_РК=('Расход', 'sum'), Клики=('Клики', 'sum'), Показы=('Показы', 'sum'), Заказы_РК=('Заказы', 'sum'), Выручка_РК=('Сумма заказов', 'sum')
     ) if not ads_daily.empty else pd.DataFrame(columns=['date', 'nmId', 'Расходы_РК', 'Клики', 'Показы', 'Заказы_РК', 'Выручка_РК'])
 
     kw = dedupe_keyword_rows(keywords_global_for_history) if 'keywords_global_for_history' in globals() and isinstance(globals().get('keywords_global_for_history'), pd.DataFrame) else pd.DataFrame()
     if not kw.empty:
         kw = kw.groupby(['date', 'nmId'], as_index=False).agg(
-            query_freq=('query_freq', 'sum'),
-            keyword_orders=('keyword_orders', 'sum'),
-            median_position=('median_position', 'median'),
-            visibility_pct=('visibility_pct', 'mean'),
+            query_freq=('query_freq', 'sum'), keyword_orders=('keyword_orders', 'sum'), median_position=('median_position', 'median'), visibility_pct=('visibility_pct', 'mean'), demand_week=('demand_week', 'sum')
         )
     else:
-        kw = pd.DataFrame(columns=['date', 'nmId', 'query_freq', 'keyword_orders', 'median_position', 'visibility_pct'])
+        kw = pd.DataFrame(columns=['date', 'nmId', 'query_freq', 'keyword_orders', 'median_position', 'visibility_pct', 'demand_week'])
 
-    out = base.merge(ad, on=['date', 'nmId'], how='left').merge(e, on='nmId', how='left').merge(kw, on=['date', 'nmId'], how='left')
-
-    for c in ['Заказы', 'Сумма_заказов', 'Продажи_воронки', 'buyout_rate', 'addToCartConversion', 'cartToOrderConversion',
-              'Расходы_РК', 'Клики', 'Показы', 'Заказы_РК', 'Выручка_РК', 'np_unit', 'query_freq', 'median_position', 'visibility_pct']:
+    out = base.merge(ad, on=['date', 'nmId'], how='left').merge(econ_latest, on='nmId', how='left').merge(kw, on=['date', 'nmId'], how='left')
+    for c in ['Заказы', 'Сумма_заказов', 'Продажи_воронки', 'buyout_rate', 'addToCartConversion', 'cartToOrderConversion', 'Расходы_РК', 'Клики', 'Показы', 'Заказы_РК', 'Выручка_РК', 'gp_realized', 'np_unit', 'query_freq', 'median_position', 'visibility_pct', 'demand_week']:
         if c not in out.columns:
             out[c] = 0.0
         out[c] = pd.to_numeric(out[c], errors='coerce').fillna(0.0)
 
-    out['buyout_rate'] = out['buyout_rate'].where(out['buyout_rate'] > 0, 0.85).clip(lower=0.0, upper=1.0)
+    out['buyout_rate'] = np.where(out['buyout_rate'] > 0, out['buyout_rate'], out['subject_norm'].map(get_subject_buyout_rate)).clip(0.0, 1.0)
     out['Выручка_для_расчёта'] = np.where(out['Продажи_воронки'] > 0, out['Продажи_воронки'], out['Сумма_заказов'])
-    out['Валовая прибыль после рекламы, ₽'] = out['Выручка_для_расчёта'] * out['buyout_rate'] - out['Расходы_РК']
+    out['Валовая прибыль после рекламы, ₽'] = out['Заказы'] * out['gp_realized'] - out['Расходы_РК']
     out['ДРР, доля'] = np.where(out['Выручка_для_расчёта'] * out['buyout_rate'] > 0, out['Расходы_РК'] / (out['Выручка_для_расчёта'] * out['buyout_rate']), 0.0)
     out['CPO, ₽'] = np.where(out['Заказы_РК'] > 0, out['Расходы_РК'] / out['Заказы_РК'], 0.0)
-    out['Прогнозная чистая прибыль, ₽'] = np.where(out['Заказы'] > 0, out['Заказы'] * out['buyout_rate'] * out['np_unit'], 0.0)
+    out['Прогнозная чистая прибыль, ₽'] = out['Заказы'] * out['buyout_rate'] * out['np_unit'] - out['Расходы_РК']
     out['День зрелый'] = pd.to_datetime(out['date']).dt.date <= (datetime.now().date() - timedelta(days=MATURE_END_OFFSET))
 
     if 'subject' not in out.columns:
         out['subject'] = out.get('subject_norm', '')
 
     out = out.rename(columns={
-        'date': 'Дата',
-        'nmId': 'Артикул WB',
-        'supplier_article': 'Артикул продавца',
-        'subject': 'Предмет',
-        'query_freq': 'Частота запросов',
-        'median_position': 'Медианная позиция',
-        'visibility_pct': 'Видимость, %',
-        'addToCartConversion': 'Конверсия в корзину, %',
-        'cartToOrderConversion': 'Конверсия в заказ, %',
-        'buyout_rate': '% выкупа',
+        'date': 'Дата', 'nmId': 'Артикул WB', 'supplier_article': 'Артикул продавца', 'subject': 'Предмет', 'query_freq': 'Частота запросов',
+        'median_position': 'Медианная позиция', 'visibility_pct': 'Видимость, %', 'demand_week': 'Спрос по ключам',
+        'addToCartConversion': 'Конверсия в корзину, %', 'cartToOrderConversion': 'Конверсия в заказ, %', 'buyout_rate': '% выкупа',
     })
-    wanted = ['Дата', 'Товар', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Заказы', 'Сумма_заказов', '% выкупа', 'Расходы_РК',
-              'Валовая прибыль после рекламы, ₽', 'Клики', 'CPO, ₽', 'Прогнозная чистая прибыль, ₽', 'Показы', 'Заказы_РК',
-              'Выручка_РК', 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Медианная позиция',
-              'Видимость, %', 'День зрелый']
+    wanted = ['Дата', 'Товар', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Заказы', 'Сумма_заказов', '% выкупа', 'Расходы_РК', 'Валовая прибыль после рекламы, ₽', 'Клики', 'CPO, ₽', 'Прогнозная чистая прибыль, ₽', 'Показы', 'Заказы_РК', 'Выручка_РК', 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Спрос по ключам', 'Медианная позиция', 'Видимость, %', 'День зрелый']
     return trim_to_columns(out, wanted)
-
 
 
 def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, funnel: pd.DataFrame, econ: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
@@ -3396,53 +3520,41 @@ def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFram
 
     meta = campaigns[['id_campaign', 'nmId', 'placement', 'payment_type', 'current_bid_rub', 'campaign_status']].drop_duplicates()
     key_map = master[['nmId', 'supplier_article', 'subject', 'subject_norm']].drop_duplicates()
+    econ_latest = latest_econ_rows(econ, ['nmId', 'gp_realized', 'np_unit']).copy() if not econ.empty else pd.DataFrame(columns=['nmId', 'gp_realized', 'np_unit'])
     df = ads_daily.groupby(['date', 'id_campaign', 'nmId'], as_index=False).agg(
-        Показы=('Показы', 'sum'),
-        Клики=('Клики', 'sum'),
-        Заказы_РК=('Заказы', 'sum'),
-        Расходы_РК=('Расход', 'sum'),
-        Выручка_РК=('Сумма заказов', 'sum'),
+        Показы=('Показы', 'sum'), Клики=('Клики', 'sum'), Заказы_РК=('Заказы', 'sum'), Расходы_РК=('Расход', 'sum'), Выручка_РК=('Сумма заказов', 'sum')
     )
 
-    if not funnel.empty:
-        buy = funnel.groupby(['date', 'nmId'], as_index=False).agg(
-            buyout_rate=('buyoutPercent', 'mean'),
-            funnel_sales=('ordersSumRub', 'sum'),
-        )
+    kw = dedupe_keyword_rows(keywords_global_for_history) if 'keywords_global_for_history' in globals() and isinstance(globals().get('keywords_global_for_history'), pd.DataFrame) else pd.DataFrame()
+    if not kw.empty:
+        kw = kw.groupby(['date', 'nmId'], as_index=False).agg(demand_week=('demand_week', 'sum'), query_freq=('query_freq', 'sum'))
     else:
-        buy = pd.DataFrame(columns=['date', 'nmId', 'buyout_rate', 'funnel_sales'])
+        kw = pd.DataFrame(columns=['date', 'nmId', 'demand_week', 'query_freq'])
 
-    econ_latest = latest_econ_rows(econ, ['nmId', 'np_unit']).copy() if not econ.empty else pd.DataFrame(columns=['nmId', 'np_unit'])
-    df = df.merge(meta, on=['id_campaign', 'nmId'], how='left').merge(key_map, on='nmId', how='left').merge(buy, on=['date', 'nmId'], how='left').merge(econ_latest, on='nmId', how='left')
-
-    df['buyout_rate'] = pd.to_numeric(df.get('buyout_rate'), errors='coerce').fillna(0.85)
-    df['buyout_rate'] = df['buyout_rate'].clip(lower=0.0, upper=1.0)
+    df = df.merge(meta, on=['id_campaign', 'nmId'], how='left').merge(key_map, on='nmId', how='left').merge(econ_latest, on='nmId', how='left').merge(kw, on=['date', 'nmId'], how='left')
+    df['buyout_rate'] = df['subject_norm'].map(get_subject_buyout_rate)
+    df['gp_realized'] = pd.to_numeric(df.get('gp_realized'), errors='coerce').fillna(0.0)
     df['np_unit'] = pd.to_numeric(df.get('np_unit'), errors='coerce').fillna(0.0)
-    df['funnel_sales'] = pd.to_numeric(df.get('funnel_sales'), errors='coerce').fillna(0.0)
-    df['revenue_for_drr'] = np.where(df['Выручка_РК'] > 0, df['Выручка_РК'], 0.0)
+    df['demand_week'] = pd.to_numeric(df.get('demand_week'), errors='coerce').fillna(0.0)
+    df['query_freq'] = pd.to_numeric(df.get('query_freq'), errors='coerce').fillna(0.0)
+    df['Выручка_РК'] = pd.to_numeric(df.get('Выручка_РК'), errors='coerce').fillna(0.0)
 
-    df['ДРР кампании, доля'] = np.where(df['revenue_for_drr'] * df['buyout_rate'] > 0, df['Расходы_РК'] / (df['revenue_for_drr'] * df['buyout_rate']), 0.0)
-    df['ВП кампании после рекламы, ₽'] = df['revenue_for_drr'] * df['buyout_rate'] - df['Расходы_РК']
+    df['ДРР кампании, доля'] = np.where(df['Выручка_РК'] * df['buyout_rate'] > 0, df['Расходы_РК'] / (df['Выручка_РК'] * df['buyout_rate']), 0.0)
+    df['ВП кампании после рекламы, ₽'] = df['Заказы_РК'] * df['gp_realized'] - df['Расходы_РК']
     df['ROI кампании'] = np.where(df['Расходы_РК'] > 0, ((df['Заказы_РК'] * df['buyout_rate'] * df['np_unit']) - df['Расходы_РК']) / df['Расходы_РК'], 0.0)
     df['CPO кампании, ₽'] = np.where(df['Заказы_РК'] > 0, df['Расходы_РК'] / df['Заказы_РК'], 0.0)
     df['Тип'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'), 'Поиск', 'Полки')
+    df['Тип кампании'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'), 'CPC', 'CPM')
     df['День зрелый'] = pd.to_datetime(df['date']).dt.date <= (datetime.now().date() - timedelta(days=MATURE_END_OFFSET))
 
     if 'subject' not in df.columns:
         df['subject'] = df.get('subject_norm', '')
 
     df = df.rename(columns={
-        'date': 'Дата',
-        'nmId': 'Артикул WB',
-        'supplier_article': 'Артикул продавца',
-        'subject': 'Предмет',
-        'id_campaign': 'ID кампании',
-        'current_bid_rub': 'Ставка, ₽',
-        'placement': 'Плейсмент',
+        'date': 'Дата', 'nmId': 'Артикул WB', 'supplier_article': 'Артикул продавца', 'subject': 'Предмет', 'id_campaign': 'ID кампании',
+        'current_bid_rub': 'Ставка, ₽', 'placement': 'Плейсмент', 'demand_week': 'Спрос по ключам', 'query_freq': 'Частота запросов',
     })
-    wanted = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики',
-              'Заказы_РК', 'Выручка_РК', 'Расходы_РК', 'ДРР кампании, доля', 'ВП кампании после рекламы, ₽', 'ROI кампании',
-              'CPO кампании, ₽', 'День зрелый']
+    wanted = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип кампании', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики', 'Заказы_РК', 'Выручка_РК', 'Расходы_РК', 'ДРР кампании, доля', 'ВП кампании после рекламы, ₽', 'ROI кампании', 'CPO кампании, ₽', 'Спрос по ключам', 'Частота запросов', 'День зрелый']
     return trim_to_columns(df, wanted)
 
 
@@ -3453,12 +3565,7 @@ def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, mast
     keys = master[['nmId','supplier_article','subject_norm']].drop_duplicates()
     npu = econ_latest[['nmId','gp_realized','np_unit']].drop_duplicates() if 'gp_realized' in econ_latest.columns else econ_latest[['nmId','np_unit']].copy()
     df = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].merge(meta,on=['id_campaign','nmId'],how='left').merge(keys,on='nmId',how='left').merge(npu,on='nmId',how='left')
-    if funnel is not None and not funnel.empty:
-        b = funnel[(funnel['date'] >= window['cur_start']) & (funnel['date'] <= window['cur_end'])].groupby('nmId', as_index=False).agg(buyout_rate=('buyoutPercent','mean'))
-        df = df.merge(b,on='nmId',how='left')
-    df['buyout_rate'] = pd.to_numeric(df.get('buyout_rate'), errors='coerce')
-    df['buyout_rate'] = np.where(df['buyout_rate'] > 1, df['buyout_rate']/100.0, df['buyout_rate'])
-    df['buyout_rate'] = pd.Series(df['buyout_rate']).fillna(0.85)
+    df['buyout_rate'] = df['subject_norm'].map(get_subject_buyout_rate)
     df['channel'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'),'CPC','CPM')
     grp = df.groupby(['supplier_article','channel'], as_index=False).agg(spend=('Расход','sum'), orders=('Заказы','sum'), revenue=('Сумма заказов','sum'), clicks=('Клики','sum'), shows=('Показы','sum'), buyout_rate=('buyout_rate','mean'), np_unit=('np_unit','mean'))
     grp['cpo'] = np.where(grp['orders']>0, grp['spend']/grp['orders'], 0.0)
@@ -3501,85 +3608,96 @@ def build_item_current_metrics(item_history: pd.DataFrame, cur_start: date, cur_
 def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool]:
     current_bid = safe_float(row.get('current_bid_rub'))
     max_bid = safe_float(row.get('max_bid_rub'))
-    payment_type = str(row.get('payment_type','')).lower()
+    payment_type = canonical_payment_type(row.get('payment_type'))
     min_bid = safe_float(row.get('Минимальная ставка WB, ₽')) if pd.notna(row.get('Минимальная ставка WB, ₽')) else (4.0 if payment_type == 'cpc' else 80.0)
     floor_bid = max(min_bid, 4.0 if payment_type == 'cpc' else 80.0)
+    step = get_bid_step_rub(payment_type)
+    subject_norm = canonical_subject(row.get('subject_norm', row.get('subject', '')))
+    subject_name = get_subject_display_name(subject_norm)
+
+    category_drr = safe_float(row.get('category_drr_cur'))
+    category_limit = safe_float(row.get('category_limit_drr')) or get_category_drr_limit(subject_norm)
+    category_orders_growth = safe_float(row.get('category_orders_growth_pct'))
+    category_gp_growth = safe_float(row.get('category_gp_growth_pct'))
+    category_demand_growth = safe_float(row.get('category_demand_growth_pct'))
+    category_plan_att = safe_float(row.get('category_plan_attainment_pct', row.get('plan_attainment_pct', 100.0)))
+
     campaign_drr = safe_float(row.get('campaign_drr_cur'))
     campaign_gp = safe_float(row.get('campaign_gp_cur'))
     campaign_gp_growth = safe_float(row.get('campaign_gp_growth_pct'))
-    campaign_order_growth = safe_float(row.get('campaign_order_growth_pct'))
+    campaign_orders_growth = safe_float(row.get('campaign_order_growth_pct'))
+    campaign_click_growth = safe_float(row.get('campaign_click_growth_pct'))
+    campaign_impression_growth = safe_float(row.get('campaign_impression_growth_pct'))
+    campaign_roi = safe_float(row.get('campaign_roi_cur'))
+
     item_gp_growth = safe_float(row.get('item_gp_growth_pct'))
-    category_drr = safe_float(row.get('category_drr_cur'))
-    category_gp_growth = safe_float(row.get('category_gp_growth_pct'))
-    category_limit = safe_float(row.get('category_limit_drr')) or get_category_drr_limit(row.get('subject_norm', ''))
-    better_channel = str(row.get('better_channel',''))
+    item_orders_growth = safe_float(row.get('item_order_growth_pct'))
+    better_channel = str(row.get('better_channel', '') or '').strip().upper()
     row_channel = 'CPC' if payment_type == 'cpc' else 'CPM'
-    cpo_cpc = safe_float(row.get('cpo_cpc'))
-    cpo_cpm = safe_float(row.get('cpo_cpm'))
-    gp_cpc = safe_float(row.get('gp_after_ads_cpc'))
-    gp_cpm = safe_float(row.get('gp_after_ads_cpm'))
-    plan_att = safe_float(row.get('plan_attainment_pct'))
-    roi = safe_float(row.get('campaign_roi_cur'))
-    supplier_article = str(row.get('supplier_article',''))
-    subject_name = get_subject_display_name(row.get('subject_norm', row.get('subject', '')))
-    reason_parts = []
+    campaign_is_active = bool(row.get('campaign_is_active', False))
+    supplier_article = str(row.get('supplier_article', '') or '').strip()
 
-    category_guard = False
-    if category_drr > category_limit > 0:
-        category_guard = True
-        reason_parts.append(f'ДРР категории «{subject_name}» {category_drr*100:.1f}% выше лимита {category_limit*100:.1f}%')
+    can_raise_more = (max_bid <= 0) or (current_bid + step <= max_bid + 1e-9)
+    rate_limit = max_bid > 0 and current_bid >= max_bid - 1e-9
+    positive_traffic = campaign_impression_growth > 0 or campaign_click_growth > 0
+    positive_orders = campaign_orders_growth > 0
+    positive_gp = campaign_gp_growth > 0
+    trend_confirmed = positive_traffic and positive_orders and positive_gp
+    doubtful_trend = (positive_traffic and not positive_orders) or (positive_orders and not positive_gp)
+    demand_explains_drop = is_drop_explained_by_demand(category_orders_growth, category_demand_growth)
 
-    if campaign_drr > cfg.campaign_hard_drr:
-        target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.hard_down_step), 2)))
-        return 'Снизить', target, f'ДРР кампании {campaign_drr*100:.1f}% выше 16% — жёсткое ограничение', True
+    def raise_bid() -> float:
+        return apply_bid_step(current_bid, payment_type, 'up', floor_bid, max_bid)
 
-    if supplier_article in {'901_/6','901/6'} and row_channel in {'CPC','CPM'} and roi < cfg.roi_9016_target:
-        target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-        return 'Снизить', target, f'ROI ниже целевого значения ({roi*100:.1f}% < 10%)', True
+    def lower_bid() -> float:
+        return apply_bid_step(current_bid, payment_type, 'down', floor_bid, max_bid)
 
-    if campaign_gp <= 0:
-        target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-        return 'Снизить', target, f'Кампания убыточна ({campaign_gp:.0f} ₽)', True
+    level1 = f"Уровень 1 Категория: {subject_name}; план {category_plan_att:.0f}%, ДРР {category_drr*100:.1f}% при лимите {category_limit*100:.1f}%, заказы {category_orders_growth:.1f}%, ВП {category_gp_growth:.1f}%, спрос {category_demand_growth:.1f}%"
+    level2 = f"Уровень 2 Кампания: ДРР {campaign_drr*100:.1f}%, ВП {campaign_gp:.0f} ₽, рост показов {campaign_impression_growth:.1f}%, кликов {campaign_click_growth:.1f}%, заказов {campaign_orders_growth:.1f}%, ВП {campaign_gp_growth:.1f}%"
+    level3 = f"Уровень 3 Товар: рост заказов {item_orders_growth:.1f}%, рост чистой/валовой прибыли {item_gp_growth:.1f}%"
 
-    over_target = max(0.0, campaign_drr*100 - cfg.campaign_target_drr*100)
-    required_growth = over_target * cfg.orders_growth_per_1pp_over_12
-    if campaign_drr > cfg.campaign_target_drr:
-        if campaign_order_growth < required_growth or campaign_gp_growth <= 0:
-            target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-            return 'Снизить', target, f'ДРР кампании {campaign_drr*100:.1f}% выше 12%, рост заказов {campaign_order_growth:.1f}% < требуемых {required_growth:.1f}% или ВП не растёт', True
-        reason_parts.append(f'ДРР кампании {campaign_drr*100:.1f}% выше 12%, но рост заказов {campaign_order_growth:.1f}% оправдывает превышение')
+    if not campaign_is_active:
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; кампания не активна — ставку не меняем", False
 
-    if category_guard:
-        if campaign_drr > cfg.campaign_target_drr:
-            target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-            return 'Снизить', target, '; '.join(reason_parts + ['Категория выше лимита, и эта кампания тоже выше 12% — снижаем']) , True
-        reason_parts.append('Категория выше лимита, но эта кампания сама в целевой зоне — применяем общие правила')
+    if supplier_article in {'901_/6', '901/6'} and campaign_roi < cfg.roi_9016_target and current_bid > floor_bid:
+        return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; ROI 901/6 ниже целевого {cfg.roi_9016_target*100:.0f}%", True
 
-    conflict = item_gp_growth > 0 and campaign_gp_growth < 0 and abs(campaign_gp_growth) > abs(item_gp_growth)
-    if conflict:
-        reason_parts.append('Рост ВП товара достигнут за счёт падения ВП кампании')
-    if category_gp_growth < 0 and not category_guard:
-        reason_parts.append('ВП категории снижается — рост только при хорошем сигнале кампании')
+    if campaign_gp <= 0 and current_bid > floor_bid:
+        return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; кампания убыточна — снижаем на 1 шаг ({step:.0f} ₽)", True
 
-    if better_channel == 'CPC' and row_channel == 'CPC':
-        if campaign_drr <= cfg.campaign_target_drr and campaign_gp_growth >= 0 and (max_bid > current_bid + 0.01):
-            new_bid = min(max_bid, round(current_bid * (1 + (cfg.max_up_step if plan_att >= 100 else cfg.test_up_step)), 2))
-            if new_bid > current_bid:
-                return 'Повысить', max(floor_bid, new_bid), '; '.join(reason_parts + ['Поиск выигрывает по весам, категория и кампания в норме']), False
-        return 'Без изменений', current_bid, '; '.join(reason_parts + ['Поиск выигрывает по весам, удерживаем']), False
+    if category_drr > category_limit:
+        if campaign_drr > 0.10 and current_bid > floor_bid:
+            return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; категория выше лимита, эта кампания тоже >10% ДРР — снижаем на 1 шаг ({step:.0f} ₽)", True
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; категория выше лимита, но у кампании ДРР <= 10% — не режем автоматически", False
 
-    if better_channel == 'CPM' and row_channel == 'CPM':
-        if campaign_drr <= cfg.campaign_target_drr and campaign_gp_growth >= 0 and (max_bid > current_bid + 0.01):
-            new_bid = min(max_bid, round(current_bid * (1 + (cfg.max_up_step if plan_att >= 100 else cfg.test_up_step)), 2))
-            if new_bid > current_bid:
-                return 'Повысить', max(floor_bid, new_bid), '; '.join(reason_parts + ['Полки выигрывают по весам, категория и кампания в норме']), False
-        return 'Без изменений', current_bid, '; '.join(reason_parts + ['Полки выигрывают по весам, удерживаем']), False
+    if category_orders_growth < 0 and not demand_explains_drop and category_drr <= category_limit:
+        if campaign_drr <= 0.10 and campaign_gp > 0 and can_raise_more:
+            return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; заказы категории падают быстрее спроса — усиливаем эффективную кампанию <=10% ДРР на 1 шаг ({step:.0f} ₽)", False
 
-    if row_channel != better_channel and ((row_channel == 'CPM' and ((gp_cpm < gp_cpc) or (cpo_cpm > 0 and cpo_cpc > 0 and cpo_cpm > cpo_cpc))) or (row_channel == 'CPC' and ((gp_cpc < gp_cpm) or (cpo_cpc > 0 and cpo_cpm > 0 and cpo_cpc > cpo_cpm)))):
-        target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-        return 'Снизить', target, '; '.join(reason_parts + ['Канал хуже альтернативного по CPO/ВП']), True
+    if category_orders_growth > 0 and category_gp_growth < 0:
+        if campaign_drr > 0.10 and current_bid > floor_bid:
+            return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; заказы категории растут, а ВП падает — режем кампанию >10% ДРР на 1 шаг ({step:.0f} ₽)", True
 
-    return 'Без изменений', current_bid, '; '.join(reason_parts + ['Без изменений']) if reason_parts else 'Без изменений', False
+    if campaign_drr <= category_limit and campaign_gp > 0:
+        if doubtful_trend:
+            return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; трафик меняется, но заказ/ВП не подтверждены — ждём 3 дня", False
+        if trend_confirmed and can_raise_more:
+            return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; кампания прибыльная и растёт — повышаем на 1 шаг ({step:.0f} ₽)", False
+        if category_plan_att < 95 and item_gp_growth <= 0 and can_raise_more:
+            return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; отстаём от плана, ДРР в норме, прибыль товара не растёт — повышаем на 1 шаг ({step:.0f} ₽)", False
+        if better_channel and better_channel != row_channel:
+            return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; альтернативный канал сильнее, но эта кампания прибыльная — не режем автоматически", False
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; недостаточно сигнала для изменения", rate_limit
+
+    if campaign_drr > category_limit:
+        if (campaign_gp_growth <= 0 or campaign_orders_growth <= 0) and current_bid > floor_bid:
+            return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; ДРР кампании выше верхнего значения и рост не подтверждён — снижаем на 1 шаг ({step:.0f} ₽)", True
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; ДРР кампании выше верхнего значения, но кампания пока прибыльна — ждём подтверждение", False
+
+    if rate_limit:
+        return 'Предел эффективности ставки', round(current_bid, 2), f"{level1}; {level2}; {level3}; ставка упёрлась в расчётный максимум", True
+
+    return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; без изменений", False
 
 
 def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Dict[str, Any]:
@@ -3601,10 +3719,12 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     daily_campaign = build_daily_campaign_history(ads_daily, campaigns, funnel, econ, master)
 
     econ_latest = latest_econ_rows(econ, ['nmId','supplier_article','product_root','subject','subject_norm','buyout_rate','gp_realized','np_unit']).copy() if not econ.empty else pd.DataFrame(columns=['nmId','supplier_article','product_root','subject','subject_norm','buyout_rate','gp_realized','np_unit'])
+    category_diag = build_category_window_diagnostics(orders, ads_daily, funnel, keywords, master, econ_latest, window)
     keywords_current = aggregate_keyword_item(keywords, window['cur_start'], window['cur_end'])
     funnel_item, funnel_subject = build_funnel_item(funnel, master, window['cur_start'], window['cur_end'])
 
     campaigns_base = campaigns[['id_campaign','nmId','placement','payment_type','current_bid_rub','campaign_status']].drop_duplicates().merge(master[['nmId','supplier_article','product_root','subject','subject_norm','rating_reviews','rating_card']].drop_duplicates(), on='nmId', how='left').merge(econ_latest[['nmId','buyout_rate','gp_realized','np_unit']], on='nmId', how='left').drop_duplicates(['id_campaign','nmId','placement','payment_type'])
+    campaigns_base['buyout_rate'] = campaigns_base['subject_norm'].map(get_subject_buyout_rate)
 
     cur = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].groupby(['id_campaign','nmId'], as_index=False).agg(
         Показы=('Показы','sum'), Клики=('Клики','sum'), Заказы=('Заказы','sum'), Расход=('Расход','sum'), Сумма_заказов=('Сумма заказов','sum')
@@ -3646,10 +3766,12 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['ctr_pct'] = np.where(rows['Показы'] > 0, rows['Клики'] / rows['Показы'] * 100.0, 0.0)
     rows['campaign_drr_cur'] = np.where(rows['Сумма_заказов'] * rows['buyout_rate'] > 0, rows['Расход'] / (rows['Сумма_заказов'] * rows['buyout_rate']), 0.0)
     rows['campaign_drr_base'] = np.where(rows['base_Сумма_заказов'] * rows['buyout_rate'] > 0, rows['base_Расход'] / (rows['base_Сумма_заказов'] * rows['buyout_rate']), 0.0)
-    rows['campaign_gp_cur'] = rows['Сумма_заказов'] * rows['buyout_rate'] - rows['Расход']
-    rows['campaign_gp_base'] = rows['base_Сумма_заказов'] * rows['buyout_rate'] - rows['base_Расход']
+    rows['campaign_gp_cur'] = rows['Заказы'] * rows['gp_realized'] - rows['Расход']
+    rows['campaign_gp_base'] = rows['base_Заказы'] * rows['gp_realized'] - rows['base_Расход']
     rows['campaign_gp_growth_pct'] = np.where(rows['campaign_gp_base'] != 0, (rows['campaign_gp_cur'] - rows['campaign_gp_base']) / np.abs(rows['campaign_gp_base']) * 100.0, np.where(rows['campaign_gp_cur'] > 0, 100.0, 0.0))
     rows['campaign_order_growth_pct'] = np.where(rows['base_Заказы'] > 0, (rows['Заказы'] / rows['base_Заказы'] - 1) * 100.0, np.where(rows['Заказы'] > 0, 100.0, 0.0))
+    rows['campaign_click_growth_pct'] = np.where(rows['base_Клики'] > 0, (rows['Клики'] / rows['base_Клики'] - 1) * 100.0, np.where(rows['Клики'] > 0, 100.0, 0.0))
+    rows['campaign_impression_growth_pct'] = np.where(rows['base_Показы'] > 0, (rows['Показы'] / rows['base_Показы'] - 1) * 100.0, np.where(rows['Показы'] > 0, 100.0, 0.0))
     rows['campaign_cpo'] = np.where(rows['Заказы'] > 0, rows['Расход'] / rows['Заказы'], 0.0)
     rows['campaign_roi_cur'] = np.where(rows['Расход'] > 0, ((rows['Заказы'] * rows['buyout_rate'] * rows['np_unit']) - rows['Расход']) / rows['Расход'], 0.0)
     item_revenue_cur = numeric_series(rows, 'item_revenue_cur', 0.0)
@@ -3674,26 +3796,59 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['card_issue'] = ((add_to_cart_conv < 0.5 * subj_add_to_cart) | (cart_to_order_conv < 0.5 * subj_cart_to_order)) if 'subj_addToCart' in rows.columns else False
 
     if category_plan is not None and not category_plan.empty and 'subject_norm' in category_plan.columns:
-        cat_cols = [c for c in ['subject_norm','ДРР категории, доля','Факт ВП MTD, ₽','План ВП MTD, ₽','Лимит ДРР категории, доля'] if c in category_plan.columns]
+        cat_cols = [c for c in ['subject_norm','Факт ВП MTD, ₽','План ВП MTD, ₽','Темп плана ВП, %','Лимит ДРР категории, доля'] if c in category_plan.columns]
         cat_merge = category_plan[cat_cols].drop_duplicates('subject_norm').copy()
         cat_merge = cat_merge.rename(columns={
-            'ДРР категории, доля': 'category_drr_cur',
-            'Факт ВП MTD, ₽': 'category_gp_cur',
+            'Факт ВП MTD, ₽': 'category_gp_mtd',
             'План ВП MTD, ₽': 'category_gp_plan',
-            'Лимит ДРР категории, доля': 'category_limit_drr',
+            'Темп плана ВП, %': 'category_plan_attainment_pct',
+            'Лимит ДРР категории, доля': 'category_limit_drr_plan',
         })
         rows = rows.merge(cat_merge, on='subject_norm', how='left')
-        rows['category_drr_cur'] = pd.to_numeric(rows.get('category_drr_cur'), errors='coerce').fillna(0.0)
-        rows['category_gp_cur'] = pd.to_numeric(rows.get('category_gp_cur'), errors='coerce').fillna(0.0)
-        rows['category_gp_plan'] = pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').fillna(0.0)
-        rows['category_limit_drr'] = pd.to_numeric(series_or_default(rows, 'category_limit_drr', np.nan), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
-        rows['category_gp_growth_pct'] = np.where(rows['category_gp_plan'] != 0, (rows['category_gp_cur'] - rows['category_gp_plan']) / np.abs(rows['category_gp_plan']) * 100.0, 0.0)
+    else:
+        rows['category_gp_mtd'] = 0.0
+        rows['category_gp_plan'] = 0.0
+        rows['category_plan_attainment_pct'] = 100.0
+        rows['category_limit_drr_plan'] = np.nan
+
+    if category_diag is not None and not category_diag.empty:
+        rows = rows.merge(category_diag[['subject_norm','category_drr_cur','category_gp_cur','category_gp_base','category_orders_cur','category_orders_base','category_orders_growth_pct','category_gp_growth_pct','category_demand_cur','category_demand_base','category_demand_growth_pct','category_limit_drr']], on='subject_norm', how='left')
     else:
         rows['category_drr_cur'] = 0.0
         rows['category_gp_cur'] = 0.0
-        rows['category_gp_plan'] = 0.0
-        rows['category_limit_drr'] = rows['subject_norm'].map(get_category_drr_limit)
+        rows['category_gp_base'] = 0.0
+        rows['category_orders_cur'] = 0.0
+        rows['category_orders_base'] = 0.0
+        rows['category_orders_growth_pct'] = 0.0
         rows['category_gp_growth_pct'] = 0.0
+        rows['category_demand_cur'] = 0.0
+        rows['category_demand_base'] = 0.0
+        rows['category_demand_growth_pct'] = 0.0
+        rows['category_limit_drr'] = rows['subject_norm'].map(get_category_drr_limit)
+
+    rows['category_limit_drr'] = pd.to_numeric(rows.get('category_limit_drr'), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
+    rows['category_plan_attainment_pct'] = pd.to_numeric(rows.get('category_plan_attainment_pct'), errors='coerce').fillna(np.where(pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').fillna(0.0) > 0, pd.to_numeric(rows.get('category_gp_mtd'), errors='coerce').fillna(0.0) / pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').replace(0, np.nan).fillna(1.0) * 100.0, 100.0))
+
+    category_plan = category_diag.copy() if category_diag is not None else pd.DataFrame(columns=['subject_norm'])
+    if category_plan is not None and not category_plan.empty:
+        category_plan['Категория'] = category_plan['subject_norm'].map(get_subject_display_name)
+        category_plan['Лимит ДРР категории, доля'] = category_plan['category_limit_drr']
+        category_plan['Лимит ДРР категории, %'] = category_plan['category_limit_drr'] * 100.0
+        category_plan['ДРР категории, доля'] = category_plan['category_drr_cur']
+        category_plan['ДРР категории, %'] = category_plan['category_drr_cur'] * 100.0
+        category_plan['Факт ВП MTD, ₽'] = category_plan['category_gp_cur']
+        category_plan['ВП базовое окно, ₽'] = category_plan['category_gp_base']
+        category_plan['Темп категории, %'] = category_plan['category_gp_growth_pct']
+        category_plan['Заказы окно'] = category_plan['category_orders_cur']
+        category_plan['Заказы база'] = category_plan['category_orders_base']
+        category_plan['Рост заказов окна, %'] = category_plan['category_orders_growth_pct']
+        category_plan['Спрос окно'] = category_plan['category_demand_cur']
+        category_plan['Спрос база'] = category_plan['category_demand_base']
+        category_plan['Рост спроса окна, %'] = category_plan['category_demand_growth_pct']
+        category_plan['Фиксированный % выкупа'] = category_plan['subject_norm'].map(lambda x: get_subject_buyout_rate(x) * 100.0)
+        category_plan['Рабочее окно с'] = window['cur_start']
+        category_plan['Рабочее окно по'] = window['cur_end']
+        category_plan = category_plan[['Категория','subject_norm','Фиксированный % выкупа','Заказы окно','Заказы база','Рост заказов окна, %','Спрос окно','Спрос база','Рост спроса окна, %','Факт ВП MTD, ₽','ВП базовое окно, ₽','Темп категории, %','ДРР категории, доля','ДРР категории, %','Лимит ДРР категории, доля','Лимит ДРР категории, %','Рабочее окно с','Рабочее окно по']]
 
     rows = normalize_core_columns(rows)
     if 'supplier_article' not in rows.columns:
@@ -3769,6 +3924,12 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
             'Лимит ДРР категории, %': round(safe_float(r.get('category_limit_drr')) * 100, 2),
             'Факт ВП категории MTD, ₽': round(safe_float(r.get('category_gp_cur')), 2),
             'Темп категории, %': round(safe_float(r.get('category_gp_growth_pct')), 2),
+            'Рост заказов категории, %': round(safe_float(r.get('category_orders_growth_pct')), 2),
+            'Рост спроса категории, %': round(safe_float(r.get('category_demand_growth_pct')), 2),
+            'Темп плана категории, %': round(safe_float(r.get('category_plan_attainment_pct')), 2),
+            'Рост показов кампании, %': round(safe_float(r.get('campaign_impression_growth_pct')), 2),
+            'Рост кликов кампании, %': round(safe_float(r.get('campaign_click_growth_pct')), 2),
+            'Рост заказов кампании, %': round(safe_float(r.get('campaign_order_growth_pct')), 2),
             'CPO CPC, ₽': round(safe_float(r.get('cpo_cpc')), 2),
             'CPO Полок, ₽': round(safe_float(r.get('cpo_cpm')), 2),
             'ДРР CPC, %': round(safe_float(r.get('drr_cpc')) * 100, 2),
@@ -3875,10 +4036,10 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
 
     item_cols = ['Дата', 'Товар', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Заказы', 'Сумма_заказов', '% выкупа', 'Расходы_РК',
                  'Валовая прибыль после рекламы, ₽', 'Клики', 'CPO, ₽', 'Прогнозная чистая прибыль, ₽', 'Показы', 'Заказы_РК', 'Выручка_РК',
-                 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Медианная позиция', 'Видимость, %', 'День зрелый']
-    campaign_cols = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики',
+                 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Спрос по ключам', 'Медианная позиция', 'Видимость, %', 'День зрелый']
+    campaign_cols = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип кампании', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики',
                      'Заказы_РК', 'Выручка_РК', 'Расходы_РК', 'ДРР кампании, доля', 'ВП кампании после рекламы, ₽', 'ROI кампании',
-                     'CPO кампании, ₽', 'День зрелый']
+                     'CPO кампании, ₽', 'Спрос по ключам', 'Частота запросов', 'День зрелый']
 
     daily_item = trim_to_columns(daily_item, item_cols)
     daily_campaign = trim_to_columns(daily_campaign, campaign_cols)
@@ -3983,6 +4144,537 @@ def run_manager(args: argparse.Namespace) -> None:
     log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
     history_append = build_history_append(decisions, as_of_date)
     save_outputs(provider, results, 'run', bid_send_log, None, history_append)
+
+
+
+
+def parse_abc_snapshot_dt(key: str) -> datetime:
+    text = str(key or '')
+    m = re.search(r'_at_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})', text)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}:{m.group(3)}", "%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    return datetime.min
+
+
+def load_latest_abc_reference(provider: BaseProvider) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    try:
+        keys = provider.list_keys(ABC_PREFIX)
+    except Exception:
+        return pd.DataFrame(), {}
+    abc_keys = [k for k in keys if re.search(r'wb_abc_report_goods__.*\.xlsx$', Path(str(k)).name, flags=re.I)]
+    if not abc_keys:
+        return pd.DataFrame(), {}
+    best_key = max(abc_keys, key=parse_abc_snapshot_dt)
+    try:
+        df = provider.read_excel(best_key).copy()
+    except Exception:
+        return pd.DataFrame(), {}
+    if df.empty:
+        return pd.DataFrame(), {}
+
+    df = df.rename(columns={
+        'Артикул WB': 'nmId',
+        'Артикул продавца': 'supplier_article',
+        'Предмет': 'subject',
+        'Ваша категория': 'manager_category',
+        'Процент выкупов, %': 'buyout_pct',
+        'Заказы': 'orders_cnt',
+    })
+    if 'nmId' in df.columns:
+        df['nmId'] = pd.to_numeric(df['nmId'], errors='coerce')
+    else:
+        df['nmId'] = np.nan
+    df['supplier_article'] = df.get('supplier_article', '').fillna('').astype(str)
+    df['subject'] = df.get('subject', '').fillna('').astype(str)
+    df['subject_norm'] = df['subject'].map(canonical_subject)
+    df['manager_category'] = df.get('manager_category', '').fillna('').astype(str).str.strip()
+    df['manager_category'] = df['manager_category'].replace({'': 'Без менеджера'})
+    df['buyout_pct'] = pd.to_numeric(df.get('buyout_pct'), errors='coerce')
+    df['orders_cnt'] = pd.to_numeric(df.get('orders_cnt'), errors='coerce').fillna(0.0)
+    df['buyout_pct_clipped'] = df['buyout_pct'].clip(lower=0.0, upper=100.0)
+
+    rates: Dict[str, float] = {}
+    for subject_norm, grp in df.groupby('subject_norm'):
+        if not subject_norm:
+            continue
+        valid = grp['buyout_pct_clipped'].notna()
+        if not valid.any():
+            continue
+        w = grp.loc[valid, 'orders_cnt'].fillna(0.0)
+        x = grp.loc[valid, 'buyout_pct_clipped'].fillna(0.0)
+        if float(w.sum()) > 0:
+            pct_value = float((x * w).sum() / w.sum())
+        else:
+            pct_value = float(x.mean())
+        rates[subject_norm] = round(clamp(pct_value / 100.0, 0.0, 1.0), 4)
+
+    ref_cols = [c for c in ['nmId', 'supplier_article', 'subject', 'subject_norm', 'manager_category', 'buyout_pct_clipped', 'orders_cnt'] if c in df.columns]
+    ref = df[ref_cols].drop_duplicates().copy()
+    ref.attrs['source_key'] = best_key
+    return ref, rates
+
+
+def _normalize_funnel_subject_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame(columns=['supplier_article', 'nmId', 'subject', 'subject_norm', 'buyout_rate', 'orders_qty', 'orders_sum'])
+    df = raw_df.copy()
+    first_row = df.iloc[0].astype(str).tolist() if len(df.index) > 0 else []
+    if 'Предмет' in first_row and ('Процент выкупа' in first_row or 'Процент выкупа (предыдущий период)' in first_row):
+        df.columns = [str(x).strip() for x in df.iloc[0].tolist()]
+        df = df.iloc[1:].copy()
+    df = df.rename(columns={
+        'Артикул продавца': 'supplier_article',
+        'Артикул WB': 'nmId',
+        'Предмет': 'subject',
+        'Процент выкупа': 'buyout_pct',
+        'Заказали, шт': 'orders_qty',
+        'Заказали на сумму, ₽': 'orders_sum',
+        'Выкупили на сумму, ₽': 'buyout_sum',
+        'ordersSumRub': 'orders_sum',
+        'buyoutsSumRub': 'buyout_sum',
+        'ordersCount': 'orders_qty',
+        'buyoutPercent': 'buyout_pct',
+    })
+    if 'subject' not in df.columns:
+        return pd.DataFrame(columns=['supplier_article', 'nmId', 'subject', 'subject_norm', 'buyout_rate', 'orders_qty', 'orders_sum'])
+    out = df.copy()
+    out['supplier_article'] = out.get('supplier_article', '').fillna('').astype(str).str.strip()
+    out['nmId'] = pd.to_numeric(out.get('nmId'), errors='coerce')
+    out['subject'] = out.get('subject', '').fillna('').astype(str).str.strip()
+    out['subject_norm'] = out['subject'].map(canonical_subject)
+    direct_rate = to_buyout_rate(out.get('buyout_pct', pd.Series(index=out.index, dtype=float)), default=np.nan)
+    if 'orders_sum' in out.columns and 'buyout_sum' in out.columns:
+        orders_sum = pd.to_numeric(out.get('orders_sum'), errors='coerce').fillna(0.0)
+        buyout_sum = pd.to_numeric(out.get('buyout_sum'), errors='coerce').fillna(0.0)
+        ratio_sum = pd.Series(np.where(orders_sum > 0, buyout_sum / orders_sum, np.nan), index=out.index)
+        direct_rate = direct_rate.where(~direct_rate.isna(), ratio_sum)
+    out['buyout_rate'] = pd.to_numeric(direct_rate, errors='coerce').clip(lower=0.0, upper=1.0)
+    out['orders_qty'] = pd.to_numeric(out.get('orders_qty'), errors='coerce').fillna(0.0)
+    out['orders_sum'] = pd.to_numeric(out.get('orders_sum'), errors='coerce').fillna(0.0)
+    out = out[out['subject_norm'].ne('') & out['buyout_rate'].notna()].copy()
+    return out[['supplier_article', 'nmId', 'subject', 'subject_norm', 'buyout_rate', 'orders_qty', 'orders_sum']]
+
+
+def load_latest_funnel_subject_reference(provider: BaseProvider) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    candidates: List[Tuple[str, pd.DataFrame]] = []
+
+    def _append_candidate(name: str, raw_df: pd.DataFrame) -> None:
+        norm = _normalize_funnel_subject_sheet(raw_df)
+        if not norm.empty:
+            candidates.append((name, norm))
+
+    try:
+        sheets = provider.read_excel_all_sheets(FUNNEL_KEY)
+        if isinstance(sheets, dict):
+            for sheet_name, raw_df in sheets.items():
+                if str(sheet_name).strip().lower() in {'товары', 'products'}:
+                    _append_candidate(f'{FUNNEL_KEY}::{sheet_name}', raw_df)
+                    break
+            if not candidates:
+                for sheet_name, raw_df in sheets.items():
+                    _append_candidate(f'{FUNNEL_KEY}::{sheet_name}', raw_df)
+                    if candidates:
+                        break
+    except Exception:
+        pass
+
+    if not candidates and isinstance(provider, LocalProvider):
+        local_candidates = sorted(provider.base_dir.glob('*Воронка продаж*.zip')) + sorted(provider.base_dir.glob('*Воронка продаж*.xlsx'))
+        for path in local_candidates:
+            try:
+                if path.suffix.lower() == '.zip':
+                    with zipfile.ZipFile(path) as zf:
+                        for member in zf.namelist():
+                            if member.lower().endswith('.xlsx'):
+                                data = io.BytesIO(zf.read(member))
+                                xls = pd.ExcelFile(data)
+                                for sheet_name in xls.sheet_names:
+                                    raw_df = pd.read_excel(data, sheet_name=sheet_name)
+                                    _append_candidate(f'{path.name}::{sheet_name}', raw_df)
+                                    if candidates:
+                                        break
+                                if candidates:
+                                    break
+                else:
+                    xls = pd.ExcelFile(path)
+                    for sheet_name in xls.sheet_names:
+                        raw_df = pd.read_excel(path, sheet_name=sheet_name)
+                        _append_candidate(f'{path.name}::{sheet_name}', raw_df)
+                        if candidates:
+                            break
+                if candidates:
+                    break
+            except Exception:
+                continue
+
+    if not candidates:
+        return pd.DataFrame(), {}
+
+    source_name, ref = candidates[0]
+    rates: Dict[str, float] = {}
+    for subject_norm, grp in ref.groupby('subject_norm'):
+        if not subject_norm:
+            continue
+        weights = grp['orders_qty'].fillna(0.0)
+        if float(weights.sum()) <= 0:
+            weights = grp['orders_sum'].fillna(0.0)
+        values = grp['buyout_rate'].fillna(np.nan)
+        valid = values.notna()
+        if not valid.any():
+            continue
+        values = values[valid]
+        weights = weights[valid]
+        if float(weights.sum()) > 0:
+            rate_value = float((values * weights).sum() / weights.sum())
+        else:
+            rate_value = float(values.mean())
+        rates[subject_norm] = round(clamp(rate_value, 0.0, 1.0), 4)
+
+    ref = ref.drop_duplicates().copy()
+    ref.attrs['source_key'] = source_name
+    return ref, rates
+
+
+def write_binary_provider(provider: BaseProvider, key: str, data: bytes, content_type: str = 'application/octet-stream') -> None:
+    if isinstance(provider, S3Provider):
+        provider.s3.put_object(Bucket=provider.bucket, Key=key, Body=data, ContentType=content_type)
+        return
+    if isinstance(provider, LocalProvider):
+        path = provider._resolve(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return
+    raise TypeError(f'Unsupported provider type for binary write: {type(provider)}')
+
+
+def article_natural_key(value: Any) -> List[Any]:
+    text = str(value or '').strip()
+    parts = re.split(r'(\d+)', text)
+    out: List[Any] = []
+    for part in parts:
+        if not part:
+            continue
+        out.append(int(part) if part.isdigit() else part.lower())
+    return out
+
+
+def wrap_text_to_width(draw: Any, text: str, font: Any, max_width: int) -> List[str]:
+    text = str(text or '').strip()
+    if not text:
+        return ['']
+    words = text.split()
+    if not words:
+        return ['']
+    lines: List[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f'{current} {word}'
+        width = draw.textbbox((0, 0), candidate, font=font)[2]
+        if width <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def build_manager_pdf_bytes(manager_name: str, manager_df: pd.DataFrame, run_dt_text: str, source_key: str = '') -> bytes:
+    from PIL import Image, ImageDraw, ImageFont
+
+    def load_font(size: int, bold: bool = False):
+        candidates = [
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        ]
+        for candidate in candidates:
+            if Path(candidate).exists():
+                return ImageFont.truetype(candidate, size=size)
+        return ImageFont.load_default()
+
+    page_w, page_h = 1654, 2339
+    left, right, top, bottom = 90, 90, 90, 90
+    body_width = page_w - left - right
+    title_font = load_font(34, bold=True)
+    meta_font = load_font(19, bold=False)
+    header_font = load_font(22, bold=True)
+    body_font = load_font(20, bold=False)
+    small_font = load_font(17, bold=False)
+    line_h = 30
+    gap = 10
+
+    pages: List[Any] = []
+    img = Image.new('RGB', (page_w, page_h), 'white')
+    draw = ImageDraw.Draw(img)
+    y = top
+
+    def new_page():
+        nonlocal img, draw, y
+        pages.append(img)
+        img = Image.new('RGB', (page_w, page_h), 'white')
+        draw = ImageDraw.Draw(img)
+        y = top
+
+    def ensure_space(lines_needed: int, extra: int = 0):
+        nonlocal y
+        need = lines_needed * line_h + extra
+        if y + need > page_h - bottom:
+            new_page()
+
+    title = f'Рекомендации по ставкам - {manager_name}'
+    draw.text((left, y), title, fill='black', font=title_font)
+    y += 54
+    meta_lines = [
+        f'Дата формирования: {run_dt_text}',
+        f'Строк рекомендаций: {len(manager_df)}',
+    ]
+    if source_key:
+        meta_lines.append(f'Источник менеджеров/выкупа: {Path(source_key).name}')
+    for meta in meta_lines:
+        draw.text((left, y), meta, fill='black', font=meta_font)
+        y += 28
+    y += 16
+    draw.line((left, y, page_w - right, y), fill='black', width=2)
+    y += 24
+
+    for _, row in manager_df.iterrows():
+        head = f"Артикул {row.get('Артикул продавца','')} | WB {safe_int(row.get('Артикул WB'))} | ID кампании {safe_int(row.get('ID кампании'))} | {row.get('Тип кампании','')}"
+        rec = f"Рекомендация: {row.get('Действие','')} | ставка {safe_float(row.get('Текущая ставка, ₽')):.0f} -> {safe_float(row.get('Новая ставка, ₽')):.0f} ₽"
+        metrics = (
+            f"Цифры: расход {safe_float(row.get('Расход РК, ₽')):.0f} ₽; "
+            f"заказы РК {safe_float(row.get('Заказы РК')):.0f}; "
+            f"ДРР кампании {safe_float(row.get('ДРР кампании, %')):.1f}%; "
+            f"ВП кампании {safe_float(row.get('ВП кампании текущее окно после рекламы, ₽')):.0f} ₽; "
+            f"ДРР категории {safe_float(row.get('ДРР категории, %')):.1f}%"
+        )
+        reason = f"Почему: {row.get('Причина','')}"
+        lines: List[Tuple[str, Any]] = []
+        for text, font in [(head, header_font), (rec, body_font), (metrics, body_font), (reason, small_font)]:
+            wrapped = wrap_text_to_width(draw, text, font, body_width)
+            for line in wrapped:
+                lines.append((line, font))
+        ensure_space(len(lines) + 2, extra=18)
+        for idx, (line, font) in enumerate(lines):
+            draw.text((left, y), line, fill='black', font=font)
+            y += line_h if font != header_font else 34
+        y += gap
+        draw.line((left, y, page_w - right, y), fill=(180, 180, 180), width=1)
+        y += 18
+
+    pages.append(img)
+    buf = io.BytesIO()
+    first, *rest = pages
+    first.save(buf, format='PDF', resolution=150.0, save_all=True, append_images=rest)
+    return buf.getvalue()
+
+
+def build_manager_recommendations(decisions_df: pd.DataFrame, abc_ref: pd.DataFrame) -> pd.DataFrame:
+    work = decisions_df.copy()
+    if work.empty:
+        return work
+    if abc_ref is not None and not abc_ref.empty:
+        manager_map = abc_ref[['nmId', 'manager_category']].dropna().drop_duplicates('nmId').copy()
+        manager_map = manager_map.rename(columns={'nmId': 'Артикул WB', 'manager_category': 'Менеджер'})
+        work = work.merge(manager_map, on='Артикул WB', how='left')
+    if 'Менеджер' not in work.columns:
+        work['Менеджер'] = 'Без менеджера'
+    work['Менеджер'] = work['Менеджер'].fillna('Без менеджера').astype(str).str.strip().replace({'': 'Без менеджера'})
+    work['_article_sort'] = work['Артикул продавца'].map(lambda x: '|'.join(f"{p:010d}" if isinstance(p, int) else str(p) for p in article_natural_key(x)))
+    work = work.sort_values(['Менеджер', '_article_sort', 'ID кампании', 'Тип кампании'], kind='stable').drop(columns=['_article_sort'])
+    return work
+
+
+def save_manager_recommendation_pdfs(provider: BaseProvider, decisions_df: pd.DataFrame, abc_ref: pd.DataFrame, run_dt_text: str) -> pd.DataFrame:
+    work = build_manager_recommendations(decisions_df, abc_ref)
+    if work.empty:
+        return pd.DataFrame([{'Менеджер': 'Нет данных', 'Файл': '', 'Строк рекомендаций': 0}])
+
+    source_key = ''
+    if abc_ref is not None and hasattr(abc_ref, 'attrs'):
+        source_key = str(abc_ref.attrs.get('source_key') or '')
+
+    index_rows: List[Dict[str, Any]] = []
+    base_prefix = SERVICE_ROOT + 'Рекомендации_менеджерам/'
+    for manager_name, grp in work.groupby('Менеджер', dropna=False):
+        manager_name = str(manager_name or 'Без менеджера').strip() or 'Без менеджера'
+        pdf_bytes = build_manager_pdf_bytes(manager_name, grp, run_dt_text, source_key)
+        safe_name = re.sub(r'[^0-9A-Za-zА-Яа-я_-]+', '_', manager_name).strip('_') or 'manager'
+        key = base_prefix + f'Рекомендации_{safe_name}.pdf'
+        write_binary_provider(provider, key, pdf_bytes, content_type='application/pdf')
+        index_rows.append({
+            'Менеджер': manager_name,
+            'Файл': key,
+            'Строк рекомендаций': int(len(grp)),
+        })
+    return pd.DataFrame(index_rows).sort_values(['Менеджер']).reset_index(drop=True)
+
+
+def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame] = None, history_append: Optional[pd.DataFrame] = None) -> None:
+    decisions = results.get('decisions', pd.DataFrame()).copy()
+    plan_sheet = results.get('plan_sheet', pd.DataFrame()).copy()
+    category_plan = results.get('category_plan', pd.DataFrame()).copy()
+    daily_item = results.get('daily_item_history', pd.DataFrame()).copy()
+    daily_campaign = results.get('daily_campaign_history', pd.DataFrame()).copy()
+    product_metrics = results.get('product_metrics', pd.DataFrame()).copy()
+    campaign_profit = results.get('campaign_profit', pd.DataFrame()).copy()
+    effects = results.get('effects', pd.DataFrame()).copy()
+    weak = results.get('weak', pd.DataFrame()).copy()
+    min_bids_df = results.get('min_bids_df', pd.DataFrame()).copy()
+    history_append = history_append.copy() if isinstance(history_append, pd.DataFrame) else pd.DataFrame()
+
+    abc_ref = globals().get('ABC_REFERENCE_DF', pd.DataFrame())
+    if abc_ref is None or not isinstance(abc_ref, pd.DataFrame):
+        abc_ref = pd.DataFrame()
+    manager_index = save_manager_recommendation_pdfs(provider, decisions, abc_ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    if not decisions.empty:
+        decisions = build_manager_recommendations(decisions, abc_ref)
+
+    item_cols = ['Дата', 'Товар', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Заказы', 'Сумма_заказов', '% выкупа', 'Расходы_РК',
+                 'Валовая прибыль после рекламы, ₽', 'Клики', 'CPO, ₽', 'Прогнозная чистая прибыль, ₽', 'Показы', 'Заказы_РК', 'Выручка_РК',
+                 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Спрос по ключам', 'Медианная позиция', 'Видимость, %', 'День зрелый']
+    campaign_cols = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип кампании', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики',
+                     'Заказы_РК', 'Выручка_РК', 'Расходы_РК', 'ДРР кампании, доля', 'ВП кампании после рекламы, ₽', 'ROI кампании',
+                     'CPO кампании, ₽', 'Спрос по ключам', 'Частота запросов', 'День зрелый']
+
+    daily_item = trim_to_columns(daily_item, item_cols)
+    daily_campaign = trim_to_columns(daily_campaign, campaign_cols)
+
+    summary = pd.DataFrame([{
+        'Режим': 'run',
+        'Дата формирования': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Всего рекомендаций': int(len(decisions)),
+        'Изменённых ставок': int(len(decisions[decisions['Действие'].isin(['Повысить', 'Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])])) if not decisions.empty else 0,
+        'Блоков отправки ставок': 0 if bid_send_log is None or bid_send_log.empty else int(len(bid_send_log)),
+        'PDF менеджерам': int(len(manager_index)) if not manager_index.empty else 0,
+        'Текущее окно с': results['window']['cur_start'],
+        'Текущее окно по': results['window']['cur_end'],
+        'База с': results['window']['base_start'],
+        'База по': results['window']['base_end'],
+    }])
+
+    old_sheets = {}
+    try:
+        if provider.file_exists(OUT_SINGLE_REPORT):
+            old_sheets = provider.read_excel_all_sheets(OUT_SINGLE_REPORT)
+    except Exception:
+        old_sheets = {}
+
+    def append_dedup(old_df: pd.DataFrame, new_df: pd.DataFrame, keys: List[str], final_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        old_df = old_df.copy() if isinstance(old_df, pd.DataFrame) else pd.DataFrame()
+        new_df = new_df.copy() if isinstance(new_df, pd.DataFrame) else pd.DataFrame()
+        if final_cols:
+            old_df = trim_to_columns(old_df, final_cols)
+            new_df = trim_to_columns(new_df, final_cols)
+        if new_df.empty:
+            base = old_df
+        elif old_df.empty:
+            base = new_df
+        else:
+            base = pd.concat([old_df, new_df], ignore_index=True, sort=False)
+        real_keys = [k for k in keys if k in base.columns]
+        base = base.drop_duplicates(real_keys, keep='last') if real_keys else base
+        if final_cols:
+            base = trim_to_columns(base, final_cols)
+        return base
+
+    decisions_hist = append_dedup(old_sheets.get('История решений день', pd.DataFrame()), history_append, ['Дата запуска', 'ID кампании', 'Артикул WB', 'Плейсмент'])
+    item_hist_all = append_dedup(old_sheets.get('История день товар', pd.DataFrame()), daily_item, ['Дата', 'Артикул WB'], item_cols)
+    campaign_hist_all = append_dedup(old_sheets.get('История день кампания', pd.DataFrame()), daily_campaign, ['Дата', 'ID кампании', 'Артикул WB'], campaign_cols)
+    old_bid_hist = old_sheets.get('История ставок', pd.DataFrame())
+    bid_hist_all = append_dedup(old_bid_hist, decisions[decisions['Действие'].isin(['Повысить', 'Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])].copy(), ['ID кампании', 'Артикул WB', 'Плейсмент', 'Дата запуска'])
+    archive_all = append_dedup(old_sheets.get('Архив решений', pd.DataFrame()), decisions, ['Дата запуска', 'ID кампании', 'Артикул WB', 'Плейсмент'])
+
+    eff_stub = pd.DataFrame([{'Комментарий': 'Детальная эффективность ставки вынесена в отдельный файл Эффективность_ставки_ежедневно.xlsx'}])
+
+    sheets = {
+        'Сводка': summary,
+        'Решения': decisions,
+        'План': plan_sheet,
+        'План категорий': category_plan,
+        'Товар день': daily_item,
+        'Кампания день': daily_campaign,
+        'Товар итог': product_metrics,
+        'Кампании прибыль': campaign_profit,
+        'Фактически изменённые ставки': bid_send_log if bid_send_log is not None and not bid_send_log.empty else pd.DataFrame([{'Комментарий': 'Нет отправленных блоков ставок'}]),
+        'Лимиты ставок': decisions[[c for c in ['Менеджер', 'Артикул продавца', 'ID кампании', 'Тип кампании', 'Статус кампании', 'Активна для API', 'Текущая ставка, ₽', 'Комфортная ставка, ₽', 'Максимальная ставка, ₽', 'Экспериментальная ставка, ₽', 'Тип лимита', 'Причина лимита'] if c in decisions.columns]].copy() if not decisions.empty else pd.DataFrame(),
+        'Минимальные ставки WB': min_bids_df if not min_bids_df.empty else pd.DataFrame([{'Комментарий': 'Нет данных по min bid'}]),
+        'Слабые позиции': weak,
+        'Эффект изменений': effects,
+        'Рекомендации менеджерам': manager_index if not manager_index.empty else pd.DataFrame([{'Комментарий': 'PDF не сформированы'}]),
+        'Лог API': pd.DataFrame(API_CALL_LOGS) if API_CALL_LOGS else pd.DataFrame([{'Комментарий': 'Нет вызовов API'}]),
+        'История решений день': decisions_hist,
+        'История ставок': bid_hist_all,
+        'Архив решений': archive_all,
+        'Эффективность ставки': eff_stub,
+        'История день товар': item_hist_all,
+        'История день кампания': campaign_hist_all,
+    }
+
+    sheets = {name: normalize_output_df(df) for name, df in sheets.items()}
+    provider.write_excel(OUT_SINGLE_REPORT, sheets)
+    provider.write_excel(OUT_PREVIEW, sheets)
+    provider.write_text(OUT_SUMMARY, json.dumps(summary.iloc[0].to_dict(), ensure_ascii=False, default=str, indent=2))
+
+    eff_sheets = results.get('eff_history_sheets', {})
+    if not eff_sheets:
+        eff_sheets = {'Комментарий': pd.DataFrame([{'Комментарий': 'Нет данных по эффективности ставки'}])}
+    eff_sheets = {name: normalize_output_df(df) for name, df in eff_sheets.items()}
+    provider.write_excel(OUT_EFF, eff_sheets)
+
+
+def run_manager(args: argparse.Namespace) -> None:
+    API_CALL_LOGS.clear()
+    MIN_BID_ROWS.clear()
+    provider = choose_provider(args.local_data_dir)
+    abc_ref, abc_rates = load_latest_abc_reference(provider)
+    funnel_ref, funnel_rates = load_latest_funnel_subject_reference(provider)
+    globals()['ABC_REFERENCE_DF'] = abc_ref
+    globals()['FUNNEL_SUBJECT_REFERENCE_DF'] = funnel_ref
+
+    merged_rates = dict(SUBJECT_FIXED_BUYOUT_RATES)
+    if abc_rates:
+        merged_rates.update(abc_rates)
+    if funnel_rates:
+        merged_rates.update(funnel_rates)
+    globals()['SUBJECT_FIXED_BUYOUT_RATES'] = merged_rates
+
+    if merged_rates:
+        target_rate_text = ', '.join(
+            f"{get_subject_display_name(k)}={v*100:.1f}%"
+            for k, v in sorted(merged_rates.items())
+            if k in TARGET_SUBJECTS
+        )
+        all_subjects_loaded = len([k for k in merged_rates.keys() if str(k).strip()])
+        source_parts = []
+        if abc_rates:
+            source_parts.append(f'ABC={len(abc_rates)}')
+        if funnel_rates:
+            source_parts.append(f'Воронка={len(funnel_rates)}')
+        source_text = ', '.join(source_parts) if source_parts else 'fallback'
+        log(f'📦 Выкуп по всем предметам загружен: {all_subjects_loaded} предметов ({source_text})')
+        if target_rate_text:
+            log(f'📦 Целевые категории: {target_rate_text}')
+    as_of_date = datetime.strptime(args.as_of_date, '%Y-%m-%d').date() if args.as_of_date else datetime.now().date()
+    cfg = Config()
+    results = prepare_metrics(provider, cfg, as_of_date)
+    api_key = os.getenv('WB_PROMO_KEY_TOPFACE','').strip()
+    results = enrich_with_min_bids(results, api_key)
+    decisions = results['decisions'].copy()
+    log(f'✅ Всего строк решений: {len(decisions)}')
+    changed = decisions[decisions['Действие'].isin(['Повысить','Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])].copy()
+    log(f'🔁 Изменённых ставок: {len(changed)}')
+    if not changed.empty:
+        print(changed[['Товар','Артикул продавца','Предмет','ID кампании','Плейсмент','Текущая ставка, ₽','Новая ставка, ₽','Действие','Причина']].head(30).to_string(index=False), flush=True)
+    payload = decisions_to_payload(decisions)
+    bid_send_log = send_payload(payload, api_key, dry_run=False)
+    log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
+    history_append = build_history_append(decisions, as_of_date)
+    save_outputs(provider, results, 'run', bid_send_log, None, history_append)
+
 
 
 def main() -> None:
