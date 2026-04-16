@@ -3613,8 +3613,16 @@ def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, mast
     meta = campaigns[['id_campaign','nmId','payment_type']].drop_duplicates()
     keys = master[['nmId','supplier_article','subject_norm']].drop_duplicates()
     npu = econ_latest[['nmId','gp_realized','np_unit']].drop_duplicates() if 'gp_realized' in econ_latest.columns else econ_latest[['nmId','np_unit']].copy()
-    df = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].merge(meta,on=['id_campaign','nmId'],how='left').merge(keys,on='nmId',how='left').merge(npu,on='nmId',how='left')
-    df['buyout_rate'] = df['subject_norm'].map(get_subject_buyout_rate)
+    nm_to_subject = build_nm_to_subject_map(master)
+    df = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].copy()
+    df = df.merge(meta, on=['id_campaign','nmId'], how='left')
+    df = df.merge(keys, on='nmId', how='left')
+    df = df.merge(npu, on='nmId', how='left')
+    df = with_resolved_subject_norm(df, nm_to_subject)
+    if 'supplier_article' not in df.columns:
+        df['supplier_article'] = ''
+    df['supplier_article'] = df['supplier_article'].fillna('').astype(str)
+    df['buyout_rate'] = df['subject_norm'].map(get_subject_buyout_rate).fillna(0.90)
     df['channel'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'),'CPC','CPM')
     grp = df.groupby(['supplier_article','channel'], as_index=False).agg(spend=('Расход','sum'), orders=('Заказы','sum'), revenue=('Сумма заказов','sum'), clicks=('Клики','sum'), shows=('Показы','sum'), buyout_rate=('buyout_rate','mean'), np_unit=('np_unit','mean'))
     grp['cpo'] = np.where(grp['orders']>0, grp['spend']/grp['orders'], 0.0)
