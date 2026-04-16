@@ -3462,7 +3462,7 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     eff_sheets = results.get('eff_history_sheets', {})
     if not eff_sheets:
         eff_sheets = {'Комментарий': pd.DataFrame([{'Комментарий':'Нет данных по эффективности ставки'}])}
-    provider.write_excel(OUT_EFFICIENCY, eff_sheets)
+    provider.write_excel(OUT_EFF, eff_sheets)
 
 
 def run_manager(args: argparse.Namespace) -> None:
