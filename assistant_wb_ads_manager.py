@@ -28,6 +28,80 @@ from openpyxl.utils import get_column_letter
 STORE_NAME = "TOPFACE"
 TARGET_SUBJECTS = {"кисти косметические", "блески", "помады", "косметические карандаши"}
 GROWTH_SUBJECTS = {"блески", "помады", "косметические карандаши"}
+CATEGORY_DRR_LIMITS = {
+    "кисти косметические": 0.14,
+    "косметические карандаши": 0.14,
+    "помады": 0.16,
+    "блески": 0.16,
+}
+SUBJECT_DISPLAY_NAMES = {
+    "кисти косметические": "Кисти косметические",
+    "косметические карандаши": "Косметические карандаши",
+    "помады": "Помады",
+    "блески": "Блески",
+}
+FUNNEL_SALES_CANDIDATES = [
+    "ordersSumRub",
+    "ordersSum",
+    "ordersSumRur",
+    "ordersAmountRub",
+    "ordersAmount",
+    "sumOrdersRub",
+    "sumOrders",
+    "sum_orders_rub",
+    "sum_orders",
+    "salesRub",
+    "salesSumRub",
+    "salesSum",
+    "salesAmount",
+    "revenueRub",
+    "revenue",
+    "Продажи, ₽",
+    "Продажи",
+    "Сумма продаж, ₽",
+    "Сумма продаж",
+    "Сумма заказов, ₽",
+    "Сумма заказов",
+    "Заказано на сумму, ₽",
+    "Заказано на сумму",
+]
+
+def get_category_drr_limit(subject_norm: Any) -> float:
+    return CATEGORY_DRR_LIMITS.get(canonical_subject(subject_norm), 0.15)
+
+def get_subject_display_name(subject_norm: Any) -> str:
+    norm = canonical_subject(subject_norm)
+    return SUBJECT_DISPLAY_NAMES.get(norm, str(subject_norm or "").strip() or norm)
+
+def _normalize_name_for_match(value: Any) -> str:
+    return re.sub(r"[^0-9a-zа-я]+", "", str(value or "").strip().lower())
+
+def find_matching_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    if df is None or df.empty:
+        return ""
+    cols = list(df.columns)
+    exact = {str(c): str(c) for c in cols}
+    for cand in candidates:
+        if cand in exact:
+            return exact[cand]
+    normalized = {_normalize_name_for_match(c): str(c) for c in cols}
+    for cand in candidates:
+        key = _normalize_name_for_match(cand)
+        if key in normalized:
+            return normalized[key]
+    for cand in candidates:
+        key = _normalize_name_for_match(cand)
+        if not key:
+            continue
+        for norm_col, original_col in normalized.items():
+            if key in norm_col or norm_col in key:
+                return original_col
+    return ""
+
+def to_buyout_rate(series: pd.Series, default: float = 0.0) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    s = np.where(pd.Series(s).fillna(0) > 1, pd.Series(s).fillna(0) / 100.0, pd.Series(s).fillna(0))
+    return pd.Series(s).fillna(default).clip(lower=0.0, upper=1.0)
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
 WB_NMS_URL = "https://advert-api.wildberries.ru/adv/v0/auction/nms"
@@ -50,6 +124,7 @@ OUT_PRODUCT = SERVICE_ROOT + "Метрики_по_товарам.xlsx"
 OUT_EFF = SERVICE_ROOT + "Эффективность_ставки_ежедневно.xlsx"
 OUT_WEAK = SERVICE_ROOT + "Слабые_позиции_приоритет.xlsx"
 OUT_EFFECTS = SERVICE_ROOT + "Эффект_изменений.xlsx"
+# Блок работы с оттенками отключён: каждый оттенок должен вестись отдельной рекламной кампанией.
 OUT_SHADE_ACTIONS = SERVICE_ROOT + "Рекомендации_по_оттенкам.xlsx"
 OUT_SHADE_PORTFOLIO = SERVICE_ROOT + "Состав_кампаний_по_оттенкам.xlsx"
 OUT_SHADE_TESTS = SERVICE_ROOT + "Тесты_оттенков.xlsx"
@@ -791,7 +866,10 @@ def compute_required_growth(blended_drr: float, spend_growth: float, subject_nor
         return min(max(10.0, sg * 1.00), 25.0)
 
 def choose_control_key(subject_norm: str, supplier_article: str, product_root: str) -> str:
-    return product_root if subject_norm in GROWTH_SUBJECTS else supplier_article
+    supplier_article = str(supplier_article or '').strip()
+    if supplier_article:
+        return supplier_article
+    return str(product_root or '').strip()
 
 def build_subject_benchmarks(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
@@ -1733,7 +1811,7 @@ def send_payload(payload: Dict[str, Any], api_key: str, dry_run: bool) -> pd.Dat
         })
     return pd.DataFrame(logs)
 
-def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame], history_append: pd.DataFrame) -> None:
+def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], history_append: pd.DataFrame) -> None:
     decisions = results["decisions"].copy()
     limits_df = decisions[["Артикул продавца","ID кампании","Тип кампании","Текущая ставка, ₽","Комфортная ставка, ₽","Максимальная ставка, ₽","Экспериментальная ставка, ₽","Тип лимита"]].copy()
 
@@ -2750,22 +2828,26 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
     cur_end = as_of_date - timedelta(days=MATURE_END_OFFSET)
     elapsed_days = max(1, (cur_end - cur_start).days + 1)
     prev_days = _days_in_month(prev_start)
+    window = compute_analysis_window(as_of_date)
 
     ord_prev = orders[(orders['date'] >= prev_start) & (orders['date'] <= prev_end) & (~orders['isCancel'])].copy() if not orders.empty else pd.DataFrame()
     ord_cur = orders[(orders['date'] >= cur_start) & (orders['date'] <= cur_end) & (~orders['isCancel'])].copy() if not orders.empty else pd.DataFrame()
 
     funnel_prev = funnel[(funnel['date'] >= prev_start) & (funnel['date'] <= prev_end)].copy() if not funnel.empty else pd.DataFrame()
     funnel_cur = funnel[(funnel['date'] >= cur_start) & (funnel['date'] <= cur_end)].copy() if not funnel.empty else pd.DataFrame()
+    funnel_window = funnel[(funnel['date'] >= window['cur_start']) & (funnel['date'] <= window['cur_end'])].copy() if not funnel.empty else pd.DataFrame()
 
     ads_prev = ads_daily[(ads_daily['date'] >= prev_start) & (ads_daily['date'] <= prev_end)].copy() if not ads_daily.empty else pd.DataFrame()
     ads_cur = ads_daily[(ads_daily['date'] >= cur_start) & (ads_daily['date'] <= cur_end)].copy() if not ads_daily.empty else pd.DataFrame()
+    ads_window = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].copy() if not ads_daily.empty else pd.DataFrame()
 
     econ_latest = econ.sort_values('Неделя').drop_duplicates('nmId', keep='last')[['nmId','supplier_article','np_unit']].copy() if not econ.empty else pd.DataFrame(columns=['nmId','supplier_article','np_unit'])
     key_map = master[['nmId','supplier_article','product_root','subject','subject_norm']].drop_duplicates().copy() if not master.empty else pd.DataFrame(columns=['nmId','supplier_article','product_root','subject','subject_norm'])
 
     if ord_prev.empty:
         empty = pd.DataFrame([{'Комментарий':'Нет данных для плана прошлого месяца'}])
-        return empty, pd.DataFrame([{'Комментарий':'Нет данных для плана категории 901'}])
+        empty_cat = pd.DataFrame([{'Комментарий':'Нет данных для расчёта категорий'}])
+        return empty, empty_cat
 
     prev_item = ord_prev.groupby(['nmId','supplier_article'], as_index=False).agg(
         orders_prev=('nmId','count'),
@@ -2786,9 +2868,7 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
 
     plan = prev_item.merge(prev_buyout, on='nmId', how='left').merge(prev_spend, on='nmId', how='left').merge(cur_item, on=['nmId','supplier_article'], how='left').merge(cur_buyout, on='nmId', how='left').merge(cur_spend, on='nmId', how='left').merge(key_map, on=['nmId','supplier_article'], how='left').merge(econ_latest, on=['nmId','supplier_article'], how='left').merge(traffic, on='supplier_article', how='left')
     for c in ['buyout_prev','buyout_cur']:
-        plan[c] = pd.to_numeric(plan.get(c), errors='coerce')
-        plan[c] = np.where(plan[c] > 1, plan[c] / 100.0, plan[c])
-        plan[c] = pd.Series(plan[c]).fillna(0.85).clip(lower=0.3, upper=1.0)
+        plan[c] = to_buyout_rate(plan.get(c, 0), default=0.85)
     for c in ['ad_spend_prev','ad_spend_cur','orders_cur','revenue_cur','np_unit','traffic_coeff','query_freq_cur','query_freq_prev_scaled','atc_cur','ord_conv_cur']:
         if c not in plan.columns:
             plan[c] = 0.0
@@ -2813,7 +2893,7 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
         'buyout_cur','ad_spend_cur','fact_drr_mtd','forecast_net_profit_mtd','np_unit','atc_cur','ord_conv_cur','problem_reason'
     ]].copy()
     out = out.rename(columns={
-        'nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет','orders_prev':'Заказы прошлого месяца, шт',
+        'nmId':'Артикул WB','supplier_article':'Артикул продавца','subject':'Предмет','subject_norm':'subject_norm','orders_prev':'Заказы прошлого месяца, шт',
         'revenue_prev':'Сумма заказов прошлого месяца, ₽','buyout_prev':'% выкупа прошлого месяца','ad_spend_prev':'Расходы РК прошлого месяца, ₽',
         'vp_after_ads_prev_month':'ВП после рекламы прошлого месяца, ₽','daily_plan_vp_after_ads':'Дневной план ВП после рекламы, ₽',
         'traffic_coeff':'Коэффициент трафика','query_freq_cur':'Частота запросов текущий период','query_freq_prev_scaled':'Ожидаемая частота по прошлому периоду',
@@ -2823,24 +2903,70 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
         'np_unit':'Чистая прибыль на 1 товар, ₽','atc_cur':'Конверсия в корзину, %','ord_conv_cur':'Конверсия в заказ, %','problem_reason':'Причина плана'
     })
 
-    # category 901
-    cat = out[out['Артикул продавца'].astype(str).str.startswith('901')].copy()
-    if cat.empty:
-        cat_out = pd.DataFrame([{'Категория':'901','Комментарий':'Нет данных по категории 901'}])
-    else:
-        cat_row = {
-            'Категория':'901',
-            'План ВП MTD, ₽': cat['План ВП MTD, ₽'].sum(),
-            'Факт ВП MTD, ₽': cat['Факт ВП MTD, ₽'].sum(),
-            'Отклонение ВП от плана, ₽': cat['Факт ВП MTD, ₽'].sum() - cat['План ВП MTD, ₽'].sum(),
-            'Темп плана ВП, %': (cat['Факт ВП MTD, ₽'].sum() / cat['План ВП MTD, ₽'].sum() * 100.0) if cat['План ВП MTD, ₽'].sum() else 0.0,
-            'Расходы РК MTD, ₽': cat['Расходы РК MTD, ₽'].sum(),
-            'Сумма заказов MTD, ₽': cat['Сумма заказов MTD, ₽'].sum(),
-            'Выкупленная выручка MTD, ₽': (cat['Сумма заказов MTD, ₽'] * cat['% выкупа MTD']).sum(),
+    plan_subject = out.groupby('subject_norm', as_index=False).agg(
+        **{
+            'План ВП MTD, ₽': ('План ВП MTD, ₽', 'sum'),
+            'Факт ВП MTD, ₽': ('Факт ВП MTD, ₽', 'sum'),
+            'Отклонение ВП от плана, ₽': ('Отклонение ВП от плана, ₽', 'sum'),
+            'Расходы РК MTD, ₽': ('Расходы РК MTD, ₽', 'sum'),
+            'Сумма заказов MTD, ₽': ('Сумма заказов MTD, ₽', 'sum'),
         }
-        cat_row['ДРР категории, доля'] = (cat_row['Расходы РК MTD, ₽'] / cat_row['Выкупленная выручка MTD, ₽']) if cat_row['Выкупленная выручка MTD, ₽'] else 0.0
-        cat_out = pd.DataFrame([cat_row])
-    return out.sort_values(['Предмет','Артикул продавца']), cat_out
+    ) if not out.empty else pd.DataFrame(columns=['subject_norm','План ВП MTD, ₽','Факт ВП MTD, ₽','Отклонение ВП от плана, ₽','Расходы РК MTD, ₽','Сумма заказов MTD, ₽'])
+    if not plan_subject.empty:
+        plan_subject['Темп плана ВП, %'] = np.where(plan_subject['План ВП MTD, ₽'] != 0, plan_subject['Факт ВП MTD, ₽'] / plan_subject['План ВП MTD, ₽'] * 100.0, 0.0)
+
+    ads_window_subject = pd.DataFrame(columns=['subject_norm','Расходы рекламы окно, ₽'])
+    if not ads_window.empty:
+        ads_window_subject = ads_window.merge(key_map[['nmId','subject_norm']].drop_duplicates(), on='nmId', how='left')
+        ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].map(canonical_subject)
+        ads_window_subject = ads_window_subject[ads_window_subject['subject_norm'].isin(TARGET_SUBJECTS)].groupby('subject_norm', as_index=False).agg(**{'Расходы рекламы окно, ₽': ('Расход','sum')})
+
+    funnel_sales_col = find_matching_column(funnel_window, FUNNEL_SALES_CANDIDATES)
+    funnel_window_subject = pd.DataFrame(columns=['subject_norm','Продажи воронка окно, ₽','Выкупленная выручка окно, ₽'])
+    if not funnel_window.empty and funnel_sales_col:
+        fw = funnel_window.copy()
+        fw['Продажи воронка строка, ₽'] = pd.to_numeric(fw.get(funnel_sales_col), errors='coerce').fillna(0.0)
+        fw['buyout_rate_row'] = to_buyout_rate(fw.get('buyoutPercent', 0), default=0.0)
+        fw['Выкупленная выручка строка, ₽'] = fw['Продажи воронка строка, ₽'] * fw['buyout_rate_row']
+        fw = fw.merge(key_map[['nmId','supplier_article','subject','subject_norm']].drop_duplicates(), on='nmId', how='left')
+        fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
+        fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+        if not fw.empty:
+            funnel_window_subject = fw.groupby('subject_norm', as_index=False).agg(
+                **{
+                    'Продажи воронка окно, ₽': ('Продажи воронка строка, ₽', 'sum'),
+                    'Выкупленная выручка окно, ₽': ('Выкупленная выручка строка, ₽', 'sum'),
+                }
+            )
+
+    category_out = pd.DataFrame({'subject_norm': sorted(TARGET_SUBJECTS)})
+    if not plan_subject.empty:
+        category_out = category_out.merge(plan_subject, on='subject_norm', how='left')
+    if not ads_window_subject.empty:
+        category_out = category_out.merge(ads_window_subject, on='subject_norm', how='left')
+    if not funnel_window_subject.empty:
+        category_out = category_out.merge(funnel_window_subject, on='subject_norm', how='left')
+
+    for col in ['План ВП MTD, ₽','Факт ВП MTD, ₽','Отклонение ВП от плана, ₽','Расходы РК MTD, ₽','Сумма заказов MTD, ₽','Темп плана ВП, %','Расходы рекламы окно, ₽','Продажи воронка окно, ₽','Выкупленная выручка окно, ₽']:
+        if col not in category_out.columns:
+            category_out[col] = 0.0
+        category_out[col] = pd.to_numeric(category_out[col], errors='coerce').fillna(0.0)
+
+    category_out['Категория'] = category_out['subject_norm'].map(get_subject_display_name)
+    category_out['Лимит ДРР категории, доля'] = category_out['subject_norm'].map(get_category_drr_limit)
+    category_out['Лимит ДРР категории, %'] = category_out['Лимит ДРР категории, доля'] * 100.0
+    category_out['Рабочее окно с'] = window['cur_start']
+    category_out['Рабочее окно по'] = window['cur_end']
+    category_out['Источник продаж для ДРР'] = funnel_sales_col if funnel_sales_col else 'Не найден столбец продаж в воронке'
+    category_out['ДРР категории, доля'] = np.where(category_out['Выкупленная выручка окно, ₽'] > 0, category_out['Расходы рекламы окно, ₽'] / category_out['Выкупленная выручка окно, ₽'], 0.0)
+    category_out['Комментарий'] = np.where(category_out['Выкупленная выручка окно, ₽'] > 0, '', 'Нет данных продаж из воронки за рабочее окно')
+    category_out = category_out[[
+        'Категория','subject_norm','Лимит ДРР категории, доля','Лимит ДРР категории, %','Рабочее окно с','Рабочее окно по',
+        'Расходы рекламы окно, ₽','Продажи воронка окно, ₽','Выкупленная выручка окно, ₽','ДРР категории, доля',
+        'План ВП MTD, ₽','Факт ВП MTD, ₽','Отклонение ВП от плана, ₽','Темп плана ВП, %','Расходы РК MTD, ₽','Сумма заказов MTD, ₽','Источник продаж для ДРР','Комментарий'
+    ]].sort_values('Категория')
+
+    return out.sort_values(['Предмет','Артикул продавца']), category_out
 
 
 def build_daily_item_history(orders: pd.DataFrame, ads_daily: pd.DataFrame, funnel: pd.DataFrame, econ: pd.DataFrame, master: pd.DataFrame) -> pd.DataFrame:
@@ -2993,6 +3119,7 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
     item_gp_growth = safe_float(row.get('item_gp_growth_pct'))
     category_drr = safe_float(row.get('category_drr_cur'))
     category_gp_growth = safe_float(row.get('category_gp_growth_pct'))
+    category_limit = safe_float(row.get('category_limit_drr')) or get_category_drr_limit(row.get('subject_norm', ''))
     better_channel = str(row.get('better_channel',''))
     row_channel = 'CPC' if payment_type == 'cpc' else 'CPM'
     cpo_cpc = safe_float(row.get('cpo_cpc'))
@@ -3002,24 +3129,19 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
     plan_att = safe_float(row.get('plan_attainment_pct'))
     roi = safe_float(row.get('campaign_roi_cur'))
     supplier_article = str(row.get('supplier_article',''))
+    subject_name = get_subject_display_name(row.get('subject_norm', row.get('subject', '')))
     reason_parts = []
 
-    # category is top priority
     category_guard = False
-    if supplier_article.startswith('901'):
-        if category_drr > cfg.category_soft_drr:
-            category_guard = True
-            reason_parts.append(f'ДРР категории {category_drr*100:.1f}% выше 14%')
-        elif category_drr > cfg.category_target_drr and category_gp_growth < 0:
-            category_guard = True
-            reason_parts.append(f'ДРР категории {category_drr*100:.1f}% выше 10% и ВП категории падает')
+    if category_drr > category_limit > 0:
+        category_guard = True
+        reason_parts.append(f'ДРР категории «{subject_name}» {category_drr*100:.1f}% выше лимита {category_limit*100:.1f}%')
 
-    # campaign hard rules
     if campaign_drr > cfg.campaign_hard_drr:
         target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.hard_down_step), 2)))
         return 'Снизить', target, f'ДРР кампании {campaign_drr*100:.1f}% выше 16% — жёсткое ограничение', True
 
-    if supplier_article in {'901_/6','901/6'} and row_channel in {'CPC','CPM'} and safe_float(row.get('campaign_roi_cur')) < cfg.roi_9016_target:
+    if supplier_article in {'901_/6','901/6'} and row_channel in {'CPC','CPM'} and roi < cfg.roi_9016_target:
         target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
         return 'Снизить', target, f'ROI ниже целевого значения ({roi*100:.1f}% < 10%)', True
 
@@ -3035,19 +3157,18 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
             return 'Снизить', target, f'ДРР кампании {campaign_drr*100:.1f}% выше 12%, рост заказов {campaign_order_growth:.1f}% < требуемых {required_growth:.1f}% или ВП не растёт', True
         reason_parts.append(f'ДРР кампании {campaign_drr*100:.1f}% выше 12%, но рост заказов {campaign_order_growth:.1f}% оправдывает превышение')
 
-    # category guard overrides lower-level growth
     if category_guard:
-        if row_channel == better_channel and campaign_gp_growth > 0 and campaign_drr <= cfg.campaign_target_drr:
-            return 'Без изменений', current_bid, '; '.join(reason_parts + ['Категория под контролем, сохраняем лучший канал']), False
-        target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
-        return 'Снизить', target, '; '.join(reason_parts + ['Тормозим кампанию в защиту категории']), True
+        if campaign_drr > cfg.campaign_target_drr:
+            target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
+            return 'Снизить', target, '; '.join(reason_parts + ['Категория выше лимита, и эта кампания тоже выше 12% — снижаем']) , True
+        reason_parts.append('Категория выше лимита, но эта кампания сама в целевой зоне — применяем общие правила')
 
-    # campaign is second priority, item only diagnostic
     conflict = item_gp_growth > 0 and campaign_gp_growth < 0 and abs(campaign_gp_growth) > abs(item_gp_growth)
     if conflict:
         reason_parts.append('Рост ВП товара достигнут за счёт падения ВП кампании')
+    if category_gp_growth < 0 and not category_guard:
+        reason_parts.append('ВП категории снижается — рост только при хорошем сигнале кампании')
 
-    # channel allocation by weights
     if better_channel == 'CPC' and row_channel == 'CPC':
         if campaign_drr <= cfg.campaign_target_drr and campaign_gp_growth >= 0 and (max_bid > current_bid + 0.01):
             new_bid = min(max_bid, round(current_bid * (1 + (cfg.max_up_step if plan_att >= 100 else cfg.test_up_step)), 2))
@@ -3062,8 +3183,7 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
                 return 'Повысить', max(floor_bid, new_bid), '; '.join(reason_parts + ['Полки выигрывают по весам, категория и кампания в норме']), False
         return 'Без изменений', current_bid, '; '.join(reason_parts + ['Полки выигрывают по весам, удерживаем']), False
 
-    # worse channel: cut if not profitable enough
-    if row_channel != better_channel and ((row_channel == 'CPM' and (gp_cpm < gp_cpc or cpo_cpm > 0 and cpo_cpc > 0 and cpo_cpm > cpo_cpc)) or (row_channel == 'CPC' and (gp_cpc < gp_cpm or cpo_cpc > 0 and cpo_cpm > 0 and cpo_cpc > cpo_cpm))):
+    if row_channel != better_channel and ((row_channel == 'CPM' and ((gp_cpm < gp_cpc) or (cpo_cpm > 0 and cpo_cpc > 0 and cpo_cpm > cpo_cpc))) or (row_channel == 'CPC' and ((gp_cpc < gp_cpm) or (cpo_cpc > 0 and cpo_cpm > 0 and cpo_cpc > cpo_cpm)))):
         target = max(floor_bid, min(max_bid if max_bid > 0 else current_bid, round(current_bid * (1 - cfg.down_step), 2)))
         return 'Снизить', target, '; '.join(reason_parts + ['Канал хуже альтернативного по CPO/ВП']), True
 
@@ -3103,15 +3223,13 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
 
     rows = campaigns_base.merge(cur, on=['id_campaign','nmId'], how='left').merge(base, on=['id_campaign','nmId'], how='left').fillna(0)
     rows = ensure_business_keys(rows)
-    if 'supplier_article' not in rows.columns:
-        rows['supplier_article'] = ''
-    rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
-    if 'subject' not in rows.columns:
-        rows['subject'] = rows.get('subject_norm', '')
-    rows['subject'] = rows['subject'].fillna('').astype(str)
-    rows = ensure_business_keys(rows)
+    rows['supplier_article'] = rows.get('supplier_article', '').fillna('').astype(str)
+    rows['subject'] = rows.get('subject', rows.get('subject_norm', '')).fillna('').astype(str)
+    rows['subject_norm'] = rows.get('subject_norm', rows['subject'].map(canonical_subject)).fillna('').astype(str).map(canonical_subject)
+
     rows = rows.merge(keywords_current[['nmId','supplier_article','demand_week','median_position','visibility_pct','keyword_orders','keyword_clicks']].drop_duplicates(), on=['nmId','supplier_article'], how='left')
     rows = rows.merge(funnel_item[['nmId','addToCartConversion','cartToOrderConversion','buyoutPercent']], on='nmId', how='left')
+
     if not daily_item.empty and 'Комментарий' not in daily_item.columns:
         daily_item = ensure_business_keys(daily_item)
         item_metrics = build_item_current_metrics(daily_item, window['cur_start'], window['cur_end'], window['base_start'], window['base_end'])
@@ -3120,6 +3238,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
             rows = rows.merge(item_metrics, on='Артикул продавца', how='left')
         elif 'supplier_article' in rows.columns and 'supplier_article' in item_metrics.columns:
             rows = rows.merge(item_metrics, on='supplier_article', how='left')
+
     if not plan_df.empty and 'Комментарий' not in plan_df.columns:
         plan_df = ensure_business_keys(plan_df)
         plan_cols = [c for c in ['Артикул WB','Артикул продавца','План ВП MTD, ₽','Факт ВП MTD, ₽','Темп плана ВП, %','Причина плана'] if c in plan_df.columns]
@@ -3129,6 +3248,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         rows['Факт ВП MTD, ₽'] = 0.0
         rows['Темп плана ВП, %'] = 0.0
         rows['Причина плана'] = ''
+
     rows['ctr_pct'] = np.where(rows['Показы'] > 0, rows['Клики'] / rows['Показы'] * 100.0, 0.0)
     rows['campaign_drr_cur'] = np.where(rows['Сумма_заказов'] * rows['buyout_rate'] > 0, rows['Расход'] / (rows['Сумма_заказов'] * rows['buyout_rate']), 0.0)
     rows['campaign_drr_base'] = np.where(rows['base_Сумма_заказов'] * rows['buyout_rate'] > 0, rows['base_Расход'] / (rows['base_Сумма_заказов'] * rows['buyout_rate']), 0.0)
@@ -3144,28 +3264,35 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['ad_spend'] = pd.to_numeric(rows.get('item_spend_cur'), errors='coerce').fillna(0.0)
     rows['ad_orders'] = pd.to_numeric(rows.get('Заказы'), errors='coerce').fillna(0.0)
     rows['order_growth_pct'] = pd.to_numeric(rows.get('item_order_growth_pct'), errors='coerce').fillna(0.0)
-    rows['spend_growth_pct'] = np.where(pd.to_numeric(rows.get('item_spend_cur'), errors='coerce').fillna(0.0) > 0, 0.0, 0.0)
+    rows['spend_growth_pct'] = np.where(pd.to_numeric(rows.get('base_item_spend_cur', 0), errors='coerce').fillna(0.0) > 0, (pd.to_numeric(rows.get('item_spend_cur'), errors='coerce').fillna(0.0) / pd.to_numeric(rows.get('base_item_spend_cur', 0), errors='coerce').replace(0, np.nan).fillna(1.0) - 1.0) * 100.0, 0.0)
     rows['required_growth_pct'] = rows.apply(lambda r: compute_required_growth(safe_float(r.get('campaign_drr_cur')), safe_float(r.get('spend_growth_pct')), str(r.get('subject_norm',''))), axis=1)
     rows['card_issue'] = (pd.to_numeric(rows.get('addToCartConversion'), errors='coerce').fillna(0.0) < 0.5 * pd.to_numeric(rows.get('subj_addToCart', 0), errors='coerce').fillna(0.0)) | (pd.to_numeric(rows.get('cartToOrderConversion'), errors='coerce').fillna(0.0) < 0.5 * pd.to_numeric(rows.get('subj_cartToOrder', 0), errors='coerce').fillna(0.0)) if 'subj_addToCart' in rows.columns else False
 
-    # category 901 merge
-    if category_plan is not None and not category_plan.empty and 'Категория' in category_plan.columns:
-        cat = category_plan.iloc[0].to_dict() if len(category_plan) else {}
-        rows['category_drr_cur'] = safe_float(cat.get('ДРР категории, доля'))
-        rows['category_gp_cur'] = safe_float(cat.get('Факт ВП MTD, ₽'))
-        rows['category_gp_plan'] = safe_float(cat.get('План ВП MTD, ₽'))
-        base_cat = safe_float(cat.get('План ВП MTD, ₽'))
-        rows['category_gp_growth_pct'] = np.where(base_cat != 0, (safe_float(cat.get('Факт ВП MTD, ₽')) - base_cat) / abs(base_cat) * 100.0, 0.0)
+    if category_plan is not None and not category_plan.empty and 'subject_norm' in category_plan.columns:
+        cat_cols = [c for c in ['subject_norm','ДРР категории, доля','Факт ВП MTD, ₽','План ВП MTD, ₽','Лимит ДРР категории, доля'] if c in category_plan.columns]
+        cat_merge = category_plan[cat_cols].drop_duplicates('subject_norm').copy()
+        cat_merge = cat_merge.rename(columns={
+            'ДРР категории, доля': 'category_drr_cur',
+            'Факт ВП MTD, ₽': 'category_gp_cur',
+            'План ВП MTD, ₽': 'category_gp_plan',
+            'Лимит ДРР категории, доля': 'category_limit_drr',
+        })
+        rows = rows.merge(cat_merge, on='subject_norm', how='left')
+        rows['category_drr_cur'] = pd.to_numeric(rows.get('category_drr_cur'), errors='coerce').fillna(0.0)
+        rows['category_gp_cur'] = pd.to_numeric(rows.get('category_gp_cur'), errors='coerce').fillna(0.0)
+        rows['category_gp_plan'] = pd.to_numeric(rows.get('category_gp_plan'), errors='coerce').fillna(0.0)
+        rows['category_limit_drr'] = pd.to_numeric(rows.get('category_limit_drr'), errors='coerce').fillna(rows['subject_norm'].map(get_category_drr_limit))
+        rows['category_gp_growth_pct'] = np.where(rows['category_gp_plan'] != 0, (rows['category_gp_cur'] - rows['category_gp_plan']) / np.abs(rows['category_gp_plan']) * 100.0, 0.0)
     else:
         rows['category_drr_cur'] = 0.0
         rows['category_gp_cur'] = 0.0
         rows['category_gp_plan'] = 0.0
+        rows['category_limit_drr'] = rows['subject_norm'].map(get_category_drr_limit)
         rows['category_gp_growth_pct'] = 0.0
 
-    # ensure merge keys still exist after plan/item merges
     rows = normalize_core_columns(rows)
     if 'supplier_article' not in rows.columns:
-        rows['supplier_article'] = rows.get('Артикул продавца', rows.get('control_key', ''))
+        rows['supplier_article'] = rows.get('Артикул продавца', '')
     rows['supplier_article'] = rows['supplier_article'].fillna('').astype(str)
     rows = rows.merge(build_channel_balance(ads_daily, campaigns, master, econ_latest, window, funnel), on='supplier_article', how='left')
     for c in ['cpo_cpc','cpo_cpm','drr_cpc','drr_cpm','gp_after_ads_cpc','gp_after_ads_cpm','orders_cpc','orders_cpm']:
@@ -3179,7 +3306,9 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     rows['eff_index_imp'] = np.where(pd.to_numeric(rows.get('bench_capture_imp'), errors='coerce').fillna(0) > 0, rows['capture_imp'] / pd.to_numeric(rows.get('bench_capture_imp'), errors='coerce').fillna(1), 1.0)
     rows['eff_index_click'] = np.where(pd.to_numeric(rows.get('bench_capture_click'), errors='coerce').fillna(0) > 0, rows['capture_click'] / pd.to_numeric(rows.get('bench_capture_click'), errors='coerce').fillna(1), 1.0)
 
-    # Deduplicate decisively
+    limits = rows.apply(lambda r: pd.Series(compute_bid_limits(r, subject_benchmarks), index=['comfort_bid_rub','max_bid_rub','experiment_bid_rub','limit_type']), axis=1)
+    rows = pd.concat([rows, limits], axis=1)
+
     rows = rows.sort_values(['id_campaign','nmId','placement']).drop_duplicates(['id_campaign','nmId','placement','payment_type'])
 
     decisions = []
@@ -3197,43 +3326,44 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
             'Предмет': r.get('subject',''),
             'Плейсмент': r.get('placement',''),
             'Тип кампании': f"{r.get('payment_type','')}_{r.get('placement','')}",
-            'Текущая ставка, ₽': round(safe_float(r.get('current_bid_rub')),2),
-            'Комфортная ставка, ₽': round(safe_float(r.get('comfort_bid_rub')),2) if pd.notna(r.get('comfort_bid_rub')) else None,
-            'Максимальная ставка, ₽': round(safe_float(r.get('max_bid_rub')),2) if pd.notna(r.get('max_bid_rub')) else None,
-            'Экспериментальная ставка, ₽': round(safe_float(r.get('experiment_bid_rub')),2) if pd.notna(r.get('experiment_bid_rub')) else None,
+            'Текущая ставка, ₽': round(safe_float(r.get('current_bid_rub')), 2),
+            'Комфортная ставка, ₽': round(safe_float(r.get('comfort_bid_rub')), 2) if pd.notna(r.get('comfort_bid_rub')) else None,
+            'Максимальная ставка, ₽': round(safe_float(r.get('max_bid_rub')), 2) if pd.notna(r.get('max_bid_rub')) else None,
+            'Экспериментальная ставка, ₽': round(safe_float(r.get('experiment_bid_rub')), 2) if pd.notna(r.get('experiment_bid_rub')) else None,
             'Тип лимита': r.get('limit_type',''),
             'Действие': action,
-            'Новая ставка, ₽': round(safe_float(new_bid),2),
+            'Новая ставка, ₽': round(safe_float(new_bid), 2),
             'Причина': reason,
-            'Показы': round(safe_float(r.get('Показы')),0),
-            'Клики': round(safe_float(r.get('Клики')),0),
-            'CTR, %': round(safe_float(r.get('ctr_pct')),2),
-            'Заказы РК': round(safe_float(r.get('Заказы')),2),
-            'Выручка РК, ₽': round(safe_float(r.get('Сумма_заказов')),2),
-            'Расход РК, ₽': round(safe_float(r.get('Расход')),2),
-            'ДРР кампании, %': round(safe_float(r.get('campaign_drr_cur'))*100,2),
-            'ВП кампании текущее окно после рекламы, ₽': round(safe_float(r.get('campaign_gp_cur')),2),
-            'ВП кампании базовое окно после рекламы, ₽': round(safe_float(r.get('campaign_gp_base')),2),
-            'Рост ВП кампании, %': round(safe_float(r.get('campaign_gp_growth_pct')),2),
-            'ROI кампании, %': round(safe_float(r.get('campaign_roi_cur'))*100,2),
-            'CPO кампании, ₽': round(safe_float(r.get('campaign_cpo')),2),
-            'Все заказы товара': round(safe_float(r.get('total_orders')),2),
-            'Выручка товара, ₽': round(safe_float(r.get('total_revenue')),2),
-            'Общий ДРР товара, %': round(safe_float(r.get('blended_drr'))*100,2),
-            'ВП товара, % рост': round(safe_float(r.get('item_gp_growth_pct')),2),
-            'План ВП MTD, ₽': round(safe_float(r.get('План ВП MTD, ₽')),2),
-            'Факт ВП MTD, ₽': round(safe_float(r.get('Факт ВП MTD, ₽')),2),
-            'Темп плана ВП, %': round(safe_float(r.get('Темп плана ВП, %')),2),
+            'Показы': round(safe_float(r.get('Показы')), 0),
+            'Клики': round(safe_float(r.get('Клики')), 0),
+            'CTR, %': round(safe_float(r.get('ctr_pct')), 2),
+            'Заказы РК': round(safe_float(r.get('Заказы')), 2),
+            'Выручка РК, ₽': round(safe_float(r.get('Сумма_заказов')), 2),
+            'Расход РК, ₽': round(safe_float(r.get('Расход')), 2),
+            'ДРР кампании, %': round(safe_float(r.get('campaign_drr_cur')) * 100, 2),
+            'ВП кампании текущее окно после рекламы, ₽': round(safe_float(r.get('campaign_gp_cur')), 2),
+            'ВП кампании базовое окно после рекламы, ₽': round(safe_float(r.get('campaign_gp_base')), 2),
+            'Рост ВП кампании, %': round(safe_float(r.get('campaign_gp_growth_pct')), 2),
+            'ROI кампании, %': round(safe_float(r.get('campaign_roi_cur')) * 100, 2),
+            'CPO кампании, ₽': round(safe_float(r.get('campaign_cpo')), 2),
+            'Все заказы товара': round(safe_float(r.get('total_orders')), 2),
+            'Выручка товара, ₽': round(safe_float(r.get('total_revenue')), 2),
+            'Общий ДРР товара, %': round(safe_float(r.get('blended_drr')) * 100, 2),
+            'ВП товара, % рост': round(safe_float(r.get('item_gp_growth_pct')), 2),
+            'План ВП MTD, ₽': round(safe_float(r.get('План ВП MTD, ₽')), 2),
+            'Факт ВП MTD, ₽': round(safe_float(r.get('Факт ВП MTD, ₽')), 2),
+            'Темп плана ВП, %': round(safe_float(r.get('Темп плана ВП, %')), 2),
             'Причина плана': r.get('Причина плана',''),
-            'ДРР категории 901, %': round(safe_float(r.get('category_drr_cur'))*100,2) if str(r.get('supplier_article','')).startswith('901') else None,
-            'Факт ВП категории 901, ₽': round(safe_float(r.get('category_gp_cur')),2) if str(r.get('supplier_article','')).startswith('901') else None,
-            'Темп категории, %': round(safe_float(r.get('category_gp_growth_pct')),2) if str(r.get('supplier_article','')).startswith('901') else None,
-            'CPO CPC, ₽': round(safe_float(r.get('cpo_cpc')),2),
-            'CPO Полок, ₽': round(safe_float(r.get('cpo_cpm')),2),
-            'ДРР CPC, %': round(safe_float(r.get('drr_cpc'))*100,2),
-            'ДРР Полок, %': round(safe_float(r.get('drr_cpm'))*100,2),
-            'ВП CPC, ₽': round(safe_float(r.get('gp_after_ads_cpc')),2),
-            'ВП Полок, ₽': round(safe_float(r.get('gp_after_ads_cpm')),2),
+            'ДРР категории, %': round(safe_float(r.get('category_drr_cur')) * 100, 2),
+            'Лимит ДРР категории, %': round(safe_float(r.get('category_limit_drr')) * 100, 2),
+            'Факт ВП категории MTD, ₽': round(safe_float(r.get('category_gp_cur')), 2),
+            'Темп категории, %': round(safe_float(r.get('category_gp_growth_pct')), 2),
+            'CPO CPC, ₽': round(safe_float(r.get('cpo_cpc')), 2),
+            'CPO Полок, ₽': round(safe_float(r.get('cpo_cpm')), 2),
+            'ДРР CPC, %': round(safe_float(r.get('drr_cpc')) * 100, 2),
+            'ДРР Полок, %': round(safe_float(r.get('drr_cpm')) * 100, 2),
+            'ВП CPC, ₽': round(safe_float(r.get('gp_after_ads_cpc')), 2),
+            'ВП Полок, ₽': round(safe_float(r.get('gp_after_ads_cpm')), 2),
             'Лучший канал': r.get('better_channel',''),
             'Статус риска': ('Критический' if safe_float(r.get('campaign_drr_cur')) > cfg.campaign_hard_drr else ('Высокий' if safe_float(r.get('campaign_drr_cur')) > cfg.campaign_target_drr or safe_float(r.get('campaign_gp_cur')) <= 0 else 'Низкий')),
             'Потенциал роста': ('Высокий' if r.get('better_channel','') == ('CPC' if str(r.get('payment_type','')).lower() == 'cpc' else 'CPM') and safe_float(r.get('campaign_gp_cur')) > 0 and safe_float(r.get('campaign_drr_cur')) <= cfg.campaign_target_drr else 'Низкий')
@@ -3258,21 +3388,6 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
     effects = decisions_df[decisions_df['Действие'].isin(['Повысить','Снизить']) & (decisions_df['Новая ставка, ₽'] != decisions_df['Текущая ставка, ₽'])].copy()
     effects = effects[['Дата запуска','Артикул продавца','ID кампании','Тип кампании','Текущая ставка, ₽','Новая ставка, ₽','Действие','Причина']] if not effects.empty else pd.DataFrame([{'Комментарий':'Нет изменений ставок'}])
 
-    orders_60 = orders[(orders['date'] >= as_of_date - timedelta(days=60)) & (orders['date'] <= as_of_date) & (~orders['isCancel'])].copy() if not orders.empty else pd.DataFrame()
-    shade_portfolio = build_shade_portfolio(campaigns, master, orders_60)
-    # build shade product metrics clean
-    if not isinstance(product_metrics, pd.DataFrame) or product_metrics.empty or 'Артикул продавца' not in product_metrics.columns:
-        shade_pm = pd.DataFrame(columns=['control_key','blended_drr','subject_norm'])
-    else:
-        shade_pm = product_metrics.copy()
-        shade_pm['control_key'] = shade_pm['Артикул продавца']
-        shade_pm['blended_drr'] = pd.to_numeric(shade_pm.get('ДРР'), errors='coerce').fillna(0)
-        shade_pm['subject_norm'] = shade_pm['Артикул продавца'].map(lambda x: canonical_subject('кисти косметические') if str(x).startswith('901') else '')
-        shade_pm = shade_pm[['control_key','blended_drr','subject_norm']]
-    shade_actions, shade_tests = build_shade_actions(campaigns, shade_portfolio, master, orders_60, shade_pm, api_key=os.getenv('WB_PROMO_KEY_TOPFACE',''))
-    if shade_actions.empty:
-        shade_actions = pd.DataFrame([{'Комментарий':'Нет действий по оттенкам'}])
-
     return {
         'rows': rows,
         'decisions': decisions_df,
@@ -3280,9 +3395,6 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         'product_metrics': product_metrics,
         'campaign_profit': campaign_profit,
         'effects': effects,
-        'shade_portfolio': shade_portfolio if not shade_portfolio.empty else pd.DataFrame([{'Комментарий':'Нет кампаний по оттенкам'}]),
-        'shade_actions': shade_actions,
-        'shade_tests': shade_tests,
         'eff_history_sheets': build_efficiency_history(ads_daily, campaigns, aggregate_keyword_daily(keywords), master, bid_history, as_of_date),
         'window': window,
         'daily_item_history': daily_item,
@@ -3316,53 +3428,10 @@ def decisions_to_payload(decisions_df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def apply_shade_actions(actions_df: pd.DataFrame, api_key: str, dry_run: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    work = actions_df.copy()
-    if work.empty or 'Действие API' not in work.columns:
-        empty = pd.DataFrame([{'Комментарий':'Нет действий по оттенкам'}])
-        return empty, work, pd.DataFrame([{'Комментарий':'Нет активных тестов оттенков'}])
-    add_rows = work[work['Действие API'] == 'add'].copy()
-    add_rows['ID кампании'] = pd.to_numeric(add_rows.get('ID кампании'), errors='coerce')
-    add_rows['Артикул WB'] = pd.to_numeric(add_rows.get('Артикул WB'), errors='coerce')
-    add_rows = add_rows.dropna(subset=['ID кампании','Артикул WB'])
-    logs = []
-    tests_rows = []
-    if add_rows.empty:
-        return pd.DataFrame([{'Комментарий':'Нет валидных оттенков для добавления'}]), work, pd.DataFrame([{'Комментарий':'Нет активных тестов оттенков'}])
-    for advert_id, g in add_rows.groupby('ID кампании'):
-        nm_ids = sorted({safe_int(x) for x in g['Артикул WB'].tolist() if safe_int(x) > 0})
-        payload = {'nms':[{'advert_id': safe_int(advert_id), 'nms': {'add': nm_ids, 'delete': []}}]}
-        resp = wb_api_request('PATCH', WB_NMS_URL, api_key, payload, method_name='Изменение оттенков', timeout=120, dry_run=dry_run, context={'advert_id': safe_int(advert_id),'nm_ids': ','.join(map(str,nm_ids))})
-        status = 'skipped'
-        response_txt = 'Нет ключа'
-        added_set = set()
-        if dry_run or not api_key:
-            status = 'dry-run' if api_key else 'skipped'
-            response_txt = 'dry-run' if api_key else 'Нет WB_PROMO_KEY_TOPFACE'
-        else:
-            response_txt = truncate_text(resp.text if resp is not None else '', 4000)
-            if resp is not None and resp.status_code == 200:
-                status = 'ok'
-                try:
-                    data = resp.json()
-                    nms = data.get('nms', []) if isinstance(data, dict) else []
-                    for block in nms:
-                        add = block.get('nms', {}).get('add') if isinstance(block.get('nms'), dict) else None
-                        if isinstance(add, list):
-                            added_set.update({safe_int(x) for x in add})
-                except Exception:
-                    added_set = set()
-            else:
-                status = 'failed'
-        logs.append({'timestamp': now_ts(), 'advert_id': safe_int(advert_id), 'status': status, 'http_status': '' if resp is None else resp.status_code, 'nm_count': len(nm_ids), 'request_body': json_dumps_safe(payload), 'response': response_txt})
-        for idx in g.index:
-            nm = safe_int(work.at[idx, 'Артикул WB'])
-            if status in {'dry-run','skipped','failed'}:
-                work.at[idx, 'Статус применения'] = 'dry-run' if status=='dry-run' else ('ошибка' if status=='failed' else 'пропущено')
-            else:
-                work.at[idx, 'Статус применения'] = 'добавлен' if nm in added_set else 'не подтверждено WB'
-            tests_rows.append({'ID кампании': safe_int(advert_id), 'Новый оттенок': work.at[idx, 'Новый оттенок'], 'Артикул WB': nm, 'Статус': work.at[idx, 'Статус применения'], 'Дата': now_ts()})
-    tests = pd.DataFrame(tests_rows) if tests_rows else pd.DataFrame([{'Комментарий':'Нет активных тестов оттенков'}])
-    return pd.DataFrame(logs), work, tests
+    empty_log = pd.DataFrame([{'Комментарий':'Блок оттенков отключён: каждый оттенок теперь ведётся отдельной рекламной кампанией'}])
+    empty_actions = pd.DataFrame([{'Комментарий':'Блок оттенков отключён'}])
+    empty_tests = pd.DataFrame([{'Комментарий':'Блок оттенков отключён'}])
+    return empty_log, empty_actions, empty_tests
 
 
 def build_history_append(decisions: pd.DataFrame, as_of_date: date) -> pd.DataFrame:
@@ -3374,7 +3443,7 @@ def build_history_append(decisions: pd.DataFrame, as_of_date: date) -> pd.DataFr
     return hist
 
 
-def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame], history_append: pd.DataFrame) -> None:
+def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame] = None, history_append: Optional[pd.DataFrame] = None) -> None:
     decisions = results.get('decisions', pd.DataFrame()).copy()
     plan_sheet = results.get('plan_sheet', pd.DataFrame()).copy()
     category_plan = results.get('category_plan', pd.DataFrame()).copy()
@@ -3384,10 +3453,8 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     campaign_profit = results.get('campaign_profit', pd.DataFrame()).copy()
     effects = results.get('effects', pd.DataFrame()).copy()
     weak = results.get('weak', pd.DataFrame()).copy()
-    shade_portfolio = results.get('shade_portfolio', pd.DataFrame()).copy()
-    shade_actions = results.get('shade_actions', pd.DataFrame()).copy()
-    shade_tests = results.get('shade_tests', pd.DataFrame()).copy()
     min_bids_df = results.get('min_bids_df', pd.DataFrame()).copy()
+    history_append = history_append.copy() if isinstance(history_append, pd.DataFrame) else pd.DataFrame()
 
     summary = pd.DataFrame([{
         'Режим': 'run',
@@ -3395,7 +3462,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
         'Всего рекомендаций': int(len(decisions)),
         'Изменённых ставок': int(len(decisions[decisions['Действие'].isin(['Повысить','Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])])) if not decisions.empty else 0,
         'Блоков отправки ставок': 0 if bid_send_log is None or bid_send_log.empty else int(len(bid_send_log)),
-        'Блоков применения оттенков': 0 if shade_apply_log is None or shade_apply_log.empty else int(len(shade_apply_log)),
         'Текущее окно с': results['window']['cur_start'],
         'Текущее окно по': results['window']['cur_end'],
         'База с': results['window']['base_start'],
@@ -3426,14 +3492,13 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     bid_hist_all = append_dedup(old_bid_hist, decisions[decisions['Действие'].isin(['Повысить','Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])].copy(), ['ID кампании','Артикул WB','Плейсмент','Дата запуска'])
     archive_all = append_dedup(old_sheets.get('Архив решений', pd.DataFrame()), decisions, ['Дата запуска','ID кампании','Артикул WB','Плейсмент'])
 
-    # stub in main file for bid efficiency details
     eff_stub = pd.DataFrame([{'Комментарий':'Детальная эффективность ставки вынесена в отдельный файл Эффективность_ставки_ежедневно.xlsx'}])
 
     sheets = {
         'Сводка': summary,
         'Решения': decisions,
         'План': plan_sheet,
-        'План категории 901': category_plan,
+        'План категорий': category_plan,
         'Товар день': daily_item,
         'Кампания день': daily_campaign,
         'Товар итог': product_metrics,
@@ -3443,9 +3508,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
         'Минимальные ставки WB': min_bids_df if not min_bids_df.empty else pd.DataFrame([{'Комментарий':'Нет данных по min bid'}]),
         'Слабые позиции': weak,
         'Эффект изменений': effects,
-        'Состав кампаний по оттенкам': shade_portfolio,
-        'Рекомендации по оттенкам': shade_actions,
-        'Тесты оттенков': shade_tests,
         'Лог API': pd.DataFrame(API_CALL_LOGS) if API_CALL_LOGS else pd.DataFrame([{'Комментарий':'Нет вызовов API'}]),
         'История решений день': decisions_hist,
         'История ставок': bid_hist_all,
@@ -3458,7 +3520,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     provider.write_excel(OUT_PREVIEW, sheets)
     provider.write_text(OUT_SUMMARY, json.dumps(summary.iloc[0].to_dict(), ensure_ascii=False, default=str, indent=2))
 
-    # separate file for detailed bid efficiency
     eff_sheets = results.get('eff_history_sheets', {})
     if not eff_sheets:
         eff_sheets = {'Комментарий': pd.DataFrame([{'Комментарий':'Нет данных по эффективности ставки'}])}
@@ -3483,12 +3544,8 @@ def run_manager(args: argparse.Namespace) -> None:
     payload = decisions_to_payload(decisions)
     bid_send_log = send_payload(payload, api_key, dry_run=False)
     log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
-    shade_apply_log, shade_applied_df, shade_tests = apply_shade_actions(results.get('shade_actions', pd.DataFrame()), api_key, dry_run=False)
-    results['shade_actions'] = shade_applied_df
-    results['shade_tests'] = shade_tests
-    log(f"🎨 Блоков оттенков к применению: {0 if shade_apply_log is None or shade_apply_log.empty else len(shade_apply_log)}")
     history_append = build_history_append(decisions, as_of_date)
-    save_outputs(provider, results, 'run', bid_send_log, shade_apply_log, history_append)
+    save_outputs(provider, results, 'run', bid_send_log, None, history_append)
 
 
 def main() -> None:
