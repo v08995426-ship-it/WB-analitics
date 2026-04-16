@@ -264,6 +264,11 @@ def ensure_business_keys(df: pd.DataFrame) -> pd.DataFrame:
         out['Предмет'] = out['subject']
     return out
 
+
+
+def normalize_core_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return ensure_business_keys(df)
+
 def safe_int(v: Any, default: int = 0) -> int:
     try:
         if pd.isna(v):
