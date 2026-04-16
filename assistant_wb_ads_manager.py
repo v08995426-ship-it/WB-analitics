@@ -155,6 +155,15 @@ def build_category_window_diagnostics(
 ) -> pd.DataFrame:
     subjects = pd.DataFrame({'subject_norm': sorted(TARGET_SUBJECTS)})
     key_map = master[['nmId', 'subject_norm']].drop_duplicates() if not master.empty else pd.DataFrame(columns=['nmId', 'subject_norm'])
+    key_map = key_map.copy()
+    if 'nmId' in key_map.columns:
+        key_map['nmId'] = pd.to_numeric(key_map['nmId'], errors='coerce')
+        key_map = key_map.dropna(subset=['nmId']).copy()
+    nm_to_subject: Dict[Any, Any] = {}
+    if not key_map.empty:
+        km = key_map.dropna(subset=['subject_norm']).copy()
+        km['subject_norm'] = km['subject_norm'].map(canonical_subject)
+        nm_to_subject = dict(zip(km['nmId'].tolist(), km['subject_norm'].tolist()))
 
     def _orders_slice(start: date, end: date, suffix: str) -> pd.DataFrame:
         if orders.empty:
@@ -163,8 +172,10 @@ def build_category_window_diagnostics(
         if ords.empty:
             return pd.DataFrame(columns=['subject_norm', f'category_orders_{suffix}', f'category_gp_before_ads_{suffix}'])
         gp_map = econ_latest[['nmId', 'gp_realized']].drop_duplicates() if not econ_latest.empty else pd.DataFrame(columns=['nmId', 'gp_realized'])
-        ords = ords.merge(key_map, on='nmId', how='left').merge(gp_map, on='nmId', how='left')
-        ords['subject_norm'] = ords['subject_norm'].map(canonical_subject)
+        if not key_map.empty:
+            ords = ords.merge(key_map, on='nmId', how='left', suffixes=('', '_m'))
+        ords = with_resolved_subject_norm(ords, nm_to_subject)
+        ords = ords.merge(gp_map, on='nmId', how='left')
         ords['gp_realized'] = pd.to_numeric(ords.get('gp_realized'), errors='coerce').fillna(0.0)
         ords = ords[ords['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if ords.empty:
@@ -182,8 +193,9 @@ def build_category_window_diagnostics(
         ad = ads_daily[(ads_daily['date'] >= start) & (ads_daily['date'] <= end)].copy()
         if ad.empty:
             return pd.DataFrame(columns=['subject_norm', f'category_spend_{suffix}'])
-        ad = ad.merge(key_map, on='nmId', how='left')
-        ad['subject_norm'] = ad['subject_norm'].map(canonical_subject)
+        if not key_map.empty:
+            ad = ad.merge(key_map, on='nmId', how='left', suffixes=('', '_m'))
+        ad = with_resolved_subject_norm(ad, nm_to_subject)
         ad['Расход'] = pd.to_numeric(ad.get('Расход'), errors='coerce').fillna(0.0)
         ad = ad[ad['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if ad.empty:
@@ -196,9 +208,7 @@ def build_category_window_diagnostics(
         kw = keywords[(keywords['date'] >= start) & (keywords['date'] <= end)].copy()
         if kw.empty:
             return pd.DataFrame(columns=['subject_norm', f'category_demand_{suffix}'])
-        if 'subject_norm' not in kw.columns:
-            kw['subject_norm'] = kw.get('subject', '').map(canonical_subject)
-        kw['subject_norm'] = kw['subject_norm'].map(canonical_subject)
+        kw = with_resolved_subject_norm(kw, nm_to_subject)
         kw['demand_week'] = pd.to_numeric(kw.get('demand_week'), errors='coerce').fillna(0.0)
         kw = kw[kw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if kw.empty:
@@ -212,8 +222,9 @@ def build_category_window_diagnostics(
         if fw.empty:
             return pd.DataFrame(columns=['subject_norm', 'category_funnel_sales_cur', 'category_realized_sales_cur'])
         sales_col = find_matching_column(fw, FUNNEL_SALES_CANDIDATES)
-        fw = fw.merge(key_map, on='nmId', how='left')
-        fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
+        if not key_map.empty:
+            fw = fw.merge(key_map, on='nmId', how='left', suffixes=('', '_m'))
+        fw = with_resolved_subject_norm(fw, nm_to_subject)
         fw['funnel_sales'] = pd.to_numeric(fw.get(sales_col if sales_col else 'ordersSumRub', 0), errors='coerce').fillna(0.0)
         fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if fw.empty:
@@ -316,8 +327,46 @@ def latest_econ_rows(econ: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     work = econ.copy()
     week_col = find_matching_column(work, ECON_WEEK_CANDIDATES)
     if week_col:
-        work["_econ_order"] = pd.to_datetime(work[week_col], errors="coerce")
-        work["_econ_order"] = work["_econ_order"].fillna(pd.Timestamp("1900-01-01"))
+        raw = work[week_col].fillna("").astype(str).str.strip()
+        parsed = pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+
+        mask_iso_week = raw.str.fullmatch(r"\d{4}-W\d{2}")
+        if mask_iso_week.any():
+            parsed.loc[mask_iso_week] = pd.to_datetime(
+                raw.loc[mask_iso_week] + "-1",
+                format="%G-W%V-%u",
+                errors="coerce",
+            )
+
+        mask_iso_date = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}")
+        if mask_iso_date.any():
+            parsed.loc[mask_iso_date] = pd.to_datetime(
+                raw.loc[mask_iso_date],
+                format="%Y-%m-%d",
+                errors="coerce",
+            )
+
+        mask_dot_date = raw.str.fullmatch(r"\d{2}\.\d{2}\.\d{4}")
+        if mask_dot_date.any():
+            parsed.loc[mask_dot_date] = pd.to_datetime(
+                raw.loc[mask_dot_date],
+                format="%d.%m.%Y",
+                errors="coerce",
+            )
+
+        mask_slash_date = raw.str.fullmatch(r"\d{2}/\d{2}/\d{4}")
+        if mask_slash_date.any():
+            parsed.loc[mask_slash_date] = pd.to_datetime(
+                raw.loc[mask_slash_date],
+                format="%d/%m/%Y",
+                errors="coerce",
+            )
+
+        other_mask = parsed.isna() & raw.ne("")
+        if other_mask.any():
+            parsed.loc[other_mask] = pd.to_datetime(raw.loc[other_mask], errors="coerce")
+
+        work["_econ_order"] = parsed.fillna(pd.Timestamp("1900-01-01"))
     else:
         work["_econ_order"] = np.arange(len(work))
     cols = [c for c in cols if c in work.columns]
