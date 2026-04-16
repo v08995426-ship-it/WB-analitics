@@ -2915,9 +2915,20 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
     if not plan_subject.empty:
         plan_subject['Темп плана ВП, %'] = np.where(plan_subject['План ВП MTD, ₽'] != 0, plan_subject['Факт ВП MTD, ₽'] / plan_subject['План ВП MTD, ₽'] * 100.0, 0.0)
 
+    nm_to_subject = {}
+    if not key_map.empty:
+        nm_to_subject = key_map.dropna(subset=['nmId']).drop_duplicates('nmId').set_index('nmId')['subject_norm'].to_dict()
+
     ads_window_subject = pd.DataFrame(columns=['subject_norm','Расходы рекламы окно, ₽'])
     if not ads_window.empty:
-        ads_window_subject = ads_window.merge(key_map[['nmId','subject_norm']].drop_duplicates(), on='nmId', how='left')
+        ads_window_subject = ads_window.copy()
+        if 'subject_norm' not in ads_window_subject.columns:
+            ads_window_subject['subject_norm'] = ads_window_subject['nmId'].map(nm_to_subject)
+        else:
+            ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].where(
+                ads_window_subject['subject_norm'].notna() & (ads_window_subject['subject_norm'].astype(str).str.strip() != ''),
+                ads_window_subject['nmId'].map(nm_to_subject),
+            )
         ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].map(canonical_subject)
         ads_window_subject = ads_window_subject[ads_window_subject['subject_norm'].isin(TARGET_SUBJECTS)].groupby('subject_norm', as_index=False).agg(**{'Расходы рекламы окно, ₽': ('Расход','sum')})
 
@@ -2928,7 +2939,13 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
         fw['Продажи воронка строка, ₽'] = pd.to_numeric(fw.get(funnel_sales_col), errors='coerce').fillna(0.0)
         fw['buyout_rate_row'] = to_buyout_rate(fw.get('buyoutPercent', 0), default=0.0)
         fw['Выкупленная выручка строка, ₽'] = fw['Продажи воронка строка, ₽'] * fw['buyout_rate_row']
-        fw = fw.merge(key_map[['nmId','supplier_article','subject','subject_norm']].drop_duplicates(), on='nmId', how='left')
+        if 'subject_norm' not in fw.columns:
+            fw['subject_norm'] = fw['nmId'].map(nm_to_subject)
+        else:
+            fw['subject_norm'] = fw['subject_norm'].where(
+                fw['subject_norm'].notna() & (fw['subject_norm'].astype(str).str.strip() != ''),
+                fw['nmId'].map(nm_to_subject),
+            )
         fw['subject_norm'] = fw['subject_norm'].map(canonical_subject)
         fw = fw[fw['subject_norm'].isin(TARGET_SUBJECTS)].copy()
         if not fw.empty:
