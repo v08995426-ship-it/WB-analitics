@@ -457,6 +457,23 @@ def with_resolved_subject_norm(df: pd.DataFrame, nm_to_subject: Dict[Any, Any]) 
 
     out["subject_norm"] = resolved.fillna("").astype(str).map(canonical_subject)
     return out
+
+
+def build_nm_to_subject_map(master: pd.DataFrame) -> Dict[Any, Any]:
+    if master is None or master.empty:
+        return {}
+    work = master.copy()
+    if 'nmId' not in work.columns:
+        return {}
+    work = with_resolved_subject_norm(work, {})
+    nm_series = pd.to_numeric(work['nmId'], errors='coerce')
+    subj_series = work.get('subject_norm', pd.Series('', index=work.index)).fillna('').astype(str).map(canonical_subject)
+    mask = nm_series.notna() & subj_series.ne('')
+    if not mask.any():
+        return {}
+    dedup = pd.DataFrame({'nmId': nm_series[mask].astype('int64'), 'subject_norm': subj_series[mask]})
+    dedup = dedup.drop_duplicates(subset=['nmId'], keep='first')
+    return dict(zip(dedup['nmId'], dedup['subject_norm']))
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
 WB_NMS_URL = "https://advert-api.wildberries.ru/adv/v0/auction/nms"
@@ -3610,36 +3627,70 @@ def build_daily_campaign_history(ads_daily: pd.DataFrame, campaigns: pd.DataFram
 def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, master: pd.DataFrame, econ_latest: pd.DataFrame, window: Dict[str, date], funnel: Optional[pd.DataFrame]=None) -> pd.DataFrame:
     if ads_daily.empty or campaigns.empty:
         return pd.DataFrame(columns=['supplier_article'])
-    meta = campaigns[['id_campaign','nmId','payment_type']].drop_duplicates()
-    keys = master[['nmId','supplier_article','subject_norm']].drop_duplicates()
-    npu = econ_latest[['nmId','gp_realized','np_unit']].drop_duplicates() if 'gp_realized' in econ_latest.columns else econ_latest[['nmId','np_unit']].copy()
-    nm_to_subject = build_nm_to_subject_map(master)
+    meta_cols = [c for c in ['id_campaign', 'nmId', 'payment_type'] if c in campaigns.columns]
+    meta = campaigns[meta_cols].drop_duplicates().copy()
+    key_cols = [c for c in ['nmId', 'supplier_article', 'subject_norm', 'subject', 'Предмет', 'Название предмета'] if c in master.columns]
+    keys = master[key_cols].drop_duplicates().copy() if key_cols else pd.DataFrame(columns=['nmId'])
+    npu_cols = [c for c in ['nmId', 'gp_realized', 'np_unit'] if c in econ_latest.columns]
+    npu = econ_latest[npu_cols].drop_duplicates().copy() if npu_cols else pd.DataFrame(columns=['nmId'])
+
     df = ads_daily[(ads_daily['date'] >= window['cur_start']) & (ads_daily['date'] <= window['cur_end'])].copy()
-    df = df.merge(meta, on=['id_campaign','nmId'], how='left')
-    df = df.merge(keys, on='nmId', how='left')
-    df = df.merge(npu, on='nmId', how='left')
+    if not meta.empty:
+        merge_on = [c for c in ['id_campaign', 'nmId'] if c in df.columns and c in meta.columns]
+        if merge_on:
+            df = df.merge(meta, on=merge_on, how='left')
+    if not keys.empty and 'nmId' in df.columns and 'nmId' in keys.columns:
+        df = df.merge(keys, on='nmId', how='left')
+    if not npu.empty and 'nmId' in df.columns and 'nmId' in npu.columns:
+        df = df.merge(npu, on='nmId', how='left')
+
+    nm_to_subject = build_nm_to_subject_map(master)
     df = with_resolved_subject_norm(df, nm_to_subject)
+
     if 'supplier_article' not in df.columns:
         df['supplier_article'] = ''
     df['supplier_article'] = df['supplier_article'].fillna('').astype(str)
-    df['buyout_rate'] = df['subject_norm'].map(get_subject_buyout_rate).fillna(0.90)
-    df['channel'] = np.where(df['payment_type'].astype(str).str.lower().eq('cpc'),'CPC','CPM')
-    grp = df.groupby(['supplier_article','channel'], as_index=False).agg(spend=('Расход','sum'), orders=('Заказы','sum'), revenue=('Сумма заказов','sum'), clicks=('Клики','sum'), shows=('Показы','sum'), buyout_rate=('buyout_rate','mean'), np_unit=('np_unit','mean'))
-    grp['cpo'] = np.where(grp['orders']>0, grp['spend']/grp['orders'], 0.0)
-    grp['drr'] = np.where(grp['revenue']*grp['buyout_rate']>0, grp['spend']/(grp['revenue']*grp['buyout_rate']), 0.0)
-    grp['gp_after_ads'] = grp['revenue']*grp['buyout_rate'] - grp['spend']
-    wide = grp.pivot(index='supplier_article', columns='channel', values=['cpo','drr','gp_after_ads','orders','spend']).copy()
-    wide.columns = [f'{a.lower()}_{b.lower()}' for a,b in wide.columns]
+    if 'subject' not in df.columns:
+        df['subject'] = df.get('subject_norm', '')
+
+    df['buyout_rate'] = pd.to_numeric(df['subject_norm'].map(get_subject_buyout_rate), errors='coerce').fillna(0.0)
+    df['payment_type'] = df.get('payment_type', '').astype(str)
+    df['channel'] = np.where(df['payment_type'].str.lower().eq('cpc'), 'CPC', 'CPM')
+
+    for col in ['Расход', 'Заказы', 'Сумма заказов', 'Клики', 'Показы', 'np_unit']:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+    grp = df.groupby(['supplier_article', 'channel'], as_index=False).agg(
+        spend=('Расход', 'sum'),
+        orders=('Заказы', 'sum'),
+        revenue=('Сумма заказов', 'sum'),
+        clicks=('Клики', 'sum'),
+        shows=('Показы', 'sum'),
+        buyout_rate=('buyout_rate', 'mean'),
+        np_unit=('np_unit', 'mean')
+    )
+    grp['cpo'] = np.where(grp['orders'] > 0, grp['spend'] / grp['orders'], 0.0)
+    grp['drr'] = np.where(grp['revenue'] * grp['buyout_rate'] > 0, grp['spend'] / (grp['revenue'] * grp['buyout_rate']), 0.0)
+    grp['gp_after_ads'] = grp['revenue'] * grp['buyout_rate'] - grp['spend']
+
+    if grp.empty:
+        return pd.DataFrame(columns=['supplier_article'])
+
+    wide = grp.pivot(index='supplier_article', columns='channel', values=['cpo', 'drr', 'gp_after_ads', 'orders', 'spend']).copy()
+    wide.columns = [f'{a.lower()}_{b.lower()}' for a, b in wide.columns]
     wide = wide.reset_index()
-    for c in ['cpo_cpc','cpo_cpm','drr_cpc','drr_cpm','gp_after_ads_cpc','gp_after_ads_cpm','orders_cpc','orders_cpm','spend_cpc','spend_cpm']:
+    for c in ['cpo_cpc', 'cpo_cpm', 'drr_cpc', 'drr_cpm', 'gp_after_ads_cpc', 'gp_after_ads_cpm', 'orders_cpc', 'orders_cpm', 'spend_cpc', 'spend_cpm']:
         if c not in wide.columns:
             wide[c] = 0.0
         wide[c] = pd.to_numeric(wide[c], errors='coerce').fillna(0.0)
+
     def _better(r):
-        # higher score is better
         cpc_score = (1 if (r['gp_after_ads_cpc'] > 0) else 0) + (1 if (r['cpo_cpc'] > 0 and (r['cpo_cpm'] == 0 or r['cpo_cpc'] <= r['cpo_cpm'])) else 0) + (1 if r['gp_after_ads_cpc'] >= r['gp_after_ads_cpm'] else 0)
         cpm_score = (1 if (r['gp_after_ads_cpm'] > 0) else 0) + (1 if (r['cpo_cpm'] > 0 and (r['cpo_cpc'] == 0 or r['cpo_cpm'] <= r['cpo_cpc'])) else 0) + (1 if r['gp_after_ads_cpm'] > r['gp_after_ads_cpc'] else 0)
         return 'CPC' if cpc_score >= cpm_score else 'CPM'
+
     wide['better_channel'] = wide.apply(_better, axis=1)
     wide['worse_channel'] = np.where(wide['better_channel'].eq('CPC'), 'CPM', 'CPC')
     return wide
