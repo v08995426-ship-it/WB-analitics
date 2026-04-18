@@ -4496,92 +4496,226 @@ def wrap_text_to_width(draw: Any, text: str, font: Any, max_width: int) -> List[
     return lines
 
 
+
 def build_manager_pdf_bytes(manager_name: str, manager_df: pd.DataFrame, run_dt_text: str, source_key: str = '') -> bytes:
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer
+    """
+    Build PDF bytes for manager recommendations.
 
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=14 * mm,
-        rightMargin=14 * mm,
-        topMargin=14 * mm,
-        bottomMargin=14 * mm,
-        title=f'Рекомендации по ставкам - {manager_name}',
-        author='Ассистент WB',
-    )
+    Fallback order:
+    1) reportlab
+    2) matplotlib PdfPages
+    3) minimal built-in PDF (ASCII-safe transliterated text)
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer
 
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'ManagerTitle',
-        parent=styles['Title'],
-        fontName='Helvetica-Bold',
-        fontSize=16,
-        leading=20,
-        alignment=TA_LEFT,
-        textColor=colors.black,
-        spaceAfter=6,
-    )
-    meta_style = ParagraphStyle(
-        'ManagerMeta',
-        parent=styles['BodyText'],
-        fontName='Helvetica',
-        fontSize=9,
-        leading=12,
-        textColor=colors.HexColor('#444444'),
-        spaceAfter=2,
-    )
-    head_style = ParagraphStyle(
-        'ManagerHead',
-        parent=styles['Heading4'],
-        fontName='Helvetica-Bold',
-        fontSize=10.5,
-        leading=13,
-        textColor=colors.black,
-        spaceAfter=4,
-    )
-    body_style = ParagraphStyle(
-        'ManagerBody',
-        parent=styles['BodyText'],
-        fontName='Helvetica',
-        fontSize=9.5,
-        leading=12,
-        textColor=colors.black,
-        spaceAfter=3,
-    )
-    reason_style = ParagraphStyle(
-        'ManagerReason',
-        parent=styles['BodyText'],
-        fontName='Helvetica',
-        fontSize=8.8,
-        leading=11,
-        textColor=colors.HexColor('#222222'),
-        spaceAfter=0,
-    )
-
-    def esc(value: Any) -> str:
-        text_value = '' if value is None else str(value)
-        return (
-            text_value.replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('\n', '<br/>')
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buf,
+            pagesize=A4,
+            leftMargin=14 * mm,
+            rightMargin=14 * mm,
+            topMargin=14 * mm,
+            bottomMargin=14 * mm,
+            title=f'Рекомендации по ставкам - {manager_name}',
+            author='Ассистент WB',
         )
 
-    story = [
-        Paragraph(esc(f'Рекомендации по ставкам - {manager_name}'), title_style),
-        Paragraph(esc(f'Дата формирования: {run_dt_text}'), meta_style),
-        Paragraph(esc(f'Строк рекомендаций: {len(manager_df)}'), meta_style),
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'ManagerTitle',
+            parent=styles['Title'],
+            fontName='Helvetica-Bold',
+            fontSize=16,
+            leading=20,
+            alignment=TA_LEFT,
+            textColor=colors.black,
+            spaceAfter=6,
+        )
+        meta_style = ParagraphStyle(
+            'ManagerMeta',
+            parent=styles['BodyText'],
+            fontName='Helvetica',
+            fontSize=9,
+            leading=12,
+            textColor=colors.HexColor('#444444'),
+            spaceAfter=2,
+        )
+        head_style = ParagraphStyle(
+            'ManagerHead',
+            parent=styles['Heading4'],
+            fontName='Helvetica-Bold',
+            fontSize=10.5,
+            leading=13,
+            textColor=colors.black,
+            spaceAfter=4,
+        )
+        body_style = ParagraphStyle(
+            'ManagerBody',
+            parent=styles['BodyText'],
+            fontName='Helvetica',
+            fontSize=9.5,
+            leading=12,
+            textColor=colors.black,
+            spaceAfter=3,
+        )
+        reason_style = ParagraphStyle(
+            'ManagerReason',
+            parent=styles['BodyText'],
+            fontName='Helvetica',
+            fontSize=8.8,
+            leading=11,
+            textColor=colors.HexColor('#222222'),
+            spaceAfter=0,
+        )
+
+        def esc(value: Any) -> str:
+            text_value = '' if value is None else str(value)
+            return (
+                text_value.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('\n', '<br/>')
+            )
+
+        story = [
+            Paragraph(esc(f'Рекомендации по ставкам - {manager_name}'), title_style),
+            Paragraph(esc(f'Дата формирования: {run_dt_text}'), meta_style),
+            Paragraph(esc(f'Строк рекомендаций: {len(manager_df)}'), meta_style),
+        ]
+        if source_key:
+            story.append(Paragraph(esc(f'Источник менеджеров/выкупа: {Path(source_key).name}'), meta_style))
+        story.extend([Spacer(1, 4), HRFlowable(width='100%', thickness=1, color=colors.black), Spacer(1, 8)])
+
+        for _, row in manager_df.iterrows():
+            current_bid = safe_float(row.get('Текущая ставка, ₽'))
+            new_bid = safe_float(row.get('Новая ставка, ₽'))
+            drr_campaign = safe_float(row.get('ДРР кампании, %'))
+            drr_category = safe_float(row.get('ДРР категории, %'))
+            spend = safe_float(row.get('Расход РК, ₽'))
+            orders = safe_float(row.get('Заказы РК'))
+            gp = safe_float(row.get('ВП кампании текущее окно после рекламы, ₽'))
+
+            head = (
+                f"Артикул {esc(row.get('Артикул продавца', ''))} | "
+                f"WB {safe_int(row.get('Артикул WB'))} | "
+                f"ID кампании {safe_int(row.get('ID кампании'))} | "
+                f"{esc(row.get('Тип кампании', ''))}"
+            )
+            rec = (
+                f"<b>Рекомендация:</b> {esc(row.get('Действие', ''))} | "
+                f"ставка {current_bid:.0f} -> {new_bid:.0f} ₽"
+            )
+            metrics = (
+                f"<b>Цифры:</b> расход {spend:.0f} ₽; "
+                f"заказы РК {orders:.0f}; "
+                f"ДРР кампании {drr_campaign:.1f}%; "
+                f"ВП кампании {gp:.0f} ₽; "
+                f"ДРР категории {drr_category:.1f}%"
+            )
+            reason = f"<b>Почему:</b> {esc(row.get('Причина', ''))}"
+
+            block = [
+                Paragraph(head, head_style),
+                Paragraph(rec, body_style),
+                Paragraph(metrics, body_style),
+                Paragraph(reason, reason_style),
+                Spacer(1, 6),
+                HRFlowable(width='100%', thickness=0.6, color=colors.HexColor('#B5B5B5')),
+                Spacer(1, 7),
+            ]
+            story.append(KeepTogether(block))
+
+        doc.build(story)
+        return buf.getvalue()
+    except Exception:
+        pass
+
+    try:
+        import math
+        import textwrap
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        lines: List[str] = []
+        lines.append(f'Рекомендации по ставкам - {manager_name}')
+        lines.append(f'Дата формирования: {run_dt_text}')
+        lines.append(f'Строк рекомендаций: {len(manager_df)}')
+        if source_key:
+            lines.append(f'Источник менеджеров/выкупа: {Path(source_key).name}')
+        lines.append('')
+
+        for _, row in manager_df.iterrows():
+            current_bid = safe_float(row.get('Текущая ставка, ₽'))
+            new_bid = safe_float(row.get('Новая ставка, ₽'))
+            drr_campaign = safe_float(row.get('ДРР кампании, %'))
+            drr_category = safe_float(row.get('ДРР категории, %'))
+            spend = safe_float(row.get('Расход РК, ₽'))
+            orders = safe_float(row.get('Заказы РК'))
+            gp = safe_float(row.get('ВП кампании текущее окно после рекламы, ₽'))
+
+            block = [
+                f"Артикул {row.get('Артикул продавца', '')} | WB {safe_int(row.get('Артикул WB'))} | ID кампании {safe_int(row.get('ID кампании'))} | {row.get('Тип кампании', '')}",
+                f"Рекомендация: {row.get('Действие', '')} | ставка {current_bid:.0f} -> {new_bid:.0f} ₽",
+                f"Цифры: расход {spend:.0f} ₽; заказы РК {orders:.0f}; ДРР кампании {drr_campaign:.1f}%; ВП кампании {gp:.0f} ₽; ДРР категории {drr_category:.1f}%",
+                f"Почему: {row.get('Причина', '')}",
+                "-" * 110,
+            ]
+            for b in block:
+                wrapped = textwrap.wrap(str(b), width=115, break_long_words=False, break_on_hyphens=False) or ['']
+                lines.extend(wrapped)
+
+        line_height = 0.022
+        usable_lines = 42
+        total_pages = max(1, math.ceil(len(lines) / usable_lines))
+        buf = io.BytesIO()
+        with PdfPages(buf) as pdf:
+            for page_idx in range(total_pages):
+                page_lines = lines[page_idx * usable_lines:(page_idx + 1) * usable_lines]
+                fig = plt.figure(figsize=(8.27, 11.69))
+                ax = fig.add_axes([0, 0, 1, 1])
+                ax.axis('off')
+                y = 0.97
+                for i, line in enumerate(page_lines):
+                    fontsize = 12 if (page_idx == 0 and i == 0) else 8.5
+                    weight = 'bold' if (page_idx == 0 and i == 0) else 'normal'
+                    ax.text(0.04, y, str(line), ha='left', va='top', fontsize=fontsize, fontweight=weight, family='DejaVu Sans')
+                    y -= line_height
+                pdf.savefig(fig)
+                plt.close(fig)
+        return buf.getvalue()
+    except Exception:
+        pass
+
+    def _translit(value: Any) -> str:
+        mapping = {
+            'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'E','Ж':'Zh','З':'Z','И':'I','Й':'Y','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'Kh','Ц':'Ts','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya',
+            'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i','й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya',
+            '₽':'RUB','—':'-','–':'-','№':'No '
+        }
+        s = '' if value is None else str(value)
+        return ''.join(mapping.get(ch, ch if ord(ch) < 128 else '?') for ch in s)
+
+    def _pdf_escape(text_value: str) -> str:
+        return text_value.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+
+    lines = [
+        _translit(f'Rekomendatsii po stavkam - {manager_name}'),
+        _translit(f'Data formirovaniya: {run_dt_text}'),
+        _translit(f'Strok rekomendatsiy: {len(manager_df)}'),
     ]
     if source_key:
-        story.append(Paragraph(esc(f'Источник менеджеров/выкупа: {Path(source_key).name}'), meta_style))
-    story.extend([Spacer(1, 4), HRFlowable(width='100%', thickness=1, color=colors.black), Spacer(1, 8)])
+        lines.append(_translit(f'Istochnik menedzherov/vykupa: {Path(source_key).name}'))
+    lines.append('')
 
+    import textwrap
     for _, row in manager_df.iterrows():
         current_bid = safe_float(row.get('Текущая ставка, ₽'))
         new_bid = safe_float(row.get('Новая ставка, ₽'))
@@ -4590,39 +4724,62 @@ def build_manager_pdf_bytes(manager_name: str, manager_df: pd.DataFrame, run_dt_
         spend = safe_float(row.get('Расход РК, ₽'))
         orders = safe_float(row.get('Заказы РК'))
         gp = safe_float(row.get('ВП кампании текущее окно после рекламы, ₽'))
-
-        head = (
-            f"Артикул {esc(row.get('Артикул продавца', ''))} | "
-            f"WB {safe_int(row.get('Артикул WB'))} | "
-            f"ID кампании {safe_int(row.get('ID кампании'))} | "
-            f"{esc(row.get('Тип кампании', ''))}"
-        )
-        rec = (
-            f"<b>Рекомендация:</b> {esc(row.get('Действие', ''))} | "
-            f"ставка {current_bid:.0f} -> {new_bid:.0f} ₽"
-        )
-        metrics = (
-            f"<b>Цифры:</b> расход {spend:.0f} ₽; "
-            f"заказы РК {orders:.0f}; "
-            f"ДРР кампании {drr_campaign:.1f}%; "
-            f"ВП кампании {gp:.0f} ₽; "
-            f"ДРР категории {drr_category:.1f}%"
-        )
-        reason = f"<b>Почему:</b> {esc(row.get('Причина', ''))}"
-
         block = [
-            Paragraph(head, head_style),
-            Paragraph(rec, body_style),
-            Paragraph(metrics, body_style),
-            Paragraph(reason, reason_style),
-            Spacer(1, 6),
-            HRFlowable(width='100%', thickness=0.6, color=colors.HexColor('#B5B5B5')),
-            Spacer(1, 7),
+            _translit(f"Artikul {row.get('Артикул продавца', '')} | WB {safe_int(row.get('Артикул WB'))} | ID kampanii {safe_int(row.get('ID кампании'))} | {row.get('Тип кампании', '')}"),
+            _translit(f"Rekomendatsiya: {row.get('Действие', '')} | stavka {current_bid:.0f} -> {new_bid:.0f} RUB"),
+            _translit(f"Tsifry: rashod {spend:.0f} RUB; zakazy RK {orders:.0f}; DRR kampanii {drr_campaign:.1f}%; VP kampanii {gp:.0f} RUB; DRR kategorii {drr_category:.1f}%"),
+            _translit(f"Pochemu: {row.get('Причина', '')}"),
+            "-" * 110,
         ]
-        story.append(KeepTogether(block))
+        for b in block:
+            lines.extend(textwrap.wrap(str(b), width=110, break_long_words=False, break_on_hyphens=False) or [''])
 
-    doc.build(story)
-    return buf.getvalue()
+    lines_per_page = 46
+    page_width = 595
+    page_height = 842
+    content = []
+    page_objects = []
+    font_obj_num = 3
+    obj_num = 4
+
+    pages = [lines[i:i+lines_per_page] for i in range(0, len(lines), lines_per_page)] or [[]]
+    for page_lines in pages:
+        stream_lines = ['BT', '/F1 9 Tf', '14 TL', '40 800 Td']
+        for i, line in enumerate(page_lines):
+            if i > 0:
+                stream_lines.append('T*')
+            stream_lines.append(f'({_pdf_escape(line)}) Tj')
+        stream_lines.append('ET')
+        stream = '\n'.join(stream_lines).encode('latin-1', errors='replace')
+        content_obj = obj_num
+        page_obj = obj_num + 1
+        content.append((content_obj, f"<< /Length {len(stream)} >>\nstream\n".encode('latin-1') + stream + b"\nendstream"))
+        page_objects.append(page_obj)
+        content.append((page_obj, f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] /Contents {content_obj} 0 R /Resources << /Font << /F1 {font_obj_num} 0 R >> >> >>".encode('latin-1')))
+        obj_num += 2
+
+    objects = [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, f"<< /Type /Pages /Kids [{' '.join(f'{n} 0 R' for n in page_objects)}] /Count {len(page_objects)} >>".encode('latin-1')),
+        (3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+    ] + content
+
+    pdf = io.BytesIO()
+    pdf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {0: 0}
+    for num, body in objects:
+        offsets[num] = pdf.tell()
+        pdf.write(f"{num} 0 obj\n".encode('latin-1'))
+        pdf.write(body)
+        pdf.write(b"\nendobj\n")
+    xref_pos = pdf.tell()
+    max_obj = max(offsets)
+    pdf.write(f"xref\n0 {max_obj + 1}\n".encode('latin-1'))
+    pdf.write(b"0000000000 65535 f \n")
+    for i in range(1, max_obj + 1):
+        pdf.write(f"{offsets.get(i, 0):010d} 00000 n \n".encode('latin-1'))
+    pdf.write(f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF".encode('latin-1'))
+    return pdf.getvalue()
 
 
 def build_manager_recommendations(decisions_df: pd.DataFrame, abc_ref: pd.DataFrame) -> pd.DataFrame:
