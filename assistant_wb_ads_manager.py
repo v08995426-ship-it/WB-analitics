@@ -4497,91 +4497,131 @@ def wrap_text_to_width(draw: Any, text: str, font: Any, max_width: int) -> List[
 
 
 def build_manager_pdf_bytes(manager_name: str, manager_df: pd.DataFrame, run_dt_text: str, source_key: str = '') -> bytes:
-    from PIL import Image, ImageDraw, ImageFont
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import HRFlowable, KeepTogether, Paragraph, SimpleDocTemplate, Spacer
 
-    def load_font(size: int, bold: bool = False):
-        candidates = [
-            '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-            '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf' if bold else '/usr/share/fonts/dejavu/DejaVuSans.ttf',
-        ]
-        for candidate in candidates:
-            if Path(candidate).exists():
-                return ImageFont.truetype(candidate, size=size)
-        return ImageFont.load_default()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+        title=f'Рекомендации по ставкам - {manager_name}',
+        author='Ассистент WB',
+    )
 
-    page_w, page_h = 1654, 2339
-    left, right, top, bottom = 90, 90, 90, 90
-    body_width = page_w - left - right
-    title_font = load_font(34, bold=True)
-    meta_font = load_font(19, bold=False)
-    header_font = load_font(22, bold=True)
-    body_font = load_font(20, bold=False)
-    small_font = load_font(17, bold=False)
-    line_h = 30
-    gap = 10
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'ManagerTitle',
+        parent=styles['Title'],
+        fontName='Helvetica-Bold',
+        fontSize=16,
+        leading=20,
+        alignment=TA_LEFT,
+        textColor=colors.black,
+        spaceAfter=6,
+    )
+    meta_style = ParagraphStyle(
+        'ManagerMeta',
+        parent=styles['BodyText'],
+        fontName='Helvetica',
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor('#444444'),
+        spaceAfter=2,
+    )
+    head_style = ParagraphStyle(
+        'ManagerHead',
+        parent=styles['Heading4'],
+        fontName='Helvetica-Bold',
+        fontSize=10.5,
+        leading=13,
+        textColor=colors.black,
+        spaceAfter=4,
+    )
+    body_style = ParagraphStyle(
+        'ManagerBody',
+        parent=styles['BodyText'],
+        fontName='Helvetica',
+        fontSize=9.5,
+        leading=12,
+        textColor=colors.black,
+        spaceAfter=3,
+    )
+    reason_style = ParagraphStyle(
+        'ManagerReason',
+        parent=styles['BodyText'],
+        fontName='Helvetica',
+        fontSize=8.8,
+        leading=11,
+        textColor=colors.HexColor('#222222'),
+        spaceAfter=0,
+    )
 
-    pages: List[Any] = []
-    img = Image.new('RGB', (page_w, page_h), 'white')
-    draw = ImageDraw.Draw(img)
-    y = top
+    def esc(value: Any) -> str:
+        text_value = '' if value is None else str(value)
+        return (
+            text_value.replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('\n', '<br/>')
+        )
 
-    def new_page():
-        nonlocal img, draw, y
-        pages.append(img)
-        img = Image.new('RGB', (page_w, page_h), 'white')
-        draw = ImageDraw.Draw(img)
-        y = top
-
-    def ensure_space(lines_needed: int, extra: int = 0):
-        nonlocal y
-        need = lines_needed * line_h + extra
-        if y + need > page_h - bottom:
-            new_page()
-
-    title = f'Рекомендации по ставкам - {manager_name}'
-    draw.text((left, y), title, fill='black', font=title_font)
-    y += 54
-    meta_lines = [
-        f'Дата формирования: {run_dt_text}',
-        f'Строк рекомендаций: {len(manager_df)}',
+    story = [
+        Paragraph(esc(f'Рекомендации по ставкам - {manager_name}'), title_style),
+        Paragraph(esc(f'Дата формирования: {run_dt_text}'), meta_style),
+        Paragraph(esc(f'Строк рекомендаций: {len(manager_df)}'), meta_style),
     ]
     if source_key:
-        meta_lines.append(f'Источник менеджеров/выкупа: {Path(source_key).name}')
-    for meta in meta_lines:
-        draw.text((left, y), meta, fill='black', font=meta_font)
-        y += 28
-    y += 16
-    draw.line((left, y, page_w - right, y), fill='black', width=2)
-    y += 24
+        story.append(Paragraph(esc(f'Источник менеджеров/выкупа: {Path(source_key).name}'), meta_style))
+    story.extend([Spacer(1, 4), HRFlowable(width='100%', thickness=1, color=colors.black), Spacer(1, 8)])
 
     for _, row in manager_df.iterrows():
-        head = f"Артикул {row.get('Артикул продавца','')} | WB {safe_int(row.get('Артикул WB'))} | ID кампании {safe_int(row.get('ID кампании'))} | {row.get('Тип кампании','')}"
-        rec = f"Рекомендация: {row.get('Действие','')} | ставка {safe_float(row.get('Текущая ставка, ₽')):.0f} -> {safe_float(row.get('Новая ставка, ₽')):.0f} ₽"
-        metrics = (
-            f"Цифры: расход {safe_float(row.get('Расход РК, ₽')):.0f} ₽; "
-            f"заказы РК {safe_float(row.get('Заказы РК')):.0f}; "
-            f"ДРР кампании {safe_float(row.get('ДРР кампании, %')):.1f}%; "
-            f"ВП кампании {safe_float(row.get('ВП кампании текущее окно после рекламы, ₽')):.0f} ₽; "
-            f"ДРР категории {safe_float(row.get('ДРР категории, %')):.1f}%"
-        )
-        reason = f"Почему: {row.get('Причина','')}"
-        lines: List[Tuple[str, Any]] = []
-        for text, font in [(head, header_font), (rec, body_font), (metrics, body_font), (reason, small_font)]:
-            wrapped = wrap_text_to_width(draw, text, font, body_width)
-            for line in wrapped:
-                lines.append((line, font))
-        ensure_space(len(lines) + 2, extra=18)
-        for idx, (line, font) in enumerate(lines):
-            draw.text((left, y), line, fill='black', font=font)
-            y += line_h if font != header_font else 34
-        y += gap
-        draw.line((left, y, page_w - right, y), fill=(180, 180, 180), width=1)
-        y += 18
+        current_bid = safe_float(row.get('Текущая ставка, ₽'))
+        new_bid = safe_float(row.get('Новая ставка, ₽'))
+        drr_campaign = safe_float(row.get('ДРР кампании, %'))
+        drr_category = safe_float(row.get('ДРР категории, %'))
+        spend = safe_float(row.get('Расход РК, ₽'))
+        orders = safe_float(row.get('Заказы РК'))
+        gp = safe_float(row.get('ВП кампании текущее окно после рекламы, ₽'))
 
-    pages.append(img)
-    buf = io.BytesIO()
-    first, *rest = pages
-    first.save(buf, format='PDF', resolution=150.0, save_all=True, append_images=rest)
+        head = (
+            f"Артикул {esc(row.get('Артикул продавца', ''))} | "
+            f"WB {safe_int(row.get('Артикул WB'))} | "
+            f"ID кампании {safe_int(row.get('ID кампании'))} | "
+            f"{esc(row.get('Тип кампании', ''))}"
+        )
+        rec = (
+            f"<b>Рекомендация:</b> {esc(row.get('Действие', ''))} | "
+            f"ставка {current_bid:.0f} -> {new_bid:.0f} ₽"
+        )
+        metrics = (
+            f"<b>Цифры:</b> расход {spend:.0f} ₽; "
+            f"заказы РК {orders:.0f}; "
+            f"ДРР кампании {drr_campaign:.1f}%; "
+            f"ВП кампании {gp:.0f} ₽; "
+            f"ДРР категории {drr_category:.1f}%"
+        )
+        reason = f"<b>Почему:</b> {esc(row.get('Причина', ''))}"
+
+        block = [
+            Paragraph(head, head_style),
+            Paragraph(rec, body_style),
+            Paragraph(metrics, body_style),
+            Paragraph(reason, reason_style),
+            Spacer(1, 6),
+            HRFlowable(width='100%', thickness=0.6, color=colors.HexColor('#B5B5B5')),
+            Spacer(1, 7),
+        ]
+        story.append(KeepTogether(block))
+
+    doc.build(story)
     return buf.getvalue()
 
 
