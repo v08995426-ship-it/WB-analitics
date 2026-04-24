@@ -1506,8 +1506,30 @@ def determine_status_recommendation(row: pd.Series) -> str:
     campaign_cpo = safe_float(row.get('campaign_cpo'))
     block_avg_cpo = safe_float(row.get('block_avg_cpo'))
     impressions = safe_float(row.get('Показы'))
-    if block_campaigns >= 2 and impressions >= 10000 and campaign_drr >= 0.18 and block_avg_cpo > 0 and campaign_cpo >= block_avg_cpo * 1.35:
+    supplier_article = str(row.get('supplier_article', '') or '').strip()
+    product_root = str(row.get('product_root', '') or '').strip().upper()
+    subject_norm = canonical_subject(row.get('subject_norm', row.get('subject', '')))
+    best_campaign_id = safe_int(row.get('block_best_campaign_id'))
+    current_campaign_id = safe_int(row.get('id_campaign'))
+
+    is_901_block = supplier_article.upper().startswith('901') or product_root.startswith('901') or subject_norm == 'кисти косметические'
+    is_best_campaign = best_campaign_id > 0 and current_campaign_id == best_campaign_id
+    is_alt_campaign = block_campaigns >= 2 and not is_best_campaign
+
+    pause_candidate = (
+        is_alt_campaign and
+        not is_901_block and
+        impressions >= 10000 and
+        campaign_drr >= 0.18 and
+        block_avg_cpo > 0 and
+        campaign_cpo >= block_avg_cpo * 1.35
+    )
+    if pause_candidate:
         return 'Кандидат на паузу'
+    if is_901_block:
+        return 'Не паузить'
+    if is_best_campaign:
+        return 'Ядро трафика'
     return 'Оставить'
 
 def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool]:
@@ -1566,7 +1588,13 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
     cpo_vs_best = (campaign_cpo / block_best_cpo) if block_best_cpo > 0 and campaign_cpo > 0 else 0.0
     is_block_leader = block_campaigns >= 2 and campaign_cpo > 0 and block_best_cpo > 0 and cpo_vs_best <= 1.15
     is_block_weak = block_campaigns >= 2 and block_avg_cpo > 0 and campaign_cpo > 0 and cpo_vs_avg >= 1.20
-    pause_candidate = block_campaigns >= 2 and safe_float(row.get('Показы')) >= 10000 and campaign_drr >= 0.18 and block_avg_cpo > 0 and cpo_vs_avg >= 1.35
+    best_campaign_id = safe_int(row.get('block_best_campaign_id'))
+    current_campaign_id = safe_int(row.get('id_campaign'))
+    is_best_campaign = best_campaign_id > 0 and current_campaign_id == best_campaign_id
+    is_alt_campaign = block_campaigns >= 2 and not is_best_campaign
+    product_root = str(row.get('product_root', '') or '').strip().upper()
+    is_901_block = supplier_article.upper().startswith('901') or product_root.startswith('901') or subject_norm == 'кисти косметические'
+    pause_candidate = is_alt_campaign and (not is_901_block) and safe_float(row.get('Показы')) >= 10000 and campaign_drr >= 0.18 and block_avg_cpo > 0 and cpo_vs_avg >= 1.35
     low_impressions_probe = impressions_3d < 1000 and can_raise_more and (position_3d <= 0 or position_3d > 20) and campaign_drr <= max(category_limit, 0.12)
 
     def raise_bid() -> float:
@@ -1591,7 +1619,7 @@ def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool
         return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; категория выше лимита, но у кампании ДРР <= 10% — не режем автоматически", False
 
     if pause_candidate:
-        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; кампания неэффективна внутри товарного блока: >10 000 показов, CPO сильно выше среднего по блоку и ДРР > 18% — кандидат на паузу", True
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; это альтернативная кампания внутри блока, лидер остаётся активным; >10 000 показов, CPO сильно выше среднего по блоку и ДРР > 18% — кандидат на паузу", True
 
     if campaign_gp <= 0 and current_bid > floor_bid:
         return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; кампания убыточна — снижаем на 1 шаг ({step:.0f} ₽)", True
