@@ -210,14 +210,11 @@ def safe_map_col(df: pd.DataFrame, col: str, func) -> None:
     if col not in df.columns:
         df[col] = np.nan
         return
-    obj = df[col]
-    if isinstance(obj, pd.DataFrame):
-        ser = obj.iloc[:, 0]
-    elif isinstance(obj, pd.Series):
-        ser = obj
+    if isinstance(df[col], pd.Series):
+        df[col] = df[col].map(func)
     else:
-        ser = pd.Series(obj, index=df.index)
-    df[col] = ser.map(func)
+        # robust fallback
+        df[col] = pd.Series(df[col]).map(func)
 
 def unique_preserve(items: Iterable[Any]) -> List[Any]:
     out = []
@@ -775,7 +772,7 @@ class DataLoader:
 class Part2Analyzer:
     def __init__(self, data: LoadedData):
         self.data = data
-        self.windows = self.determine_windows()
+        self.windows = self.determine_windows()  # fix: initialize before methods that use it
         self.daily_article = self.build_daily_article()
         self.localization_daily = self.build_localization_daily()
         self.article_period = self.build_article_period()
@@ -807,8 +804,6 @@ class Part2Analyzer:
     def _period_name(self, day: pd.Timestamp) -> Optional[str]:
         if pd.isna(day):
             return None
-        if not hasattr(self, "windows") or not isinstance(getattr(self, "windows", None), dict):
-            self.windows = self.determine_windows()
         day = pd.Timestamp(day).normalize()
         if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
             return "cur_14d"
