@@ -842,7 +842,14 @@ class Part2Analyzer:
             f = f[(f["day"] >= self.windows["prev_start"]) & (f["day"] <= self.windows["cur_end"])].copy()
             f["nm_id"] = to_numeric(f["nm_id"])
             map_sku = cur[["nm_id","supplier_article","subject","brand","code"]].dropna(subset=["nm_id"]).drop_duplicates("nm_id")
-            f = f.merge(map_sku, on="nm_id", how="left")
+            f = f.merge(map_sku, on="nm_id", how="left", suffixes=("", "_m"))
+            for _c in ["supplier_article", "subject", "brand", "code"]:
+                if f"{_c}_m" in f.columns:
+                    if _c not in f.columns:
+                        f[_c] = f[f"{_c}_m"]
+                    else:
+                        f[_c] = f[_c].where(f[_c].notna() & (f[_c] != ""), f[f"{_c}_m"])
+                    f.drop(columns=[f"{_c}_m"], inplace=True)
             fg = f.groupby(["day","supplier_article","nm_id","subject","brand","code"], dropna=False).agg(
                 open_card_count=("open_card_count","sum"),
                 cart_count=("cart","sum"),
@@ -872,7 +879,14 @@ class Part2Analyzer:
             a = a[(a["day"] >= self.windows["prev_start"]) & (a["day"] <= self.windows["cur_end"])].copy()
             a["nm_id"] = to_numeric(a["nm_id"])
             map_sku = cur[["nm_id","supplier_article","subject","brand","code"]].dropna(subset=["nm_id"]).drop_duplicates("nm_id")
-            a = a.merge(map_sku, on="nm_id", how="left")
+            a = a.merge(map_sku, on="nm_id", how="left", suffixes=("", "_m"))
+            for _c in ["supplier_article", "subject", "brand", "code"]:
+                if f"{_c}_m" in a.columns:
+                    if _c not in a.columns:
+                        a[_c] = a[f"{_c}_m"]
+                    else:
+                        a[_c] = a[_c].where(a[_c].notna() & (a[_c] != ""), a[f"{_c}_m"])
+                    a.drop(columns=[f"{_c}_m"], inplace=True)
             ag = a.groupby(["day","supplier_article","nm_id","subject","brand","code"], dropna=False).agg(
                 ad_impressions=("impressions","sum"),
                 ad_clicks=("clicks","sum"),
