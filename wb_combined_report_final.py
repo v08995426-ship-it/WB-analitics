@@ -573,7 +573,7 @@ class DataLoader:
                 df["orders"] = 1
                 if "warehouse" not in df.columns and "warehouseName" in df.columns:
                     df["warehouse"] = df["warehouseName"]
-                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
                 dfs.append(df)
             except Exception as e:
                 self.warnings.append(f"Orders read error {path}: {e}")
@@ -603,7 +603,7 @@ class DataLoader:
                 df["week_start"] = pd.Timestamp(start) if start else pd.NaT
                 df["week_end"] = pd.Timestamp(end) if end else pd.NaT
                 df = self._finalize_common(df)
-                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
                 df["stock_available"] = to_numeric(df.get("stock_available", 0)).fillna(0)
                 df["stock_total"] = to_numeric(df.get("stock_total", np.nan)).fillna(df["stock_available"]).fillna(0)
                 if "Дата запроса" in df.columns and "day" not in df.columns:
@@ -834,8 +834,12 @@ class DataLoader:
                     df = self._finalize_common(df)
                     for c in ["impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]:
                         df[c] = to_numeric(df.get(c, np.nan))
-                    df["section"] = (df["section"] if "section" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
-                    df["entry_point"] = (df["entry_point"] if "entry_point" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                    if "section" not in df.columns:
+                        df["section"] = ""
+                    if "entry_point" not in df.columns:
+                        df["entry_point"] = ""
+                    df["section"] = df["section"].map(normalize_text)
+                    df["entry_point"] = df["entry_point"].map(normalize_text)
                     holder.append(df)
                 except Exception as e:
                     self.warnings.append(f"Entry points read error {path}: {e}")
@@ -1021,6 +1025,8 @@ class Part2Analyzer:
     def _period_name(self, day: pd.Timestamp) -> Optional[str]:
         if pd.isna(day):
             return None
+        if not hasattr(self, "windows") or not getattr(self, "windows", None):
+            self.windows = self.determine_windows()
         if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
             return "cur_14d"
         if self.windows["prev_start"] <= day <= self.windows["prev_end"]:
@@ -1209,10 +1215,19 @@ class Part2Analyzer:
     def build_localization_period(self) -> pd.DataFrame:
         if self.localization_daily.empty:
             return pd.DataFrame()
+
+        def _safe_weighted(day_df: pd.DataFrame) -> float:
+            vals = to_numeric(day_df.get("is_available_flag", 0)).fillna(0).astype(float)
+            w = to_numeric(day_df.get("warehouse_weight", 0)).fillna(0).astype(float)
+            s = float(w.sum())
+            if s <= 0:
+                return float(vals.mean()) if len(vals) else np.nan
+            return float(np.average(vals, weights=w))
+
         g = self.localization_daily.groupby(["supplier_article", "period_name"], dropna=False).apply(
             lambda x: pd.Series({
                 "localization_coverage_count": x.groupby(["day"])["is_available_flag"].mean().mean(),
-                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: np.average(d["is_available_flag"], weights=d["warehouse_weight"])) .mean(),
+                "localization_coverage_weighted": x.groupby(["day"]).apply(_safe_weighted).mean(),
                 "main_warehouses_count": x["warehouse"].nunique(),
             })
         ).reset_index()
