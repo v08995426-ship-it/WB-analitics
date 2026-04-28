@@ -818,9 +818,6 @@ class DataLoader:
         if not files:
             files = self._glob_root(["*Портрет покупателя*.xlsx"])
         cat_dfs, sku_dfs = [], []
-        need_text = ["section", "entry_point", "supplier_article", "brand", "title", "subject"]
-        need_num = ["nm_id", "impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]
-
         for path in files:
             start, end = parse_entry_period_from_name(Path(path).name)
             week_code = week_code_from_date(start) if start else None
@@ -828,48 +825,18 @@ class DataLoader:
                 try:
                     sheet_name = sheets[0] if sheets else 0
                     try:
-                        df = self._read_selected_fast(
-                            path,
-                            sheet_name=sheet_name,
-                            header_row=2,
-                            needed_headers=[
-                                "Раздел", "Точка входа", "Показы", "Переходы в карточку", "Перешли в карточку",
-                                "CTR", "Добавления в корзину", "Добавили в корзину", "Конверсия в корзину",
-                                "Заказы", "Заказали", "Конверсия в заказ",
-                                "Артикул ВБ", "Артикул WB", "Артикул продавца", "supplierArticle",
-                                "Бренд", "Название", "Предмет",
-                            ],
-                        )
+                        df = self._read_selected_fast(path, sheet_name=sheet_name, header_row=2, needed_headers=["Раздел", "Точка входа", "Показы", "Переходы в карточку", "CTR", "Добавления в корзину", "Конверсия в корзину", "Заказы", "Конверсия в заказ", "Артикул ВБ", "Артикул продавца", "Бренд", "Название", "Предмет"])
                     except Exception:
                         df = self._read_df(path, sheets, (1,))
-
-                    for c in need_text:
-                        if c not in df.columns:
-                            df[c] = ""
-                    for c in need_num:
-                        if c not in df.columns:
-                            df[c] = np.nan
-
                     df["week_start"] = pd.Timestamp(start) if start else pd.NaT
                     df["week_end"] = pd.Timestamp(end) if end else pd.NaT
                     df["week_code"] = week_code
                     df = self._finalize_common(df)
-
-                    for c in need_num:
-                        df[c] = to_numeric(df[c])
-
-                    df["section"] = df["section"].map(normalize_text)
-                    df["entry_point"] = df["entry_point"].map(normalize_text)
-                    df["supplier_article"] = df["supplier_article"].map(clean_article)
-                    df["brand"] = df["brand"].map(normalize_text)
-                    df["title"] = df["title"].map(normalize_text)
-                    df["subject"] = df["subject"].map(normalize_text)
-
-                    holder.append(df[[
-                        "section", "entry_point", "nm_id", "supplier_article", "brand", "title", "subject",
-                        "impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order",
-                        "week_code", "week_start", "week_end"
-                    ]].copy())
+                    for c in ["impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]:
+                        df[c] = to_numeric(df.get(c, np.nan))
+                    df["section"] = df.get("section", "").map(normalize_text)
+                    df["entry_point"] = df.get("entry_point", "").map(normalize_text)
+                    holder.append(df)
                 except Exception as e:
                     self.warnings.append(f"Entry points read error {path}: {e}")
         return (
@@ -953,8 +920,9 @@ class Part2Analyzer:
     def __init__(self, data: LoadedData):
         self.data = data
         self.master = self.build_master()
-        self.daily_article = self.build_daily_article()
+        # windows must exist before any daily builders call _period_name()
         self.windows = self.determine_windows()
+        self.daily_article = self.build_daily_article()
         self.demand_daily_subject = self.build_subject_demand_daily()
         self.localization_daily = self.build_localization_daily()
         self.article_period = self.build_article_period_metrics()
@@ -1054,9 +1022,13 @@ class Part2Analyzer:
     def _period_name(self, day: pd.Timestamp) -> Optional[str]:
         if pd.isna(day):
             return None
-        if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
+        windows = getattr(self, "windows", None)
+        if not windows:
+            windows = self.determine_windows()
+            self.windows = windows
+        if windows["cur_start"] <= day <= windows["cur_end"]:
             return "cur_14d"
-        if self.windows["prev_start"] <= day <= self.windows["prev_end"]:
+        if windows["prev_start"] <= day <= windows["prev_end"]:
             return "prev_14d"
         return None
 
