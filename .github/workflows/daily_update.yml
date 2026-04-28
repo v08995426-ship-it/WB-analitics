@@ -32,8 +32,7 @@ jobs:
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
 
-          # Wildberries API ключи
-          WB_STATS_KEY_TOPFACE: ${{ secrets.WB_STATS_KEY_TOPFACE }}
+          # Wildberries API: один универсальный ключ для всех методов
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
 
           # Ссылка на Google Sheets (лист "Остатки из 1С")
