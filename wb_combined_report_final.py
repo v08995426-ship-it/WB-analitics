@@ -573,7 +573,7 @@ class DataLoader:
                 df["orders"] = 1
                 if "warehouse" not in df.columns and "warehouseName" in df.columns:
                     df["warehouse"] = df["warehouseName"]
-                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
+                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
                 dfs.append(df)
             except Exception as e:
                 self.warnings.append(f"Orders read error {path}: {e}")
@@ -603,7 +603,7 @@ class DataLoader:
                 df["week_start"] = pd.Timestamp(start) if start else pd.NaT
                 df["week_end"] = pd.Timestamp(end) if end else pd.NaT
                 df = self._finalize_common(df)
-                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
+                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
                 df["stock_available"] = to_numeric(df.get("stock_available", 0)).fillna(0)
                 df["stock_total"] = to_numeric(df.get("stock_total", np.nan)).fillna(df["stock_available"]).fillna(0)
                 if "Дата запроса" in df.columns and "day" not in df.columns:
@@ -834,8 +834,8 @@ class DataLoader:
                     df = self._finalize_common(df)
                     for c in ["impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]:
                         df[c] = to_numeric(df.get(c, np.nan))
-                    df["section"] = df.get("section", "").map(normalize_text)
-                    df["entry_point"] = df.get("entry_point", "").map(normalize_text)
+                    df["section"] = (df["section"] if "section" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                    df["entry_point"] = (df["entry_point"] if "entry_point" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
                     holder.append(df)
                 except Exception as e:
                     self.warnings.append(f"Entry points read error {path}: {e}")
@@ -919,9 +919,8 @@ class DataLoader:
 class Part2Analyzer:
     def __init__(self, data: LoadedData):
         self.data = data
-        self.master = self.build_master()
-        # windows must exist before any daily builders call _period_name()
         self.windows = self.determine_windows()
+        self.master = self.build_master()
         self.daily_article = self.build_daily_article()
         self.demand_daily_subject = self.build_subject_demand_daily()
         self.localization_daily = self.build_localization_daily()
@@ -1020,15 +1019,13 @@ class Part2Analyzer:
         }
 
     def _period_name(self, day: pd.Timestamp) -> Optional[str]:
+        if not hasattr(self, "windows") or not isinstance(getattr(self, "windows", None), dict) or not self.windows:
+            self.windows = self.determine_windows()
         if pd.isna(day):
             return None
-        windows = getattr(self, "windows", None)
-        if not windows:
-            windows = self.determine_windows()
-            self.windows = windows
-        if windows["cur_start"] <= day <= windows["cur_end"]:
+        if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
             return "cur_14d"
-        if windows["prev_start"] <= day <= windows["prev_end"]:
+        if self.windows["prev_start"] <= day <= self.windows["prev_end"]:
             return "prev_14d"
         return None
 
@@ -1217,7 +1214,7 @@ class Part2Analyzer:
         g = self.localization_daily.groupby(["supplier_article", "period_name"], dropna=False).apply(
             lambda x: pd.Series({
                 "localization_coverage_count": x.groupby(["day"])["is_available_flag"].mean().mean(),
-                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: np.average(d["is_available_flag"], weights=d["warehouse_weight"])) .mean(),
+                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: weighted_mean(d["is_available_flag"], d["warehouse_weight"])) .mean(),
                 "main_warehouses_count": x["warehouse"].nunique(),
             })
         ).reset_index()
