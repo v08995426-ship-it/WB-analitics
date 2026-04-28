@@ -772,10 +772,21 @@ class Stage1Builder:
         log(f"Economics usable rows: {len(econ):,}; articles {econ['supplier_article'].nunique():,}")
         return econ, diag
 
-    def match_ads_daily(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def match_ads_daily(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ads = self._filter_subjects(self.data.ads_daily)
         if ads.empty:
-            return pd.DataFrame(columns=["day", "nm_id", "supplier_article", "ad_spend"]), pd.DataFrame()
+            diag = pd.DataFrame([{
+                "ads_rows_total": 0,
+                "ads_rows_with_article": 0,
+                "ads_rows_with_nm": 0,
+                "ads_spend_total": 0.0,
+                "ads_match_note": "Источник рекламы пустой"
+            }])
+            return (
+                pd.DataFrame(columns=["day", "nm_id", "supplier_article", "ad_spend"]),
+                pd.DataFrame(columns=["day", "nm_id", "ad_spend"]),
+                diag,
+            )
         ads = self.attach_master(ads)
         by_both = ads.groupby(["day", "nm_id", "supplier_article"], dropna=False).agg(ad_spend=("spend", "sum")).reset_index()
         by_nm = ads.groupby(["day", "nm_id"], dropna=False).agg(ad_spend=("spend", "sum")).reset_index()
@@ -838,7 +849,39 @@ class Stage1Builder:
         econ_pick = self.pick_econ_for_day(daily)
         daily = daily.merge(econ_pick, on=["day", "supplier_article", "nm_id"], how="left")
 
-        ads_by_both, ads_by_nm, ads_diag = self.match_ads_daily()
+        matched_ads = self.match_ads_daily()
+        if isinstance(matched_ads, tuple):
+            if len(matched_ads) == 3:
+                ads_by_both, ads_by_nm, ads_diag = matched_ads
+            elif len(matched_ads) == 2:
+                ads_by_both, ads_by_nm = matched_ads
+                ads_diag = pd.DataFrame([{
+                    "ads_rows_total": len(ads_by_both) if isinstance(ads_by_both, pd.DataFrame) else 0,
+                    "ads_rows_with_article": len(ads_by_both) if isinstance(ads_by_both, pd.DataFrame) else 0,
+                    "ads_rows_with_nm": len(ads_by_nm) if isinstance(ads_by_nm, pd.DataFrame) else 0,
+                    "ads_spend_total": float(ads_by_both["ad_spend"].sum()) if isinstance(ads_by_both, pd.DataFrame) and "ad_spend" in ads_by_both.columns else 0.0,
+                    "ads_match_note": "match_ads_daily вернул 2 значения, ads_diag создан автоматически"
+                }])
+            else:
+                ads_by_both = pd.DataFrame(columns=["day", "nm_id", "supplier_article", "ad_spend"])
+                ads_by_nm = pd.DataFrame(columns=["day", "nm_id", "ad_spend"])
+                ads_diag = pd.DataFrame([{
+                    "ads_rows_total": 0,
+                    "ads_rows_with_article": 0,
+                    "ads_rows_with_nm": 0,
+                    "ads_spend_total": 0.0,
+                    "ads_match_note": f"Неожиданное число возвращаемых значений: {len(matched_ads)}"
+                }])
+        else:
+            ads_by_both = pd.DataFrame(columns=["day", "nm_id", "supplier_article", "ad_spend"])
+            ads_by_nm = pd.DataFrame(columns=["day", "nm_id", "ad_spend"])
+            ads_diag = pd.DataFrame([{
+                "ads_rows_total": 0,
+                "ads_rows_with_article": 0,
+                "ads_rows_with_nm": 0,
+                "ads_spend_total": 0.0,
+                "ads_match_note": "match_ads_daily вернул не tuple"
+            }])
         tech = {"orders_daily": daily.copy(), "ads_diag": ads_diag, "econ_diag": self.econ_diag.copy()}
 
         if not ads_by_both.empty:
