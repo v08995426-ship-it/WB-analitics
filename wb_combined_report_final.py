@@ -9,8 +9,7 @@ import io
 import math
 import os
 import re
-from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -18,78 +17,103 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import boto3
 import numpy as np
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.dimensions import SheetFormatProperties
 
-# -------------------------
-# Constants
-# -------------------------
 
-TARGET_SUBJECTS = [
-    "Кисти косметические",
-    "Помады",
-    "Блески",
-    "Косметические карандаши",
-]
+# =========================================================
+# Helpers
+# =========================================================
+
+def log(message: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\xa0", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def norm_key(value: Any) -> str:
+    text = normalize_text(value).lower().replace("ё", "е")
+    text = text.replace("%", " pct ")
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def clean_article(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text.lower() in {"nan", "none"}:
+        return ""
+    return text
+
 
 EXCLUDED_ARTICLES = {
-    "CZ420", "CZ420брови", "CZ420глаза", "DE49", "DE49глаза",
-    "PT901", "cz420", "cz420глаза",
+    "cz420",
+    "cz420брови",
+    "cz420глаза",
+    "de49",
+    "de49глаза",
+    "pt901",
 }
 
-SUBJECT_ORDER = {
-    "Кисти косметические": 1,
-    "Помады": 2,
-    "Блески": 3,
-    "Косметические карандаши": 4,
-}
 
-THIN = Side(style="thin", color="D0D0D0")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-FILL_HEADER = PatternFill("solid", fgColor="DCE6F1")
-FILL_SECTION = PatternFill("solid", fgColor="EAF3E6")
-FILL_TITLE = PatternFill("solid", fgColor="C6E0B4")
-FILL_NEG = PatternFill("solid", fgColor="FCE4D6")
-FILL_POS = PatternFill("solid", fgColor="E2F0D9")
-FILL_ARTICLE = PatternFill("solid", fgColor="F4F6F8")
-
-NUM_FMT_RUB = '# ##0" р."'
-NUM_FMT_PCT = '0.00%'
-NUM_FMT_PCT_PT = '0.00'
-NUM_FMT_DATE = 'dd.mm.yyyy'
-
-# -------------------------
-# Helpers
-# -------------------------
-
-def log(msg: str) -> None:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def is_excluded_article(article: Any) -> bool:
+    return clean_article(article).lower() in EXCLUDED_ARTICLES
 
 
-def normalize_text(v: Any) -> str:
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+def extract_code(article: Any) -> str:
+    text = clean_article(article)
+    if not text:
         return ""
-    s = str(v).replace("\xa0", " ").strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    low = text.lower()
+    if low.startswith("pt901.f"):
+        return "901"
+    m = re.search(r"(\d{2,4})", low)
+    if m:
+        return str(int(m.group(1)))
+    return text
 
 
-def clean_article(v: Any) -> str:
-    s = normalize_text(v)
-    if not s or s.lower() in {"nan", "none"}:
+def article_to_rrp_key(article: Any) -> str:
+    text = clean_article(article)
+    if not text:
         return ""
-    return s
-
-
-def norm_key(v: Any) -> str:
-    s = normalize_text(v).lower().replace("ё", "е")
-    s = s.replace("%", " pct ")
-    s = re.sub(r"[^\w]+", " ", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    low = text.lower().replace("_", "/")
+    # PT-form already
+    m = re.match(r"^pt(\d+)\.f(\d+)$", low)
+    if m:
+        return f"PT{int(m.group(1)):03d}.F{int(m.group(2)):02d}"
+    m = re.match(r"^pt(\d+)\.(\d+)$", low)
+    if m:
+        return f"PT{int(m.group(1)):03d}.{int(m.group(2)):03d}"
+    # slash form
+    m = re.match(r"^(\d+)\/(\d+)$", low)
+    if m:
+        code = int(m.group(1))
+        shade = int(m.group(2))
+        if code == 901:
+            return f"PT901.F{shade:02d}"
+        return f"PT{code:03d}.{shade:03d}"
+    # brush text pt901.f25-like with uppercase/lowercase noise
+    m = re.match(r"^pt?(\d+)\.f(\d+)$", low)
+    if m:
+        code = int(m.group(1))
+        shade = int(m.group(2))
+        return f"PT{code:03d}.F{shade:02d}"
+    m = re.match(r"^pt?(\d+)\.(\d+)$", low)
+    if m:
+        code = int(m.group(1))
+        shade = int(m.group(2))
+        return f"PT{code:03d}.{shade:03d}"
+    # exact pt901 excluded but keep key blank
+    return text.upper()
 
 
 def to_numeric(series: pd.Series) -> pd.Series:
@@ -106,62 +130,40 @@ def safe_div(a: Any, b: Any) -> float:
         b = float(b)
     except Exception:
         return np.nan
-    if b == 0 or pd.isna(b):
+    if b == 0 or math.isnan(b):
         return np.nan
     return a / b
 
 
 def pct_delta(cur: Any, prev: Any) -> float:
-    if pd.isna(cur) or pd.isna(prev) or prev == 0:
+    if pd.isna(prev) or prev == 0 or pd.isna(cur):
         return np.nan
     return (float(cur) - float(prev)) / float(prev)
 
 
-def fmt_money(v: Any) -> str:
-    if pd.isna(v):
-        return "—"
-    return f"{int(round(float(v))):,}".replace(",", " ") + " р."
+def pp_delta(cur: Any, prev: Any) -> float:
+    if pd.isna(prev) or pd.isna(cur):
+        return np.nan
+    return float(cur) - float(prev)
 
 
-def fmt_pct(v: Any, is_ratio: bool = True) -> str:
-    if pd.isna(v):
-        return "—"
-    x = float(v) * 100 if is_ratio else float(v)
-    return f"{x:.2f}%".replace(".", ",")
+def week_code_from_date(dt_value: Any) -> Optional[str]:
+    if pd.isna(dt_value):
+        return None
+    ts = pd.Timestamp(dt_value)
+    iso = ts.isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
 
 
-def fmt_pp(v: Any) -> str:
-    if pd.isna(v):
-        return "—"
-    return f"{float(v):+.2f} п.п.".replace(".", ",")
-
-
-def fmt_num(v: Any, digits: int = 1) -> str:
-    if pd.isna(v):
-        return "—"
-    return f"{float(v):.{digits}f}".replace(".", ",")
-
-
-def clean_code_from_article(article: str) -> str:
-    a = clean_article(article)
-    if not a:
-        return ""
-    low = a.lower().replace("_", "").replace(" ", "")
-    if low.startswith("pt901"):
-        return "901"
-    m = re.search(r"(\d+)", a)
-    return m.group(1) if m else a
-
-
-def valid_article(article: str) -> bool:
-    a = clean_article(article)
-    if not a:
-        return False
-    if a in EXCLUDED_ARTICLES:
-        return False
-    if a.upper() in {x.upper() for x in EXCLUDED_ARTICLES}:
-        return False
-    return True
+def week_bounds_from_code(week_code: str) -> Tuple[Optional[date], Optional[date]]:
+    m = re.match(r"^(\d{4})-W(\d{2})$", str(week_code))
+    if not m:
+        return None, None
+    year = int(m.group(1))
+    week = int(m.group(2))
+    start = date.fromisocalendar(year, week, 1)
+    end = date.fromisocalendar(year, week, 7)
+    return start, end
 
 
 def parse_week_code_from_name(name: str) -> Optional[str]:
@@ -171,98 +173,179 @@ def parse_week_code_from_name(name: str) -> Optional[str]:
     return f"{m.group(1)}-W{m.group(2)}"
 
 
-def week_bounds_from_code(week_code: str) -> Tuple[Optional[date], Optional[date]]:
-    m = re.match(r"^(\d{4})-W(\d{2})$", str(week_code))
-    if not m:
-        return None, None
-    y, w = int(m.group(1)), int(m.group(2))
-    return date.fromisocalendar(y, w, 1), date.fromisocalendar(y, w, 7)
-
-
-def week_code_from_date(dt: Any) -> Optional[str]:
-    if pd.isna(dt):
-        return None
-    ts = pd.Timestamp(dt)
-    iso = ts.isocalendar()
-    return f"{int(iso.year)}-W{int(iso.week):02d}"
-
-
 def parse_abc_period_from_name(name: str) -> Tuple[Optional[date], Optional[date]]:
     m = re.search(r"__(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})__", name)
     if not m:
         return None, None
-    return date(int(m.group(3)), int(m.group(2)), int(m.group(1))), date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    start = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    end = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    return start, end
 
 
 def parse_entry_period_from_name(name: str) -> Tuple[Optional[date], Optional[date]]:
     m = re.search(r"с (\d{2})-(\d{2})-(\d{4}) по (\d{2})-(\d{2})-(\d{4})", name)
     if not m:
         return None, None
-    return date(int(m.group(3)), int(m.group(2)), int(m.group(1))), date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    start = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    end = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    return start, end
 
 
-def dedupe_columns(cols: Iterable[Any]) -> List[str]:
-    out: List[str] = []
-    seen: Dict[str, int] = {}
-    for c in cols:
-        base = normalize_text(c) or "unnamed"
-        seen[base] = seen.get(base, 0) + 1
-        out.append(base if seen[base] == 1 else f"{base}__{seen[base]}")
+def unique_preserve(items: Iterable[Any]) -> List[Any]:
+    out: List[Any] = []
+    seen = set()
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
     return out
 
 
-def pick_existing(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    norm = {norm_key(c): c for c in df.columns}
-    for a in aliases:
-        if norm_key(a) in norm:
-            return norm[norm_key(a)]
-    for c in df.columns:
-        kc = norm_key(c)
-        for a in aliases:
-            if norm_key(a) in kc:
-                return c
-    return None
+def dedupe_columns(cols: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    counts: Dict[str, int] = {}
+    for c in cols:
+        base = normalize_text(c) or "unnamed"
+        counts[base] = counts.get(base, 0) + 1
+        result.append(base if counts[base] == 1 else f"{base}__{counts[base]}")
+    return result
 
 
-def ensure_col(df: pd.DataFrame, target: str, aliases: List[str]) -> pd.DataFrame:
-    found = pick_existing(df, aliases)
-    if found is None:
-        df[target] = np.nan
-    elif found != target:
-        df[target] = df[found]
-    return df
+def pick_best_sheet(sheet_names: List[str], preferred: Iterable[str]) -> Any:
+    if not sheet_names:
+        return 0
+    norm_map = {norm_key(s): s for s in sheet_names}
+    for name in preferred:
+        k = norm_key(name)
+        if k in norm_map:
+            return norm_map[k]
+    return sheet_names[0]
 
 
-def normalize_rrp_key(article: str) -> str:
-    a = clean_article(article)
-    if not a:
-        return ""
-    al = a.lower()
-    if al.startswith("pt901.f"):
-        m = re.search(r"f(\d+)", al)
-        return f"PT901.F{int(m.group(1)):02d}" if m else a.upper()
-    code = clean_code_from_article(a)
-    m = re.search(r"/(\d+)", a)
-    if m:
-        return f"PT{int(code)}.{int(m.group(1)):03d}"
-    return a.upper()
+def read_excel_flexible(
+    data: bytes,
+    filename: str,
+    preferred_sheets: Optional[Iterable[str]] = None,
+    header_candidates: Iterable[int] = (0, 1, 2),
+) -> Tuple[pd.DataFrame, str, int]:
+    bio = io.BytesIO(data)
+    xl = pd.ExcelFile(bio)
+    sheet = pick_best_sheet(xl.sheet_names, preferred_sheets or [])
+    best_df: Optional[pd.DataFrame] = None
+    best_header = 0
+    best_score = -10**9
+    for header in header_candidates:
+        try:
+            df = xl.parse(sheet_name=sheet, header=header, dtype=object)
+        except Exception:
+            continue
+        df = df.copy()
+        df.columns = dedupe_columns(df.columns)
+        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+        score = -1000 if df.empty else len(df.columns)
+        if score > best_score:
+            best_score = score
+            best_df = df
+            best_header = header
+    if best_df is None:
+        raise ValueError(f"Не удалось прочитать Excel: {filename}")
+    best_df.columns = dedupe_columns(best_df.columns)
+    return best_df, str(sheet), best_header
 
 
-def is_target_subject(subject: str) -> bool:
-    return normalize_text(subject) in TARGET_SUBJECTS
+def rename_using_aliases(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> pd.DataFrame:
+    norm_existing = {norm_key(col): col for col in df.columns}
+    out = df.copy()
+    for target, aliases in alias_map.items():
+        chosen = None
+        for alias in aliases:
+            k = norm_key(alias)
+            if k in norm_existing:
+                chosen = norm_existing[k]
+                break
+        if chosen is not None and chosen != target:
+            out[target] = out[chosen]
+        elif chosen is None and target not in out.columns:
+            out[target] = np.nan
+    return out
 
 
-# -------------------------
+def weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    v = to_numeric(values)
+    w = to_numeric(weights)
+    m = v.notna() & w.notna() & (w >= 0)
+    if not m.any():
+        return np.nan
+    if w[m].sum() == 0:
+        return v[m].mean()
+    return np.average(v[m], weights=w[m])
+
+
+def weighted_avg_position(values: pd.Series, weights: pd.Series) -> float:
+    return weighted_mean(values, weights)
+
+
+COMMON_ALIASES: Dict[str, List[str]] = {
+    "day": ["Дата", "dt", "date", "Дата заказа", "Дата отчета", "Дата сбора"],
+    "week": ["Неделя", "week"],
+    "nm_id": ["Артикул WB", "Артикул ВБ", "nmID", "nmId"],
+    "supplier_article": ["Артикул продавца", "supplierArticle", "Артикул WB продавца"],
+    "brand": ["Бренд", "brand"],
+    "subject": ["Предмет", "subject", "Название предмета"],
+    "title": ["Название", "Название товара", "Товар"],
+    "query": ["Поисковый запрос", "Запрос", "query", "Ключевое слово"],
+    "frequency": ["Частота запросов", "Частота WB", "Частота", "frequency"],
+    "median_position": ["Медианная позиция", "Средняя позиция", "Позиция"],
+    "visibility_pct": ["Видимость", "Видимость, %"],
+    "warehouse": ["Склад", "warehouseName"],
+    "region": ["Регион", "regionName"],
+    "stock_available": ["Доступно для продажи", "Остаток", "stock"],
+    "stock_total": ["Полное количество"],
+    "impressions": ["Показы", "impressions"],
+    "clicks": ["Клики", "Клики в карточку", "Переходы в карточку", "Перешли в карточку", "clicks"],
+    "ctr": ["CTR"],
+    "cart": ["Добавили в корзину", "Добавления в корзину", "Добавлени в корзину", "addToCartCount"],
+    "conv_cart": ["Конверсия в корзину", "addToCartConversion"],
+    "orders": ["Заказы", "Заказали", "orders", "ordersCount", "Кол-во продаж"],
+    "conv_order": ["Конверсия в заказ", "cartToOrderConversion", "CR", "Конверсия в заказ (из корзины), %"],
+    "open_card_count": ["Открытие карточки", "openCardCount", "Открытия карточки"],
+    "buyouts_count": ["buyoutsCount", "Выкупы заказов"],
+    "cancel_count": ["cancelCount", "Отмена заказа"],
+    "spend": ["Расход", "spend", "Продвижение"],
+    "cpc": ["CPC"],
+    "campaign_id": ["ID кампании"],
+    "campaign_name": ["Название"],
+    "status": ["Статус"],
+    "payment_type": ["Тип оплаты"],
+    "gross_profit": ["Валовая прибыль", "Чистая прибыль"],
+    "gross_revenue": ["Валовая выручка"],
+    "drr_pct": ["ДРР, %"],
+    "margin_pct": ["Маржинальность, %", "Валовая рентабельность, %"],
+    "profitability_pct": ["Рентабельность, %", "Чистая рентабельность, %"],
+    "abc_class": ["ABC-анализ"],
+    "section": ["Раздел"],
+    "entry_point": ["Точка входа"],
+    "finished_price": ["finishedPrice", "Ср. цена продажи", "Цена с учетом всех скидок, кроме суммы по WB Кошельку", "Средняя цена покупателя"],
+    "price_with_disc": ["priceWithDisc", "Цена со скидкой продавца, в том числе со скидкой WB Клуба", "Средняя цена продажи"],
+    "spp": ["SPP", "СПП", "Скидка WB, %", "СПП, %"],
+}
+
+
+# =========================================================
 # Storage
-# -------------------------
+# =========================================================
 
 class BaseStorage:
     def list_files(self, prefix: str) -> List[str]:
         raise NotImplementedError
+
     def read_bytes(self, path: str) -> bytes:
         raise NotImplementedError
+
     def write_bytes(self, path: str, data: bytes) -> None:
         raise NotImplementedError
+
     def exists(self, path: str) -> bool:
         raise NotImplementedError
 
@@ -270,27 +353,35 @@ class BaseStorage:
 class LocalStorage(BaseStorage):
     def __init__(self, root: str):
         self.root = Path(root)
-    def _abs(self, rel: str) -> Path:
-        return self.root / rel
+
+    def _abs(self, rel_path: str) -> Path:
+        return self.root / rel_path
+
     def list_files(self, prefix: str) -> List[str]:
         prefix = prefix.replace("\\", "/").rstrip("/")
-        p = self._abs(prefix)
-        base = p if p.exists() else p.parent
+        prefix_path = self._abs(prefix)
+        base = prefix_path if prefix_path.exists() else prefix_path.parent
         if not base.exists():
-            base = self.root
-        out = []
-        for x in base.rglob("*"):
-            if x.is_file():
-                rel = str(x.relative_to(self.root)).replace("\\", "/")
-                if rel.startswith(prefix) or prefix in rel or Path(rel).name.startswith(Path(prefix).name):
-                    out.append(rel)
-        return sorted(set(out))
+            return []
+        files = []
+        for p in base.rglob("*"):
+            if p.is_file():
+                rel = str(p.relative_to(self.root)).replace("\\", "/")
+                if rel.startswith(prefix):
+                    files.append(rel)
+        return sorted(files)
+
+    def glob_root(self, pattern: str) -> List[str]:
+        return sorted(str(p.relative_to(self.root)).replace("\\", "/") for p in self.root.glob(pattern) if p.is_file())
+
     def read_bytes(self, path: str) -> bytes:
         return self._abs(path).read_bytes()
+
     def write_bytes(self, path: str, data: bytes) -> None:
         out = self._abs(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_bytes(data)
+
     def exists(self, path: str) -> bool:
         return self._abs(path).exists()
 
@@ -304,8 +395,10 @@ class S3Storage(BaseStorage):
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
+
     def list_files(self, prefix: str) -> List[str]:
-        out, token = [], None
+        files = []
+        token = None
         while True:
             kwargs = {"Bucket": self.bucket, "Prefix": prefix}
             if token:
@@ -314,15 +407,19 @@ class S3Storage(BaseStorage):
             for item in resp.get("Contents", []):
                 key = item["Key"]
                 if not key.endswith("/"):
-                    out.append(key)
+                    files.append(key)
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
-        return sorted(out)
+        return sorted(files)
+
     def read_bytes(self, path: str) -> bytes:
-        return self.s3.get_object(Bucket=self.bucket, Key=path)["Body"].read()
+        obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+        return obj["Body"].read()
+
     def write_bytes(self, path: str, data: bytes) -> None:
         self.s3.put_object(Bucket=self.bucket, Key=path, Body=data)
+
     def exists(self, path: str) -> bool:
         try:
             self.s3.head_object(Bucket=self.bucket, Key=path)
@@ -333,522 +430,486 @@ class S3Storage(BaseStorage):
 
 def make_storage(root: str) -> BaseStorage:
     bucket = os.getenv("YC_BUCKET_NAME", "").strip()
-    key = os.getenv("YC_ACCESS_KEY_ID", "").strip()
-    secret = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
-    if bucket and key and secret:
+    access_key = os.getenv("YC_ACCESS_KEY_ID", "").strip()
+    secret_key = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+    if bucket and access_key and secret_key:
         log("Using Yandex Object Storage (S3)")
-        return S3Storage(bucket, key, secret)
+        return S3Storage(bucket=bucket, access_key=access_key, secret_key=secret_key)
     log("Using local filesystem")
-    return LocalStorage(root)
+    return LocalStorage(root=root)
 
 
-# -------------------------
-# Reading helpers
-# -------------------------
-
-def read_excel_best(data: bytes, preferred_sheet: Optional[List[str]] = None, header_candidates: Tuple[int, ...] = (0, 1, 2)) -> Tuple[pd.DataFrame, str]:
-    bio = io.BytesIO(data)
-    xl = pd.ExcelFile(bio)
-    if preferred_sheet:
-        sheet = None
-        norm = {norm_key(s): s for s in xl.sheet_names}
-        for p in preferred_sheet:
-            if norm_key(p) in norm:
-                sheet = norm[norm_key(p)]
-                break
-        if sheet is None:
-            sheet = xl.sheet_names[0]
-    else:
-        sheet = xl.sheet_names[0]
-    best, best_score = None, -1
-    for h in header_candidates:
-        try:
-            df = xl.parse(sheet_name=sheet, header=h, dtype=object)
-        except Exception:
-            continue
-        df.columns = dedupe_columns(df.columns)
-        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        score = len(df.columns) + len(df) * 0.001
-        if score > best_score:
-            best, best_score = df, score
-    if best is None:
-        raise ValueError(f"Не удалось прочитать {sheet}")
-    return best, sheet
-
-
-# -------------------------
-# Data loading
-# -------------------------
+# =========================================================
+# Loader
+# =========================================================
 
 @dataclass
-class Loaded:
-    orders: pd.DataFrame
-    stocks: pd.DataFrame
-    search: pd.DataFrame
-    funnel: pd.DataFrame
-    ads: pd.DataFrame
-    econ_unit: pd.DataFrame
-    abc: pd.DataFrame
-    entry: pd.DataFrame
-    rrp: pd.DataFrame
-    warnings: List[str]
+class LoadedData:
+    orders: pd.DataFrame = field(default_factory=pd.DataFrame)
+    stocks: pd.DataFrame = field(default_factory=pd.DataFrame)
+    search: pd.DataFrame = field(default_factory=pd.DataFrame)
+    funnel: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ads_daily: pd.DataFrame = field(default_factory=pd.DataFrame)
+    ads_total: pd.DataFrame = field(default_factory=pd.DataFrame)
+    campaigns: pd.DataFrame = field(default_factory=pd.DataFrame)
+    economics: pd.DataFrame = field(default_factory=pd.DataFrame)
+    abc: pd.DataFrame = field(default_factory=pd.DataFrame)
+    entry_points_category: pd.DataFrame = field(default_factory=pd.DataFrame)
+    entry_points_sku: pd.DataFrame = field(default_factory=pd.DataFrame)
+    rrp: pd.DataFrame = field(default_factory=pd.DataFrame)
+    warnings: List[str] = field(default_factory=list)
 
 
-class Loader:
-    def __init__(self, storage: BaseStorage, root_reports: str = "Отчёты", store: str = "TOPFACE"):
+class DataLoader:
+    def __init__(self, storage: BaseStorage, store: str, reports_root: str = "Отчёты"):
         self.storage = storage
-        self.root_reports = root_reports.rstrip("/")
         self.store = store
+        self.reports_root = reports_root.rstrip("/")
         self.warnings: List[str] = []
 
-    def _list(self, prefixes: List[str], contains: Optional[List[str]] = None) -> List[str]:
-        files = []
-        for p in prefixes:
-            try:
-                files.extend(self.storage.list_files(p))
-            except Exception as e:
-                self.warnings.append(f"Не удалось получить список файлов {p}: {e}")
-        uniq = []
-        seen = set()
-        for f in sorted(files):
-            if not f.lower().endswith(".xlsx"):
-                continue
-            if contains and not all(c.lower() in Path(f).name.lower() for c in contains):
-                continue
-            if f not in seen:
-                uniq.append(f); seen.add(f)
-        return uniq
+    def _prefix(self, *parts: str) -> str:
+        return "/".join([self.reports_root, *parts]).replace("//", "/")
 
-    def _filter_last_weeks(self, files: List[str], count: int = 8) -> List[str]:
-        keyed = []
-        for f in files:
-            wc = parse_week_code_from_name(Path(f).name)
-            if wc:
-                keyed.append((wc, f))
-        if keyed:
-            return [f for _, f in sorted(keyed)[-count:]]
-        return files[-count:]
+    def _list_under(self, prefixes: Iterable[str]) -> List[str]:
+        all_files: List[str] = []
+        for prefix in prefixes:
+            try:
+                all_files.extend(self.storage.list_files(prefix))
+            except Exception:
+                pass
+        return unique_preserve(sorted([f for f in all_files if f.lower().endswith(".xlsx")]))
+
+    def _glob_root(self, patterns: Iterable[str]) -> List[str]:
+        if not isinstance(self.storage, LocalStorage):
+            return []
+        files: List[str] = []
+        for pattern in patterns:
+            files.extend(self.storage.glob_root(pattern))
+        return unique_preserve(sorted(files))
+
+    def _read_df(self, path: str, preferred_sheets: Optional[Iterable[str]] = None, header_candidates: Iterable[int] = (0, 1, 2)) -> pd.DataFrame:
+        raw, _sheet, _header = read_excel_flexible(self.storage.read_bytes(path), path, preferred_sheets, header_candidates)
+        raw.columns = dedupe_columns(raw.columns)
+        return rename_using_aliases(raw, COMMON_ALIASES)
+
+    def _read_selected(self, path: str, sheet_name: Optional[str] = None, header: int = 0, usecols=None) -> pd.DataFrame:
+        data = self.storage.read_bytes(path)
+        bio = io.BytesIO(data)
+        df = pd.read_excel(bio, sheet_name=sheet_name, header=header, dtype=object, usecols=usecols)
+        df.columns = dedupe_columns(df.columns)
+        return rename_using_aliases(df, COMMON_ALIASES)
+
+    def _read_selected_fast(self, path: str, sheet_name: Optional[str] = None, header_row: int = 1, needed_headers: Optional[Iterable[str]] = None) -> pd.DataFrame:
+        from openpyxl import load_workbook as _load_wb
+        data = self.storage.read_bytes(path)
+        wb = _load_wb(io.BytesIO(data), read_only=True, data_only=True)
+        ws = wb[sheet_name] if isinstance(sheet_name, str) and sheet_name in wb.sheetnames else wb[wb.sheetnames[0] if sheet_name in [None, 0] else wb.sheetnames[int(sheet_name)]]
+        needed = {norm_key(x) for x in (needed_headers or [])}
+        rows = ws.iter_rows(values_only=True)
+        header = None
+        for _ in range(max(header_row - 1, 0)):
+            next(rows, None)
+        header = [normalize_text(x) for x in (next(rows, []) or [])]
+        if not header:
+            return pd.DataFrame()
+        idxs = [i for i, h in enumerate(header) if norm_key(h) in needed] if needed else list(range(len(header)))
+        cols = [header[i] for i in idxs]
+        recs = []
+        for r in rows:
+            if r is None:
+                continue
+            rec = [r[i] if i < len(r) else None for i in idxs]
+            if all(v is None or v == '' for v in rec):
+                continue
+            recs.append(rec)
+        df = pd.DataFrame(recs, columns=cols)
+        df.columns = dedupe_columns(df.columns)
+        return rename_using_aliases(df, COMMON_ALIASES)
+
+    def _finalize_common(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        if "nm_id" in df.columns:
+            df["nm_id"] = to_numeric(df["nm_id"])
+        if "supplier_article" in df.columns:
+            df["supplier_article"] = df["supplier_article"].map(clean_article)
+        if "subject" in df.columns:
+            df["subject"] = df["subject"].map(normalize_text)
+        if "brand" in df.columns:
+            df["brand"] = df["brand"].map(normalize_text)
+        if "title" in df.columns:
+            df["title"] = df["title"].map(normalize_text)
+        return df
 
     def load_orders(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/Заказы/{self.store}/Недельные",
-            f"{self.root_reports}/Заказы/{self.store}",
-            "",
-        ], contains=["Заказы_"]), 12)
+        files = self._list_under([
+            self._prefix("Заказы", self.store, "Недельные"),
+            self._prefix("Заказы", self.store),
+        ])
+        if not files:
+            files = self._glob_root(["Заказы_*.xlsx"])
         dfs = []
-        for f in files:
+        usecols = lambda c: norm_key(c) in {norm_key(x) for x in ["date", "Дата", "warehouseName", "Склад", "supplierArticle", "Артикул продавца", "nmId", "Артикул WB", "subject", "Предмет", "brand", "Бренд", "finishedPrice", "priceWithDisc", "spp", "isCancel"]}
+        for path in files:
             try:
-                df, _ = read_excel_best(self.storage.read_bytes(f), preferred_sheet=["Заказы"], header_candidates=(0,1,2))
-                for tgt, aliases in {
-                    "day": ["date", "Дата", "Дата заказа"],
-                    "supplier_article": ["supplierArticle", "Артикул продавца"],
-                    "nm_id": ["nmId", "nmID", "Артикул WB"],
-                    "subject": ["subject", "Предмет"],
-                    "brand": ["brand", "Бренд"],
-                    "warehouse": ["warehouseName", "Склад"],
-                    "finishedPrice": ["finishedPrice", "Цена покупателя", "Цена с учетом всех скидок, кроме суммы по WB Кошельку"],
-                    "priceWithDisc": ["priceWithDisc", "Цена со скидкой продавца, в том числе со скидкой WB Клуба", "Средняя цена продажи"],
-                    "spp": ["spp", "СПП"],
-                    "isCancel": ["isCancel", "Отмена заказа"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                df = df[["day","supplier_article","nm_id","subject","brand","warehouse","finishedPrice","priceWithDisc","spp","isCancel"]].copy()
+                try:
+                    df = self._read_selected_fast(path, sheet_name=0, header_row=1, needed_headers=["date", "warehouseName", "supplierArticle", "nmId", "subject", "brand", "finishedPrice", "priceWithDisc", "spp"])
+                except Exception:
+                    try:
+                        df = self._read_selected(path, sheet_name=0, header=0, usecols=usecols)
+                    except Exception:
+                        df = self._read_df(path, None, (0, 1, 2))
+                week_code = parse_week_code_from_name(Path(path).name)
+                start, end = week_bounds_from_code(week_code) if week_code else (None, None)
+                df["week_code"] = week_code
+                df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                df["week_end"] = pd.Timestamp(end) if end else pd.NaT
+                if "day" not in df.columns and "date" in df.columns:
+                    df["day"] = df["date"]
                 df["day"] = to_dt(df["day"]).dt.normalize()
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["subject"] = df["subject"].map(normalize_text)
-                df["brand"] = df["brand"].map(normalize_text)
-                df["warehouse"] = df["warehouse"].map(normalize_text)
-                df["finishedPrice"] = to_numeric(df["finishedPrice"])
-                df["priceWithDisc"] = to_numeric(df["priceWithDisc"])
-                df["spp"] = to_numeric(df["spp"])
-                df["isCancel"] = df["isCancel"].fillna(False)
-                df = df[df["day"].notna()].copy()
+                df = self._finalize_common(df)
+                for c in ["finished_price", "price_with_disc", "spp"]:
+                    df[c] = to_numeric(df.get(c, np.nan))
+                df["orders"] = 1
+                if "warehouse" not in df.columns and "warehouseName" in df.columns:
+                    df["warehouse"] = df["warehouseName"]
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
                 dfs.append(df)
             except Exception as e:
-                self.warnings.append(f"Ошибка чтения orders {f}: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        out = pd.concat(dfs, ignore_index=True)
-        out = out[out["subject"].map(is_target_subject)].copy()
-        out = out[out["supplier_article"].map(valid_article)].copy()
-        out["code"] = out["supplier_article"].map(clean_code_from_article)
+                self.warnings.append(f"Orders read error {path}: {e}")
+        out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        if not out.empty:
+            out = out[out["day"].notna()].copy()
         return out
 
     def load_stocks(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/Остатки/{self.store}/Недельные",
-            f"{self.root_reports}/Остатки/{self.store}",
-            "",
-        ], contains=["Остатки_"]), 12)
+        files = self._list_under([self._prefix("Остатки", self.store, "Недельные")])
+        if not files:
+            files = self._glob_root(["Остатки_*.xlsx"])
         dfs = []
-        for f in files:
+        usecols = lambda c: norm_key(c) in {norm_key(x) for x in ["Дата запроса", "Дата сбора", "Склад", "Артикул продавца", "Артикул WB", "Доступно для продажи", "Полное количество", "Предмет", "Бренд"]}
+        for path in files:
             try:
-                df, _ = read_excel_best(self.storage.read_bytes(f), preferred_sheet=["Остатки"], header_candidates=(0,))
-                for tgt, aliases in {
-                    "day": ["Дата запроса", "Дата"],
-                    "warehouse": ["Склад", "warehouseName"],
-                    "supplier_article": ["Артикул продавца", "supplierArticle"],
-                    "nm_id": ["Артикул WB", "nmId", "nmID"],
-                    "subject": ["Предмет", "subject"],
-                    "stock_available": ["Доступно для продажи", "Остаток"],
-                    "stock_total": ["Полное количество"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                df = df[["day","warehouse","supplier_article","nm_id","subject","stock_available","stock_total"]].copy()
-                df["day"] = to_dt(df["day"]).dt.normalize()
-                if df["day"].isna().all():
-                    wc = parse_week_code_from_name(Path(f).name)
-                    _, end = week_bounds_from_code(wc) if wc else (None, None)
-                    if end:
-                        df["day"] = pd.Timestamp(end)
-                df["warehouse"] = df["warehouse"].map(normalize_text)
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["subject"] = df["subject"].map(normalize_text)
-                df["stock_available"] = to_numeric(df["stock_available"]).fillna(0)
-                df["stock_total"] = to_numeric(df["stock_total"]).fillna(df["stock_available"]).fillna(0)
+                try:
+                    df = self._read_selected_fast(path, sheet_name=0, header_row=1, needed_headers=["Дата запроса", "Склад", "Артикул продавца", "Артикул WB", "Доступно для продажи", "Полное количество", "Предмет", "Бренд"])
+                except Exception:
+                    try:
+                        df = self._read_selected(path, sheet_name=0, header=0, usecols=usecols)
+                    except Exception:
+                        df = self._read_df(path, None, (0,))
+                week_code = parse_week_code_from_name(Path(path).name)
+                start, end = week_bounds_from_code(week_code) if week_code else (None, None)
+                df["week_code"] = week_code
+                df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                df["week_end"] = pd.Timestamp(end) if end else pd.NaT
+                df = self._finalize_common(df)
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
+                df["stock_available"] = to_numeric(df.get("stock_available", 0)).fillna(0)
+                df["stock_total"] = to_numeric(df.get("stock_total", np.nan)).fillna(df["stock_available"]).fillna(0)
+                if "Дата запроса" in df.columns and "day" not in df.columns:
+                    df["day"] = to_dt(df["Дата запроса"]).dt.normalize()
                 dfs.append(df)
             except Exception as e:
-                self.warnings.append(f"Ошибка чтения stocks {f}: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        out = pd.concat(dfs, ignore_index=True)
-        out = out[out["subject"].map(is_target_subject)].copy()
-        out = out[out["supplier_article"].map(valid_article)].copy()
-        out["code"] = out["supplier_article"].map(clean_code_from_article)
-        return out
+                self.warnings.append(f"Stocks read error {path}: {e}")
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def load_search(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/Поисковые запросы/{self.store}/Недельные",
-            f"{self.root_reports}/Поисковые запросы/{self.store}",
-            "",
-        ], contains=["Неделя "]), 12)
+        files = self._list_under([self._prefix("Поисковые запросы", self.store, "Недельные")])
+        if not files:
+            files = self._glob_root(["Неделя *.xlsx"])
         dfs = []
-        for f in files:
+        usecols = lambda c: norm_key(c) in {norm_key(x) for x in ["Дата", "Артикул WB", "Артикул продавца", "Предмет", "Бренд", "Поисковый запрос", "Частота запросов", "Медианная позиция", "Видимость"]}
+        for path in files:
             try:
-                df, _ = read_excel_best(self.storage.read_bytes(f), header_candidates=(0,1,2))
-                for tgt, aliases in {
-                    "day": ["Дата", "date"],
-                    "supplier_article": ["Артикул продавца", "supplierArticle"],
-                    "nm_id": ["Артикул WB", "nmId", "nmID"],
-                    "subject": ["Предмет", "subject"],
-                    "query": ["Поисковый запрос", "Запрос", "query"],
-                    "frequency": ["Частота запросов", "Частота"],
-                    "median_position": ["Медианная позиция", "Средняя позиция"],
-                    "visibility": ["Видимость", "Видимость, %"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                df = df[["day","supplier_article","nm_id","subject","query","frequency","median_position","visibility"]].copy()
+                try:
+                    df = self._read_selected_fast(path, sheet_name=0, header_row=1, needed_headers=["Дата", "Артикул WB", "Артикул продавца", "Предмет", "Бренд", "Поисковый запрос", "Частота запросов", "Медианная позиция", "Видимость"])
+                except Exception:
+                    try:
+                        df = self._read_selected(path, sheet_name=0, header=0, usecols=usecols)
+                    except Exception:
+                        df = self._read_df(path, None, (0,))
+                week_code = parse_week_code_from_name(Path(path).name)
+                start, end = week_bounds_from_code(week_code) if week_code else (None, None)
+                df["week_code"] = week_code
+                df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                df["week_end"] = pd.Timestamp(end) if end else pd.NaT
                 df["day"] = to_dt(df["day"]).dt.normalize()
-                if df["day"].isna().all():
-                    wc = parse_week_code_from_name(Path(f).name)
-                    start, end = week_bounds_from_code(wc) if wc else (None, None)
-                    if start and end:
-                        dates = pd.date_range(start, end)
-                        # if weekly file without day detail, replicate evenly by day
-                        tmp = []
-                        for _, r in df.iterrows():
-                            for d in dates:
-                                rr = r.copy(); rr["day"] = d
-                                tmp.append(rr)
-                        df = pd.DataFrame(tmp)
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["subject"] = df["subject"].map(normalize_text)
-                df["query"] = df["query"].map(normalize_text)
-                df["frequency"] = to_numeric(df["frequency"]).fillna(0)
-                df["median_position"] = to_numeric(df["median_position"])
-                df["visibility"] = to_numeric(df["visibility"])
+                df = self._finalize_common(df)
+                for c in ["frequency", "median_position", "visibility_pct"]:
+                    df[c] = to_numeric(df.get(c, np.nan))
                 dfs.append(df)
             except Exception as e:
-                self.warnings.append(f"Ошибка чтения search {f}: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        out = pd.concat(dfs, ignore_index=True)
-        out = out[out["subject"].map(is_target_subject)].copy()
-        out = out[out["supplier_article"].map(valid_article)].copy()
-        out["code"] = out["supplier_article"].map(clean_code_from_article)
+                self.warnings.append(f"Search read error {path}: {e}")
+        out = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        if not out.empty:
+            out = out[out["day"].notna()].copy()
         return out
 
     def load_funnel(self) -> pd.DataFrame:
-        cands = self._list([
-            f"{self.root_reports}/Воронка продаж/{self.store}",
-            f"{self.root_reports}/Воронка продаж",
-            "",
-        ], contains=["Воронка продаж"])
-        path = cands[0] if cands else None
+        candidates = [
+            self._prefix("Воронка продаж", self.store, "Воронка продаж.xlsx"),
+            self._prefix("Воронка продаж", "Воронка продаж.xlsx"),
+            "Воронка продаж (1).xlsx",
+            "Воронка продаж.xlsx",
+        ]
+        path = next((c for c in candidates if self.storage.exists(c)), None)
+        if not path:
+            files = self._glob_root(["Воронка продаж*.xlsx"])
+            path = files[0] if files else None
         if not path:
             return pd.DataFrame()
         try:
-            df, _ = read_excel_best(self.storage.read_bytes(path), header_candidates=(0,1,2))
-            for tgt, aliases in {
-                "day": ["dt", "Дата", "date"],
-                "nm_id": ["nmID", "nmId", "Артикул WB"],
-                "open_card_count": ["openCardCount", "Открытие карточки"],
-                "cart_count": ["addToCartCount", "Добавили в корзину"],
-                "orders_funnel": ["ordersCount", "Заказали", "Заказы"],
-                "buyouts": ["buyoutsCount"],
-                "cancel_count": ["cancelCount"],
-                "conv_to_cart": ["addToCartConversion", "Конверсия в корзину"],
-                "conv_cart_to_order": ["cartToOrderConversion", "Конверсия в заказ"],
-            }.items():
-                df = ensure_col(df, tgt, aliases)
-            df = df[["day","nm_id","open_card_count","cart_count","orders_funnel","buyouts","cancel_count","conv_to_cart","conv_cart_to_order"]].copy()
+            df = self._read_df(path, None, (0,))
             df["day"] = to_dt(df["day"]).dt.normalize()
-            df["nm_id"] = to_numeric(df["nm_id"])
-            for c in ["open_card_count","cart_count","orders_funnel","buyouts","cancel_count","conv_to_cart","conv_cart_to_order"]:
-                df[c] = to_numeric(df[c])
+            df = self._finalize_common(df)
+            for c in ["open_card_count", "cart", "orders", "buyouts_count", "cancel_count", "conv_cart", "conv_order"]:
+                df[c] = to_numeric(df.get(c, np.nan))
             return df[df["day"].notna()].copy()
         except Exception as e:
-            self.warnings.append(f"Ошибка чтения funnel {path}: {e}")
+            self.warnings.append(f"Funnel read error {path}: {e}")
             return pd.DataFrame()
 
-    def load_ads(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/Реклама/{self.store}/Недельные",
-            f"{self.root_reports}/Реклама/{self.store}",
-            "",
-        ], contains=["Реклама"]), 12)
-        dfs = []
-        for f in files:
-            try:
-                df, sheet = read_excel_best(self.storage.read_bytes(f), preferred_sheet=["Статистика_Ежедневно", "Статистика_Итого"], header_candidates=(0,))
-                for tgt, aliases in {
-                    "day": ["Дата", "date"],
-                    "nm_id": ["Артикул WB", "nmId", "nmID"],
-                    "subject": ["Название предмета", "Предмет"],
-                    "impressions": ["Показы"],
-                    "clicks": ["Клики"],
-                    "orders": ["Заказы"],
-                    "spend": ["Расход", "Продвижение"],
-                    "ctr": ["CTR"],
-                    "cpc": ["CPC"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                if sheet == "Статистика_Итого" or df["day"].isna().all():
-                    wc = parse_week_code_from_name(Path(f).name)
-                    start, end = week_bounds_from_code(wc) if wc else (None, None)
-                    if start and end:
-                        dates = pd.date_range(start, end)
-                        tmp = []
-                        for _, r in df.iterrows():
-                            for d in dates:
-                                rr = r.copy(); rr["day"] = d
-                                for c in ["impressions","clicks","orders","spend"]:
-                                    rr[c] = safe_div(rr[c], len(dates)) if pd.notna(rr[c]) else np.nan
-                                tmp.append(rr)
-                        df = pd.DataFrame(tmp)
-                df = df[["day","nm_id","subject","impressions","clicks","orders","spend","ctr","cpc"]].copy()
-                df["day"] = to_dt(df["day"]).dt.normalize()
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["subject"] = df["subject"].map(normalize_text)
-                for c in ["impressions","clicks","orders","spend","ctr","cpc"]:
-                    df[c] = to_numeric(df[c])
-                dfs.append(df)
-            except Exception as e:
-                self.warnings.append(f"Ошибка чтения ads {f}: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        return pd.concat(dfs, ignore_index=True)
+    def load_ads(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        files = self._list_under([
+            self._prefix("Реклама", self.store, "Недельные"),
+            self._prefix("Реклама", self.store),
+        ])
+        if not files:
+            files = self._glob_root(["Анализ рекламы.xlsx", "Реклама_*.xlsx"])
+        daily_dfs, total_dfs, camp_dfs = [], [], []
+        for path in files:
+            name = Path(path).name
+            week_code = parse_week_code_from_name(name)
+            start, end = week_bounds_from_code(week_code) if week_code else (None, None)
+            for target, sheets, holder in [
+                ("daily", ["Статистика_Ежедневно"], daily_dfs),
+                ("total", ["Статистика_Итого"], total_dfs),
+                ("camp", ["Список_кампаний"], camp_dfs),
+            ]:
+                try:
+                    df = self._read_df(path, sheets, (0,))
+                    df["week_code"] = week_code
+                    df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                    df["week_end"] = pd.Timestamp(end) if end else pd.NaT
+                    if "day" in df.columns:
+                        df["day"] = to_dt(df["day"]).dt.normalize()
+                    df = self._finalize_common(df)
+                    for c in ["impressions", "clicks", "ctr", "cpc", "orders", "conv_order", "spend"]:
+                        df[c] = to_numeric(df.get(c, np.nan))
+                    holder.append(df)
+                except Exception:
+                    continue
+        return (
+            pd.concat(daily_dfs, ignore_index=True) if daily_dfs else pd.DataFrame(),
+            pd.concat(total_dfs, ignore_index=True) if total_dfs else pd.DataFrame(),
+            pd.concat(camp_dfs, ignore_index=True) if camp_dfs else pd.DataFrame(),
+        )
 
-    def load_econ(self) -> pd.DataFrame:
-        cands = self._list([
-            f"{self.root_reports}/Финансовые показатели/{self.store}",
-            f"{self.root_reports}/Финансовые показатели/{self.store}/Недельные",
-            "",
-        ], contains=["Экономика"])
-        path = cands[0] if cands else None
+    def load_economics(self) -> pd.DataFrame:
+        candidates = [
+            self._prefix("Финансовые показатели", self.store, "Экономика.xlsx"),
+            self._prefix("Финансовые показатели", self.store, "Недельные", "Экономика.xlsx"),
+            "Экономика (2).xlsx",
+            "Экономика.xlsx",
+        ]
+        path = next((c for c in candidates if self.storage.exists(c)), None)
+        if not path:
+            files = self._glob_root(["Экономика*.xlsx"])
+            path = files[0] if files else None
         if not path:
             return pd.DataFrame()
         try:
-            df, _ = read_excel_best(self.storage.read_bytes(path), preferred_sheet=["Юнит экономика"], header_candidates=(0,1,2))
-            colmap = {
-                "week_code": ["Неделя"],
-                "nm_id": ["Артикул WB"],
-                "supplier_article": ["Артикул продавца"],
-                "subject": ["Предмет"],
-                "sales_qty": ["Чистые продажи, шт", "Продажи, шт"],
-                "buyout_pct": ["Процент выкупа"],
-                "avg_sale_price": ["Средняя цена продажи"],
-                "avg_buyer_price": ["Средняя цена покупателя"],
-                "spp": ["СПП, %"],
-                "commission_unit": ["Комиссия WB, руб/ед"],
-                "acquiring_unit": ["Эквайринг, руб/ед"],
-                "log_direct_unit": ["Логистика прямая, руб/ед"],
-                "log_return_unit": ["Логистика обратная, руб/ед"],
-                "storage_unit": ["Хранение, руб/ед"],
-                "acceptance_unit": ["Приёмка, руб/ед"],
-                "ads_unit": ["Реклама, руб/ед"],
-                "other_unit": ["Прочие расходы, руб/ед", "Штрафы и удержания, руб/ед"],
-                "cost_unit": ["Себестоимость, руб"],
-                "gp_unit": ["Валовая прибыль, руб/ед"],
-                "np_unit": ["Чистая прибыль, руб/ед"],
-                "margin_pct": ["Валовая рентабельность, %"],
-                "profitability_pct": ["Чистая рентабельность, %"],
+            df = self._read_df(path, ["Юнит экономика"], (0, 1, 2))
+            df = self._finalize_common(df)
+            rename_map = {
+                "Продажи, шт": "sales_qty",
+                "Возвраты, шт": "returns_qty",
+                "Чистые продажи, шт": "net_sales_qty",
+                "Процент выкупа": "buyout_pct",
+                "Средняя цена продажи": "econ_price_with_disc",
+                "Средняя цена покупателя": "econ_finished_price",
+                "Комиссия WB, руб/ед": "commission_unit",
+                "Эквайринг, руб/ед": "acquiring_unit",
+                "Логистика прямая, руб/ед": "logistics_direct_unit",
+                "Логистика обратная, руб/ед": "logistics_return_unit",
+                "Хранение, руб/ед": "storage_unit",
+                "Приёмка, руб/ед": "acceptance_unit",
+                "Штрафы и удержания, руб/ед": "penalties_unit",
+                "Реклама, руб/ед": "ads_unit",
+                "Прочие расходы, руб/ед": "other_unit",
+                "Себестоимость, руб": "cost_unit",
+                "НДС, руб/ед": "vat_unit",
+                "Валовая прибыль, руб/ед": "gp_unit",
+                "Чистая прибыль, руб/ед": "np_unit",
+                "Валовая рентабельность, %": "margin_pct",
+                "Чистая рентабельность, %": "profitability_pct",
             }
-            for tgt, aliases in colmap.items():
-                df = ensure_col(df, tgt, aliases)
-            keep = list(colmap.keys())
-            df = df[keep].copy()
-            df["supplier_article"] = df["supplier_article"].map(clean_article)
-            df["nm_id"] = to_numeric(df["nm_id"])
-            df["subject"] = df["subject"].map(normalize_text)
-            for c in keep:
-                if c not in {"week_code","supplier_article","subject"}:
-                    df[c] = to_numeric(df[c])
-            df = df[df["subject"].map(is_target_subject)].copy()
-            df = df[df["supplier_article"].map(valid_article)].copy()
-            df["code"] = df["supplier_article"].map(clean_code_from_article)
+            for old, new in rename_map.items():
+                if old in df.columns and new not in df.columns:
+                    df[new] = df[old]
+            num_cols = list(rename_map.values())
+            for c in num_cols:
+                df[c] = to_numeric(df.get(c, np.nan))
             return df
         except Exception as e:
-            self.warnings.append(f"Ошибка чтения экономики {path}: {e}")
+            self.warnings.append(f"Economics read error {path}: {e}")
             return pd.DataFrame()
 
     def load_abc(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/ABC",
-            "",
-        ], contains=["wb_abc_report_goods__"]), 20)
+        files = self._list_under([self._prefix("ABC")])
+        files = [f for f in files if "wb_abc_report_goods__" in Path(f).name]
+        if not files:
+            files = self._glob_root(["wb_abc_report_goods__*.xlsx"])
         dfs = []
-        for f in files:
+        for path in files:
             try:
-                df, _ = read_excel_best(self.storage.read_bytes(f), header_candidates=(0,))
-                for tgt, aliases in {
-                    "nm_id": ["Артикул WB", "nmId"],
-                    "supplier_article": ["Артикул продавца", "supplierArticle"],
-                    "subject": ["Предмет"],
-                    "brand": ["Бренд"],
-                    "orders": ["Кол-во продаж", "Заказы", "orders"],
-                    "gross_profit": ["Валовая прибыль"],
-                    "gross_revenue": ["Валовая выручка"],
-                    "drr_pct": ["ДРР, %", "ДРР"],
-                    "margin_pct": ["Маржинальность, %", "Маржинальность"],
-                    "profitability_pct": ["Рентабельность, %", "Рентабельность"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                start, end = parse_abc_period_from_name(Path(f).name)
-                wc = week_code_from_date(start) if start else parse_week_code_from_name(Path(f).name)
-                df = df[["nm_id","supplier_article","subject","brand","orders","gross_profit","gross_revenue","drr_pct","margin_pct","profitability_pct"]].copy()
-                df["week_code"] = wc
+                df = self._read_df(path, None, (0,))
+                start, end = parse_abc_period_from_name(Path(path).name)
                 df["week_start"] = pd.Timestamp(start) if start else pd.NaT
                 df["week_end"] = pd.Timestamp(end) if end else pd.NaT
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["subject"] = df["subject"].map(normalize_text)
-                df["brand"] = df["brand"].map(normalize_text)
-                for c in ["orders","gross_profit","gross_revenue","drr_pct","margin_pct","profitability_pct"]:
-                    df[c] = to_numeric(df[c])
+                df["week_code"] = week_code_from_date(start) if start else None
+                df = self._finalize_common(df)
+                if "Кол-во продаж" in df.columns and "abc_sales_qty" not in df.columns:
+                    df["abc_sales_qty"] = df["Кол-во продаж"]
+                elif "orders" in df.columns:
+                    df["abc_sales_qty"] = df["orders"]
+                else:
+                    df["abc_sales_qty"] = np.nan
+                extra_renames = {
+                    "Эквайринг": "abc_acquiring",
+                    "Комиссия": "abc_commission",
+                    "Логистика": "abc_logistics",
+                    "Платное хранение": "abc_storage",
+                    "Платная приемка": "abc_acceptance",
+                    "Продвижение": "abc_promotion",
+                    "Доплаты": "abc_extra",
+                    "Штрафы": "abc_fines",
+                    "Себестоимость": "abc_cost",
+                    "Налог": "abc_tax",
+                    "Внешние расходы": "abc_external",
+                    "Чистая прибыль": "abc_net_profit",
+                    "Чистая прибыль на 1 товар": "abc_net_profit_unit",
+                    "Сумма продаж": "abc_sales_sum",
+                    "Заказы": "abc_orders_funnel",
+                    "Открытие карточки": "abc_open_card",
+                    "Добавлени в корзину": "abc_cart",
+                    "Конверсия в корзину, %": "abc_conv_cart",
+                    "Конверсия в заказ (из корзины), %": "abc_conv_order",
+                    "Ср. цена продажи": "abc_finished_price",
+                    "Процент выкупов, %": "abc_buyout_pct",
+                }
+                for old, new in extra_renames.items():
+                    if old in df.columns:
+                        df[new] = df[old]
+                for c in [
+                    "gross_profit", "gross_revenue", "abc_sales_qty", "drr_pct", "margin_pct", "profitability_pct",
+                    "abc_acquiring", "abc_commission", "abc_logistics", "abc_storage", "abc_acceptance", "abc_promotion",
+                    "abc_extra", "abc_fines", "abc_cost", "abc_tax", "abc_external", "abc_net_profit", "abc_net_profit_unit",
+                    "abc_orders_funnel", "abc_open_card", "abc_cart", "abc_conv_cart", "abc_conv_order", "abc_finished_price", "abc_buyout_pct",
+                ]:
+                    df[c] = to_numeric(df.get(c, np.nan))
                 dfs.append(df)
             except Exception as e:
-                self.warnings.append(f"Ошибка чтения ABC {f}: {e}")
-        if not dfs:
-            # fallback from economics overall weekly
-            cands = self._list([
-                f"{self.root_reports}/Финансовые показатели/{self.store}",
-                "",
-            ], contains=["Экономика"])
-            if cands:
-                try:
-                    df, _ = read_excel_best(self.storage.read_bytes(cands[0]), preferred_sheet=["Общий факт за неделю"], header_candidates=(0,1,2))
-                    for tgt, aliases in {
-                        "week_code": ["Неделя"],
-                        "nm_id": ["Артикул WB"],
-                        "supplier_article": ["Артикул продавца"],
-                        "subject": ["Предмет"],
-                        "brand": ["Бренд"],
-                        "orders": ["Чистые продажи, шт", "Продажи, шт"],
-                        "gross_profit": ["Валовая прибыль"],
-                        "gross_revenue": ["Валовая выручка"],
-                        "drr_pct": ["Реклама", "ДРР, %"],
-                        "margin_pct": ["Валовая рентабельность, %"],
-                        "profitability_pct": ["Чистая рентабельность, %"],
-                    }.items():
-                        df = ensure_col(df, tgt, aliases)
-                    df = df[["week_code","nm_id","supplier_article","subject","brand","orders","gross_profit","gross_revenue","drr_pct","margin_pct","profitability_pct"]].copy()
-                    df["week_start"] = df["week_code"].map(lambda x: pd.Timestamp(week_bounds_from_code(x)[0]) if x else pd.NaT)
-                    df["week_end"] = df["week_code"].map(lambda x: pd.Timestamp(week_bounds_from_code(x)[1]) if x else pd.NaT)
-                    dfs = [df]
-                except Exception as e:
-                    self.warnings.append(f"Ошибка fallback ABC из экономики: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        out = pd.concat(dfs, ignore_index=True)
-        out = out[out["subject"].map(is_target_subject)].copy()
-        out = out[out["supplier_article"].map(valid_article)].copy()
-        out["code"] = out["supplier_article"].map(clean_code_from_article)
-        return out
+                self.warnings.append(f"ABC read error {path}: {e}")
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    def load_entry(self) -> pd.DataFrame:
-        files = self._filter_last_weeks(self._list([
-            f"{self.root_reports}/Точки входа/{self.store}",
-            "",
-        ], contains=["Портрет покупателя. Точки входа"]), 12)
-        dfs = []
-        for f in files:
-            try:
-                data = self.storage.read_bytes(f)
-                df, _ = read_excel_best(data, preferred_sheet=["Детализация по артикулам"], header_candidates=(1,0,2))
-                for tgt, aliases in {
-                    "section": ["Раздел"],
-                    "entry_point": ["Точка входа"],
-                    "nm_id": ["Артикул ВБ", "Артикул WB", "nmId"],
-                    "supplier_article": ["Артикул продавца", "supplierArticle"],
-                    "brand": ["Бренд"],
-                    "title": ["Название"],
-                    "subject": ["Предмет"],
-                    "impressions": ["Показы"],
-                    "clicks": ["Перешли в карточку", "Клики"],
-                    "ctr": ["CTR"],
-                    "cart": ["Добавили в корзину"],
-                    "conv_cart": ["Конверсия в корзину"],
-                    "orders": ["Заказали"],
-                    "conv_order": ["Конверсия в заказ"],
-                }.items():
-                    df = ensure_col(df, tgt, aliases)
-                start, end = parse_entry_period_from_name(Path(f).name)
-                wc = week_code_from_date(start) if start else parse_week_code_from_name(Path(f).name)
-                df = df[["section","entry_point","nm_id","supplier_article","brand","title","subject","impressions","clicks","ctr","cart","conv_cart","orders","conv_order"]].copy()
-                df["week_code"] = wc
-                df["week_start"] = pd.Timestamp(start) if start else pd.NaT
-                df["week_end"] = pd.Timestamp(end) if end else pd.NaT
-                df["section"] = df["section"].map(normalize_text)
-                df["entry_point"] = df["entry_point"].map(normalize_text)
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["subject"] = df["subject"].map(normalize_text)
-                for c in ["impressions","clicks","ctr","cart","conv_cart","orders","conv_order"]:
-                    df[c] = to_numeric(df[c])
-                dfs.append(df)
-            except Exception as e:
-                self.warnings.append(f"Ошибка чтения entry {f}: {e}")
-        if not dfs:
-            return pd.DataFrame()
-        out = pd.concat(dfs, ignore_index=True)
-        out = out[out["subject"].map(is_target_subject)].copy()
-        out = out[out["supplier_article"].map(valid_article)].copy()
-        out["code"] = out["supplier_article"].map(clean_code_from_article)
-        return out
+    def load_entry_points(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        files = self._list_under([self._prefix("Точки входа", self.store)])
+        if not files:
+            files = self._glob_root(["*Портрет покупателя*.xlsx"])
+        cat_dfs, sku_dfs = [], []
+        need_text = ["section", "entry_point", "supplier_article", "brand", "title", "subject"]
+        need_num = ["nm_id", "impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]
+
+        for path in files:
+            start, end = parse_entry_period_from_name(Path(path).name)
+            week_code = week_code_from_date(start) if start else None
+            for sheets, holder in [(["Детализация по точкам входа"], cat_dfs), (["Детализация по артикулам"], sku_dfs)]:
+                try:
+                    sheet_name = sheets[0] if sheets else 0
+                    try:
+                        df = self._read_selected_fast(
+                            path,
+                            sheet_name=sheet_name,
+                            header_row=2,
+                            needed_headers=[
+                                "Раздел", "Точка входа", "Показы", "Переходы в карточку", "Перешли в карточку",
+                                "CTR", "Добавления в корзину", "Добавили в корзину", "Конверсия в корзину",
+                                "Заказы", "Заказали", "Конверсия в заказ",
+                                "Артикул ВБ", "Артикул WB", "Артикул продавца", "supplierArticle",
+                                "Бренд", "Название", "Предмет",
+                            ],
+                        )
+                    except Exception:
+                        df = self._read_df(path, sheets, (1,))
+
+                    for c in need_text:
+                        if c not in df.columns:
+                            df[c] = ""
+                    for c in need_num:
+                        if c not in df.columns:
+                            df[c] = np.nan
+
+                    df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                    df["week_end"] = pd.Timestamp(end) if end else pd.NaT
+                    df["week_code"] = week_code
+                    df = self._finalize_common(df)
+
+                    for c in need_num:
+                        df[c] = to_numeric(df[c])
+
+                    df["section"] = df["section"].map(normalize_text)
+                    df["entry_point"] = df["entry_point"].map(normalize_text)
+                    df["supplier_article"] = df["supplier_article"].map(clean_article)
+                    df["brand"] = df["brand"].map(normalize_text)
+                    df["title"] = df["title"].map(normalize_text)
+                    df["subject"] = df["subject"].map(normalize_text)
+
+                    holder.append(df[[
+                        "section", "entry_point", "nm_id", "supplier_article", "brand", "title", "subject",
+                        "impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order",
+                        "week_code", "week_start", "week_end"
+                    ]].copy())
+                except Exception as e:
+                    self.warnings.append(f"Entry points read error {path}: {e}")
+        return (
+            pd.concat(cat_dfs, ignore_index=True) if cat_dfs else pd.DataFrame(),
+            pd.concat(sku_dfs, ignore_index=True) if sku_dfs else pd.DataFrame(),
+        )
 
     def load_rrp(self) -> pd.DataFrame:
-        cands = self._list([""], contains=["РРЦ"])
-        path = cands[0] if cands else None
+        candidates = [
+            self._prefix("Финансовые показатели", self.store, "РРЦ.xlsx"),
+            "РРЦ.xlsx",
+        ]
+        path = next((c for c in candidates if self.storage.exists(c)), None)
+        if not path:
+            files = self._glob_root(["РРЦ.xlsx"])
+            path = files[0] if files else None
         if not path:
             return pd.DataFrame()
         try:
-            df, _ = read_excel_best(self.storage.read_bytes(path), preferred_sheet=["TF"], header_candidates=(0,1))
-            df = ensure_col(df, "rrp_key", ["ПРАВИЛЬНЫЙ АРТИКУЛ"])
-            df = ensure_col(df, "rrp", ["РРЦ"])
-            df = df[["rrp_key","rrp"]].copy()
-            df["rrp_key"] = df["rrp_key"].map(normalize_text)
-            df["rrp"] = to_numeric(df["rrp"])
-            return df[df["rrp_key"] != ""].drop_duplicates("rrp_key")
+            raw, _, _ = read_excel_flexible(self.storage.read_bytes(path), path, preferred_sheets=["TF"], header_candidates=(0,))
+            raw.columns = dedupe_columns(raw.columns)
+            df = raw.copy()
+            col_article = next((c for c in df.columns if norm_key(c) == norm_key("ПРАВИЛЬНЫЙ АРТИКУЛ")), None)
+            col_rrp = next((c for c in df.columns if norm_key(c) == norm_key("РРЦ")), None)
+            col_name = next((c for c in df.columns if norm_key(c) == norm_key("Наименование")), None)
+            if col_article is None or col_rrp is None:
+                return pd.DataFrame()
+            out = pd.DataFrame({
+                "rrp_key": df[col_article].map(lambda x: normalize_text(x).upper()),
+                "rrp": to_numeric(df[col_rrp]),
+                "rrp_name": df[col_name].map(normalize_text) if col_name else "",
+            })
+            out = out[out["rrp_key"] != ""].copy()
+            out = out.drop_duplicates(subset=["rrp_key"], keep="first")
+            return out
         except Exception as e:
-            self.warnings.append(f"Ошибка чтения РРЦ {path}: {e}")
+            self.warnings.append(f"RRP read error {path}: {e}")
             return pd.DataFrame()
 
-    def load_all(self) -> Loaded:
+    def load_all(self) -> LoadedData:
         log("Loading orders")
         orders = self.load_orders()
         log("Loading stocks")
@@ -858,873 +919,1041 @@ class Loader:
         log("Loading funnel")
         funnel = self.load_funnel()
         log("Loading ads")
-        ads = self.load_ads()
+        ads_daily, ads_total, campaigns = self.load_ads()
         log("Loading economics")
-        econ = self.load_econ()
+        economics = self.load_economics()
         log("Loading ABC")
         abc = self.load_abc()
         log("Loading entry points")
-        entry = self.load_entry()
+        entry_cat, entry_sku = self.load_entry_points()
         log("Loading RRP")
         rrp = self.load_rrp()
-        return Loaded(orders, stocks, search, funnel, ads, econ, abc, entry, rrp, self.warnings)
+        return LoadedData(
+            orders=orders,
+            stocks=stocks,
+            search=search,
+            funnel=funnel,
+            ads_daily=ads_daily,
+            ads_total=ads_total,
+            campaigns=campaigns,
+            economics=economics,
+            abc=abc,
+            entry_points_category=entry_cat,
+            entry_points_sku=entry_sku,
+            rrp=rrp,
+            warnings=self.warnings,
+        )
 
 
-# -------------------------
-# Analyzer
-# -------------------------
+# =========================================================
+# Analytics
+# =========================================================
 
-class Analyzer:
-    def __init__(self, data: Loaded):
+class Part2Analyzer:
+    def __init__(self, data: LoadedData):
         self.data = data
-        self.latest_day = self._detect_latest_day()
-        self.cur_start = self.latest_day - timedelta(days=13)
-        self.prev_end = self.cur_start - timedelta(days=1)
-        self.prev_start = self.prev_end - timedelta(days=13)
-        self.lookback_loc_start = self.latest_day - timedelta(days=27)
-        self.rrp_map = dict(zip(data.rrp["rrp_key"], data.rrp["rrp"])) if not data.rrp.empty else {}
-        self.master = self._build_master()
-        log(f"Analysis windows: prev {self.prev_start}..{self.prev_end}; cur {self.cur_start}..{self.latest_day}")
-
-        self.article_day = self.build_article_day()
+        self.master = self.build_master()
+        self.daily_article = self.build_daily_article()
+        self.windows = self.determine_windows()
+        self.demand_daily_subject = self.build_subject_demand_daily()
         self.localization_daily = self.build_localization_daily()
-        self.article_period = self.build_article_period()
-        self.product_period = self.aggregate_period(self.article_period, "code")
-        self.category_period = self.aggregate_period(self.article_period, "subject")
-        self.product_with_sku = self.build_product_with_articles()
-        self.summary_struct = self.build_summary_struct()
-        self.reasons_category = self.build_reason_rows(self.category_period, "category")
-        self.reasons_product = self.build_reason_rows(self.product_period, "product")
-        self.channels = self.build_channels()
+        self.article_period = self.build_article_period_metrics()
+        self.article_compare = self.build_compare(self.article_period, ["supplier_article", "nm_id", "code", "subject", "brand", "title"])
+        self.product_compare = self.aggregate_compare(self.article_period, level="product")
+        self.category_compare = self.aggregate_compare(self.article_period, level="category")
+        self.channel_compare = self.build_channel_compare()
+        self.sku_contribution = self.build_sku_contribution()
+        self.price_monitor = self.build_price_monitor()
+        self.example_901_5 = self.build_example_901_5()
 
-    def _detect_latest_day(self) -> date:
-        candidates = []
-        for df, col in [
-            (self.data.orders, "day"), (self.data.search, "day"), (self.data.funnel, "day"),
-        ]:
-            if not df.empty and col in df.columns and df[col].notna().any():
-                candidates.append(pd.to_datetime(df[col], errors="coerce").max().date())
-        if candidates:
-            return max(candidates)
-        return date.today()
-
-    def _build_master(self) -> pd.DataFrame:
+    # ---------- Master ----------
+    def build_master(self) -> pd.DataFrame:
         frames = []
-        for df in [self.data.orders, self.data.search, self.data.abc, self.data.econ_unit, self.data.entry]:
+        base_cols = ["nm_id", "supplier_article", "subject", "brand", "title"]
+        for df in [self.data.orders, self.data.search, self.data.stocks, self.data.abc, self.data.economics, self.data.entry_points_sku]:
             if df.empty:
                 continue
-            cols = [c for c in ["supplier_article","nm_id","subject","brand","code"] if c in df.columns]
-            if cols:
-                frames.append(df[cols].copy())
+            x = df[[c for c in base_cols if c in df.columns]].copy()
+            for c in base_cols:
+                if c not in x.columns:
+                    x[c] = np.nan
+            frames.append(x[base_cols])
         if not frames:
-            return pd.DataFrame(columns=["supplier_article","nm_id","subject","brand","code"])
-        m = pd.concat(frames, ignore_index=True)
-        if "brand" not in m.columns:
-            m["brand"] = ""
-        m["supplier_article"] = m["supplier_article"].map(clean_article)
-        m["subject"] = m["subject"].map(normalize_text)
-        if "code" not in m.columns:
-            m["code"] = m["supplier_article"].map(clean_code_from_article)
-        m = m.drop_duplicates(subset=["supplier_article","nm_id"], keep="first")
-        return m
+            return pd.DataFrame(columns=base_cols + ["code", "rrp_key"])
+        master = pd.concat(frames, ignore_index=True)
+        master["nm_id"] = to_numeric(master["nm_id"])
+        master["supplier_article"] = master["supplier_article"].map(clean_article)
+        master = master[master["supplier_article"] != ""].copy()
+        master = master[~master["supplier_article"].map(is_excluded_article)].copy()
+        master["code"] = master["supplier_article"].map(extract_code)
+        master["rrp_key"] = master["supplier_article"].map(article_to_rrp_key)
+        master["quality"] = (
+            master["subject"].map(lambda x: 1 if clean_article(x) else 0) * 4
+            + master["title"].map(lambda x: 1 if clean_article(x) else 0) * 2
+            + master["brand"].map(lambda x: 1 if clean_article(x) else 0)
+        )
+        master = master.sort_values("quality", ascending=False)
+        master = master.drop_duplicates(subset=["supplier_article"], keep="first")
+        if not self.data.rrp.empty:
+            master = master.merge(self.data.rrp, on="rrp_key", how="left")
+        return master.drop(columns=["quality"])
 
-    def build_article_day(self) -> pd.DataFrame:
-        # orders daily
-        o = self.data.orders.copy()
-        if o.empty:
-            return pd.DataFrame()
-        o = o[(o["day"] >= pd.Timestamp(self.prev_start)) & (o["day"] <= pd.Timestamp(self.latest_day))].copy()
-        o["is_valid_order"] = ~o["isCancel"].astype(bool)
-        od = o[o["is_valid_order"]].groupby(["day","supplier_article","nm_id","subject","code"], dropna=False).agg(
-            orders_day=("is_valid_order","sum"),
-            finishedPrice_avg=("finishedPrice","mean"),
-            priceWithDisc_avg=("priceWithDisc","mean"),
-            spp_avg=("spp","mean"),
-        ).reset_index()
+    def attach_master(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or self.master.empty:
+            return df.copy()
+        out = df.copy()
+        if "supplier_article" in out.columns:
+            out = out.merge(self.master[["supplier_article", "nm_id", "subject", "brand", "title", "code", "rrp_key", "rrp"]], on="supplier_article", how="left", suffixes=("", "_m"))
+            for c in ["nm_id", "subject", "brand", "title", "code", "rrp_key", "rrp"]:
+                if f"{c}_m" in out.columns:
+                    if c not in out.columns:
+                        out[c] = out[f"{c}_m"]
+                    else:
+                        cond = out[c].isna() | (out[c] == "")
+                        out.loc[cond, c] = out.loc[cond, f"{c}_m"]
+                    out = out.drop(columns=[f"{c}_m"])
+        if "nm_id" in out.columns:
+            nm_map = self.master.dropna(subset=["nm_id"]).drop_duplicates(subset=["nm_id"])[["nm_id", "supplier_article", "subject", "brand", "title", "code", "rrp_key", "rrp"]]
+            out = out.merge(nm_map, on="nm_id", how="left", suffixes=("", "_n"))
+            for c in ["supplier_article", "subject", "brand", "title", "code", "rrp_key", "rrp"]:
+                if f"{c}_n" in out.columns:
+                    if c not in out.columns:
+                        out[c] = out[f"{c}_n"]
+                    else:
+                        cond = out[c].isna() | (out[c] == "")
+                        out.loc[cond, c] = out.loc[cond, f"{c}_n"]
+                    out = out.drop(columns=[f"{c}_n"])
+        if "supplier_article" in out.columns:
+            out = out[~out["supplier_article"].map(is_excluded_article)].copy()
+            out["code"] = out["supplier_article"].map(extract_code)
+            out["rrp_key"] = out["supplier_article"].map(article_to_rrp_key)
+        return out
 
-        # funnel
-        f = self.data.funnel.copy()
-        if not f.empty:
-            f = f[(f["day"] >= pd.Timestamp(self.prev_start)) & (f["day"] <= pd.Timestamp(self.latest_day))].copy()
-            f = f.merge(self.master[["supplier_article","nm_id","subject","code"]].drop_duplicates("nm_id"), on="nm_id", how="left")
-            fg = f.groupby(["day","supplier_article","nm_id","subject","code"], dropna=False).agg(
-                open_card_count=("open_card_count","sum"),
-                cart_count=("cart_count","sum"),
-                orders_funnel=("orders_funnel","sum"),
-                conv_to_cart=("conv_to_cart","mean"),
-                conv_cart_to_order=("conv_cart_to_order","mean"),
-            ).reset_index()
-        else:
-            fg = pd.DataFrame(columns=["day","supplier_article","nm_id","subject","code"])
-
-        # search daily by article
-        s = self.data.search.copy()
-        if not s.empty:
-            s = s[(s["day"] >= pd.Timestamp(self.prev_start)) & (s["day"] <= pd.Timestamp(self.latest_day))].copy()
-            # demand by category/day from unique queries
-            catd = s.groupby(["day","subject","query"], dropna=False).agg(freq=("frequency","max")).reset_index()
-            catd = catd.groupby(["day","subject"], dropna=False).agg(demand_day=("freq","sum")).reset_index()
-            sg = s.groupby(["day","supplier_article","nm_id","subject","code"], dropna=False).agg(
-                search_freq=("frequency","sum"),
-                visibility=("visibility","mean"),
-                median_position=("median_position","median"),
-            ).reset_index()
-            sg = sg.merge(catd, on=["day","subject"], how="left")
-        else:
-            sg = pd.DataFrame(columns=["day","supplier_article","nm_id","subject","code"])
-
-        # ads daily
-        a = self.data.ads.copy()
-        if not a.empty:
-            a = a[(a["day"] >= pd.Timestamp(self.prev_start)) & (a["day"] <= pd.Timestamp(self.latest_day))].copy()
-            a = a.merge(self.master[["supplier_article","nm_id","subject","code"]].drop_duplicates("nm_id"), on="nm_id", how="left")
-            ag = a.groupby(["day","supplier_article","nm_id","subject","code"], dropna=False).agg(
-                ad_spend=("spend","sum"),
-                ad_clicks=("clicks","sum"),
-                ad_orders=("orders","sum"),
-                ad_impressions=("impressions","sum"),
-            ).reset_index()
-        else:
-            ag = pd.DataFrame(columns=["day","supplier_article","nm_id","subject","code"])
-
-        # combine
-        keys = pd.concat([
-            od[["day","supplier_article","nm_id","subject","code"]],
-            fg[[c for c in ["day","supplier_article","nm_id","subject","code"] if c in fg.columns]],
-            sg[[c for c in ["day","supplier_article","nm_id","subject","code"] if c in sg.columns]],
-            ag[[c for c in ["day","supplier_article","nm_id","subject","code"] if c in ag.columns]],
-        ], ignore_index=True).drop_duplicates()
-
-        cur = keys.merge(od, on=["day","supplier_article","nm_id","subject","code"], how="left")
-        if not fg.empty:
-            cur = cur.merge(fg, on=["day","supplier_article","nm_id","subject","code"], how="left")
-        if not sg.empty:
-            cur = cur.merge(sg, on=["day","supplier_article","nm_id","subject","code"], how="left")
-        if not ag.empty:
-            cur = cur.merge(ag, on=["day","supplier_article","nm_id","subject","code"], how="left")
-
-        for c in [
-            "orders_day","finishedPrice_avg","priceWithDisc_avg","spp_avg","open_card_count","cart_count",
-            "orders_funnel","conv_to_cart","conv_cart_to_order","search_freq","visibility","median_position",
-            "demand_day","ad_spend","ad_clicks","ad_orders","ad_impressions"
+    # ---------- Windows ----------
+    def determine_windows(self) -> Dict[str, pd.Timestamp]:
+        candidates = []
+        for df, col in [
+            (self.data.funnel, "day"),
+            (self.data.orders, "day"),
+            (self.data.search, "day"),
         ]:
-            if c not in cur.columns:
-                cur[c] = np.nan
+            if not df.empty and col in df.columns:
+                candidates.append(pd.to_datetime(df[col], errors="coerce").max())
+        last_day = max([c for c in candidates if pd.notna(c)]) if candidates else pd.Timestamp.today().normalize()
+        cur_end = pd.Timestamp(last_day).normalize()
+        cur_start = cur_end - pd.Timedelta(days=13)
+        prev_end = cur_start - pd.Timedelta(days=1)
+        prev_start = prev_end - pd.Timedelta(days=13)
+        return {
+            "cur_start": cur_start,
+            "cur_end": cur_end,
+            "prev_start": prev_start,
+            "prev_end": prev_end,
+        }
 
-        # economics week mapping for daily GP forecast from economics
-        e = self.data.econ_unit.copy()
-        if not e.empty:
-            em = e[["week_code","supplier_article","nm_id","gp_unit","buyout_pct"]].copy()
-            cur["week_code"] = cur["day"].map(week_code_from_date)
-            cur = cur.merge(em, on=["week_code","supplier_article","nm_id"], how="left")
-            # fallback by article only
-            miss = cur["gp_unit"].isna()
-            if miss.any():
-                em2 = e.groupby(["week_code","supplier_article"], dropna=False).agg(gp_unit=("gp_unit","mean"), buyout_pct=("buyout_pct","mean")).reset_index()
-                tmp = cur.loc[miss, ["week_code","supplier_article"]].merge(em2, on=["week_code","supplier_article"], how="left")
-                cur.loc[miss, "gp_unit"] = tmp["gp_unit"].values
-                cur.loc[miss, "buyout_pct"] = tmp["buyout_pct"].values
-            cur["gross_profit_day"] = cur["orders_day"].fillna(0) * cur["gp_unit"].fillna(0) * cur["buyout_pct"].fillna(100) / 100.0
+    def _period_name(self, day: pd.Timestamp) -> Optional[str]:
+        if pd.isna(day):
+            return None
+        if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
+            return "cur_14d"
+        if self.windows["prev_start"] <= day <= self.windows["prev_end"]:
+            return "prev_14d"
+        return None
+
+    # ---------- Daily article operations ----------
+    def build_daily_article(self) -> pd.DataFrame:
+        parts = []
+        if not self.data.funnel.empty:
+            f = self.data.funnel.copy()
+            f = f[f["day"].notna()].copy()
+            grp = f.groupby(["day", "nm_id"], dropna=False).agg(
+                open_card_count=("open_card_count", "sum"),
+                cart_count=("cart", "sum"),
+                orders_funnel=("orders", "sum"),
+                buyouts_funnel=("buyouts_count", "sum"),
+                cancel_funnel=("cancel_count", "sum"),
+                conv_to_cart=("conv_cart", "mean"),
+                conv_cart_to_order=("conv_order", "mean"),
+            ).reset_index()
+            parts.append(grp)
+        if parts:
+            cur = parts[0]
         else:
-            cur["gross_profit_day"] = np.nan
+            cur = pd.DataFrame(columns=["day", "nm_id"])
 
-        cur["rrp_key"] = cur["supplier_article"].map(normalize_rrp_key)
-        cur["rrp"] = cur["rrp_key"].map(self.rrp_map)
-        cur["finished_rrp_coeff"] = cur.apply(lambda r: safe_div(r.get("finishedPrice_avg"), r.get("rrp")), axis=1)
-        cur["pwd_rrp_coeff"] = cur.apply(lambda r: safe_div(r.get("priceWithDisc_avg"), r.get("rrp")), axis=1)
-        return cur.sort_values(["day","subject","code","supplier_article"], ascending=[False,True,True,True])
-
-    def build_localization_daily(self) -> pd.DataFrame:
-        s = self.data.stocks.copy()
-        o = self.data.orders.copy()
-        if s.empty or o.empty:
-            return pd.DataFrame(columns=["Артикул","Дата","Покрытие, %"])
-        s = s[(s["day"] >= pd.Timestamp(self.prev_start)) & (s["day"] <= pd.Timestamp(self.latest_day))].copy()
-        o = o[(o["day"] >= pd.Timestamp(self.lookback_loc_start)) & (o["day"] <= pd.Timestamp(self.latest_day)) & (~o["isCancel"].astype(bool))].copy()
-        s = s[s["subject"].map(is_target_subject)].copy()
-        o = o[o["subject"].map(is_target_subject)].copy()
-        if s.empty or o.empty:
-            return pd.DataFrame(columns=["Артикул","Дата","Покрытие, %"])
-
-        latest_stock_day = s["day"].max()
-        latest = s[s["day"] == latest_stock_day].copy()
-        main_wh = []
-        for art, g in latest.groupby("supplier_article", dropna=False):
-            g = g.groupby("warehouse", as_index=False)["stock_total"].sum().sort_values("stock_total", ascending=False)
-            total = g["stock_total"].sum()
-            if total <= 0:
-                continue
-            g["share"] = g["stock_total"] / total
-            g["cum"] = g["share"].cumsum()
-            picked = g[g["cum"] <= 0.97].copy()
-            if picked.empty:
-                picked = g.head(1).copy()
-            elif picked["cum"].max() < 0.97 and len(picked) < len(g):
-                picked = g.head(len(picked) + 1).copy()
-            picked["supplier_article"] = art
-            main_wh.append(picked[["supplier_article","warehouse"]])
-        if not main_wh:
-            return pd.DataFrame(columns=["Артикул","Дата","Покрытие, %"])
-        main_wh = pd.concat(main_wh, ignore_index=True).drop_duplicates()
-
-        wh_orders = o.groupby(["supplier_article","warehouse"], dropna=False).size().reset_index(name="orders_28d")
-        wh_orders["avg_orders_day_wh"] = wh_orders["orders_28d"] / 28.0
-        wh_orders = wh_orders.merge(main_wh, on=["supplier_article","warehouse"], how="inner")
-        # weights by warehouse order share, fallback equal
-        total_ord = wh_orders.groupby("supplier_article", as_index=False)["orders_28d"].sum().rename(columns={"orders_28d":"orders_total"})
-        wh_orders = wh_orders.merge(total_ord, on="supplier_article", how="left")
-        wh_orders["weight"] = wh_orders.apply(lambda r: safe_div(r["orders_28d"], r["orders_total"]), axis=1)
-        for art, idx in wh_orders.groupby("supplier_article").groups.items():
-            if wh_orders.loc[idx, "weight"].isna().all() or wh_orders.loc[idx, "weight"].sum() == 0:
-                wh_orders.loc[idx, "weight"] = 1 / len(idx)
-
-        # repeat weekly stock snapshot for each day in week
-        stock_rows = []
-        for _, r in s.iterrows():
-            d = pd.Timestamp(r["day"]).date()
-            week_code = week_code_from_date(d)
-            start, end = week_bounds_from_code(week_code)
-            if not start or not end:
-                continue
-            for dd in pd.date_range(start, end):
-                if dd.date() < self.prev_start or dd.date() > self.latest_day:
-                    continue
-                stock_rows.append({
-                    "day": dd.normalize(),
-                    "supplier_article": r["supplier_article"],
-                    "warehouse": r["warehouse"],
-                    "stock_qty": float(r["stock_available"]),
+        if not self.data.orders.empty:
+            o = self.data.orders.copy()
+            o = o[o["day"].notna()].copy()
+            grp = o.groupby(["day", "supplier_article", "nm_id"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "orders_from_orders": to_numeric(g["orders"]).fillna(1).sum(),
+                    "finishedPrice_avg": weighted_mean(g["finished_price"], g["orders"].fillna(1)),
+                    "priceWithDisc_avg": weighted_mean(g["price_with_disc"], g["orders"].fillna(1)),
+                    "spp_avg": weighted_mean(g["spp"], g["orders"].fillna(1)),
                 })
-        if not stock_rows:
-            return pd.DataFrame(columns=["Артикул","Дата","Покрытие, %"])
-        daily_stock = pd.DataFrame(stock_rows)
-        daily_stock = daily_stock.merge(wh_orders[["supplier_article","warehouse","avg_orders_day_wh","weight"]], on=["supplier_article","warehouse"], how="inner")
-        daily_stock["coverage_days"] = daily_stock.apply(lambda r: safe_div(r["stock_qty"], r["avg_orders_day_wh"]), axis=1)
-        daily_stock["available_flag"] = np.where(daily_stock["stock_qty"] >= daily_stock["avg_orders_day_wh"], 1.0, 0.0)
-        cov = daily_stock.groupby(["day","supplier_article"], dropna=False).agg(coverage=("available_flag", lambda x: np.average(x, weights=daily_stock.loc[x.index, "weight"]))).reset_index()
-        cov["coverage"] = cov["coverage"].fillna(0)
-        cov["Артикул"] = cov["supplier_article"]
-        cov["Дата"] = cov["day"]
-        cov["Покрытие, %"] = cov["coverage"]
-        return cov[["Артикул","Дата","Покрытие, %"]].sort_values(["Артикул","Дата"], ascending=[True,False])
+            ).reset_index()
+            cur = cur.merge(grp, on=[c for c in ["day", "supplier_article", "nm_id"] if c in cur.columns and c in grp.columns], how="outer") if not cur.empty else grp
 
-    def _window_df(self, df: pd.DataFrame, start: date, end: date, day_col: str = "day") -> pd.DataFrame:
-        if df.empty or day_col not in df.columns:
-            return df.iloc[0:0].copy()
-        s = pd.Timestamp(start); e = pd.Timestamp(end)
-        return df[(pd.to_datetime(df[day_col], errors="coerce") >= s) & (pd.to_datetime(df[day_col], errors="coerce") <= e)].copy()
-
-    def _window_abc(self, start: date, end: date) -> pd.DataFrame:
-        a = self.data.abc.copy()
-        if a.empty:
-            return a
-        return a[(a["week_start"].dt.date >= start) & (a["week_end"].dt.date <= end)].copy()
-
-    def _window_entry(self, start: date, end: date) -> pd.DataFrame:
-        e = self.data.entry.copy()
-        if e.empty:
-            return e
-        return e[(e["week_start"].dt.date >= start) & (e["week_end"].dt.date <= end)].copy()
-
-    def _window_econ(self, start: date, end: date) -> pd.DataFrame:
-        e = self.data.econ_unit.copy()
-        if e.empty:
-            return e
-        weeks = set()
-        for d in pd.date_range(start, end):
-            weeks.add(week_code_from_date(d))
-        return e[e["week_code"].isin(weeks)].copy()
-
-    def build_article_period(self) -> pd.DataFrame:
-        rows = []
-        demand_map = {}
         if not self.data.search.empty:
             s = self.data.search.copy()
-            catd = s.groupby(["day","subject","query"], dropna=False).agg(freq=("frequency","max")).reset_index()
-            catd = catd.groupby(["day","subject"], dropna=False).agg(demand=("freq","sum")).reset_index()
-            for period_name, start, end in [("prev_14d", self.prev_start, self.prev_end), ("cur_14d", self.cur_start, self.latest_day)]:
-                x = self._window_df(catd, start, end).groupby("subject", as_index=False)["demand"].sum()
-                for _, r in x.iterrows():
-                    demand_map[(period_name, r["subject"])] = r["demand"]
-
-        loc = self.localization_daily.copy()
-        if not loc.empty:
-            loc["Дата"] = pd.to_datetime(loc["Дата"]).dt.normalize()
-            loc_prev = self._window_df(loc.rename(columns={"Дата":"day","Артикул":"supplier_article","Покрытие, %":"coverage"}), self.prev_start, self.prev_end)
-            loc_cur = self._window_df(loc.rename(columns={"Дата":"day","Артикул":"supplier_article","Покрытие, %":"coverage"}), self.cur_start, self.latest_day)
-            loc_prev = loc_prev.groupby("supplier_article", as_index=False)["coverage"].mean().rename(columns={"coverage":"loc_prev"})
-            loc_cur = loc_cur.groupby("supplier_article", as_index=False)["coverage"].mean().rename(columns={"coverage":"loc_cur"})
-        else:
-            loc_prev = pd.DataFrame(columns=["supplier_article","loc_prev"])
-            loc_cur = pd.DataFrame(columns=["supplier_article","loc_cur"])
-
-        arts = sorted(set(self.article_day["supplier_article"].dropna().tolist()) | set(self.data.abc["supplier_article"].dropna().tolist()) | set(self.data.econ_unit["supplier_article"].dropna().tolist()))
-        for art in arts:
-            if not valid_article(art):
-                continue
-            code = clean_code_from_article(art)
-            subj = ""
-            brand = "TopFace"
-            ms = self.master[self.master["supplier_article"] == art]
-            if not ms.empty:
-                subj = ms["subject"].dropna().astype(str).iloc[0]
-                if "brand" in ms.columns and ms["brand"].dropna().any():
-                    brand = ms["brand"].dropna().astype(str).iloc[0]
-            if not is_target_subject(subj):
-                continue
-            ady = self.article_day[self.article_day["supplier_article"] == art].copy()
-            abc_all = self.data.abc[self.data.abc["supplier_article"] == art].copy()
-            entry_all = self.data.entry[self.data.entry["supplier_article"] == art].copy()
-            for period_name, start, end in [("prev_14d", self.prev_start, self.prev_end), ("cur_14d", self.cur_start, self.latest_day)]:
-                d = self._window_df(ady, start, end)
-                a = abc_all[(abc_all["week_start"].dt.date >= start) & (abc_all["week_end"].dt.date <= end)]
-                e = entry_all[(entry_all["week_start"].dt.date >= start) & (entry_all["week_end"].dt.date <= end)]
-                eu = self._window_econ(start, end)
-                eu = eu[eu["supplier_article"] == art]
-                sales_w = to_numeric(eu["sales_qty"]).fillna(0)
-                def wavg(col):
-                    ser = to_numeric(eu[col]).fillna(np.nan)
-                    if eu.empty:
-                        return np.nan
-                    if sales_w.sum() > 0 and ser.notna().any():
-                        return np.average(np.nan_to_num(ser), weights=np.where(ser.notna(), sales_w, 0))
-                    return ser.mean()
-
-                row = {
-                    "Период": period_name,
-                    "Категория": subj,
-                    "Товар": code,
-                    "Артикул": art,
-                    "Бренд": brand,
-                    # daily economics-driven facts
-                    "Валовая прибыль день, ₽": d["gross_profit_day"].sum(),
-                    "Клики, шт": e["clicks"].sum() if not e.empty else d["open_card_count"].sum(),
-                    "Показы, шт": e["impressions"].sum() if not e.empty else np.nan,
-                    "CTR, %": safe_div((e["clicks"].sum() if not e.empty else np.nan), (e["impressions"].sum() if not e.empty else np.nan)) * 100,
-                    "Заказы воронка, шт": d["orders_funnel"].sum(),
-                    "Открытия карточки, шт": d["open_card_count"].sum(),
-                    "Добавления в корзину, шт": d["cart_count"].sum(),
-                    "Конверсия в корзину, %": d["conv_to_cart"].mean(),
-                    "Конверсия корзина-заказ, %": d["conv_cart_to_order"].mean(),
-                    # ABC weekly/monthly actuals
-                    "Валовая прибыль ABC, ₽": a["gross_profit"].sum(),
-                    "Валовая выручка ABC, ₽": a["gross_revenue"].sum(),
-                    "Продажи ABC, шт": a["orders"].sum(),
-                    "Валовая прибыль на 1 продажу, ₽": safe_div(a["gross_profit"].sum(), a["orders"].sum()),
-                    # prices
-                    "finishedPrice, ₽": d["finishedPrice_avg"].mean(),
-                    "priceWithDisc, ₽": d["priceWithDisc_avg"].mean(),
-                    "SPP, %": d["spp_avg"].mean(),
-                    "РРЦ, ₽": self.rrp_map.get(normalize_rrp_key(art), np.nan),
-                    "Коэф finishedPrice к РРЦ": safe_div(d["finishedPrice_avg"].mean(), self.rrp_map.get(normalize_rrp_key(art), np.nan)),
-                    "Коэф priceWithDisc к РРЦ": safe_div(d["priceWithDisc_avg"].mean(), self.rrp_map.get(normalize_rrp_key(art), np.nan)),
-                    # search / visibility
-                    "Спрос категории, шт": demand_map.get((period_name, subj), np.nan),
-                    "Видимость, %": d["visibility"].mean(),
-                    "Медианная позиция": d["median_position"].mean(),
-                    # ads
-                    "Расходы на рекламу, ₽": d["ad_spend"].sum(),
-                    "Рекламные клики, шт": d["ad_clicks"].sum(),
-                    "Рекламные заказы, шт": d["ad_orders"].sum(),
-                    "Рекламные показы, шт": d["ad_impressions"].sum(),
-                    # localization
-                    "Покрытие локализации, %": np.nan,
-                    # economics units
-                    "Комиссия WB, ₽/ед": wavg("commission_unit"),
-                    "Эквайринг, ₽/ед": wavg("acquiring_unit"),
-                    "Логистика прямая, ₽/ед": wavg("log_direct_unit"),
-                    "Логистика обратная, ₽/ед": wavg("log_return_unit"),
-                    "Хранение, ₽/ед": wavg("storage_unit"),
-                    "Приемка, ₽/ед": wavg("acceptance_unit"),
-                    "Реклама, ₽/ед": wavg("ads_unit"),
-                    "Прочие расходы, ₽/ед": wavg("other_unit"),
-                    "Себестоимость, ₽": wavg("cost_unit"),
-                    "Валовая прибыль, ₽/ед": wavg("gp_unit"),
-                    "Чистая прибыль, ₽/ед": wavg("np_unit"),
-                    "Валовая рентабельность, %": wavg("margin_pct"),
-                    "Чистая рентабельность, %": wavg("profitability_pct"),
-                }
-                rows.append(row)
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return out
-        out = out.merge(loc_prev, left_on="Артикул", right_on="supplier_article", how="left").drop(columns=[c for c in ["supplier_article"] if c in out.columns])
-        out = out.merge(loc_cur, left_on="Артикул", right_on="supplier_article", how="left").drop(columns=[c for c in ["supplier_article"] if c in out.columns])
-        out["Покрытие локализации, %"] = np.where(out["Период"] == "prev_14d", out["loc_prev"], out["loc_cur"])
-        out = out.drop(columns=[c for c in ["loc_prev","loc_cur"] if c in out.columns])
-        return out
-
-    def aggregate_period(self, df: pd.DataFrame, level: str) -> pd.DataFrame:
-        if df.empty:
-            return df
-        key = {"subject":"Категория","code":"Товар"}[level]
-        group_cols = ["Период", key]
-        numeric_cols = [c for c in df.columns if c not in {"Период","Категория","Товар","Артикул","Бренд"}]
-        agg_map = {}
-        for c in numeric_cols:
-            if c in {"finishedPrice, ₽","priceWithDisc, ₽","SPP, %","РРЦ, ₽","Коэф finishedPrice к РРЦ","Коэф priceWithDisc к РРЦ","Видимость, %","Медианная позиция","Комиссия WB, ₽/ед","Эквайринг, ₽/ед","Логистика прямая, ₽/ед","Логистика обратная, ₽/ед","Хранение, ₽/ед","Приемка, ₽/ед","Реклама, ₽/ед","Прочие расходы, ₽/ед","Себестоимость, ₽","Валовая прибыль, ₽/ед","Чистая прибыль, ₽/ед","Валовая рентабельность, %","Чистая рентабельность, %","Покрытие локализации, %"}:
-                agg_map[c] = "mean"
-            else:
-                agg_map[c] = "sum"
-        out = df.groupby(group_cols, dropna=False).agg(agg_map).reset_index()
-        if level == "code":
-            subj_map = df.groupby("Товар", as_index=False)["Категория"].first()
-            out = out.merge(subj_map, on="Товар", how="left")
-        return out
-
-    def _pair_periods(self, df: pd.DataFrame, id_cols: List[str]) -> pd.DataFrame:
-        prev = df[df["Период"] == "prev_14d"].copy().drop(columns=["Период"])
-        cur = df[df["Период"] == "cur_14d"].copy().drop(columns=["Период"])
-        paired = prev.merge(cur, on=id_cols, how="outer", suffixes=("_prev","_cur"))
-        return paired
-
-    def _ad_assessment(self, row: pd.Series) -> str:
-        spend_d = pct_delta(row.get("Расходы на рекламу, ₽_cur"), row.get("Расходы на рекламу, ₽_prev"))
-        gp_d = pct_delta(row.get("Валовая прибыль ABC, ₽_cur"), row.get("Валовая прибыль ABC, ₽_prev"))
-        ord_d = pct_delta(row.get("Продажи ABC, шт_cur"), row.get("Продажи ABC, шт_prev"))
-        click_d = pct_delta(row.get("Рекламные клики, шт_cur"), row.get("Рекламные клики, шт_prev"))
-        vis_d = pct_delta(row.get("Видимость, %_cur"), row.get("Видимость, %_prev"))
-        if pd.notna(spend_d) and spend_d >= 0.15 and pd.notna(gp_d) and gp_d < 0:
-            return "Неэффективно"
-        if pd.notna(spend_d) and spend_d >= 0.15 and pd.notna(ord_d) and ord_d >= 0.08 and pd.notna(gp_d) and gp_d >= 0.05:
-            return "Эффективно"
-        if pd.notna(spend_d) and spend_d >= 0.15 and pd.notna(click_d) and click_d >= 0.08:
-            return "Частично эффективно"
-        if pd.notna(spend_d) and spend_d >= 0.10 and pd.notna(vis_d) and vis_d >= 0:
-            return "Защитно"
-        return "Нейтрально"
-
-    def _main_reason(self, row: pd.Series) -> Tuple[str, str]:
-        gp_prev = row.get("Валовая прибыль ABC, ₽_prev", np.nan)
-        gp_cur = row.get("Валовая прибыль ABC, ₽_cur", np.nan)
-        ord_prev = row.get("Продажи ABC, шт_prev", np.nan)
-        ord_cur = row.get("Продажи ABC, шт_cur", np.nan)
-        gp1_prev = row.get("Валовая прибыль на 1 продажу, ₽_prev", np.nan)
-        gp1_cur = row.get("Валовая прибыль на 1 продажу, ₽_cur", np.nan)
-        volume_effect = (ord_cur - ord_prev) * (gp1_prev if pd.notna(gp1_prev) else 0)
-        econ_effect = ((gp1_cur - gp1_prev) if pd.notna(gp1_cur) and pd.notna(gp1_prev) else 0) * (ord_cur if pd.notna(ord_cur) else 0)
-        clicks_d = pct_delta(row.get("Клики, шт_cur"), row.get("Клики, шт_prev"))
-        conv_prev = safe_div(row.get("Заказы воронка, шт_prev"), row.get("Клики, шт_prev"))
-        conv_cur = safe_div(row.get("Заказы воронка, шт_cur"), row.get("Клики, шт_cur"))
-        conv_d = pct_delta(conv_cur, conv_prev)
-        demand_d = pct_delta(row.get("Спрос категории, шт_cur"), row.get("Спрос категории, шт_prev"))
-        vis_d = pct_delta(row.get("Видимость, %_cur"), row.get("Видимость, %_prev"))
-        pos_prev = row.get("Медианная позиция_prev", np.nan)
-        pos_cur = row.get("Медианная позиция_cur", np.nan)
-        fp_d = pct_delta(row.get("finishedPrice, ₽_cur"), row.get("finishedPrice, ₽_prev"))
-        pwd_d = pct_delta(row.get("priceWithDisc, ₽_cur"), row.get("priceWithDisc, ₽_prev"))
-        loc_prev = row.get("Покрытие локализации, %_prev", np.nan)
-        loc_cur = row.get("Покрытие локализации, %_cur", np.nan)
-        loc_d = loc_cur - loc_prev if pd.notna(loc_prev) and pd.notna(loc_cur) else np.nan
-        ad_assessment = self._ad_assessment(row)
-        gp1_d = pct_delta(gp1_cur, gp1_prev)
-        # main
-        if abs(volume_effect) >= abs(econ_effect):
-            if pd.notna(loc_d) and loc_d <= -0.15:
-                main = "Локализация"
-            elif pd.notna(clicks_d) and clicks_d <= -0.08 and ((pd.notna(vis_d) and vis_d <= -0.08) or (pd.notna(pos_prev) and pd.notna(pos_cur) and pos_cur - pos_prev > 1.0)):
-                main = "Потеря трафика из-за позиций"
-            elif pd.notna(demand_d) and demand_d <= -0.08:
-                main = "Снижение спроса"
-            elif pd.notna(conv_d) and conv_d <= -0.08 and pd.notna(fp_d) and fp_d >= 0.03:
-                main = "Цена для покупателя ухудшила конверсию"
-            elif pd.notna(conv_d) and conv_d <= -0.08:
-                main = "Снижение конверсии"
-            elif pd.notna(clicks_d) and clicks_d <= -0.08:
-                main = "Снижение трафика"
-            else:
-                main = "Снижение заказов"
-        else:
-            if pd.notna(pwd_d) and pwd_d <= -0.02 and pct_delta(gp_cur, gp_prev) < -0.05:
-                main = "Снижение priceWithDisc не окупилось"
-            elif ad_assessment == "Неэффективно":
-                main = "Реклама съела прибыль"
-            elif pd.notna(gp1_d) and gp1_d <= -0.05:
-                main = "Снижение прибыли на единицу"
-            else:
-                main = "Экономика на единицу"
-        # secondary
-        secondary = ad_assessment
-        if main == secondary:
-            secondary = ""
-        return main, secondary
-
-    def _detail_text(self, row: pd.Series, level_name: str) -> str:
-        rev_prev = row.get("Валовая выручка ABC, ₽_prev", np.nan)
-        rev_cur = row.get("Валовая выручка ABC, ₽_cur", np.nan)
-        ord_prev = row.get("Продажи ABC, шт_prev", np.nan)
-        ord_cur = row.get("Продажи ABC, шт_cur", np.nan)
-        gp_prev = row.get("Валовая прибыль ABC, ₽_prev", np.nan)
-        gp_cur = row.get("Валовая прибыль ABC, ₽_cur", np.nan)
-        clicks_prev = row.get("Клики, шт_prev", np.nan)
-        clicks_cur = row.get("Клики, шт_cur", np.nan)
-        fp_prev = row.get("finishedPrice, ₽_prev", np.nan)
-        fp_cur = row.get("finishedPrice, ₽_cur", np.nan)
-        pwd_prev = row.get("priceWithDisc, ₽_prev", np.nan)
-        pwd_cur = row.get("priceWithDisc, ₽_cur", np.nan)
-        spp_prev = row.get("SPP, %_prev", np.nan)
-        spp_cur = row.get("SPP, %_cur", np.nan)
-        loc_prev = row.get("Покрытие локализации, %_prev", np.nan)
-        loc_cur = row.get("Покрытие локализации, %_cur", np.nan)
-        d_prev = row.get("Спрос категории, шт_prev", np.nan)
-        d_cur = row.get("Спрос категории, шт_cur", np.nan)
-        vis_prev = row.get("Видимость, %_prev", np.nan)
-        vis_cur = row.get("Видимость, %_cur", np.nan)
-        ad_prev = row.get("Расходы на рекламу, ₽_prev", np.nan)
-        ad_cur = row.get("Расходы на рекламу, ₽_cur", np.nan)
-        ad_orders_prev = row.get("Рекламные заказы, шт_prev", np.nan)
-        ad_orders_cur = row.get("Рекламные заказы, шт_cur", np.nan)
-        main, secondary = row["Главная причина"], row["Вторичная причина"]
-        parts = [
-            f"Выручка {fmt_money(rev_prev)} -> {fmt_money(rev_cur)} ({fmt_pct(pct_delta(rev_cur, rev_prev))}), заказы {int(ord_prev) if pd.notna(ord_prev) else 0} -> {int(ord_cur) if pd.notna(ord_cur) else 0} ({fmt_pct(pct_delta(ord_cur, ord_prev))}), валовая прибыль {fmt_money(gp_prev)} -> {fmt_money(gp_cur)} ({fmt_pct(pct_delta(gp_cur, gp_prev))}).",
-            f"Трафик {int(clicks_prev) if pd.notna(clicks_prev) else 0} -> {int(clicks_cur) if pd.notna(clicks_cur) else 0} ({fmt_pct(pct_delta(clicks_cur, clicks_prev))}), спрос категории {int(d_prev) if pd.notna(d_prev) else 0} -> {int(d_cur) if pd.notna(d_cur) else 0} ({fmt_pct(pct_delta(d_cur, d_prev))}), видимость {fmt_pct(vis_prev/100 if pd.notna(vis_prev) else np.nan)} -> {fmt_pct(vis_cur/100 if pd.notna(vis_cur) else np.nan)}, медианная позиция {fmt_num(row.get('Медианная позиция_prev'),1)} -> {fmt_num(row.get('Медианная позиция_cur'),1)}.",
-            f"Цена для покупателя finishedPrice {fmt_money(fp_prev)} -> {fmt_money(fp_cur)}, цена продажи priceWithDisc {fmt_money(pwd_prev)} -> {fmt_money(pwd_cur)}, SPP {fmt_pct(spp_prev/100 if pd.notna(spp_prev) else np.nan)} -> {fmt_pct(spp_cur/100 if pd.notna(spp_cur) else np.nan)}.",
-            f"Локализация {fmt_pct(loc_prev)} -> {fmt_pct(loc_cur)}. Реклама: расходы {fmt_money(ad_prev)} -> {fmt_money(ad_cur)}, рекламные заказы {int(ad_orders_prev) if pd.notna(ad_orders_prev) else 0} -> {int(ad_orders_cur) if pd.notna(ad_orders_cur) else 0}, оценка: {row['Оценка рекламы']}.",
-            f"Главная причина: {main}." + (f" Вторичная: {secondary}." if secondary else ""),
-        ]
-        return " ".join(parts)
-
-    def build_reason_rows(self, df: pd.DataFrame, level: str) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame()
-        id_cols = ["Категория"] if level == "category" else ["Товар"]
-        paired = self._pair_periods(df, id_cols)
-        if level == "product":
-            subj_map = df.groupby("Товар", as_index=False)["Категория"].first()
-            paired = paired.merge(subj_map, on="Товар", how="left")
-        paired["Оценка рекламы"] = paired.apply(self._ad_assessment, axis=1)
-        reasons = paired.apply(lambda r: pd.Series(self._main_reason(r), index=["Главная причина", "Вторичная причина"]), axis=1)
-        paired = pd.concat([paired, reasons], axis=1)
-        paired["Детальный вывод"] = paired.apply(lambda r: self._detail_text(r, level), axis=1)
-        paired["Δ Выручка, ₽"] = paired["Валовая выручка ABC, ₽_cur"] - paired["Валовая выручка ABC, ₽_prev"]
-        paired["Δ Валовая прибыль, ₽"] = paired["Валовая прибыль ABC, ₽_cur"] - paired["Валовая прибыль ABC, ₽_prev"]
-        paired["Δ Заказы, шт"] = paired["Продажи ABC, шт_cur"] - paired["Продажи ABC, шт_prev"]
-        if level == "category":
-            paired = paired.sort_values("Валовая прибыль ABC, ₽_cur", ascending=False)
-        else:
-            paired = paired.sort_values(["Δ Выручка, ₽","Валовая прибыль ABC, ₽_cur"], ascending=[True,False])
-        return paired
-
-    def build_product_with_articles(self) -> pd.DataFrame:
-        if self.article_period.empty:
-            return pd.DataFrame()
-        prod = self.build_reason_rows(self.product_period, "product")
-        art = self.build_reason_rows(self.article_period[[c for c in self.article_period.columns if c not in {"Бренд"}]], "article") if False else None
-        pair = self._pair_periods(self.article_period, ["Артикул"])
-        pair["Товар"] = pair["Артикул"].map(clean_code_from_article)
-        pair = pair.merge(self.article_period.groupby("Артикул", as_index=False)["Категория"].first(), on="Артикул", how="left")
-        pair["Δ Выручка, ₽"] = pair["Валовая выручка ABC, ₽_cur"] - pair["Валовая выручка ABC, ₽_prev"]
-        pair["Δ Валовая прибыль, ₽"] = pair["Валовая прибыль ABC, ₽_cur"] - pair["Валовая прибыль ABC, ₽_prev"]
-        pair["Δ Заказы, шт"] = pair["Продажи ABC, шт_cur"] - pair["Продажи ABC, шт_prev"]
-        # contribution within product
-        prod_delta = pair.groupby("Товар", as_index=False)["Δ Валовая прибыль, ₽"].sum().rename(columns={"Δ Валовая прибыль, ₽":"prod_delta_gp"})
-        pair = pair.merge(prod_delta, on="Товар", how="left")
-        pair["Вклад SKU в товар, %"] = pair.apply(lambda r: safe_div(r["Δ Валовая прибыль, ₽"], r["prod_delta_gp"]), axis=1)
-        # keep only products with decline or growth material
-        neg_products = prod[(prod["Δ Выручка, ₽"] < 0) | (prod["Δ Заказы, шт"] < 0)]["Товар"].dropna().tolist()
-        if not neg_products:
-            neg_products = prod["Товар"].dropna().tolist()[:20]
-        pair = pair[pair["Товар"].isin(neg_products)].copy()
-        return pair.sort_values(["Товар","Δ Выручка, ₽"], ascending=[True,True])
-
-    def build_summary_struct(self) -> Dict[str, pd.DataFrame]:
-        daily = self.article_day.copy()
-        if daily.empty:
-            return {"daily": pd.DataFrame(), "weekly": pd.DataFrame(), "monthly": pd.DataFrame()}
-        daily = daily[(daily["day"] >= pd.Timestamp(self.cur_start)) & (daily["day"] <= pd.Timestamp(self.latest_day))].copy()
-        daily_cat = daily.groupby(["subject","day"], dropna=False)["gross_profit_day"].sum().reset_index()
-        daily_pivot = daily_cat.pivot(index="subject", columns="day", values="gross_profit_day").reindex(TARGET_SUBJECTS).fillna(0)
-        daily_pivot = daily_pivot[sorted(daily_pivot.columns, reverse=True)]
-
-        # weekly from ABC actual last 8 weeks
-        a = self.data.abc.copy()
-        if a.empty:
-            weekly_pivot = pd.DataFrame(index=TARGET_SUBJECTS)
-            monthly_pivot = pd.DataFrame(index=TARGET_SUBJECTS)
-        else:
-            week_cat = a.groupby(["subject","week_code","week_start"], dropna=False)["gross_profit"].sum().reset_index()
-            recent_weeks = week_cat.sort_values("week_start")["week_code"].drop_duplicates().tolist()[-8:]
-            week_cat = week_cat[week_cat["week_code"].isin(recent_weeks)]
-            weekly_pivot = week_cat.pivot(index="subject", columns="week_code", values="gross_profit").reindex(TARGET_SUBJECTS).fillna(0)
-            weekly_pivot = weekly_pivot[[c for c in sorted(weekly_pivot.columns, reverse=True)]]
-
-            a["month_key"] = a["week_end"].dt.to_period("M").astype(str)
-            month_cat = a.groupby(["subject","month_key"], dropna=False)["gross_profit"].sum().reset_index()
-            recent_months = month_cat["month_key"].drop_duplicates().tolist()[-6:]
-            month_cat = month_cat[month_cat["month_key"].isin(recent_months)]
-            monthly_pivot = month_cat.pivot(index="subject", columns="month_key", values="gross_profit").reindex(TARGET_SUBJECTS).fillna(0)
-            monthly_pivot = monthly_pivot[[c for c in sorted(monthly_pivot.columns, reverse=True)]]
-        return {"daily": daily_pivot, "weekly": weekly_pivot, "monthly": monthly_pivot}
-
-    def build_channels(self) -> pd.DataFrame:
-        e = self.data.entry.copy()
-        if e.empty:
-            return pd.DataFrame()
-        e = e[e["week_start"].dt.date >= self.prev_start].copy()
-        # only products with decline
-        if self.reasons_product.empty:
-            return pd.DataFrame()
-        target_products = set(self.reasons_product[(self.reasons_product["Δ Выручка, ₽"] < 0) | (self.reasons_product["Δ Заказы, шт"] < 0)]["Товар"].dropna())
-        if target_products:
-            e = e[e["code"].isin(target_products)].copy()
-        rows = []
-        for code, g in e.groupby("code"):
-            for ep, gg in g.groupby("entry_point"):
-                prev = gg[(gg["week_start"].dt.date >= self.prev_start) & (gg["week_end"].dt.date <= self.prev_end)]
-                cur = gg[(gg["week_start"].dt.date >= self.cur_start) & (gg["week_end"].dt.date <= self.latest_day)]
-                rows.append({
-                    "Товар": code,
-                    "Канал": ep,
-                    "Клики пред, шт": prev["clicks"].sum(),
-                    "Клики тек, шт": cur["clicks"].sum(),
-                    "CTR пред, %": safe_div(prev["clicks"].sum(), prev["impressions"].sum()) * 100,
-                    "CTR тек, %": safe_div(cur["clicks"].sum(), cur["impressions"].sum()) * 100,
-                    "Заказы пред, шт": prev["orders"].sum(),
-                    "Заказы тек, шт": cur["orders"].sum(),
-                    "Δ Заказы, шт": cur["orders"].sum() - prev["orders"].sum(),
+            s = s[s["day"].notna()].copy()
+            grp = s.groupby(["day", "supplier_article", "nm_id"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "search_frequency": to_numeric(g["frequency"]).sum(),
+                    "median_position": weighted_avg_position(g["median_position"], g["frequency"].fillna(1)),
+                    "visibility_pct": weighted_mean(g["visibility_pct"], g["frequency"].fillna(1)),
+                    "search_queries_count": g["query"].nunique(),
                 })
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return out
-        return out.sort_values(["Товар","Δ Заказы, шт"], ascending=[True,True])
+            ).reset_index()
+            cur = cur.merge(grp, on=[c for c in ["day", "supplier_article", "nm_id"] if c in cur.columns and c in grp.columns], how="outer") if not cur.empty else grp
+
+        if not self.data.ads_daily.empty:
+            a = self.data.ads_daily.copy()
+            a = a[a["day"].notna()].copy()
+            grp = a.groupby(["day", "nm_id", "supplier_article"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "ad_impressions": to_numeric(g["impressions"]).sum(),
+                    "ad_clicks": to_numeric(g["clicks"]).sum(),
+                    "ad_orders": to_numeric(g["orders"]).sum(),
+                    "ad_spend": to_numeric(g["spend"]).sum(),
+                    "ad_ctr": weighted_mean(g["ctr"], g["impressions"].fillna(1)),
+                    "ad_cpc": weighted_mean(g["cpc"], g["clicks"].fillna(1)),
+                })
+            ).reset_index()
+            cur = cur.merge(grp, on=[c for c in ["day", "supplier_article", "nm_id"] if c in cur.columns and c in grp.columns], how="outer") if not cur.empty else grp
+
+        cur = self.attach_master(cur)
+        cur = cur[~cur["supplier_article"].map(is_excluded_article)].copy()
+        for c in [
+            "open_card_count", "cart_count", "orders_funnel", "buyouts_funnel", "cancel_funnel",
+            "orders_from_orders", "search_frequency", "search_queries_count", "ad_impressions", "ad_clicks", "ad_orders", "ad_spend",
+        ]:
+            cur[c] = to_numeric(cur.get(c, 0)).fillna(0)
+        for c in ["conv_to_cart", "conv_cart_to_order", "finishedPrice_avg", "priceWithDisc_avg", "spp_avg", "median_position", "visibility_pct", "ad_ctr", "ad_cpc"]:
+            cur[c] = to_numeric(cur.get(c, np.nan))
+        cur["period_name"] = cur["day"].map(self._period_name)
+        cur = cur[cur["period_name"].notna()].copy()
+        return cur.sort_values(["day", "subject", "supplier_article"])
+
+    # ---------- Demand ----------
+    def build_subject_demand_daily(self) -> pd.DataFrame:
+        if self.data.search.empty:
+            return pd.DataFrame(columns=["day", "subject", "demand_day"])
+        s = self.data.search.copy()
+        s = s[s["day"].notna()].copy()
+        # unique query per day per subject: max frequency to avoid duplicates across sku
+        uq = s.groupby(["day", "subject", "query"], dropna=False)["frequency"].max().reset_index()
+        out = uq.groupby(["day", "subject"], dropna=False)["frequency"].sum().reset_index(name="demand_day")
+        out["period_name"] = out["day"].map(self._period_name)
+        return out[out["period_name"].notna()].copy()
+
+    # ---------- Localization ----------
+    def build_localization_daily(self) -> pd.DataFrame:
+        if self.data.orders.empty or self.data.stocks.empty:
+            return pd.DataFrame()
+        latest_day = self.windows["cur_end"]
+        lookback_start = latest_day - pd.Timedelta(days=27)
+
+        orders = self.data.orders.copy()
+        orders = orders[(orders["day"] >= lookback_start) & (orders["day"] <= latest_day)].copy()
+        orders = orders[~orders["supplier_article"].map(is_excluded_article)].copy()
+        orders["orders"] = to_numeric(orders["orders"]).fillna(1)
+        wh_avg = orders.groupby(["supplier_article", "warehouse"], dropna=False)["orders"].sum().reset_index(name="orders_28d")
+        wh_avg["avg_orders_per_day_warehouse"] = wh_avg["orders_28d"] / 28.0
+
+        latest_stock = self.data.stocks.copy()
+        latest_stock = latest_stock[~latest_stock["supplier_article"].map(is_excluded_article)].copy()
+        # Main warehouses from latest snapshot inside current window, fallback latest overall
+        if "day" in latest_stock.columns and latest_stock["day"].notna().any():
+            last_snapshot_day = pd.to_datetime(latest_stock["day"], errors="coerce").max()
+            snap = latest_stock[pd.to_datetime(latest_stock["day"], errors="coerce") == last_snapshot_day].copy()
+        else:
+            max_week = latest_stock["week_end"].max()
+            snap = latest_stock[latest_stock["week_end"] == max_week].copy()
+        main_wh_rows = []
+        for art, g in snap.groupby("supplier_article"):
+            g = g.groupby("warehouse", dropna=False)["stock_available"].sum().reset_index()
+            total = g["stock_available"].sum()
+            if total <= 0:
+                continue
+            g = g.sort_values("stock_available", ascending=False)
+            g["share"] = g["stock_available"] / total
+            g["cum"] = g["share"].cumsum()
+            cutoff = g.index[g["cum"] >= 0.97]
+            end_idx = cutoff[0] if len(cutoff) else g.index[-1]
+            kept = g.loc[:end_idx].copy()
+            # weights from orders, fallback stock share
+            ords = wh_avg[wh_avg["supplier_article"] == art][["warehouse", "orders_28d", "avg_orders_per_day_warehouse"]]
+            kept = kept.merge(ords, on="warehouse", how="left")
+            if kept["orders_28d"].fillna(0).sum() > 0:
+                kept["warehouse_weight"] = kept["orders_28d"].fillna(0) / kept["orders_28d"].fillna(0).sum()
+            else:
+                kept["warehouse_weight"] = kept["share"]
+            kept["supplier_article"] = art
+            main_wh_rows.append(kept[["supplier_article", "warehouse", "share", "warehouse_weight", "avg_orders_per_day_warehouse"]])
+        main_wh = pd.concat(main_wh_rows, ignore_index=True) if main_wh_rows else pd.DataFrame(columns=["supplier_article", "warehouse", "share", "warehouse_weight", "avg_orders_per_day_warehouse"])
+
+        # expand weekly stock snapshots to days
+        expanded = []
+        for _, row in latest_stock.iterrows():
+            art = row.get("supplier_article", "")
+            if is_excluded_article(art):
+                continue
+            week_code = row.get("week_code")
+            ws, we = week_bounds_from_code(week_code) if week_code else (None, None)
+            if ws is None:
+                if pd.notna(row.get("week_start")) and pd.notna(row.get("week_end")):
+                    ws = pd.Timestamp(row["week_start"]).date()
+                    we = pd.Timestamp(row["week_end"]).date()
+                elif pd.notna(row.get("day")):
+                    d = pd.Timestamp(row["day"]).normalize()
+                    ws = d.date()
+                    we = d.date()
+            if ws is None:
+                continue
+            d = pd.Timestamp(ws)
+            end_d = pd.Timestamp(we)
+            while d <= end_d:
+                if self.windows["prev_start"] <= d <= self.windows["cur_end"]:
+                    expanded.append({
+                        "day": d,
+                        "supplier_article": art,
+                        "warehouse": normalize_text(row.get("warehouse")),
+                        "stock_qty": float(row.get("stock_available", 0) or 0),
+                    })
+                d += pd.Timedelta(days=1)
+        if not expanded:
+            return pd.DataFrame()
+        exp = pd.DataFrame(expanded)
+        exp = exp.merge(main_wh, on=["supplier_article", "warehouse"], how="inner")
+        if exp.empty:
+            return pd.DataFrame()
+        exp["avg_orders_per_day_warehouse"] = to_numeric(exp["avg_orders_per_day_warehouse"]).fillna(0)
+        exp["coverage_days"] = exp.apply(lambda r: safe_div(r["stock_qty"], r["avg_orders_per_day_warehouse"]) if r["avg_orders_per_day_warehouse"] > 0 else (999999 if r["stock_qty"] > 0 else 0), axis=1)
+        exp["is_available_flag"] = np.where(
+            exp["avg_orders_per_day_warehouse"] <= 0,
+            np.where(exp["stock_qty"] > 0, 1, 0),
+            np.where(exp["stock_qty"] >= exp["avg_orders_per_day_warehouse"], 1, 0),
+        )
+        exp["period_name"] = exp["day"].map(self._period_name)
+        exp = exp[exp["period_name"].notna()].copy()
+        return exp.sort_values(["supplier_article", "day", "warehouse"])
+
+    def build_localization_period(self) -> pd.DataFrame:
+        if self.localization_daily.empty:
+            return pd.DataFrame()
+        g = self.localization_daily.groupby(["supplier_article", "period_name"], dropna=False).apply(
+            lambda x: pd.Series({
+                "localization_coverage_count": x.groupby(["day"])["is_available_flag"].mean().mean(),
+                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: np.average(d["is_available_flag"], weights=d["warehouse_weight"])) .mean(),
+                "main_warehouses_count": x["warehouse"].nunique(),
+            })
+        ).reset_index()
+        return self.attach_master(g)
+
+    # ---------- Period metrics ----------
+    def build_article_period_metrics(self) -> pd.DataFrame:
+        rows = []
+        periods = ["prev_14d", "cur_14d"]
+
+        # Daily ops aggregation
+        ops = self.daily_article.copy()
+        ops_period = ops.groupby(["supplier_article", "period_name"], dropna=False).apply(
+            lambda g: pd.Series({
+                "open_card_count": g["open_card_count"].sum(),
+                "cart_count": g["cart_count"].sum(),
+                "orders_funnel": g["orders_funnel"].sum(),
+                "buyouts_funnel": g["buyouts_funnel"].sum(),
+                "cancel_funnel": g["cancel_funnel"].sum(),
+                "conv_to_cart": safe_div(g["cart_count"].sum(), g["open_card_count"].sum()) * 100 if g["open_card_count"].sum() else np.nan,
+                "conv_cart_to_order": safe_div(g["orders_funnel"].sum(), g["cart_count"].sum()) * 100 if g["cart_count"].sum() else np.nan,
+                "finishedPrice_avg": weighted_mean(g["finishedPrice_avg"], g["orders_from_orders"].replace(0, 1)),
+                "priceWithDisc_avg": weighted_mean(g["priceWithDisc_avg"], g["orders_from_orders"].replace(0, 1)),
+                "spp_avg": weighted_mean(g["spp_avg"], g["orders_from_orders"].replace(0, 1)),
+                "search_frequency_article": g["search_frequency"].sum(),
+                "median_position_article": weighted_avg_position(g["median_position"], g["search_frequency"].replace(0, 1)),
+                "visibility_pct_article": weighted_mean(g["visibility_pct"], g["search_frequency"].replace(0, 1)),
+                "search_queries_count": g["search_queries_count"].sum(),
+                "ad_impressions": g["ad_impressions"].sum(),
+                "ad_clicks": g["ad_clicks"].sum(),
+                "ad_orders": g["ad_orders"].sum(),
+                "ad_spend": g["ad_spend"].sum(),
+                "ad_ctr": safe_div(g["ad_clicks"].sum(), g["ad_impressions"].sum()) * 100 if g["ad_impressions"].sum() else np.nan,
+                "ad_cpc": safe_div(g["ad_spend"].sum(), g["ad_clicks"].sum()) if g["ad_clicks"].sum() else np.nan,
+            })
+        ).reset_index()
+
+        # ABC fact
+        abc = self.data.abc.copy()
+        if not abc.empty:
+            abc["period_name"] = abc["week_end"].map(lambda d: self._period_name(pd.Timestamp(d)) if pd.notna(d) else None)
+            abc = abc[abc["period_name"].isin(periods)].copy()
+            abc_period = abc.groupby(["supplier_article", "period_name"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "abc_revenue": to_numeric(g["gross_revenue"]).sum(),
+                    "abc_gp": to_numeric(g["gross_profit"]).sum(),
+                    "abc_sales_qty": to_numeric(g["abc_sales_qty"]).sum(),
+                    "drr_pct": weighted_mean(g["drr_pct"], g["gross_revenue"].replace(0, np.nan)),
+                    "margin_pct": weighted_mean(g["margin_pct"], g["gross_revenue"].replace(0, np.nan)),
+                    "profitability_pct": weighted_mean(g["profitability_pct"], g["gross_revenue"].replace(0, np.nan)),
+                    "abc_finished_price": weighted_mean(g["abc_finished_price"], g["abc_sales_qty"].replace(0, 1)),
+                    "abc_open_card": to_numeric(g.get("abc_open_card", pd.Series())).sum() if "abc_open_card" in g.columns else np.nan,
+                    "abc_cart": to_numeric(g.get("abc_cart", pd.Series())).sum() if "abc_cart" in g.columns else np.nan,
+                    "abc_orders_funnel": to_numeric(g.get("abc_orders_funnel", pd.Series())).sum() if "abc_orders_funnel" in g.columns else np.nan,
+                })
+            ).reset_index()
+        else:
+            abc_period = pd.DataFrame(columns=["supplier_article", "period_name"])
+
+        # Economics weighted by net_sales_qty
+        econ = self.data.economics.copy()
+        if not econ.empty:
+            week_to_period = {}
+            for week_code in econ["week"].dropna().astype(str).unique():
+                ws, we = week_bounds_from_code(week_code)
+                if we is None:
+                    continue
+                week_to_period[week_code] = self._period_name(pd.Timestamp(we))
+            econ["period_name"] = econ["week"].astype(str).map(week_to_period)
+            econ = econ[econ["period_name"].isin(periods)].copy()
+            econ["weight"] = to_numeric(econ.get("net_sales_qty", np.nan)).fillna(to_numeric(econ.get("sales_qty", np.nan))).fillna(0)
+            econ_period = econ.groupby(["supplier_article", "period_name"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "econ_sales_qty": to_numeric(g["sales_qty"]).sum(),
+                    "econ_net_sales_qty": to_numeric(g["net_sales_qty"]).sum(),
+                    "buyout_pct": weighted_mean(g["buyout_pct"], g["weight"].replace(0, 1)),
+                    "econ_priceWithDisc": weighted_mean(g["econ_price_with_disc"], g["weight"].replace(0, 1)),
+                    "econ_finishedPrice": weighted_mean(g["econ_finished_price"], g["weight"].replace(0, 1)),
+                    "econ_spp": weighted_mean(g["spp"], g["weight"].replace(0, 1)),
+                    "commission_unit": weighted_mean(g["commission_unit"], g["weight"].replace(0, 1)),
+                    "acquiring_unit": weighted_mean(g["acquiring_unit"], g["weight"].replace(0, 1)),
+                    "logistics_direct_unit": weighted_mean(g["logistics_direct_unit"], g["weight"].replace(0, 1)),
+                    "logistics_return_unit": weighted_mean(g["logistics_return_unit"], g["weight"].replace(0, 1)),
+                    "storage_unit": weighted_mean(g["storage_unit"], g["weight"].replace(0, 1)),
+                    "acceptance_unit": weighted_mean(g["acceptance_unit"], g["weight"].replace(0, 1)),
+                    "penalties_unit": weighted_mean(g["penalties_unit"], g["weight"].replace(0, 1)),
+                    "ads_unit": weighted_mean(g["ads_unit"], g["weight"].replace(0, 1)),
+                    "other_unit": weighted_mean(g["other_unit"], g["weight"].replace(0, 1)),
+                    "cost_unit": weighted_mean(g["cost_unit"], g["weight"].replace(0, 1)),
+                    "gp_unit": weighted_mean(g["gp_unit"], g["weight"].replace(0, 1)),
+                    "np_unit": weighted_mean(g["np_unit"], g["weight"].replace(0, 1)),
+                    "econ_margin_pct": weighted_mean(g["margin_pct"], g["weight"].replace(0, 1)),
+                    "econ_profitability_pct": weighted_mean(g["profitability_pct"], g["weight"].replace(0, 1)),
+                })
+            ).reset_index()
+        else:
+            econ_period = pd.DataFrame(columns=["supplier_article", "period_name"])
+
+        # Article clicks from entry points sku weekly
+        entry = self.data.entry_points_sku.copy()
+        if not entry.empty:
+            entry["period_name"] = entry["week_end"].map(lambda d: self._period_name(pd.Timestamp(d)) if pd.notna(d) else None)
+            entry = entry[entry["period_name"].isin(periods)].copy()
+            entry_period = entry.groupby(["supplier_article", "period_name"], dropna=False).apply(
+                lambda g: pd.Series({
+                    "impressions_total": to_numeric(g["impressions"]).sum(),
+                    "clicks_total": to_numeric(g["clicks"]).sum(),
+                    "entry_cart": to_numeric(g["cart"]).sum(),
+                    "entry_orders": to_numeric(g["orders"]).sum(),
+                    "ctr_total": safe_div(to_numeric(g["clicks"]).sum(), to_numeric(g["impressions"]).sum()) * 100 if to_numeric(g["impressions"]).sum() else np.nan,
+                    "cr_click_to_order": safe_div(to_numeric(g["orders"]).sum(), to_numeric(g["clicks"]).sum()) * 100 if to_numeric(g["clicks"]).sum() else np.nan,
+                    "entry_conv_cart": safe_div(to_numeric(g["cart"]).sum(), to_numeric(g["clicks"]).sum()) * 100 if to_numeric(g["clicks"]).sum() else np.nan,
+                    "entry_conv_order": safe_div(to_numeric(g["orders"]).sum(), to_numeric(g["cart"]).sum()) * 100 if to_numeric(g["cart"]).sum() else np.nan,
+                })
+            ).reset_index()
+        else:
+            entry_period = pd.DataFrame(columns=["supplier_article", "period_name"])
+
+        # Localization
+        localization_period = self.build_localization_period()
+
+        # Category demand map
+        demand = self.demand_daily_subject.copy()
+        if not demand.empty:
+            demand_period = demand.groupby(["subject", "period_name"], dropna=False)["demand_day"].sum().reset_index(name="category_demand")
+        else:
+            demand_period = pd.DataFrame(columns=["subject", "period_name", "category_demand"])
+
+        # merge all by article-period
+        keys = unique_preserve(
+            list(ops_period[["supplier_article", "period_name"]].drop_duplicates().itertuples(index=False, name=None)) +
+            list(abc_period[["supplier_article", "period_name"]].drop_duplicates().itertuples(index=False, name=None)) +
+            list(econ_period[["supplier_article", "period_name"]].drop_duplicates().itertuples(index=False, name=None)) +
+            list(entry_period[["supplier_article", "period_name"]].drop_duplicates().itertuples(index=False, name=None)) +
+            list(localization_period[["supplier_article", "period_name"]].drop_duplicates().itertuples(index=False, name=None))
+        )
+        base = pd.DataFrame(keys, columns=["supplier_article", "period_name"])
+        for x in [ops_period, abc_period, econ_period, entry_period, localization_period]:
+            if not x.empty:
+                base = base.merge(x, on=["supplier_article", "period_name"], how="left")
+        base = self.attach_master(base)
+        base = base.merge(demand_period, on=["subject", "period_name"], how="left")
+        # prices vs RRP
+        base["finishedPrice_rrp_coeff"] = base.apply(lambda r: safe_div(r.get("finishedPrice_avg"), r.get("rrp")), axis=1)
+        base["priceWithDisc_rrp_coeff"] = base.apply(lambda r: safe_div(r.get("priceWithDisc_avg"), r.get("rrp")), axis=1)
+        base = base[~base["supplier_article"].map(is_excluded_article)].copy()
+        return base.sort_values(["subject", "code", "supplier_article", "period_name"])
+
+    # ---------- Compare ----------
+    def build_compare(self, df: pd.DataFrame, id_cols: List[str]) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        metric_cols = [c for c in df.columns if c not in set(id_cols + ["period_name"]) ]
+        cur = df[df["period_name"] == "cur_14d"].copy().drop(columns=["period_name"])
+        prev = df[df["period_name"] == "prev_14d"].copy().drop(columns=["period_name"])
+        cur = cur.rename(columns={c: f"{c}_cur" for c in metric_cols})
+        prev = prev.rename(columns={c: f"{c}_prev" for c in metric_cols})
+        out = prev.merge(cur, on=id_cols, how="outer")
+
+        # top level deltas
+        delta_pairs_pct = [
+            "abc_revenue", "abc_gp", "abc_sales_qty", "gp_unit", "open_card_count", "clicks_total", "ctr_total", "cr_click_to_order",
+            "finishedPrice_avg", "priceWithDisc_avg", "spp_avg", "category_demand", "median_position_article", "visibility_pct_article",
+            "ad_spend", "ad_clicks", "ad_orders", "localization_coverage_weighted", "drr_pct", "margin_pct", "profitability_pct",
+        ]
+        for m in delta_pairs_pct:
+            if f"{m}_cur" in out.columns or f"{m}_prev" in out.columns:
+                out[f"{m}_delta_pct"] = out.apply(lambda r: pct_delta(r.get(f"{m}_cur"), r.get(f"{m}_prev")), axis=1)
+                out[f"{m}_delta_abs"] = out.apply(lambda r: (r.get(f"{m}_cur") - r.get(f"{m}_prev")) if pd.notna(r.get(f"{m}_cur")) and pd.notna(r.get(f"{m}_prev")) else np.nan, axis=1)
+        out["gp_per_order_prev"] = out.apply(lambda r: safe_div(r.get("abc_gp_prev"), r.get("abc_sales_qty_prev")), axis=1)
+        out["gp_per_order_cur"] = out.apply(lambda r: safe_div(r.get("abc_gp_cur"), r.get("abc_sales_qty_cur")), axis=1)
+        out["gp_per_order_delta_pct"] = out.apply(lambda r: pct_delta(r.get("gp_per_order_cur"), r.get("gp_per_order_prev")), axis=1)
+        out["revenue_per_order_prev"] = out.apply(lambda r: safe_div(r.get("abc_revenue_prev"), r.get("abc_sales_qty_prev")), axis=1)
+        out["revenue_per_order_cur"] = out.apply(lambda r: safe_div(r.get("abc_revenue_cur"), r.get("abc_sales_qty_cur")), axis=1)
+        out["revenue_per_order_delta_pct"] = out.apply(lambda r: pct_delta(r.get("revenue_per_order_cur"), r.get("revenue_per_order_prev")), axis=1)
+
+        # contributions
+        out["gp_volume_effect"] = (out["abc_sales_qty_cur"].fillna(0) - out["abc_sales_qty_prev"].fillna(0)) * out["gp_per_order_prev"].fillna(0)
+        out["gp_economy_effect"] = (out["gp_per_order_cur"].fillna(0) - out["gp_per_order_prev"].fillna(0)) * out["abc_sales_qty_cur"].fillna(0)
+        out["orders_traffic_effect"] = (out["clicks_total_cur"].fillna(0) - out["clicks_total_prev"].fillna(0)) * out["cr_click_to_order_prev"].fillna(0) / 100.0
+        out["orders_conversion_effect"] = (out["cr_click_to_order_cur"].fillna(0) - out["cr_click_to_order_prev"].fillna(0)) * out["clicks_total_cur"].fillna(0) / 100.0
+        out["revenue_order_effect"] = (out["abc_sales_qty_cur"].fillna(0) - out["abc_sales_qty_prev"].fillna(0)) * out["revenue_per_order_prev"].fillna(0)
+        out["revenue_price_effect"] = (out["revenue_per_order_cur"].fillna(0) - out["revenue_per_order_prev"].fillna(0)) * out["abc_sales_qty_cur"].fillna(0)
+
+        # flags & reasons
+        out = self.add_flags_and_reasons(out)
+        return out
+
+    def add_flags_and_reasons(self, out: pd.DataFrame) -> pd.DataFrame:
+        def flag(col, cond):
+            out[col] = cond.astype(int)
+        flag("flag_orders_down", out["abc_sales_qty_delta_pct"] <= -0.08)
+        flag("flag_orders_up", out["abc_sales_qty_delta_pct"] >= 0.08)
+        flag("flag_clicks_down", out["clicks_total_delta_pct"] <= -0.08)
+        flag("flag_clicks_up", out["clicks_total_delta_pct"] >= 0.08)
+        flag("flag_ctr_down", out["ctr_total_delta_pct"] <= -0.05)
+        flag("flag_ctr_up", out["ctr_total_delta_pct"] >= 0.05)
+        flag("flag_conversion_down", out["cr_click_to_order_delta_pct"] <= -0.08)
+        flag("flag_conversion_up", out["cr_click_to_order_delta_pct"] >= 0.08)
+        flag("flag_market_demand_down", out["category_demand_delta_pct"] <= -0.08)
+        flag("flag_market_demand_up", out["category_demand_delta_pct"] >= 0.08)
+        flag("flag_visibility_down", (out["visibility_pct_article_delta_pct"] <= -0.08) | (out["median_position_article_delta_abs"] >= 1.0))
+        flag("flag_visibility_up", (out["visibility_pct_article_delta_pct"] >= 0.08) | (out["median_position_article_delta_abs"] <= -1.0))
+        flag("flag_finished_price_up", out["finishedPrice_avg_delta_pct"] >= 0.03)
+        flag("flag_finished_price_down", out["finishedPrice_avg_delta_pct"] <= -0.03)
+        flag("flag_pwd_up", out["priceWithDisc_avg_delta_pct"] >= 0.02)
+        flag("flag_pwd_down", out["priceWithDisc_avg_delta_pct"] <= -0.02)
+        flag("flag_spp_up", out["spp_avg_delta_abs"] >= 2.0)
+        flag("flag_spp_down", out["spp_avg_delta_abs"] <= -2.0)
+        flag("flag_stock_constraint", out["localization_coverage_weighted_delta_abs"] <= -0.15)
+        flag("flag_gp_per_order_down", out["gp_per_order_delta_pct"] <= -0.05)
+        flag("flag_gp_per_order_up", out["gp_per_order_delta_pct"] >= 0.05)
+        flag("flag_margin_down", out["margin_pct_delta_abs"] <= -2.0)
+        flag("flag_margin_up", out["margin_pct_delta_abs"] >= 2.0)
+        flag("flag_logistics_up", ((out["logistics_direct_unit_cur"].fillna(0) + out["logistics_return_unit_cur"].fillna(0)) - (out["logistics_direct_unit_prev"].fillna(0) + out["logistics_return_unit_prev"].fillna(0))) >= 0.10 * (out["logistics_direct_unit_prev"].fillna(0) + out["logistics_return_unit_prev"].fillna(0)).replace(0, np.nan))
+        flag("flag_commission_up", (out["commission_unit_delta_abs"] >= 0.05 * out["commission_unit_prev"].replace(0, np.nan)))
+        flag("flag_ads_unit_up", out["ads_unit_delta_abs"] >= 0.10 * out["ads_unit_prev"].replace(0, np.nan))
+        flag("flag_ad_spend_up", out["ad_spend_delta_pct"] >= 0.15)
+        flag("flag_ad_traffic_no_result", (out["ad_spend_delta_pct"] >= 0.15) & (out["ad_clicks_delta_pct"] >= 0.08) & (out["abc_sales_qty_delta_pct"] < 0.05))
+        flag("flag_ad_growth_effective", (out["ad_spend_delta_pct"] >= 0.15) & (out["ad_clicks_delta_pct"] >= 0.08) & (out["abc_sales_qty_delta_pct"] >= 0.08) & (out["abc_gp_delta_pct"] >= 0.05))
+        flag("flag_ad_destructive", (out["ad_spend_delta_pct"] >= 0.15) & (out["abc_gp_delta_pct"] < 0))
+        flag("flag_price_cut_unprofitable", (out["priceWithDisc_avg_delta_pct"] <= -0.02) & (out["abc_sales_qty_delta_pct"] < 0.08) & (out["abc_gp_delta_pct"] < -0.05))
+        flag("flag_price_cut_profitable", (out["priceWithDisc_avg_delta_pct"] <= -0.02) & (out["abc_sales_qty_delta_pct"] >= 0.12) & (out["abc_gp_delta_pct"] > 0))
+        flag("flag_price_hike_profitable", (out["priceWithDisc_avg_delta_pct"] >= 0.02) & (out["abc_sales_qty_delta_pct"] > -0.05) & (out["abc_gp_delta_pct"] > 0))
+        flag("flag_price_hike_harmful", (out["priceWithDisc_avg_delta_pct"] >= 0.02) & (out["abc_sales_qty_delta_pct"] < -0.08) & (out["abc_gp_delta_pct"] < 0))
+
+        def ad_assessment(r: pd.Series) -> str:
+            if r.get("flag_ad_growth_effective", 0):
+                return "Эффективно"
+            if r.get("flag_ad_destructive", 0):
+                return "Неэффективно"
+            if r.get("flag_ad_traffic_no_result", 0):
+                return "Частично эффективно"
+            if pd.notna(r.get("ad_spend_delta_pct")) and r.get("ad_spend_delta_pct") > 0 and (r.get("flag_visibility_up", 0) or (pd.notna(r.get("visibility_pct_article_delta_abs")) and r.get("visibility_pct_article_delta_abs") >= 0)):
+                return "Защитно"
+            return "Нейтрально"
+
+        def price_assessment(r: pd.Series) -> str:
+            if r.get("flag_price_cut_unprofitable", 0):
+                return "Снижение priceWithDisc не оправдано"
+            if r.get("flag_price_cut_profitable", 0):
+                return "Снижение priceWithDisc оправдано"
+            if r.get("flag_price_hike_profitable", 0):
+                return "Повышение priceWithDisc оправдано"
+            if r.get("flag_price_hike_harmful", 0):
+                return "Повышение priceWithDisc вредно"
+            if r.get("flag_finished_price_up", 0) and (r.get("flag_ctr_down", 0) or r.get("flag_conversion_down", 0)):
+                return "finishedPrice давит на конверсию"
+            if r.get("flag_finished_price_down", 0) and not (r.get("flag_orders_up", 0) or r.get("flag_conversion_up", 0)):
+                return "Снижение finishedPrice не дало заметного эффекта"
+            return "Нейтрально"
+
+        def choose_reasons(r: pd.Series) -> Tuple[str, str]:
+            volume_driven = abs(r.get("gp_volume_effect", 0) or 0) >= abs(r.get("gp_economy_effect", 0) or 0)
+            primary = "Нейтрально"
+            secondary = ""
+            if volume_driven:
+                if r.get("flag_stock_constraint", 0):
+                    primary = "Ограничение локализации"
+                elif r.get("flag_market_demand_down", 0):
+                    primary = "Снижение рыночного спроса"
+                elif r.get("flag_visibility_down", 0) and r.get("flag_clicks_down", 0):
+                    primary = "Потеря поисковой доли"
+                elif r.get("flag_ctr_down", 0) and r.get("flag_clicks_down", 0):
+                    primary = "Снижение CTR"
+                elif r.get("flag_conversion_down", 0):
+                    primary = "Снижение конверсии"
+                elif r.get("flag_finished_price_up", 0):
+                    primary = "Ценовой фактор для покупателя"
+                elif r.get("flag_spp_down", 0) or r.get("flag_spp_up", 0):
+                    primary = "Изменение SPP"
+                else:
+                    primary = "Изменение объема заказов"
+                if r.get("flag_ad_destructive", 0) or r.get("flag_ad_traffic_no_result", 0):
+                    secondary = "Реклама"
+                elif r.get("flag_finished_price_up", 0) or r.get("flag_finished_price_down", 0):
+                    secondary = "Цена для покупателя"
+                elif r.get("flag_stock_constraint", 0):
+                    secondary = "Локализация"
+            else:
+                if r.get("flag_price_cut_unprofitable", 0) or r.get("flag_price_hike_harmful", 0):
+                    primary = "Неудачное изменение priceWithDisc"
+                elif r.get("flag_ads_unit_up", 0):
+                    primary = "Реклама съела прибыль"
+                elif r.get("flag_logistics_up", 0):
+                    primary = "Рост логистики"
+                elif r.get("flag_commission_up", 0):
+                    primary = "Рост комиссии"
+                elif r.get("flag_margin_down", 0):
+                    primary = "Снижение рентабельности"
+                elif r.get("flag_gp_per_order_down", 0):
+                    primary = "Снижение прибыли на единицу"
+                else:
+                    primary = "Изменение unit economics"
+                if r.get("flag_finished_price_up", 0) or r.get("flag_pwd_up", 0) or r.get("flag_pwd_down", 0):
+                    secondary = "Цена"
+                elif r.get("flag_ad_destructive", 0):
+                    secondary = "Реклама"
+            return primary, secondary
+
+        out["ad_assessment"] = out.apply(ad_assessment, axis=1)
+        out["price_assessment"] = out.apply(price_assessment, axis=1)
+        reasons = out.apply(choose_reasons, axis=1)
+        out["primary_reason"] = [x[0] for x in reasons]
+        out["secondary_reason"] = [x[1] for x in reasons]
+        return out
+
+    def aggregate_compare(self, period_df: pd.DataFrame, level: str) -> pd.DataFrame:
+        if period_df.empty:
+            return pd.DataFrame()
+        if level == "product":
+            group_cols = ["code", "subject"]
+        elif level == "category":
+            group_cols = ["subject"]
+        else:
+            raise ValueError(level)
+
+        sum_cols = [
+            "abc_revenue", "abc_gp", "abc_sales_qty", "open_card_count", "cart_count", "orders_funnel", "buyouts_funnel", "cancel_funnel",
+            "search_frequency_article", "search_queries_count", "ad_impressions", "ad_clicks", "ad_orders", "ad_spend",
+            "impressions_total", "clicks_total", "entry_cart", "entry_orders",
+        ]
+        weight_cols = {
+            "finishedPrice_avg": "abc_sales_qty",
+            "priceWithDisc_avg": "abc_sales_qty",
+            "spp_avg": "abc_sales_qty",
+            "finishedPrice_rrp_coeff": "abc_sales_qty",
+            "priceWithDisc_rrp_coeff": "abc_sales_qty",
+            "median_position_article": "search_frequency_article",
+            "visibility_pct_article": "search_frequency_article",
+            "category_demand": "abc_sales_qty",
+            "localization_coverage_count": "abc_sales_qty",
+            "localization_coverage_weighted": "abc_sales_qty",
+            "drr_pct": "abc_revenue",
+            "margin_pct": "abc_revenue",
+            "profitability_pct": "abc_revenue",
+            "commission_unit": "abc_sales_qty",
+            "acquiring_unit": "abc_sales_qty",
+            "logistics_direct_unit": "abc_sales_qty",
+            "logistics_return_unit": "abc_sales_qty",
+            "storage_unit": "abc_sales_qty",
+            "acceptance_unit": "abc_sales_qty",
+            "penalties_unit": "abc_sales_qty",
+            "ads_unit": "abc_sales_qty",
+            "other_unit": "abc_sales_qty",
+            "cost_unit": "abc_sales_qty",
+            "gp_unit": "abc_sales_qty",
+            "np_unit": "abc_sales_qty",
+            "econ_margin_pct": "abc_sales_qty",
+            "econ_profitability_pct": "abc_sales_qty",
+            "ctr_total": "impressions_total",
+            "cr_click_to_order": "clicks_total",
+            "entry_conv_cart": "clicks_total",
+            "entry_conv_order": "entry_cart",
+            "ad_ctr": "ad_impressions",
+            "ad_cpc": "ad_clicks",
+        }
+        rows = []
+        for keys, g in period_df.groupby(group_cols + ["period_name"], dropna=False):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            row = dict(zip(group_cols + ["period_name"], keys))
+            for c in sum_cols:
+                row[c] = to_numeric(g.get(c, pd.Series(dtype=float))).sum()
+            for c, w in weight_cols.items():
+                row[c] = weighted_mean(g.get(c, pd.Series(dtype=float)), g.get(w, pd.Series(dtype=float)).replace(0, 1))
+            rows.append(row)
+        agg = pd.DataFrame(rows)
+        return self.build_compare(agg, group_cols)
+
+    # ---------- Channels ----------
+    def build_channel_compare(self) -> pd.DataFrame:
+        rows = []
+        periods = ["prev_14d", "cur_14d"]
+        if not self.data.entry_points_sku.empty:
+            x = self.data.entry_points_sku.copy()
+            x["period_name"] = x["week_end"].map(lambda d: self._period_name(pd.Timestamp(d)) if pd.notna(d) else None)
+            x = x[x["period_name"].isin(periods)].copy()
+            x = self.attach_master(x)
+            # article channels
+            for (article, entry_point, period_name), g in x.groupby(["supplier_article", "entry_point", "period_name"], dropna=False):
+                rows.append({
+                    "entity_level": "article",
+                    "entity_id": article,
+                    "entry_point": entry_point,
+                    "period_name": period_name,
+                    "impressions": to_numeric(g["impressions"]).sum(),
+                    "clicks": to_numeric(g["clicks"]).sum(),
+                    "orders": to_numeric(g["orders"]).sum(),
+                    "ctr": safe_div(to_numeric(g["clicks"]).sum(), to_numeric(g["impressions"]).sum()) * 100 if to_numeric(g["impressions"]).sum() else np.nan,
+                    "conv_order": safe_div(to_numeric(g["orders"]).sum(), to_numeric(g["clicks"]).sum()) * 100 if to_numeric(g["clicks"]).sum() else np.nan,
+                })
+            # product channels
+            for (code, entry_point, period_name), g in x.groupby(["code", "entry_point", "period_name"], dropna=False):
+                rows.append({
+                    "entity_level": "product",
+                    "entity_id": code,
+                    "entry_point": entry_point,
+                    "period_name": period_name,
+                    "impressions": to_numeric(g["impressions"]).sum(),
+                    "clicks": to_numeric(g["clicks"]).sum(),
+                    "orders": to_numeric(g["orders"]).sum(),
+                    "ctr": safe_div(to_numeric(g["clicks"]).sum(), to_numeric(g["impressions"]).sum()) * 100 if to_numeric(g["impressions"]).sum() else np.nan,
+                    "conv_order": safe_div(to_numeric(g["orders"]).sum(), to_numeric(g["clicks"]).sum()) * 100 if to_numeric(g["clicks"]).sum() else np.nan,
+                })
+        if not self.data.entry_points_category.empty:
+            x = self.data.entry_points_category.copy()
+            x["period_name"] = x["week_end"].map(lambda d: self._period_name(pd.Timestamp(d)) if pd.notna(d) else None)
+            x = x[x["period_name"].isin(periods)].copy()
+            for (entry_point, period_name), g in x.groupby(["entry_point", "period_name"], dropna=False):
+                rows.append({
+                    "entity_level": "category_total",
+                    "entity_id": "ALL",
+                    "entry_point": entry_point,
+                    "period_name": period_name,
+                    "impressions": to_numeric(g["impressions"]).sum(),
+                    "clicks": to_numeric(g["clicks"]).sum(),
+                    "orders": to_numeric(g["orders"]).sum(),
+                    "ctr": safe_div(to_numeric(g["clicks"]).sum(), to_numeric(g["impressions"]).sum()) * 100 if to_numeric(g["impressions"]).sum() else np.nan,
+                    "conv_order": safe_div(to_numeric(g["orders"]).sum(), to_numeric(g["clicks"]).sum()) * 100 if to_numeric(g["clicks"]).sum() else np.nan,
+                })
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        cur = df[df["period_name"] == "cur_14d"].drop(columns=["period_name"]).rename(columns={c: f"{c}_cur" for c in ["impressions", "clicks", "orders", "ctr", "conv_order"]})
+        prev = df[df["period_name"] == "prev_14d"].drop(columns=["period_name"]).rename(columns={c: f"{c}_prev" for c in ["impressions", "clicks", "orders", "ctr", "conv_order"]})
+        out = prev.merge(cur, on=["entity_level", "entity_id", "entry_point"], how="outer")
+        for m in ["impressions", "clicks", "orders", "ctr", "conv_order"]:
+            out[f"{m}_delta_pct"] = out.apply(lambda r: pct_delta(r.get(f"{m}_cur"), r.get(f"{m}_prev")), axis=1)
+            out[f"{m}_delta_abs"] = out.apply(lambda r: (r.get(f"{m}_cur") - r.get(f"{m}_prev")) if pd.notna(r.get(f"{m}_cur")) and pd.notna(r.get(f"{m}_prev")) else np.nan, axis=1)
+        # contribution to order delta within entity
+        contrib = []
+        for (lvl, eid), g in out.groupby(["entity_level", "entity_id"], dropna=False):
+            total_delta = to_numeric(g["orders_delta_abs"]).sum()
+            gg = g.copy()
+            gg["orders_delta_contribution"] = gg["orders_delta_abs"] / total_delta if total_delta not in [0, np.nan] else np.nan
+            contrib.append(gg)
+        return pd.concat(contrib, ignore_index=True) if contrib else out
+
+    # ---------- SKU contribution ----------
+    def build_sku_contribution(self) -> pd.DataFrame:
+        if self.article_compare.empty:
+            return pd.DataFrame()
+        x = self.article_compare.copy()
+        x["sku_gp_delta"] = x["abc_gp_cur"].fillna(0) - x["abc_gp_prev"].fillna(0)
+        x["sku_revenue_delta"] = x["abc_revenue_cur"].fillna(0) - x["abc_revenue_prev"].fillna(0)
+        x["sku_orders_delta"] = x["abc_sales_qty_cur"].fillna(0) - x["abc_sales_qty_prev"].fillna(0)
+        product_delta = x.groupby("code")["sku_gp_delta"].sum().reset_index(name="product_gp_delta")
+        x = x.merge(product_delta, on="code", how="left")
+        x["sku_contribution_to_product_gp"] = x.apply(lambda r: safe_div(r["sku_gp_delta"], r["product_gp_delta"]), axis=1)
+        return x.sort_values(["code", "sku_gp_delta"], ascending=[True, False])
+
+    # ---------- Price monitor ----------
+    def build_price_monitor(self) -> pd.DataFrame:
+        if self.article_compare.empty:
+            return pd.DataFrame()
+        cols = [
+            "supplier_article", "code", "subject", "rrp",
+            "finishedPrice_avg_prev", "finishedPrice_avg_cur", "finishedPrice_avg_delta_pct",
+            "priceWithDisc_avg_prev", "priceWithDisc_avg_cur", "priceWithDisc_avg_delta_pct",
+            "finishedPrice_rrp_coeff_prev", "finishedPrice_rrp_coeff_cur",
+            "priceWithDisc_rrp_coeff_prev", "priceWithDisc_rrp_coeff_cur",
+            "spp_avg_prev", "spp_avg_cur", "spp_avg_delta_abs",
+            "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_sales_qty_delta_pct",
+            "abc_gp_prev", "abc_gp_cur", "abc_gp_delta_pct",
+            "margin_pct_prev", "margin_pct_cur", "margin_pct_delta_abs",
+            "price_assessment",
+        ]
+        keep = [c for c in cols if c in self.article_compare.columns]
+        x = self.article_compare[keep].copy()
+        return x.sort_values("abc_gp_cur", ascending=False)
+
+    # ---------- Example ----------
+    def build_example_901_5(self) -> Dict[str, pd.DataFrame]:
+        art = "901/5"
+        res: Dict[str, pd.DataFrame] = {}
+        if not self.article_compare.empty:
+            x = self.article_compare[self.article_compare["supplier_article"].str.lower() == art.lower()].copy()
+            if not x.empty:
+                cols = [
+                    "supplier_article", "primary_reason", "secondary_reason", "ad_assessment", "price_assessment",
+                    "abc_revenue_prev", "abc_revenue_cur", "abc_revenue_delta_pct",
+                    "abc_gp_prev", "abc_gp_cur", "abc_gp_delta_pct",
+                    "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_sales_qty_delta_pct",
+                    "gp_per_order_prev", "gp_per_order_cur", "gp_per_order_delta_pct",
+                    "gp_volume_effect", "gp_economy_effect",
+                    "open_card_count_prev", "open_card_count_cur", "open_card_count_delta_pct",
+                    "clicks_total_prev", "clicks_total_cur", "clicks_total_delta_pct",
+                    "ctr_total_prev", "ctr_total_cur", "ctr_total_delta_pct",
+                    "cr_click_to_order_prev", "cr_click_to_order_cur", "cr_click_to_order_delta_pct",
+                    "category_demand_prev", "category_demand_cur", "category_demand_delta_pct",
+                    "median_position_article_prev", "median_position_article_cur", "visibility_pct_article_prev", "visibility_pct_article_cur",
+                    "finishedPrice_avg_prev", "finishedPrice_avg_cur", "priceWithDisc_avg_prev", "priceWithDisc_avg_cur",
+                    "rrp", "finishedPrice_rrp_coeff_prev", "finishedPrice_rrp_coeff_cur", "priceWithDisc_rrp_coeff_prev", "priceWithDisc_rrp_coeff_cur",
+                    "spp_avg_prev", "spp_avg_cur", "spp_avg_delta_abs",
+                    "ad_spend_prev", "ad_spend_cur", "ad_clicks_prev", "ad_clicks_cur", "ad_orders_prev", "ad_orders_cur",
+                    "localization_coverage_weighted_prev", "localization_coverage_weighted_cur",
+                    "commission_unit_prev", "commission_unit_cur", "logistics_direct_unit_prev", "logistics_direct_unit_cur", "logistics_return_unit_prev", "logistics_return_unit_cur",
+                    "ads_unit_prev", "ads_unit_cur", "cost_unit_prev", "cost_unit_cur", "margin_pct_prev", "margin_pct_cur", "profitability_pct_prev", "profitability_pct_cur",
+                ]
+                res["summary"] = x[[c for c in cols if c in x.columns]].copy()
+        if not self.localization_daily.empty:
+            x = self.localization_daily[self.localization_daily["supplier_article"].str.lower() == art.lower()].copy()
+            res["localization"] = x.sort_values(["day", "warehouse"], ascending=[False, True])
+        if not self.channel_compare.empty:
+            x = self.channel_compare[(self.channel_compare["entity_level"] == "article") & (self.channel_compare["entity_id"].astype(str).str.lower() == art.lower())].copy()
+            res["channels"] = x.sort_values("orders_delta_abs", ascending=False)
+        if not self.daily_article.empty:
+            x = self.daily_article[self.daily_article["supplier_article"].str.lower() == art.lower()].copy()
+            res["daily_ops"] = x.sort_values("day", ascending=False)
+        return res
 
 
-# -------------------------
-# Workbook writer
-# -------------------------
+# =========================================================
+# Writer
+# =========================================================
 
-class Writer:
+MONEY_FILL = PatternFill("solid", fgColor="F2F7FF")
+HEADER_FILL = PatternFill("solid", fgColor="D9EAF7")
+TITLE_FILL = PatternFill("solid", fgColor="BFD7EA")
+THIN = Side(style="thin", color="C0C0C0")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+
+class ExcelReport:
     def __init__(self):
         self.wb = Workbook()
         self.wb.remove(self.wb.active)
 
-    def _base_style(self, ws):
-        ws.freeze_panes = "B2"
-        ws.sheet_format = SheetFormatProperties(defaultRowHeight=18)
-
-    def _set_header(self, cell, title, fill=FILL_HEADER):
-        cell.value = title
-        cell.fill = fill
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = BORDER
-
-    def _autofit(self, ws, max_width: int = 45):
-        for col in ws.columns:
-            letter = get_column_letter(col[0].column)
-            max_len = 0
-            for c in col[:300]:
-                val = normalize_text(c.value)
-                max_len = max(max_len, len(val))
-            ws.column_dimensions[letter].width = min(max(max_len + 2, 12), max_width)
-
-    def add_summary(self, summary: Dict[str, pd.DataFrame], latest_day: date, cur_start: date):
-        ws = self.wb.create_sheet("Сводка")
-        self._base_style(ws)
-        ws["A1"] = f"Сводка по категориям • последние 2 недели ({cur_start:%d.%m.%Y} - {latest_day:%d.%m.%Y})"
-        ws["A1"].font = Font(bold=True, size=14)
-        ws["A1"].fill = FILL_TITLE
-
-        # Daily block
-        ws["A3"] = "Валовая прибыль по дням (дневная из Экономики)"
-        ws["A3"].font = Font(bold=True)
-        daily = summary["daily"]
-        start_row = 4
-        self._set_header(ws.cell(start_row,1), "Категория", FILL_SECTION)
-        for j, d in enumerate(daily.columns, start=2):
-            self._set_header(ws.cell(start_row,j), pd.Timestamp(d).strftime("%d.%m"), FILL_SECTION)
-        for i, subj in enumerate(TARGET_SUBJECTS, start=start_row+1):
-            self._set_header(ws.cell(i,1), subj, FILL_ARTICLE)
-            for j, d in enumerate(daily.columns, start=2):
-                c = ws.cell(i,j, float(daily.loc[subj, d]) if subj in daily.index else 0)
-                c.number_format = NUM_FMT_RUB
-                c.alignment = Alignment(horizontal="center", vertical="center")
+    def add_df(self, name: str, df: pd.DataFrame) -> None:
+        ws = self.wb.create_sheet(self.safe_title(name))
+        if df is None or df.empty:
+            ws["A1"] = "Нет данных"
+            return
+        x = df.copy().replace([np.inf, -np.inf], np.nan)
+        x = x.where(pd.notna(x), "")
+        headers = list(x.columns)
+        for j, h in enumerate(headers, 1):
+            c = ws.cell(1, j, h)
+            c.fill = HEADER_FILL
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = BORDER
+        for i, row in enumerate(x.itertuples(index=False), 2):
+            for j, v in enumerate(row, 1):
+                c = ws.cell(i, j, v)
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 c.border = BORDER
+        self._format_sheet(ws, headers)
 
-        # Weekly block below
-        weekly = summary["weekly"]
-        r0 = start_row + len(TARGET_SUBJECTS) + 4
-        ws.cell(r0,1).value = "Валовая прибыль по неделям (факт ABC)"
-        ws.cell(r0,1).font = Font(bold=True)
-        self._set_header(ws.cell(r0+1,1), "Категория", FILL_SECTION)
-        for j, w in enumerate(weekly.columns, start=2):
-            self._set_header(ws.cell(r0+1,j), w, FILL_SECTION)
-        for i, subj in enumerate(TARGET_SUBJECTS, start=r0+2):
-            self._set_header(ws.cell(i,1), subj, FILL_ARTICLE)
-            for j, w in enumerate(weekly.columns, start=2):
-                c = ws.cell(i,j, float(weekly.loc[subj,w]) if subj in weekly.index else 0)
-                c.number_format = NUM_FMT_RUB
-                c.alignment = Alignment(horizontal="center", vertical="center")
+    def add_example(self, name: str, blocks: Dict[str, pd.DataFrame]) -> None:
+        ws = self.wb.create_sheet(self.safe_title(name))
+        if not blocks:
+            ws["A1"] = "Нет данных"
+            return
+        row = 1
+        for title, df in blocks.items():
+            ws.cell(row, 1, title).fill = TITLE_FILL
+            ws.cell(row, 1).font = Font(bold=True)
+            row += 1
+            if df is None or df.empty:
+                ws.cell(row, 1, "Нет данных")
+                row += 2
+                continue
+            headers = list(df.columns)
+            for j, h in enumerate(headers, 1):
+                c = ws.cell(row, j, h)
+                c.fill = HEADER_FILL
+                c.font = Font(bold=True)
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 c.border = BORDER
-
-        # Monthly block right
-        monthly = summary["monthly"]
-        c0 = max(8, len(weekly.columns)+4)
-        ws.cell(r0, c0).value = "Валовая прибыль по месяцам (факт ABC)"
-        ws.cell(r0, c0).font = Font(bold=True)
-        self._set_header(ws.cell(r0+1,c0), "Категория", FILL_SECTION)
-        for j, m in enumerate(monthly.columns, start=c0+1):
-            self._set_header(ws.cell(r0+1,j), m, FILL_SECTION)
-        for i, subj in enumerate(TARGET_SUBJECTS, start=r0+2):
-            self._set_header(ws.cell(i,c0), subj, FILL_ARTICLE)
-            for j, m in enumerate(monthly.columns, start=c0+1):
-                c = ws.cell(i,j, float(monthly.loc[subj,m]) if subj in monthly.index else 0)
-                c.number_format = NUM_FMT_RUB
-                c.alignment = Alignment(horizontal="center", vertical="center")
-                c.border = BORDER
-        self._autofit(ws)
-
-    def add_reasons(self, cat: pd.DataFrame, prod: pd.DataFrame, sku: pd.DataFrame):
-        ws = self.wb.create_sheet("Причины")
-        self._base_style(ws)
-        ws["A1"] = "Причины динамики: категории, товары и артикулы"
-        ws["A1"].font = Font(bold=True, size=14)
-        ws["A1"].fill = FILL_TITLE
-
-        headers = [
-            "Уровень","Категория","Товар","Артикул","Выручка пред, ₽","Выручка тек, ₽","Δ Выручка, ₽",
-            "Заказы пред, шт","Заказы тек, шт","Δ Заказы, шт","Валовая прибыль пред, ₽","Валовая прибыль тек, ₽","Δ Валовая прибыль, ₽",
-            "Клики пред, шт","Клики тек, шт","Конверсия пред","Конверсия тек","Спрос пред, шт","Спрос тек, шт",
-            "finishedPrice пред, ₽","finishedPrice тек, ₽","priceWithDisc пред, ₽","priceWithDisc тек, ₽",
-            "SPP пред, %","SPP тек, %","Локализация пред, %","Локализация тек, %",
-            "Расходы рекламы пред, ₽","Расходы рекламы тек, ₽","Оценка рекламы","Главная причина","Вторичная причина","Детальный вывод"
-        ]
-        row = 3
-        for j, h in enumerate(headers, start=1):
-            self._set_header(ws.cell(row,j), h)
-        row += 1
-
-        def write_reason_rows(df: pd.DataFrame, level_name: str, group_articles: bool=False):
-            nonlocal row
-            for _, r in df.iterrows():
-                vals = [
-                    level_name,
-                    r.get("Категория", "") if level_name != "Категория" else r.get("Категория", ""),
-                    r.get("Товар", "") if level_name in {"Товар","Артикул"} else "",
-                    r.get("Артикул", "") if level_name == "Артикул" else "",
-                    r.get("Валовая выручка ABC, ₽_prev", np.nan), r.get("Валовая выручка ABC, ₽_cur", np.nan), r.get("Δ Выручка, ₽", np.nan),
-                    r.get("Продажи ABC, шт_prev", np.nan), r.get("Продажи ABC, шт_cur", np.nan), r.get("Δ Заказы, шт", np.nan),
-                    r.get("Валовая прибыль ABC, ₽_prev", np.nan), r.get("Валовая прибыль ABC, ₽_cur", np.nan), r.get("Δ Валовая прибыль, ₽", np.nan),
-                    r.get("Клики, шт_prev", np.nan), r.get("Клики, шт_cur", np.nan),
-                    safe_div(r.get("Заказы воронка, шт_prev"), r.get("Клики, шт_prev")), safe_div(r.get("Заказы воронка, шт_cur"), r.get("Клики, шт_cur")),
-                    r.get("Спрос категории, шт_prev", np.nan), r.get("Спрос категории, шт_cur", np.nan),
-                    r.get("finishedPrice, ₽_prev", np.nan), r.get("finishedPrice, ₽_cur", np.nan),
-                    r.get("priceWithDisc, ₽_prev", np.nan), r.get("priceWithDisc, ₽_cur", np.nan),
-                    r.get("SPP, %_prev", np.nan), r.get("SPP, %_cur", np.nan),
-                    r.get("Покрытие локализации, %_prev", np.nan), r.get("Покрытие локализации, %_cur", np.nan),
-                    r.get("Расходы на рекламу, ₽_prev", np.nan), r.get("Расходы на рекламу, ₽_cur", np.nan),
-                    r.get("Оценка рекламы", ""), r.get("Главная причина", ""), r.get("Вторичная причина", ""), r.get("Детальный вывод", ""),
-                ]
-                for j, v in enumerate(vals, start=1):
-                    c = ws.cell(row,j,v)
+            row += 1
+            for _, rec in df.iterrows():
+                for j, h in enumerate(headers, 1):
+                    c = ws.cell(row, j, rec[h] if pd.notna(rec[h]) else "")
                     c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                     c.border = BORDER
-                    if j in {5,6,7,11,12,13,20,21,22,23,28,29} and pd.notna(v):
-                        c.number_format = NUM_FMT_RUB
-                    if j in {16,17,24,25,26,27} and pd.notna(v):
-                        c.number_format = NUM_FMT_PCT
-                if level_name == "Категория":
-                    fill = FILL_SECTION
-                    for j in range(1, len(headers)+1):
-                        ws.cell(row,j).fill = fill
-                        ws.cell(row,j).font = Font(bold=True)
-                elif level_name == "Товар":
-                    for j in range(1, len(headers)+1):
-                        ws.cell(row,j).font = Font(bold=True)
-                else:
-                    for j in range(1, len(headers)+1):
-                        ws.cell(row,j).fill = FILL_ARTICLE
-                    ws.row_dimensions[row].outlineLevel = 1
-                    ws.row_dimensions[row].hidden = True
                 row += 1
+            row += 2
+        self._format_sheet(ws, None)
 
-        # categories
-        write_reason_rows(cat, "Категория")
-        row += 1
-        # product rows then articles underneath
-        product_order = prod[["Товар","Категория","Δ Выручка, ₽"]].copy().sort_values(["Категория","Δ Выручка, ₽"], ascending=[True,True])
-        sku_map = defaultdict(list)
-        for _, r in sku.iterrows():
-            sku_map[r["Товар"]].append(r)
-        for _, pr in product_order.iterrows():
-            rr = prod[prod["Товар"] == pr["Товар"]].iloc[0]
-            write_reason_rows(pd.DataFrame([rr]), "Товар")
-            articles = pd.DataFrame(sku_map.get(pr["Товар"], []))
-            if not articles.empty:
-                # add lightweight reason text for articles
-                pair = articles.copy()
-                pair["Оценка рекламы"] = ""
-                pair["Главная причина"] = articles.apply(lambda r: "Снижение заказов" if r.get("Δ Заказы, шт", 0) < 0 else "Рост заказов", axis=1)
-                pair["Вторичная причина"] = ""
-                pair["Детальный вывод"] = articles.apply(lambda r: f"Артикул дал изменение ВП {fmt_money(r.get('Δ Валовая прибыль, ₽'))}, выручки {fmt_money(r.get('Δ Выручка, ₽'))}, заказов {int(r.get('Δ Заказы, шт',0)) if pd.notna(r.get('Δ Заказы, шт')) else 0}.", axis=1)
-                write_reason_rows(pair.sort_values("Δ Выручка, ₽"), "Артикул")
-        ws.sheet_properties.outlinePr.summaryBelow = True
-        self._autofit(ws, max_width=35)
-        # widen detail text
-        ws.column_dimensions[get_column_letter(33)].width = 80
+    def _format_sheet(self, ws, headers: Optional[List[str]]) -> None:
+        ws.freeze_panes = "A2"
+        for col_cells in ws.columns:
+            col_letter = get_column_letter(col_cells[0].column)
+            max_len = 10
+            for c in col_cells[:300]:
+                max_len = max(max_len, len(normalize_text(c.value)))
+            ws.column_dimensions[col_letter].width = min(max_len + 3, 28)
+        # formats
+        if headers:
+            header_map = {h: idx + 1 for idx, h in enumerate(headers)}
+            for h, idx in header_map.items():
+                h_norm = norm_key(h)
+                for row in range(2, ws.max_row + 1):
+                    cell = ws.cell(row, idx)
+                    if any(k in h_norm for k in ["pct", "конверсия", "visibility", "ctr", "drr", "margin", "profitability", "coverage", "coeff", "spp", "delta pct"]):
+                        cell.number_format = '0.00'
+                    elif any(k in h_norm for k in ["price", "revenue", "profit", "spend", "commission", "logistics", "cost", "orders delta contribution", "effect", "rrp"]):
+                        cell.number_format = '#,##0 ₽'
+                    elif "дата" in h_norm or h_norm == "day":
+                        cell.number_format = 'DD.MM.YYYY'
+                    elif any(k in h_norm for k in ["qty", "count", "orders", "clicks", "impressions"]):
+                        cell.number_format = '0'
+        for row in ws.iter_rows():
+            for c in row:
+                c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                if c.row > 1:
+                    c.border = BORDER
 
-    def add_localization(self, loc: pd.DataFrame):
-        ws = self.wb.create_sheet("Локализация")
-        self._base_style(ws)
-        ws["A1"] = "Локализация: Артикул - Дата - Процент покрытия"
-        ws["A1"].font = Font(bold=True, size=14)
-        ws["A1"].fill = FILL_TITLE
-        headers = ["Артикул","Дата","Покрытие, %"]
-        for j,h in enumerate(headers, start=1):
-            self._set_header(ws.cell(3,j), h)
-        row = 4
-        for _, r in loc.iterrows():
-            ws.cell(row,1,r["Артикул"]).alignment = Alignment(horizontal="center", vertical="center")
-            c = ws.cell(row,2,pd.Timestamp(r["Дата"]).to_pydatetime())
-            c.number_format = NUM_FMT_DATE
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c = ws.cell(row,3,float(r["Покрытие, %"]))
-            c.number_format = NUM_FMT_PCT
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            for j in range(1,4):
-                ws.cell(row,j).border = BORDER
-            row += 1
-        self._autofit(ws)
+    @staticmethod
+    def safe_title(name: str) -> str:
+        bad = r'[]:*?/\\'
+        cleaned = ''.join('_' if ch in bad else ch for ch in name)
+        return cleaned[:31] or 'Sheet'
 
-    def save(self, path: str):
-        self.wb.save(path)
+    def save_bytes(self) -> bytes:
+        bio = io.BytesIO()
+        self.wb.save(bio)
+        return bio.getvalue()
 
 
-# -------------------------
-# CLI
-# -------------------------
+# =========================================================
+# Runner
+# =========================================================
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--root", default=".")
-    p.add_argument("--reports-root", default="Отчёты")
-    p.add_argument("--store", default="TOPFACE")
-    p.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE")
+def build_output_workbook(an: Part2Analyzer) -> Workbook:
+    rep = ExcelReport()
+    summary_rows = []
+    for title, comp in [("Результаты_категории", an.category_compare), ("Результаты_товары", an.product_compare), ("Результаты_артикулы", an.article_compare)]:
+        if comp.empty:
+            rep.add_df(title, pd.DataFrame())
+            continue
+        x = comp.copy()
+        if title == "Результаты_категории":
+            keep = [
+                "subject", "abc_gp_prev", "abc_gp_cur", "abc_gp_delta_pct", "abc_revenue_prev", "abc_revenue_cur", "abc_revenue_delta_pct",
+                "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_sales_qty_delta_pct", "gp_volume_effect", "gp_economy_effect",
+                "category_demand_prev", "category_demand_cur", "category_demand_delta_pct",
+                "clicks_total_prev", "clicks_total_cur", "clicks_total_delta_pct",
+                "ctr_total_prev", "ctr_total_cur", "ctr_total_delta_pct",
+                "cr_click_to_order_prev", "cr_click_to_order_cur", "cr_click_to_order_delta_pct",
+                "finishedPrice_avg_prev", "finishedPrice_avg_cur", "priceWithDisc_avg_prev", "priceWithDisc_avg_cur",
+                "spp_avg_prev", "spp_avg_cur", "localization_coverage_weighted_prev", "localization_coverage_weighted_cur",
+                "ad_spend_prev", "ad_spend_cur", "primary_reason", "secondary_reason", "ad_assessment", "price_assessment",
+            ]
+            x = x[[c for c in keep if c in x.columns]].sort_values("abc_gp_cur", ascending=False)
+        elif title == "Результаты_товары":
+            keep = [
+                "code", "subject", "abc_gp_prev", "abc_gp_cur", "abc_gp_delta_pct", "abc_revenue_prev", "abc_revenue_cur", "abc_revenue_delta_pct",
+                "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_sales_qty_delta_pct", "gp_volume_effect", "gp_economy_effect",
+                "category_demand_delta_pct", "clicks_total_delta_pct", "ctr_total_delta_pct", "cr_click_to_order_delta_pct",
+                "finishedPrice_avg_prev", "finishedPrice_avg_cur", "priceWithDisc_avg_prev", "priceWithDisc_avg_cur", "spp_avg_prev", "spp_avg_cur",
+                "localization_coverage_weighted_prev", "localization_coverage_weighted_cur", "ad_spend_prev", "ad_spend_cur",
+                "primary_reason", "secondary_reason", "ad_assessment", "price_assessment",
+            ]
+            x = x[[c for c in keep if c in x.columns]].sort_values("abc_gp_cur", ascending=False)
+        else:
+            keep = [
+                "supplier_article", "code", "subject", "abc_gp_prev", "abc_gp_cur", "abc_gp_delta_pct", "abc_revenue_prev", "abc_revenue_cur", "abc_revenue_delta_pct",
+                "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_sales_qty_delta_pct", "gp_per_order_prev", "gp_per_order_cur", "gp_per_order_delta_pct",
+                "gp_volume_effect", "gp_economy_effect", "clicks_total_delta_pct", "ctr_total_delta_pct", "cr_click_to_order_delta_pct",
+                "category_demand_delta_pct", "median_position_article_prev", "median_position_article_cur", "visibility_pct_article_prev", "visibility_pct_article_cur",
+                "finishedPrice_avg_prev", "finishedPrice_avg_cur", "priceWithDisc_avg_prev", "priceWithDisc_avg_cur", "rrp",
+                "finishedPrice_rrp_coeff_prev", "finishedPrice_rrp_coeff_cur", "priceWithDisc_rrp_coeff_prev", "priceWithDisc_rrp_coeff_cur",
+                "spp_avg_prev", "spp_avg_cur", "localization_coverage_weighted_prev", "localization_coverage_weighted_cur",
+                "ad_spend_prev", "ad_spend_cur", "primary_reason", "secondary_reason", "ad_assessment", "price_assessment",
+            ]
+            x = x[[c for c in keep if c in x.columns]].sort_values("abc_gp_cur", ascending=False)
+        rep.add_df(title, x)
+    rep.add_df("Вклад_SKU_в_товар", an.sku_contribution[[c for c in [
+        "code", "supplier_article", "subject", "abc_gp_prev", "abc_gp_cur", "sku_gp_delta", "abc_revenue_prev", "abc_revenue_cur", "sku_revenue_delta",
+        "abc_sales_qty_prev", "abc_sales_qty_cur", "sku_orders_delta", "sku_contribution_to_product_gp", "primary_reason", "secondary_reason"
+    ] if c in an.sku_contribution.columns]])
+    rep.add_df("Цена_RRP_SPP", an.price_monitor)
+    rep.add_df("Каналы_входа", an.channel_compare.sort_values(["entity_level", "entity_id", "orders_delta_abs"], ascending=[True, True, False]))
+    rep.add_df("Локализация_daily", an.localization_daily.sort_values(["supplier_article", "day", "warehouse"], ascending=[True, False, True]))
+    rep.add_example("Пример_901_5", an.example_901_5)
+    return rep.wb
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="WB combined report with part2 cause analytics")
+    p.add_argument("--root", default=".", help="Project root")
+    p.add_argument("--reports-root", default="Отчёты", help="Reports root in S3/local structure")
+    p.add_argument("--store", default="TOPFACE", help="Store")
+    p.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE", help="Output folder")
     return p.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
     storage = make_storage(args.root)
-    loader = Loader(storage, root_reports=args.reports_root, store=args.store)
+    loader = DataLoader(storage=storage, store=args.store, reports_root=args.reports_root)
+    log("Loading data")
     data = loader.load_all()
-    log("Building analytics")
-    analyzer = Analyzer(data)
-    writer = Writer()
-    writer.add_summary(analyzer.summary_struct, analyzer.latest_day, analyzer.cur_start)
-    writer.add_reasons(analyzer.reasons_category, analyzer.reasons_product, analyzer.product_with_sku)
-    writer.add_localization(analyzer.localization_daily)
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    out = f"{args.out_subdir}/Объединенный_отчет_{args.store}_{stamp}.xlsx"
-    log(f"Saving {out}")
-    bio = io.BytesIO()
-    writer.wb.save(bio)
-    storage.write_bytes(out, bio.getvalue())
-    log(f"Saved {out}")
     if data.warnings:
-        log("Warnings:")
-        for w in data.warnings[:50]:
-            log(f" - {w}")
+        for w in data.warnings:
+            log(f"WARN: {w}")
+    log("Building analytics")
+    analyzer = Part2Analyzer(data)
+    log("Building workbook")
+    wb = build_output_workbook(analyzer)
+    out_name = f"{args.out_subdir}/Объединенный_отчет_{args.store}_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+    bio = io.BytesIO()
+    wb.save(bio)
+    storage.write_bytes(out_name, bio.getvalue())
+    log(f"Saved: {out_name}")
     return 0
 
 
