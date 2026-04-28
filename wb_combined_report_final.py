@@ -619,8 +619,13 @@ class Stage1Builder:
 
     def build_econ_latest(self) -> pd.DataFrame:
         if self.data.economics.empty:
-            return pd.DataFrame(columns=["supplier_article", "nm_id"])
+            return pd.DataFrame(columns=["supplier_article", "nm_id", "subject", "code", "title"])
         econ = self._filter_subjects(self.data.economics)
+        # в Экономике названия товара обычно нет, поэтому создаём пустую колонку заранее
+        if "title" not in econ.columns:
+            econ["title"] = ""
+        else:
+            econ["title"] = econ["title"].fillna("").astype(str)
         # last available week per article
         econ["week_ord"] = econ["week_code"].astype(str)
         econ = econ.sort_values(["supplier_article", "week_ord"], ascending=[True, False])
