@@ -573,7 +573,7 @@ class DataLoader:
                 df["orders"] = 1
                 if "warehouse" not in df.columns and "warehouseName" in df.columns:
                     df["warehouse"] = df["warehouseName"]
-                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
                 dfs.append(df)
             except Exception as e:
                 self.warnings.append(f"Orders read error {path}: {e}")
@@ -603,7 +603,7 @@ class DataLoader:
                 df["week_start"] = pd.Timestamp(start) if start else pd.NaT
                 df["week_end"] = pd.Timestamp(end) if end else pd.NaT
                 df = self._finalize_common(df)
-                df["warehouse"] = (df["warehouse"] if "warehouse" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                df["warehouse"] = df.get("warehouse", "").map(normalize_text)
                 df["stock_available"] = to_numeric(df.get("stock_available", 0)).fillna(0)
                 df["stock_total"] = to_numeric(df.get("stock_total", np.nan)).fillna(df["stock_available"]).fillna(0)
                 if "Дата запроса" in df.columns and "day" not in df.columns:
@@ -834,8 +834,8 @@ class DataLoader:
                     df = self._finalize_common(df)
                     for c in ["impressions", "clicks", "ctr", "cart", "conv_cart", "orders", "conv_order"]:
                         df[c] = to_numeric(df.get(c, np.nan))
-                    df["section"] = (df["section"] if "section" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
-                    df["entry_point"] = (df["entry_point"] if "entry_point" in df.columns else pd.Series([""] * len(df), index=df.index)).map(normalize_text)
+                    df["section"] = df.get("section", "").map(normalize_text)
+                    df["entry_point"] = df.get("entry_point", "").map(normalize_text)
                     holder.append(df)
                 except Exception as e:
                     self.warnings.append(f"Entry points read error {path}: {e}")
@@ -919,9 +919,9 @@ class DataLoader:
 class Part2Analyzer:
     def __init__(self, data: LoadedData):
         self.data = data
-        self.windows = self.determine_windows()
         self.master = self.build_master()
         self.daily_article = self.build_daily_article()
+        self.windows = self.determine_windows()
         self.demand_daily_subject = self.build_subject_demand_daily()
         self.localization_daily = self.build_localization_daily()
         self.article_period = self.build_article_period_metrics()
@@ -1019,8 +1019,6 @@ class Part2Analyzer:
         }
 
     def _period_name(self, day: pd.Timestamp) -> Optional[str]:
-        if not hasattr(self, "windows") or not isinstance(getattr(self, "windows", None), dict) or not self.windows:
-            self.windows = self.determine_windows()
         if pd.isna(day):
             return None
         if self.windows["cur_start"] <= day <= self.windows["cur_end"]:
@@ -1214,7 +1212,7 @@ class Part2Analyzer:
         g = self.localization_daily.groupby(["supplier_article", "period_name"], dropna=False).apply(
             lambda x: pd.Series({
                 "localization_coverage_count": x.groupby(["day"])["is_available_flag"].mean().mean(),
-                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: weighted_mean(d["is_available_flag"], d["warehouse_weight"])) .mean(),
+                "localization_coverage_weighted": x.groupby(["day"]).apply(lambda d: np.average(d["is_available_flag"], weights=d["warehouse_weight"])) .mean(),
                 "main_warehouses_count": x["warehouse"].nunique(),
             })
         ).reset_index()
@@ -1374,6 +1372,33 @@ class Part2Analyzer:
         prev = prev.rename(columns={c: f"{c}_prev" for c in metric_cols})
         out = prev.merge(cur, on=id_cols, how="outer")
 
+        # ensure expected columns exist even when a source did not produce them
+        default_zero = [
+            "clicks_total_prev", "clicks_total_cur", "cr_click_to_order_prev", "cr_click_to_order_cur",
+            "abc_sales_qty_prev", "abc_sales_qty_cur", "abc_gp_prev", "abc_gp_cur", "abc_revenue_prev", "abc_revenue_cur",
+            "revenue_per_order_prev", "revenue_per_order_cur", "gp_per_order_prev", "gp_per_order_cur",
+        ]
+        default_nan = [
+            "abc_sales_qty_delta_pct", "clicks_total_delta_pct", "ctr_total_delta_pct", "cr_click_to_order_delta_pct",
+            "category_demand_delta_pct", "visibility_pct_article_delta_pct", "median_position_article_delta_abs",
+            "finishedPrice_avg_delta_pct", "priceWithDisc_avg_delta_pct", "spp_avg_delta_abs",
+            "localization_coverage_weighted_delta_abs", "gp_per_order_delta_pct", "margin_pct_delta_abs",
+            "commission_unit_delta_abs", "ads_unit_delta_abs", "ad_spend_delta_pct", "ad_clicks_delta_pct",
+            "abc_gp_delta_pct", "logistics_direct_unit_cur", "logistics_return_unit_cur",
+            "logistics_direct_unit_prev", "logistics_return_unit_prev", "commission_unit_prev", "ads_unit_prev",
+            "priceWithDisc_avg_prev", "priceWithDisc_avg_cur", "finishedPrice_avg_prev", "finishedPrice_avg_cur",
+            "category_demand_prev", "category_demand_cur", "visibility_pct_article_prev", "visibility_pct_article_cur",
+            "localization_coverage_weighted_prev", "localization_coverage_weighted_cur",
+            "ad_spend_prev", "ad_spend_cur", "ad_clicks_prev", "ad_clicks_cur", "ad_orders_prev", "ad_orders_cur",
+            "drr_pct_prev", "drr_pct_cur", "margin_pct_prev", "margin_pct_cur", "profitability_pct_prev", "profitability_pct_cur",
+        ]
+        for c in default_zero:
+            if c not in out.columns:
+                out[c] = 0.0
+        for c in default_nan:
+            if c not in out.columns:
+                out[c] = np.nan
+
         # top level deltas
         delta_pairs_pct = [
             "abc_revenue", "abc_gp", "abc_sales_qty", "gp_unit", "open_card_count", "clicks_total", "ctr_total", "cr_click_to_order",
@@ -1405,7 +1430,36 @@ class Part2Analyzer:
 
     def add_flags_and_reasons(self, out: pd.DataFrame) -> pd.DataFrame:
         def flag(col, cond):
-            out[col] = cond.astype(int)
+            out[col] = cond.fillna(False).astype(int)
+        must_have = {
+            "abc_sales_qty_delta_pct": np.nan,
+            "clicks_total_delta_pct": np.nan,
+            "ctr_total_delta_pct": np.nan,
+            "cr_click_to_order_delta_pct": np.nan,
+            "category_demand_delta_pct": np.nan,
+            "visibility_pct_article_delta_pct": np.nan,
+            "median_position_article_delta_abs": np.nan,
+            "finishedPrice_avg_delta_pct": np.nan,
+            "priceWithDisc_avg_delta_pct": np.nan,
+            "spp_avg_delta_abs": np.nan,
+            "localization_coverage_weighted_delta_abs": np.nan,
+            "gp_per_order_delta_pct": np.nan,
+            "margin_pct_delta_abs": np.nan,
+            "logistics_direct_unit_cur": np.nan,
+            "logistics_return_unit_cur": np.nan,
+            "logistics_direct_unit_prev": np.nan,
+            "logistics_return_unit_prev": np.nan,
+            "commission_unit_delta_abs": np.nan,
+            "commission_unit_prev": np.nan,
+            "ads_unit_delta_abs": np.nan,
+            "ads_unit_prev": np.nan,
+            "ad_spend_delta_pct": np.nan,
+            "ad_clicks_delta_pct": np.nan,
+            "abc_gp_delta_pct": np.nan,
+        }
+        for c, v in must_have.items():
+            if c not in out.columns:
+                out[c] = v
         flag("flag_orders_down", out["abc_sales_qty_delta_pct"] <= -0.08)
         flag("flag_orders_up", out["abc_sales_qty_delta_pct"] >= 0.08)
         flag("flag_clicks_down", out["clicks_total_delta_pct"] <= -0.08)
