@@ -11,6 +11,7 @@
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
+Для всех методов Wildberries используется единый ключ из переменной WB_PROMO_KEY_TOPFACE.
 """
 
 import os
@@ -144,7 +145,7 @@ class WildberriesDailyUpdater:
                 'id_columns': ['date', 'gNumber', 'srid'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v1/supplier/orders',
                 'api_method': 'GET',
-                'key_type': 'stats',
+                'key_type': 'promo',
             },
             'stocks': {
                 'name': 'Остатки',
@@ -153,7 +154,7 @@ class WildberriesDailyUpdater:
                 'id_columns': ['Дата запроса', 'Артикул WB', 'Склад'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v1/supplier/stocks',
                 'api_method': 'GET',
-                'key_type': 'stats',
+                'key_type': 'promo',
             },
             'finance': {
                 'name': 'Финансовые показатели',
@@ -162,7 +163,7 @@ class WildberriesDailyUpdater:
                 'id_columns': ['rr_dt', 'rrd_id', 'nm_id'],
                 'api_url': 'https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod',
                 'api_method': 'GET',
-                'key_type': 'stats',
+                'key_type': 'promo',
             },
             'keywords': {
                 'name': 'Позиции по Ключам',
@@ -1712,7 +1713,6 @@ def main():
         'YC_ACCESS_KEY_ID',
         'YC_SECRET_ACCESS_KEY',
         'YC_BUCKET_NAME',
-        'WB_STATS_KEY_TOPFACE',
         'WB_PROMO_KEY_TOPFACE'
     ]
     missing = [var for var in required_env if not os.environ.get(var)]
@@ -1728,8 +1728,11 @@ def main():
 
     api_keys = {
         args.store: {
-            'stats': os.environ['WB_STATS_KEY_TOPFACE'],
-            'promo': os.environ['WB_PROMO_KEY_TOPFACE']
+            # Один универсальный ключ для всех методов API
+            'promo': os.environ['WB_PROMO_KEY_TOPFACE'],
+            # Оставляем alias 'stats' для обратной совместимости внутренних обращений,
+            # но он указывает на тот же универсальный ключ.
+            'stats': os.environ['WB_PROMO_KEY_TOPFACE'],
         }
     }
 
