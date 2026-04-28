@@ -1,1559 +1,1060 @@
-import os
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import argparse
+import calendar
 import io
-import tempfile
-import traceback
-from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+import math
+import os
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
+import numpy as np
 import pandas as pd
-import pytz
-from botocore.client import Config
-from botocore.exceptions import ClientError
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# =========================
+# Logging
+# =========================
+
+def log(message: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
 
 
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
+# =========================
+# Constants
+# =========================
 
-МАГАЗИН = "TOPFACE"
-ЧАСОВОЙ_ПОЯС = "Europe/Moscow"
+TARGET_SUBJECTS = [
+    "Кисти косметические",
+    "Помады",
+    "Блески",
+    "Косметические карандаши",
+]
 
-СТАВКА_НДС = 7.0
-СТАВКА_НАЛОГА_НА_ПРИБЫЛЬ = 15.0
-
-МИН_КФ_ЛОГИСТИКИ = 0.8
-ПОРОГ_ДОРОГОГО_СКЛАДА = 1.6
-ЦЕЛЕВОЙ_КФ_ЛОГИСТИКИ = 1.4
-
-ГЛУБИНА_ПРИЕМКИ_НЕДЕЛЬ = 9
-ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ = 13
-
-ПУТЬ_ЭКОНОМИКА = f"Отчёты/Финансовые показатели/{МАГАЗИН}/Экономика.xlsx"
-ПРЕФИКС_ФИНАНСЫ = f"Отчёты/Финансовые показатели/{МАГАЗИН}/Недельные/"
-ПРЕФИКС_ОСТАТКИ = f"Отчёты/Остатки/{МАГАЗИН}/Недельные/"
-ПУТЬ_РЕКЛАМА_АНАЛИЗ = f"Отчёты/Реклама/{МАГАЗИН}/Анализ рекламы.xlsx"
-ПРЕФИКС_РЕКЛАМА_НЕДЕЛЬНЫЕ = f"Отчёты/Реклама/{МАГАЗИН}/Недельные/"
-ПУТЬ_СЕБЕСТОИМОСТЬ = "Отчёты/Себестоимость/Себестоимость.xlsx"
-
-# Флаг для разового пересчёта всех последних недель (установить True при первом запуске после изменения логики)
-ПЕРЕСЧИТАТЬ_ИСТОРИЮ = True  # Измените на True для однократного пересчёта
-
-ЛИСТ_ЮНИТ = "Юнит экономика"
-ЛИСТ_ФАКТ = "Общий факт за неделю"
-ЛИСТ_АНАЛИЗ = "Анализ неделя к неделе"
-ЛИСТ_СКЛАДЫ = "Склады и коэффициенты"
-
-ОПЕРАЦИИ_ПРОДАЖА = {
-    "Продажа",
-    "Компенсация ущерба",
-    "Добровольная компенсация при возврате",
+EXCLUDED_ARTICLES = {
+    "CZ420", "CZ420БРОВИ", "CZ420ГЛАЗА",
+    "DE49", "DE49ГЛАЗА",
+    "PT901",
 }
 
-ОПЕРАЦИИ_ВОЗВРАТ = {
-    "Возврат",
-}
+TITLE_FILL = PatternFill("solid", fgColor="D9EAF7")
+HEADER_FILL = PatternFill("solid", fgColor="EAF2F8")
+SECTION_FILL = PatternFill("solid", fgColor="F8F9FA")
+TOTAL_FILL = PatternFill("solid", fgColor="FFF2CC")
+THIN = Side(style="thin", color="C0C0C0")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-ПОДСКАЗКИ_ПРЯМАЯ_ЛОГИСТИКА = [
-    "к клиенту при продаже",
-    "к клиенту",
-]
+MONEY_FMT = '# ##0" р."'
+INT_FMT = '# ##0'
+PCT_FMT = '0.00%'
 
-ПОДСКАЗКИ_ОБРАТНАЯ_ЛОГИСТИКА = [
-    "от клиента при отмене",
-    "от клиента при возврате",
-    "к клиенту при отмене",
-    "возврат товара",
-    "возврат",
-    "от клиента",
-]
+# =========================
+# Helpers
+# =========================
 
-КОЛОНКИ_ЮНИТ = [
-    "Неделя",
-    "Артикул WB",
-    "Артикул продавца",
-    "Предмет",
-    "Бренд",
-    "Продажи, шт",
-    "Возвраты, шт",
-    "Чистые продажи, шт",
-    "Процент выкупа",
-    "Средняя цена продажи",
-    "Средняя цена покупателя",
-    "СПП, %",
-    "Комиссия WB, %",
-    "Эквайринг, %",
-    "Комиссия WB, руб/ед",
-    "Эквайринг, руб/ед",
-    "Логистика прямая, руб/ед",
-    "Логистика обратная, руб/ед",
-    "Хранение, руб/ед",
-    "Приёмка, руб/ед",
-    "Штрафы и удержания, руб/ед",
-    "Реклама, руб/ед",
-    "Прочие расходы, руб/ед",
-    "Себестоимость, руб",
-    "НДС, руб/ед",
-    "Валовая прибыль, руб/ед",
-    "Чистая прибыль, руб/ед",
-    "Валовая рентабельность, %",
-    "Чистая рентабельность, %",
-]
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\xa0", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
 
-КОЛОНКИ_ФАКТ = [
-    "Неделя",
-    "Артикул WB",
-    "Артикул продавца",
-    "Предмет",
-    "Бренд",
-    "Продажи, шт",
-    "Возвраты, шт",
-    "Чистые продажи, шт",
-    "Процент выкупа",
-    "Валовая выручка",
-    "Средняя цена продажи",
-    "Средняя цена покупателя",
-    "СПП, %",
-    "Комиссия WB",
-    "Комиссия WB, %",
-    "Эквайринг",
-    "Эквайринг, %",
-    "Логистика прямая",
-    "Логистика обратная",
-    "Хранение",
-    "Приёмка",
-    "Штрафы",
-    "Удержания",
-    "Реклама",
-    "Рекламные заказы, шт",
-    "Рекламная выручка",
-    "Рекламные показы",
-    "Рекламные клики",
-    "Прочие расходы",
-    "Себестоимость, руб",
-    "Себестоимость всего",
-    "Валовая прибыль",
-    "НДС",
-    "Прибыль до налога",
-    "Налог на прибыль",
-    "Чистая прибыль",
-    "Валовая рентабельность, %",
-    "Чистая рентабельность, %",
-    "Ставка НДС, %",
-    "Ставка налога на прибыль, %",
-]
+def norm_key(value: Any) -> str:
+    text = normalize_text(value).lower()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-КОЛОНКИ_АНАЛИЗ = [
-    "Раздел",
-    "Неделя",
-    "Артикул WB",
-    "Артикул продавца",
-    "Предмет",
-    "Показатель",
-    "Чистая прибыль текущая",
-    "Чистая прибыль предыдущая",
-    "Изменение чистой прибыли",
-    "Изменение выручки",
-    "Изменение рекламы",
-    "Изменение комиссии",
-    "Изменение логистики",
-    "Изменение СПП",
-    "Изменение вашей цены",
-    "Комментарий",
-]
+def clean_article(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text.lower() in {"nan", "none"}:
+        return ""
+    return text
 
-КОЛОНКИ_СКЛАДЫ = [
-    "Неделя",
-    "Склад",
-    "Средний коэффициент",
-    "Количество продаж, шт",
-    "Логистика факт",
-    "Логистика при коэффициенте 1,4",
-    "Переплата",
-    "Переплата на единицу",
-]
+def article_upper(value: Any) -> str:
+    return clean_article(value).upper()
 
+def normalize_supplier_article(value: Any) -> str:
+    art = clean_article(value)
+    if not art:
+        return ""
+    up = art.upper()
 
-# =========================================================
-# БАЗОВЫЕ ФУНКЦИИ
-# =========================================================
+    # exact excluded tokens
+    if up in EXCLUDED_ARTICLES:
+        return ""
 
-def лог(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    # pt901 variants should belong to 901 group, but exact PT901 excluded above
+    if re.match(r"^PT901[\./].+", up):
+        return art.lower()  # keep specific sku, code extractor will map to 901
 
+    return art
 
-def сейчас_мск():
-    return datetime.now(pytz.timezone(ЧАСОВОЙ_ПОЯС))
+def extract_code(supplier_article: Any) -> str:
+    art = clean_article(supplier_article)
+    if not art:
+        return ""
+    up = art.upper()
 
+    # pt901.f25 / PT901.F25 => 901
+    m = re.search(r"(\d+)", up)
+    if m:
+        return m.group(1).lstrip("0") or "0"
+    return up
 
-def округлить(значение, знаков=2):
-    try:
-        if pd.isna(значение):
-            return 0.0
-        return round(float(значение), знаков)
-    except Exception:
-        return 0.0
+def to_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
+def to_dt(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
 
-def безопасное_деление(a, b, знаков=6):
+def safe_div(a: Any, b: Any) -> float:
     try:
         a = float(a)
         b = float(b)
-        if b == 0:
-            return 0.0
-        return round(a / b, знаков)
     except Exception:
-        return 0.0
+        return np.nan
+    if b == 0 or math.isnan(b):
+        return np.nan
+    return a / b
 
+def week_code_from_date(dt_value: Any) -> Optional[str]:
+    if pd.isna(dt_value):
+        return None
+    ts = pd.Timestamp(dt_value)
+    iso = ts.isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
 
-def текст(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip().lower()
+def week_bounds_from_code(week_code: str) -> Tuple[Optional[date], Optional[date]]:
+    m = re.match(r"^(\d{4})-W(\d{2})$", str(week_code))
+    if not m:
+        return None, None
+    year = int(m.group(1))
+    week = int(m.group(2))
+    start = date.fromisocalendar(year, week, 1)
+    end = date.fromisocalendar(year, week, 7)
+    return start, end
 
+def parse_week_code_from_name(name: str) -> Optional[str]:
+    m = re.search(r"(\d{4})-W(\d{2})", name)
+    if not m:
+        return None
+    return f"{m.group(1)}-W{m.group(2)}"
 
-def неделя_код(дата: datetime.date) -> str:
-    год, неделя, _ = дата.isocalendar()
-    return f"{год}-W{неделя:02d}"
+def parse_abc_period_from_name(name: str) -> Tuple[Optional[date], Optional[date]]:
+    m = re.search(r"__(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})__", name)
+    if not m:
+        return None, None
+    start = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    end = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+    return start, end
 
+def dedupe_columns(cols: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    counts: Dict[str, int] = {}
+    for c in cols:
+        base = normalize_text(c) or "unnamed"
+        counts[base] = counts.get(base, 0) + 1
+        if counts[base] == 1:
+            out.append(base)
+        else:
+            out.append(f"{base}__{counts[base]}")
+    return out
 
-def последняя_полная_неделя() -> Tuple[datetime.date, datetime.date]:
-    сегодня = сейчас_мск().date()
-    понедельник_текущей = сегодня - timedelta(days=сегодня.weekday())
-    конец_прошлой = понедельник_текущей - timedelta(days=1)
-    начало_прошлой = конец_прошлой - timedelta(days=6)
-    return начало_прошлой, конец_прошлой
+def pick_best_sheet(sheet_names: List[str], preferred: Iterable[str]) -> Any:
+    if not sheet_names:
+        return 0
+    norm_map = {norm_key(s): s for s in sheet_names}
+    for name in preferred:
+        k = norm_key(name)
+        if k in norm_map:
+            return norm_map[k]
+    return sheet_names[0]
 
+def required_score(columns: Iterable[Any], expected_aliases: Dict[str, List[str]]) -> int:
+    norm_cols = {norm_key(c) for c in columns if normalize_text(c)}
+    score = 0
+    for aliases in expected_aliases.values():
+        for alias in aliases:
+            if norm_key(alias) in norm_cols:
+                score += 1
+                break
+    return score
 
-def путь_финансы_неделя(начало_недели: datetime.date) -> str:
-    return f"{ПРЕФИКС_ФИНАНСЫ}Финансовые показатели_{неделя_код(начало_недели)}.xlsx"
+def read_excel_flexible(
+    data: bytes,
+    filename: str,
+    preferred_sheets: Optional[Iterable[str]] = None,
+    header_candidates: Iterable[int] = (0, 1, 2),
+    expected_aliases: Optional[Dict[str, List[str]]] = None,
+) -> Tuple[pd.DataFrame, str, int]:
+    bio = io.BytesIO(data)
+    xl = pd.ExcelFile(bio)
+    sheet = pick_best_sheet(xl.sheet_names, preferred_sheets or [])
+    best_df: Optional[pd.DataFrame] = None
+    best_header = 0
+    best_score = -10**9
+    for header in header_candidates:
+        try:
+            df = xl.parse(sheet_name=sheet, header=header, dtype=object)
+        except Exception:
+            continue
+        df = df.copy()
+        df.columns = dedupe_columns(df.columns)
+        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+        if df.empty:
+            score = -1000
+        else:
+            score = len([c for c in df.columns if normalize_text(c)])
+            if expected_aliases:
+                score += required_score(df.columns, expected_aliases) * 100
+        if score > best_score:
+            best_score = score
+            best_df = df
+            best_header = header
+    if best_df is None:
+        raise ValueError(f"Не удалось прочитать Excel: {filename}")
+    best_df.columns = dedupe_columns(best_df.columns)
+    return best_df, str(sheet), best_header
 
+def rename_using_aliases(df: pd.DataFrame, alias_map: Dict[str, List[str]]) -> pd.DataFrame:
+    norm_existing: Dict[str, str] = {}
+    for col in df.columns:
+        norm_existing.setdefault(norm_key(col), col)
+    out = df.copy()
+    for target, aliases in alias_map.items():
+        chosen = None
+        for alias in aliases:
+            k = norm_key(alias)
+            if k in norm_existing:
+                chosen = norm_existing[k]
+                break
+        if chosen is None:
+            out[target] = np.nan
+        elif chosen != target:
+            out[target] = out[chosen]
+    return out
 
-def путь_остатки_неделя(начало_недели: datetime.date) -> str:
-    return f"{ПРЕФИКС_ОСТАТКИ}Остатки_{неделя_код(начало_недели)}.xlsx"
+def russian_weekday_name(ts: pd.Timestamp) -> str:
+    names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    return names[int(ts.weekday())]
 
+def month_label(period: pd.Timestamp) -> str:
+    months = {
+        1:"Янв",2:"Фев",3:"Мар",4:"Апр",5:"Май",6:"Июн",
+        7:"Июл",8:"Авг",9:"Сен",10:"Окт",11:"Ноя",12:"Дек"
+    }
+    return f"{months[period.month]} {period.year}"
 
-def путь_реклама_неделя(начало_недели: datetime.date) -> str:
-    return f"{ПРЕФИКС_РЕКЛАМА_НЕДЕЛЬНЫЕ}Реклама_{неделя_код(начало_недели)}.xlsx"
+def week_label(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> str:
+    return f"{start_dt.strftime('%d.%m')}-{end_dt.strftime('%d.%m')}"
 
-
-def в_дату(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce").dt.date
-
-
-def в_датавремя(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
-
-
-def привести_к_числам(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for col in cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return df
-
-
-def мода_или_последнее(series: pd.Series):
-    s = series.dropna().astype(str).str.strip()
+def target_from_series(values: pd.Series) -> float:
+    s = to_numeric(values).dropna()
     if s.empty:
-        return ""
-    moda = s.mode()
-    if not moda.empty:
-        return moda.iloc[0]
-    return s.iloc[-1]
+        return 0.0
+    med = s.median()
+    strong = s[s >= med]
+    if strong.empty:
+        return float(s.mean())
+    return float(strong.mean())
 
+def ensure_columns(df: pd.DataFrame, cols: Dict[str, Any]) -> pd.DataFrame:
+    out = df.copy()
+    for c, default in cols.items():
+        if c not in out.columns:
+            out[c] = default
+    return out
 
-def ндс_из_цены_с_ндс(выручка_с_ндс: float, ставка_ндс: float) -> float:
-    return округлить(выручка_с_ндс * ставка_ндс / (100.0 + ставка_ндс), 6)
+# =========================
+# Storage
+# =========================
 
+class BaseStorage:
+    def list_files(self, prefix: str) -> List[str]:
+        raise NotImplementedError
+    def read_bytes(self, path: str) -> bytes:
+        raise NotImplementedError
+    def write_bytes(self, path: str, data: bytes) -> None:
+        raise NotImplementedError
+    def exists(self, path: str) -> bool:
+        raise NotImplementedError
 
-def знак_строки(doc_type_name: str, supplier_oper_name: str) -> int:
-    doc = текст(doc_type_name)
-    oper = текст(supplier_oper_name)
+class LocalStorage(BaseStorage):
+    def __init__(self, root: str):
+        self.root = Path(root)
+    def _abs(self, rel_path: str) -> Path:
+        return self.root / rel_path
+    def list_files(self, prefix: str) -> List[str]:
+        prefix = prefix.replace("\\", "/").rstrip("/")
+        prefix_path = self._abs(prefix)
+        base = prefix_path if prefix_path.exists() else prefix_path.parent
+        if not base.exists():
+            return []
+        files = []
+        for p in base.rglob("*"):
+            if p.is_file():
+                rel = str(p.relative_to(self.root)).replace("\\", "/")
+                if rel.startswith(prefix):
+                    files.append(rel)
+        return sorted(files)
+    def read_bytes(self, path: str) -> bytes:
+        return self._abs(path).read_bytes()
+    def write_bytes(self, path: str, data: bytes) -> None:
+        out = self._abs(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(data)
+    def exists(self, path: str) -> bool:
+        return self._abs(path).exists()
 
-    if supplier_oper_name in ОПЕРАЦИИ_ПРОДАЖА or doc == "продажа":
-        return 1
-    if supplier_oper_name in ОПЕРАЦИИ_ВОЗВРАТ or doc == "возврат":
-        return -1
-    if oper in {x.lower() for x in ОПЕРАЦИИ_ПРОДАЖА}:
-        return 1
-    if oper in {x.lower() for x in ОПЕРАЦИИ_ВОЗВРАТ}:
-        return -1
-    return 0
-
-
-def тип_логистики(row) -> str:
-    supplier_oper = текст(row.get("supplier_oper_name", ""))
-    bonus_type = текст(row.get("bonus_type_name", ""))
-    delivery_amount = float(row.get("delivery_amount", 0) or 0)
-    return_amount = float(row.get("return_amount", 0) or 0)
-
-    if supplier_oper != "логистика":
-        return "нет"
-
-    for hint in ПОДСКАЗКИ_ОБРАТНАЯ_ЛОГИСТИКА:
-        if hint in bonus_type:
-            return "обратная"
-
-    for hint in ПОДСКАЗКИ_ПРЯМАЯ_ЛОГИСТИКА:
-        if hint in bonus_type:
-            return "прямая"
-
-    if return_amount > 0:
-        return "обратная"
-    if delivery_amount > 0:
-        return "прямая"
-
-    return "прямая"
-
-
-def список_недель(последняя_неделя: datetime.date, сколько: int) -> List[datetime.date]:
-    weeks = []
-    current = последняя_неделя
-    for _ in range(сколько):
-        weeks.append(current)
-        current = current - timedelta(days=7)
-    return sorted(weeks)
-
-
-# =========================================================
-# S3 / OBJECT STORAGE
-# =========================================================
-
-class S3Storage:
-    def __init__(self, access_key: str, secret_key: str, bucket_name: str):
-        self.bucket = bucket_name
+class S3Storage(BaseStorage):
+    def __init__(self, bucket: str, access_key: str, secret_key: str):
+        self.bucket = bucket
         self.s3 = boto3.client(
             "s3",
             endpoint_url="https://storage.yandexcloud.net",
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            region_name="ru-central1",
-            config=Config(
-                signature_version="s3v4",
-                read_timeout=300,
-                connect_timeout=60,
-                retries={"max_attempts": 5},
-            ),
         )
-
-    def file_exists(self, key: str) -> bool:
+    def list_files(self, prefix: str) -> List[str]:
+        files = []
+        token = None
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = self.s3.list_objects_v2(**kwargs)
+            for item in resp.get("Contents", []):
+                key = item["Key"]
+                if not key.endswith("/"):
+                    files.append(key)
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+        return sorted(files)
+    def read_bytes(self, path: str) -> bytes:
+        obj = self.s3.get_object(Bucket=self.bucket, Key=path)
+        return obj["Body"].read()
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.s3.put_object(Bucket=self.bucket, Key=path, Body=data)
+    def exists(self, path: str) -> bool:
         try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
+            self.s3.head_object(Bucket=self.bucket, Key=path)
             return True
-        except ClientError:
+        except Exception:
             return False
 
-    def read_excel(self, key: str, sheet_name=0):
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        data = obj["Body"].read()
-        return pd.read_excel(io.BytesIO(data), sheet_name=sheet_name)
-
-    def read_excel_all_sheets(self, key: str) -> Dict[str, pd.DataFrame]:
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        data = obj["Body"].read()
-        return pd.read_excel(io.BytesIO(data), sheet_name=None)
-
-    def write_excel_sheets(self, key: str, sheets: Dict[str, pd.DataFrame]):
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-                for sheet_name, df in sheets.items():
-                    safe_sheet = str(sheet_name)[:31]
-                    if df is None:
-                        df = pd.DataFrame()
-                    df.to_excel(writer, index=False, sheet_name=safe_sheet)
-            self.s3.upload_file(tmp_path, self.bucket, key)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-
-# =========================================================
-# ОЧИСТКА СХЕМЫ ЛИСТОВ
-# =========================================================
-
-def подготовить_пустую_схему(columns: List[str]) -> pd.DataFrame:
-    return pd.DataFrame(columns=columns)
-
-
-def очистить_схему(existing_df: pd.DataFrame, allowed_columns: List[str]) -> pd.DataFrame:
-    if existing_df is None or existing_df.empty:
-        return подготовить_пустую_схему(allowed_columns)
-
-    out = existing_df.copy()
-
-    # Оставляем только нужные русские столбцы
-    keep_cols = [c for c in allowed_columns if c in out.columns]
-    out = out[keep_cols].copy()
-
-    # Добавляем недостающие колонки
-    for col in allowed_columns:
-        if col not in out.columns:
-            out[col] = pd.NA
-
-    out = out[allowed_columns].copy()
-    return out
-
-
-# =========================================================
-# СЕБЕСТОИМОСТЬ
-# =========================================================
-
-def нормализовать_себестоимость(cost_df: pd.DataFrame) -> pd.DataFrame:
-    if cost_df.empty:
-        return pd.DataFrame(columns=["Артикул WB", "Себестоимость, руб"])
-
-    df = cost_df.copy()
-    original_columns = list(df.columns)
-
-    normalized = {}
-    for col in df.columns:
-        norm = str(col).strip().lower().replace("ё", "е")
-        normalized[col] = norm
-
-    nm_col = None
-    cost_col = None
-
-    for col, norm in normalized.items():
-        if norm in ["nm_id", "nmid", "артикул wb", "артикул вб", "код wb"]:
-            nm_col = col
-            break
-
-    if nm_col is None:
-        for col, norm in normalized.items():
-            if "артикул wb" in norm or "артикул вб" in norm:
-                nm_col = col
-                break
-
-    for col, norm in normalized.items():
-        if norm in ["cost_price", "себестоимость", "стоимость", "cost", "закупочная цена"]:
-            cost_col = col
-            break
-
-    if cost_col is None:
-        for col, norm in normalized.items():
-            if "себестоим" in norm or "стоимость" in norm or norm.startswith("cost"):
-                cost_col = col
-                break
-
-    if nm_col is None:
-        for col in original_columns:
-            if "вб" in str(col).lower():
-                nm_col = col
-                break
-
-    if cost_col is None and len(original_columns) >= 4:
-        cost_col = original_columns[-1]
-
-    if nm_col is None or cost_col is None:
-        лог(f"⚠️ Не удалось определить колонки в Себестоимости. Колонки: {original_columns}")
-        return pd.DataFrame(columns=["Артикул WB", "Себестоимость, руб"])
-
-    df = df.rename(columns={nm_col: "Артикул WB", cost_col: "Себестоимость, руб"})
-    df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-    df["Себестоимость, руб"] = pd.to_numeric(df["Себестоимость, руб"], errors="coerce")
-
-    df = df[["Артикул WB", "Себестоимость, руб"]].dropna(subset=["Артикул WB"])
-    df["Артикул WB"] = df["Артикул WB"].astype("int64")
-    df["Себестоимость, руб"] = df["Себестоимость, руб"].fillna(0.0)
-
-    return df.drop_duplicates(subset=["Артикул WB"], keep="last")
-
-
-def прочитать_себестоимость(s3: S3Storage) -> pd.DataFrame:
-    лог("📥 Шаг: чтение себестоимости")
-    if not s3.file_exists(ПУТЬ_СЕБЕСТОИМОСТЬ):
-        лог(f"⚠️ Не найден файл себестоимости: {ПУТЬ_СЕБЕСТОИМОСТЬ}")
-        return pd.DataFrame(columns=["Артикул WB", "Себестоимость, руб"])
-
-    raw = s3.read_excel(ПУТЬ_СЕБЕСТОИМОСТЬ, sheet_name=0)
-    if raw.empty:
-        return pd.DataFrame(columns=["Артикул WB", "Себестоимость, руб"])
-
-    out = нормализовать_себестоимость(raw)
-    лог(f"✅ Себестоимость загружена, SKU: {len(out)}")
-    return out
-
-
-# =========================================================
-# ЧТЕНИЕ ИСТОЧНИКОВ
-# =========================================================
-
-def прочитать_финансы_недели(s3: S3Storage, начало_недели: datetime.date) -> pd.DataFrame:
-    key = путь_финансы_неделя(начало_недели)
-    if not s3.file_exists(key):
-        лог(f"⚠️ Не найден фин. отчёт: {key}")
-        return pd.DataFrame()
-
-    df = s3.read_excel(key, sheet_name=0)
-    if df.empty:
-        return df
-
-    numeric_cols = [
-        "nm_id", "quantity", "retail_price", "retail_amount", "retail_price_withdisc_rub",
-        "commission_percent", "ppvz_for_pay", "acquiring_fee", "acquiring_percent",
-        "delivery_rub", "delivery_amount", "return_amount", "penalty", "additional_payment",
-        "rebill_logistic_cost", "storage_fee", "deduction", "acceptance", "ppvz_spp_prc", "dlv_prc"
-    ]
-    df = привести_к_числам(df, numeric_cols)
-
-    if "rr_dt" in df.columns:
-        df["rr_dt"] = в_дату(df["rr_dt"])
-    if "sale_dt" in df.columns:
-        df["sale_dt"] = в_датавремя(df["sale_dt"])
-    if "order_dt" in df.columns:
-        df["order_dt"] = в_датавремя(df["order_dt"])
-    if "nm_id" in df.columns:
-        df["nm_id"] = pd.to_numeric(df["nm_id"], errors="coerce")
-
-    return df
-
-
-def прочитать_остатки_недели(s3: S3Storage, начало_недели: datetime.date) -> pd.DataFrame:
-    key = путь_остатки_неделя(начало_недели)
-    if not s3.file_exists(key):
-        лог(f"⚠️ Не найден отчёт остатков: {key}")
-        return pd.DataFrame()
-
-    df = s3.read_excel(key, sheet_name=0)
-    if df.empty:
-        return df
-
-    if "Дата сбора" in df.columns:
-        df["Дата сбора"] = в_дату(df["Дата сбора"])
-    elif "Дата запроса" in df.columns:
-        df["Дата сбора"] = в_дату(df["Дата запроса"])
-
-    df = привести_к_числам(df, ["Артикул WB", "Доступно для продажи", "Полное количество"])
-    if "Артикул WB" in df.columns:
-        df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-
-    return df
-
-
-def подготовить_рекламный_лист(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-
-    aliases = {
-        "Артикул WB": ["Артикул WB", "Артикул", "nm_id"],
-        "Дата": ["Дата", "День"],
-        "Расход": ["Расход", "Затраты"],
-        "Сумма заказов": ["Сумма заказов", "Выручка"],
-        "Показы": ["Показы", "Просмотры"],
-        "Клики": ["Клики"],
-        "Заказы": ["Заказы"],
-    }
-
-    rename_map = {}
-    lower_cols = {str(c).strip().lower(): c for c in df.columns}
-
-    for target, variants in aliases.items():
-        for v in variants:
-            key = v.strip().lower()
-            if key in lower_cols:
-                rename_map[lower_cols[key]] = target
-                break
-
-    df = df.rename(columns=rename_map)
-
-    required = ["Артикул WB", "Дата", "Расход"]
-    if not all(col in df.columns for col in required):
-        return pd.DataFrame()
-
-    for col in ["Артикул WB", "Расход", "Сумма заказов", "Показы", "Клики", "Заказы"]:
-        if col not in df.columns:
-            df[col] = 0
-
-    df["Дата"] = в_дату(df["Дата"])
-    df = привести_к_числам(df, ["Артикул WB", "Расход", "Сумма заказов", "Показы", "Клики", "Заказы"])
-    df["Артикул WB"] = pd.to_numeric(df["Артикул WB"], errors="coerce")
-    return df
-
-
-def найти_рекламный_лист_с_данными(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    preferred = ["Статистика_Ежедневно", "Data", "Sheet1"]
-    for name in preferred:
-        if name in sheets:
-            prepared = подготовить_рекламный_лист(sheets[name].copy())
-            if not prepared.empty:
-                return prepared
-
-    for _, df in sheets.items():
-        prepared = подготовить_рекламный_лист(df.copy())
-        if not prepared.empty:
-            return prepared
-
-    return pd.DataFrame()
-
-
-def прочитать_рекламу_недели(s3: S3Storage, начало_недели: datetime.date, конец_недели: datetime.date) -> pd.DataFrame:
-    лог("📣 Шаг: чтение рекламы")
-    try:
-        sheets = s3.read_excel_all_sheets(ПУТЬ_РЕКЛАМА_АНАЛИЗ)
-        df = найти_рекламный_лист_с_данными(sheets)
-        if not df.empty:
-            out = df[(df["Дата"] >= начало_недели) & (df["Дата"] <= конец_недели)].copy()
-            лог(f"✅ Реклама прочитана из Анализ рекламы.xlsx, строк: {len(out)}")
-            return out
-        else:
-            лог("⚠️ В Анализ рекламы.xlsx не найден лист с данными по SKU. Пытаюсь weekly-файл.")
-    except Exception as e:
-        лог(f"⚠️ Не удалось прочитать Анализ рекламы.xlsx: {e}")
-
-    weekly_key = путь_реклама_неделя(начало_недели)
-    if not s3.file_exists(weekly_key):
-        лог(f"⚠️ Не найден weekly-рекламный файл: {weekly_key}. Продолжаю без рекламы по SKU.")
-        return pd.DataFrame()
-
-    try:
-        sheets = s3.read_excel_all_sheets(weekly_key)
-        df = найти_рекламный_лист_с_данными(sheets)
-        if not df.empty:
-            out = df[(df["Дата"] >= начало_недели) & (df["Дата"] <= конец_недели)].copy()
-            лог(f"✅ Реклама прочитана из weekly-файла, строк: {len(out)}")
-            return out
-        else:
-            лог("⚠️ В weekly-рекламном файле тоже нет данных по SKU. Продолжаю без рекламы по SKU.")
-    except Exception as e:
-        лог(f"⚠️ Не удалось прочитать weekly рекламу: {e}")
-
-    return pd.DataFrame()
-
-
-# =========================================================
-# ПОДГОТОВКА ФИНАНСОВЫХ СТРОК
-# =========================================================
-
-def подготовить_финансовые_строки(fin_df: pd.DataFrame) -> pd.DataFrame:
-    if fin_df.empty:
-        return pd.DataFrame()
-
-    df = fin_df.copy()
-
-    df["supplier_oper_name_norm"] = df.get("supplier_oper_name", "").astype(str).str.strip()
-    df["doc_type_name_norm"] = df.get("doc_type_name", "").astype(str).str.strip()
-    df["subject_name"] = df.get("subject_name", "").astype(str)
-    df["brand_name"] = df.get("brand_name", "").astype(str)
-    df["sa_name"] = df.get("sa_name", "").astype(str)
-    df["office_name"] = df.get("office_name", "").astype(str)
-    df["bonus_type_name"] = df.get("bonus_type_name", "").astype(str)
-
-    df["sign"] = df.apply(
-        lambda r: знак_строки(r.get("doc_type_name_norm", ""), r.get("supplier_oper_name_norm", "")),
-        axis=1
-    )
-
-    df["signed_revenue"] = df["retail_price_withdisc_rub"] * df["sign"]
-    df["signed_buyer_price"] = df["retail_amount"] * df["sign"]
-    df["signed_quantity"] = df["quantity"] * df["sign"]
-
-    commission_raw = (df["retail_price_withdisc_rub"] - df["ppvz_for_pay"] - df["acquiring_fee"]).fillna(0)
-    df["signed_commission"] = commission_raw.abs() * df["sign"]
-    df["signed_acquiring"] = df["acquiring_fee"].abs() * df["sign"]
-
-    return df
-
-
-# =========================================================
-# ХРАНЕНИЕ И СКЛАДЫ
-# =========================================================
-
-def распределить_хранение(
-    stocks_df: pd.DataFrame,
-    total_storage_week: float,
-    начало_недели: datetime.date,
-    конец_недели: datetime.date
-) -> pd.DataFrame:
-    if stocks_df.empty or "Дата сбора" not in stocks_df.columns or "Артикул WB" not in stocks_df.columns:
-        return pd.DataFrame(columns=["Артикул WB", "Хранение"])
-
-    df = stocks_df.copy()
-    df = df[df["Дата сбора"].notna()].copy()
-
-    if df.empty:
-        return pd.DataFrame(columns=["Артикул WB", "Хранение"])
-
-    in_week = df[(df["Дата сбора"] >= начало_недели) & (df["Дата сбора"] <= конец_недели)].copy()
-
-    if in_week.empty:
-        target_date = df["Дата сбора"].min()
-        in_week = df[df["Дата сбора"] == target_date].copy()
-    else:
-        target_date = in_week["Дата сбора"].min()
-        in_week = in_week[in_week["Дата сбора"] == target_date].copy()
-
-    qty_col = "Доступно для продажи" if "Доступно для продажи" in in_week.columns else "Полное количество"
-    in_week[qty_col] = pd.to_numeric(in_week[qty_col], errors="coerce").fillna(0)
-    in_week["Артикул WB"] = pd.to_numeric(in_week["Артикул WB"], errors="coerce")
-    in_week = in_week.dropna(subset=["Артикул WB"]).copy()
-    in_week["Артикул WB"] = in_week["Артикул WB"].astype("int64")
-
-    agg = (
-        in_week.groupby("Артикул WB", as_index=False)[qty_col]
-        .sum()
-        .rename(columns={qty_col: "Остаток, шт"})
-    )
-
-    total_stock_units = agg["Остаток, шт"].sum()
-    if total_stock_units <= 0:
-        agg["Хранение"] = 0.0
-        return agg[["Артикул WB", "Хранение"]]
-
-    agg["Хранение"] = agg["Остаток, шт"] * total_storage_week / total_stock_units
-    return agg[["Артикул WB", "Хранение"]]
-
-
-def анализ_складов(logistic_rows: pd.DataFrame, начало_недели: datetime.date) -> pd.DataFrame:
-    if logistic_rows.empty:
-        return подготовить_пустую_схему(КОЛОНКИ_СКЛАДЫ)
-
-    df = logistic_rows.copy()
-    df["dlv_prc"] = pd.to_numeric(df["dlv_prc"], errors="coerce")
-    df["delivery_rub"] = pd.to_numeric(df["delivery_rub"], errors="coerce").fillna(0)
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
-
-    df["тип_логистики"] = df.apply(тип_логистики, axis=1)
-    df = df[df["тип_логистики"] == "прямая"].copy()
-    df = df[df["dlv_prc"].notna()].copy()
-    df = df[df["dlv_prc"] >= МИН_КФ_ЛОГИСТИКИ].copy()
-
-    if df.empty:
-        return подготовить_пустую_схему(КОЛОНКИ_СКЛАДЫ)
-
-    def пересчёт_строки(row):
-        actual = abs(float(row["delivery_rub"]))
-        coeff = float(row["dlv_prc"])
-        if coeff <= 0:
-            return actual, actual, 0.0
-        if coeff > ПОРОГ_ДОРОГОГО_СКЛАДА:
-            base = actual / coeff
-            recalc = base * ЦЕЛЕВОЙ_КФ_ЛОГИСТИКИ
-            overpay = max(0.0, actual - recalc)
-            return actual, recalc, overpay
-        return actual, actual, 0.0
-
-    tmp = df.apply(
-        lambda r: pd.Series(пересчёт_строки(r), index=["Логистика факт", "Логистика при коэффициенте 1,4", "Переплата"]),
-        axis=1
-    )
-    df = pd.concat([df, tmp], axis=1)
-
-    out = (
-        df.groupby("office_name", as_index=False)
-        .agg(
-            **{
-                "Средний коэффициент": ("dlv_prc", "mean"),
-                "Количество продаж, шт": ("quantity", "sum"),
-                "Логистика факт": ("Логистика факт", "sum"),
-                "Логистика при коэффициенте 1,4": ("Логистика при коэффициенте 1,4", "sum"),
-                "Переплата": ("Переплата", "sum"),
-            }
-        )
-        .rename(columns={"office_name": "Склад"})
-    )
-
-    out["Переплата на единицу"] = out.apply(
-        lambda r: безопасное_деление(r["Переплата"], r["Количество продаж, шт"], 6),
-        axis=1
-    )
-    out["Неделя"] = неделя_код(начало_недели)
-
-    out = out[КОЛОНКИ_СКЛАДЫ].sort_values(["Неделя", "Переплата"], ascending=[False, False]).reset_index(drop=True)
-    return out
-
-
-# =========================================================
-# FACT / UNIT (ОСНОВНОЙ РАСЧЁТ)
-# =========================================================
-
-def посчитать_факт_и_юнит(
-    fin_df: pd.DataFrame,
-    advert_df: pd.DataFrame,
-    cost_df: pd.DataFrame,
-    stocks_df: pd.DataFrame,
-    начало_недели: datetime.date,
-    конец_недели: datetime.date,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if fin_df.empty:
-        return подготовить_пустую_схему(КОЛОНКИ_ФАКТ), подготовить_пустую_схему(КОЛОНКИ_ЮНИТ), подготовить_пустую_схему(КОЛОНКИ_СКЛАДЫ)
-
-    лог("📦 Шаг: подготовка финансовых строк")
-    df = подготовить_финансовые_строки(fin_df)
-
-    product_rows = df[df["nm_id"].notna()].copy()
-    product_rows["nm_id"] = product_rows["nm_id"].astype("int64")
-
-    meta_agg = (
-        product_rows.groupby("nm_id", as_index=False)
-        .agg(
-            **{
-                "Артикул продавца": ("sa_name", lambda x: мода_или_последнее(x)),
-                "Предмет": ("subject_name", lambda x: мода_или_последнее(x)),
-                "Бренд": ("brand_name", lambda x: мода_или_последнее(x)),
-            }
-        )
-        .rename(columns={"nm_id": "Артикул WB"})
-    )
-
-    signed_rows = product_rows[product_rows["sign"] != 0].copy()
-
-    продажи = (
-        signed_rows[signed_rows["sign"] == 1]
-        .groupby("nm_id")["quantity"]
-        .sum()
-        .rename("Продажи, шт")
-    )
-    возвраты = (
-        signed_rows[signed_rows["sign"] == -1]
-        .groupby("nm_id")["quantity"]
-        .sum()
-        .rename("Возвраты, шт")
-    )
-    чистые_продажи = (
-        signed_rows.groupby("nm_id")["signed_quantity"]
-        .sum()
-        .rename("Чистые продажи, шт")
-    )
-
-    валовая_выручка = (
-        signed_rows.groupby("nm_id")["signed_revenue"]
-        .sum()
-        .rename("Валовая выручка")
-    )
-    цена_покупателя_сумма = (
-        signed_rows.groupby("nm_id")["signed_buyer_price"]
-        .sum()
-        .rename("Сумма цены покупателя")
-    )
-
-    комиссия = (
-        signed_rows.groupby("nm_id")["signed_commission"]
-        .sum()
-        .rename("Комиссия WB")
-    )
-    эквайринг = (
-        signed_rows.groupby("nm_id")["signed_acquiring"]
-        .sum()
-        .rename("Эквайринг")
-    )
-
-    средняя_цена_продажи = (валовая_выручка / чистые_продажи.replace(0, pd.NA)).rename("Средняя цена продажи")
-    средняя_цена_покупателя = (цена_покупателя_сумма / чистые_продажи.replace(0, pd.NA)).rename("Средняя цена покупателя")
-
-    sale_like = product_rows[
-        product_rows.apply(
-            lambda r: знак_строки(r.get("doc_type_name_norm", ""), r.get("supplier_oper_name_norm", "")) == 1,
-            axis=1
-        )
-    ].copy()
-
-    sale_like = sale_like.sort_values(["nm_id", "sale_dt", "rr_dt"], ascending=[True, False, False])
-
-    последняя_комиссия_процент = (
-        sale_like.groupby("nm_id")["commission_percent"]
-        .first()
-        .rename("Комиссия WB, %")
-    )
-
-    средний_спп = (
-        sale_like.groupby("nm_id")["ppvz_spp_prc"]
-        .mean()
-        .rename("СПП, %")
-    )
-
-    средний_эквайринг_процент = (
-        sale_like.groupby("nm_id")["acquiring_percent"]
-        .mean()
-        .rename("Эквайринг, %")
-    )
-
-    logistic_rows = product_rows[product_rows["supplier_oper_name_norm"].str.lower() == "логистика"].copy()
-    if not logistic_rows.empty:
-        logistic_rows["тип_логистики"] = logistic_rows.apply(тип_логистики, axis=1)
-    else:
-        logistic_rows["тип_логистики"] = []
-
-    логистика_прямая = (
-        logistic_rows[logistic_rows["тип_логистики"] == "прямая"]
-        .groupby("nm_id")["delivery_rub"]
-        .sum()
-        .abs()
-        .rename("Логистика прямая")
-    )
-
-    логистика_обратная = (
-        logistic_rows[logistic_rows["тип_логистики"] == "обратная"]
-        .groupby("nm_id")["delivery_rub"]
-        .sum()
-        .abs()
-        .rename("Логистика обратная")
-    )
-
-    обратные_события = (
-        logistic_rows[logistic_rows["тип_логистики"] == "обратная"]
-        .groupby("nm_id")["return_amount"]
-        .sum()
-        .rename("_обратные_события")
-    )
-
-    # Нам нужна только acceptance для приёмки
-    total_acceptance_store = abs(pd.to_numeric(df.get("acceptance", 0), errors="coerce").fillna(0).sum())
-
-    if not advert_df.empty and "Артикул WB" in advert_df.columns:
-        advert_agg = (
-            advert_df.groupby("Артикул WB", as_index=False)
-            .agg(
-                **{
-                    "Реклама": ("Расход", "sum"),
-                    "Рекламные заказы, шт": ("Заказы", "sum"),
-                    "Рекламная выручка": ("Сумма заказов", "sum"),
-                    "Рекламные показы": ("Показы", "sum"),
-                    "Рекламные клики": ("Клики", "sum"),
-                }
-            )
-        )
-        advert_agg["Артикул WB"] = pd.to_numeric(advert_agg["Артикул WB"], errors="coerce").fillna(0).astype("int64")
-    else:
-        advert_agg = pd.DataFrame(columns=[
-            "Артикул WB", "Реклама", "Рекламные заказы, шт",
-            "Рекламная выручка", "Рекламные показы", "Рекламные клики"
-        ])
-
-    if cost_df.empty:
-        cost_df = pd.DataFrame(columns=["Артикул WB", "Себестоимость, руб"])
-
-    base = meta_agg.copy()
-
-    series_list = [
-        продажи, возвраты, чистые_продажи,
-        валовая_выручка, цена_покупателя_сумма,
-        комиссия, эквайринг,
-        средняя_цена_продажи, средняя_цена_покупателя,
-        последняя_комиссия_процент, средний_спп, средний_эквайринг_процент,
-        логистика_прямая, логистика_обратная, обратные_события,
-    ]
-
-    for s in series_list:
-        base = base.merge(s.reset_index().rename(columns={"nm_id": "Артикул WB"}), on="Артикул WB", how="left")
-
-    base = base.merge(cost_df, on="Артикул WB", how="left")
-    base = base.merge(advert_agg, on="Артикул WB", how="left")
-
-    if "Себестоимость, руб" not in base.columns:
-        base["Себестоимость, руб"] = 0.0
-
-    num_fill_cols = [
-        "Продажи, шт", "Возвраты, шт", "Чистые продажи, шт",
-        "Валовая выручка", "Сумма цены покупателя",
-        "Комиссия WB", "Эквайринг",
-        "Средняя цена продажи", "Средняя цена покупателя",
-        "Комиссия WB, %", "СПП, %", "Эквайринг, %",
-        "Логистика прямая", "Логистика обратная", "_обратные_события",
-        "Себестоимость, руб", "Реклама", "Рекламные заказы, шт",
-        "Рекламная выручка", "Рекламные показы", "Рекламные клики",
-    ]
-    for c in num_fill_cols:
-        if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0)
-
-    base["Оценка заказанных, шт"] = base["Продажи, шт"] + base["_обратные_события"]
-    base["Процент выкупа"] = base.apply(
-        lambda r: округлить(безопасное_деление(r["Продажи, шт"] * 100.0, r["Оценка заказанных, шт"], 6), 2)
-        if r["Оценка заказанных, шт"] > 0 else 0.0,
-        axis=1
-    )
-
-    base["Себестоимость всего"] = base["Чистые продажи, шт"] * base["Себестоимость, руб"]
-
-    # --- НОВЫЙ РАСЧЁТ ХРАНЕНИЯ И ПРОЧИХ РАСХОДОВ ---
-    # Убедимся, что средняя цена продажи есть и заполнена
-    if "Средняя цена продажи" not in base.columns:
-        base["Средняя цена продажи"] = 0.0
-    base["Средняя цена продажи"] = pd.to_numeric(base["Средняя цена продажи"], errors="coerce").fillna(0)
-
-    # Хранение = 0.5% от цены за единицу * количество чистых продаж
-    base["Хранение"] = base["Средняя цена продажи"] * 0.005 * base["Чистые продажи, шт"]
-    # Прочие расходы = 1% от цены за единицу * количество чистых продаж
-    base["Прочие расходы"] = base["Средняя цена продажи"] * 0.01 * base["Чистые продажи, шт"]
-
-    # Штрафы и удержания игнорируем
-    base["Штрафы"] = 0.0
-    base["Удержания"] = 0.0
-
-    # Расчёт приёмки (по acceptance)
-    total_units_sold_store = base["Продажи, шт"].sum()
-    приемка_на_ед = безопасное_деление(total_acceptance_store, total_units_sold_store, 6)
-    base["Приёмка"] = base["Продажи, шт"] * приемка_на_ед
-
-    base["НДС"] = base["Валовая выручка"].apply(lambda x: ндс_из_цены_с_ндс(x, СТАВКА_НДС))
-
-    base["Валовая прибыль"] = (
-        base["Валовая выручка"]
-        - base["Себестоимость всего"]
-        - base["Комиссия WB"]
-        - base["Эквайринг"]
-        - base["Логистика прямая"]
-        - base["Логистика обратная"]
-        - base["Хранение"]                # новое значение
-        - base["Приёмка"]
-        - base["Штрафы"]                   # 0
-        - base["Удержания"]                 # 0
-        - base["Реклама"]
-        - base["Прочие расходы"]            # новая статья
-    )
-
-    base["Прибыль до налога"] = base["Валовая прибыль"] - base["НДС"]
-    base["Налог на прибыль"] = base["Прибыль до налога"].apply(
-        lambda x: max(0.0, x) * СТАВКА_НАЛОГА_НА_ПРИБЫЛЬ / 100.0
-    )
-    base["Чистая прибыль"] = base["Прибыль до налога"] - base["Налог на прибыль"]
-
-    base["Валовая рентабельность, %"] = base.apply(
-        lambda r: округлить(безопасное_деление(r["Валовая прибыль"] * 100.0, r["Валовая выручка"], 6), 2)
-        if r["Валовая выручка"] else 0.0,
-        axis=1
-    )
-    base["Чистая рентабельность, %"] = base.apply(
-        lambda r: округлить(безопасное_деление(r["Чистая прибыль"] * 100.0, r["Валовая выручка"], 6), 2)
-        if r["Валовая выручка"] else 0.0,
-        axis=1
-    )
-
-    unit = base.copy()
-    unit["Неделя"] = неделя_код(начало_недели)
-    unit["Комиссия WB, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Комиссия WB"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Эквайринг, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Эквайринг"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Логистика прямая, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Логистика прямая"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Логистика обратная, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Логистика обратная"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Хранение, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Хранение"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Приёмка, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Приёмка"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Штрафы и удержания, руб/ед"] = 0.0   # обнуляем
-    unit["Реклама, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Реклама"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Прочие расходы, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Прочие расходы"], r["Чистые продажи, шт"], 6), axis=1)  # новая
-    unit["НДС, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["НДС"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Валовая прибыль, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Валовая прибыль"], r["Чистые продажи, шт"], 6), axis=1)
-    unit["Чистая прибыль, руб/ед"] = unit.apply(lambda r: безопасное_деление(r["Чистая прибыль"], r["Чистые продажи, шт"], 6), axis=1)
-    unit = unit[КОЛОНКИ_ЮНИТ].copy()
-
-    факт = base.copy()
-    факт["Неделя"] = неделя_код(начало_недели)
-    факт["Ставка НДС, %"] = СТАВКА_НДС
-    факт["Ставка налога на прибыль, %"] = СТАВКА_НАЛОГА_НА_ПРИБЫЛЬ
-    факт = факт[КОЛОНКИ_ФАКТ].copy()
-
-    склады = анализ_складов(logistic_rows, начало_недели)
-
-    return факт, unit, склады
-
-
-# =========================================================
-# ПРИЕМКА ЗА 9 НЕДЕЛЬ
-# =========================================================
-
-def норматив_приемки_за_9_недель(s3: S3Storage, последняя_неделя: datetime.date) -> float:
-    лог("📦 Шаг: расчёт норматива приёмки за 9 недель")
-    weeks = список_недель(последняя_неделя, ГЛУБИНА_ПРИЕМКИ_НЕДЕЛЬ)
-    total_acceptance = 0.0
-    total_units_sold = 0.0
-
-    for i, ws in enumerate(weeks, start=1):
-        лог(f"   → приёмка: неделя {i}/{len(weeks)} ({неделя_код(ws)})")
-        df = прочитать_финансы_недели(s3, ws)
-        if df.empty:
-            continue
-
-        df = подготовить_финансовые_строки(df)
-        signed_rows = df[df["sign"] != 0].copy()
-        sales = signed_rows[signed_rows["sign"] == 1]
-        units = pd.to_numeric(sales["quantity"], errors="coerce").fillna(0).sum()
-
-        total_units_sold += units
-        total_acceptance += abs(pd.to_numeric(df.get("acceptance", 0), errors="coerce").fillna(0).sum())
-
-    return безопасное_деление(total_acceptance, total_units_sold, 6)
-
-
-def применить_норматив_приемки(unit_df: pd.DataFrame, приемка_на_ед_9н: float) -> pd.DataFrame:
-    if unit_df.empty:
-        return unit_df
-
-    df = unit_df.copy()
-    old_acceptance = df["Приёмка, руб/ед"].copy()
-    df["Приёмка, руб/ед"] = приемка_на_ед_9н
-
-    delta = df["Приёмка, руб/ед"] - old_acceptance
-    df["Валовая прибыль, руб/ед"] = df["Валовая прибыль, руб/ед"] - delta
-    df["Чистая прибыль, руб/ед"] = df["Чистая прибыль, руб/ед"] - delta
-
-    return df
-
-
-# =========================================================
-# АНАЛИЗ НЕДЕЛЯ К НЕДЕЛЕ
-# =========================================================
-
-def объяснение_магазин(cur_store: Dict[str, float], prev_store: Dict[str, float]) -> str:
-    deltas = {
-        "выручка": cur_store["Валовая выручка"] - prev_store["Валовая выручка"],
-        "реклама": cur_store["Реклама"] - prev_store["Реклама"],
-        "комиссия": cur_store["Комиссия WB"] - prev_store["Комиссия WB"],
-        "логистика": (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) -
-                     (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]),
-        "себестоимость": cur_store["Себестоимость всего"] - prev_store["Себестоимость всего"],
-        "хранение": cur_store["Хранение"] - prev_store["Хранение"],
-        "приёмка": cur_store["Приёмка"] - prev_store["Приёмка"],
-    }
-
-    top_change = max(deltas, key=lambda k: abs(deltas[k]))
-
-    if deltas["выручка"] > 0 and cur_store["Чистая прибыль"] > prev_store["Чистая прибыль"]:
-        return f"Прибыль выросла. Основной драйвер — рост выручки. Сильнее всего изменилась статья: {top_change}."
-    if deltas["выручка"] < 0 and cur_store["Чистая прибыль"] < prev_store["Чистая прибыль"]:
-        return f"Прибыль снизилась вместе с выручкой. Сильнее всего изменилась статья: {top_change}."
-    if cur_store["Реклама"] > prev_store["Реклама"] and cur_store["Валовая выручка"] <= prev_store["Валовая выручка"]:
-        return "Прибыль снизилась: рекламные расходы выросли быстрее выручки."
-    if (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) > (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]):
-        return "Прибыль снизилась: выросли логистические расходы."
-    return f"Динамика смешанная. Наиболее сильное влияние оказала статья: {top_change}."
-
-
-def объяснение_sku(row) -> str:
-    delta_profit = row["Изменение чистой прибыли"]
-    delta_revenue = row["Изменение выручки"]
-    delta_ads = row["Изменение рекламы"]
-    delta_comm = row["Изменение комиссии"]
-    delta_log = row["Изменение логистики"]
-    delta_spp = row["Изменение СПП"]
-    delta_price = row["Изменение вашей цены"]
-
-    reasons = []
-
-    if delta_revenue > 0 and delta_profit > 0:
-        reasons.append("рост выручки")
-    if delta_revenue < 0 and delta_profit < 0:
-        reasons.append("снижение выручки")
-    if delta_ads > 0 and delta_profit < 0:
-        reasons.append("рост рекламных расходов")
-    if delta_comm > 0 and delta_profit < 0:
-        reasons.append("рост комиссии WB")
-    if delta_log > 0 and delta_profit < 0:
-        reasons.append("рост логистики")
-    if delta_price > 0:
-        reasons.append("рост вашей цены")
-    if delta_price < 0:
-        reasons.append("снижение вашей цены")
-    if delta_spp > 0:
-        reasons.append("рост СПП WB")
-    if delta_spp < 0:
-        reasons.append("снижение СПП WB")
-
-    if not reasons:
-        return "Динамика без одного явного драйвера."
-
-    return "; ".join(reasons[:3])
-
-
-def построить_анализ_неделя_к_неделе(current_fact: pd.DataFrame, prev_fact: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-
-    if current_fact.empty:
-        return подготовить_пустую_схему(КОЛОНКИ_АНАЛИЗ)
-
-    cur = current_fact.copy()
-    prev = prev_fact.copy() if prev_fact is not None else pd.DataFrame()
-    current_week = cur["Неделя"].iloc[0]
-
-    summary_cols = [
-        "Валовая выручка", "Комиссия WB", "Эквайринг", "Логистика прямая",
-        "Логистика обратная", "Хранение", "Приёмка", "Штрафы", "Удержания",
-        "Реклама", "Себестоимость всего", "Валовая прибыль", "НДС", "Налог на прибыль", "Чистая прибыль"
-    ]
-
-    cur_store = {c: cur[c].sum() for c in summary_cols}
-    if not prev.empty:
-        prev_store = {c: prev[c].sum() for c in summary_cols}
-    else:
-        prev_store = {c: 0.0 for c in summary_cols}
-
-    rows.append({
-        "Раздел": "Итог магазина",
-        "Неделя": current_week,
-        "Артикул WB": "",
-        "Артикул продавца": "",
-        "Предмет": "",
-        "Показатель": "Итог по магазину",
-        "Чистая прибыль текущая": округлить(cur_store["Чистая прибыль"], 2),
-        "Чистая прибыль предыдущая": округлить(prev_store["Чистая прибыль"], 2),
-        "Изменение чистой прибыли": округлить(cur_store["Чистая прибыль"] - prev_store["Чистая прибыль"], 2),
-        "Изменение выручки": округлить(cur_store["Валовая выручка"] - prev_store["Валовая выручка"], 2),
-        "Изменение рекламы": округлить(cur_store["Реклама"] - prev_store["Реклама"], 2),
-        "Изменение комиссии": округлить(cur_store["Комиссия WB"] - prev_store["Комиссия WB"], 2),
-        "Изменение логистики": округлить(
-            (cur_store["Логистика прямая"] + cur_store["Логистика обратная"]) -
-            (prev_store["Логистика прямая"] + prev_store["Логистика обратная"]),
-            2
-        ),
-        "Изменение СПП": "",
-        "Изменение вашей цены": "",
-        "Комментарий": объяснение_магазин(cur_store, prev_store),
-    })
-
-    if not prev.empty:
-        merge_cols = [
-            "Артикул WB", "Артикул продавца", "Предмет", "Чистая прибыль", "Валовая выручка",
-            "Реклама", "Комиссия WB", "Логистика прямая", "Логистика обратная",
-            "СПП, %", "Средняя цена продажи"
-        ]
-
-        left = cur[merge_cols].copy()
-        right = prev[merge_cols].copy()
-        merged = left.merge(right, on="Артикул WB", how="outer", suffixes=("_тек", "_пред")).fillna(0)
-
-        merged["Изменение чистой прибыли"] = merged["Чистая прибыль_тек"] - merged["Чистая прибыль_пред"]
-        merged["Изменение выручки"] = merged["Валовая выручка_тек"] - merged["Валовая выручка_пред"]
-        merged["Изменение рекламы"] = merged["Реклама_тек"] - merged["Реклама_пред"]
-        merged["Изменение комиссии"] = merged["Комиссия WB_тек"] - merged["Комиссия WB_пред"]
-        merged["Изменение логистики"] = (
-            (merged["Логистика прямая_тек"] + merged["Логистика обратная_тек"]) -
-            (merged["Логистика прямая_пред"] + merged["Логистика обратная_пред"])
-        )
-        merged["Изменение СПП"] = merged["СПП, %_тек"] - merged["СПП, %_пред"]
-        merged["Изменение вашей цены"] = merged["Средняя цена продажи_тек"] - merged["Средняя цена продажи_пред"]
-
-        merged["Артикул продавца"] = merged.get("Артикул продавца_тек", "").replace(0, "")
-        merged["Предмет"] = merged.get("Предмет_тек", "").replace(0, "")
-        merged["Комментарий"] = merged.apply(объяснение_sku, axis=1)
-
-        лидеры_роста = merged.sort_values("Изменение чистой прибыли", ascending=False).head(20)
-        лидеры_падения = merged.sort_values("Изменение чистой прибыли", ascending=True).head(20)
-
-        for _, r in лидеры_роста.iterrows():
-            rows.append({
-                "Раздел": "Лидеры роста",
-                "Неделя": current_week,
-                "Артикул WB": int(r["Артикул WB"]) if pd.notna(r["Артикул WB"]) and r["Артикул WB"] != "" else "",
-                "Артикул продавца": r.get("Артикул продавца", ""),
-                "Предмет": r.get("Предмет", ""),
-                "Показатель": "Рост прибыли",
-                "Чистая прибыль текущая": округлить(r["Чистая прибыль_тек"], 2),
-                "Чистая прибыль предыдущая": округлить(r["Чистая прибыль_пред"], 2),
-                "Изменение чистой прибыли": округлить(r["Изменение чистой прибыли"], 2),
-                "Изменение выручки": округлить(r["Изменение выручки"], 2),
-                "Изменение рекламы": округлить(r["Изменение рекламы"], 2),
-                "Изменение комиссии": округлить(r["Изменение комиссии"], 2),
-                "Изменение логистики": округлить(r["Изменение логистики"], 2),
-                "Изменение СПП": округлить(r["Изменение СПП"], 2),
-                "Изменение вашей цены": округлить(r["Изменение вашей цены"], 2),
-                "Комментарий": r["Комментарий"],
-            })
-
-        for _, r in лидеры_падения.iterrows():
-            rows.append({
-                "Раздел": "Лидеры падения",
-                "Неделя": current_week,
-                "Артикул WB": int(r["Артикул WB"]) if pd.notna(r["Артикул WB"]) and r["Артикул WB"] != "" else "",
-                "Артикул продавца": r.get("Артикул продавца", ""),
-                "Предмет": r.get("Предмет", ""),
-                "Показатель": "Падение прибыли",
-                "Чистая прибыль текущая": округлить(r["Чистая прибыль_тек"], 2),
-                "Чистая прибыль предыдущая": округлить(r["Чистая прибыль_пред"], 2),
-                "Изменение чистой прибыли": округлить(r["Изменение чистой прибыли"], 2),
-                "Изменение выручки": округлить(r["Изменение выручки"], 2),
-                "Изменение рекламы": округлить(r["Изменение рекламы"], 2),
-                "Изменение комиссии": округлить(r["Изменение комиссии"], 2),
-                "Изменение логистики": округлить(r["Изменение логистики"], 2),
-                "Изменение СПП": округлить(r["Изменение СПП"], 2),
-                "Изменение вашей цены": округлить(r["Изменение вашей цены"], 2),
-                "Комментарий": r["Комментарий"],
-            })
-
-    out = pd.DataFrame(rows)
-    for col in КОЛОНКИ_АНАЛИЗ:
-        if col not in out.columns:
-            out[col] = pd.NA
-    out = out[КОЛОНКИ_АНАЛИЗ].copy()
-    return out
-
-
-# =========================================================
-# ИСТОРИЯ / ХРАНЕНИЕ 13 НЕДЕЛЬ
-# =========================================================
-
-def объединить_с_удержанием(
-    existing_df: pd.DataFrame,
-    new_df: pd.DataFrame,
-    key_cols: List[str],
-    retention_weeks: int = ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ,
-) -> pd.DataFrame:
-    if new_df is None or new_df.empty:
-        return existing_df if existing_df is not None else pd.DataFrame()
-
-    if existing_df is None or existing_df.empty:
-        combined = new_df.copy()
-    else:
-        combined = pd.concat([existing_df, new_df], ignore_index=True)
-
-    if "Неделя" in combined.columns:
-        combined = combined.drop_duplicates(subset=key_cols, keep="last")
-        weeks_sorted = sorted([w for w in combined["Неделя"].dropna().astype(str).unique()])
-        if len(weeks_sorted) > retention_weeks:
-            keep_weeks = set(weeks_sorted[-retention_weeks:])
-            combined = combined[combined["Неделя"].astype(str).isin(keep_weeks)].copy()
-
-    return combined.reset_index(drop=True)
-
-
-def загрузить_существующую_экономику(s3: S3Storage) -> Dict[str, pd.DataFrame]:
-    if not s3.file_exists(ПУТЬ_ЭКОНОМИКА):
-        return {
-            ЛИСТ_ЮНИТ: подготовить_пустую_схему(КОЛОНКИ_ЮНИТ),
-            ЛИСТ_ФАКТ: подготовить_пустую_схему(КОЛОНКИ_ФАКТ),
-            ЛИСТ_АНАЛИЗ: подготовить_пустую_схему(КОЛОНКИ_АНАЛИЗ),
-            ЛИСТ_СКЛАДЫ: подготовить_пустую_схему(КОЛОНКИ_СКЛАДЫ),
-        }
-
-    try:
-        sheets = s3.read_excel_all_sheets(ПУТЬ_ЭКОНОМИКА)
-        return {
-            ЛИСТ_ЮНИТ: очистить_схему(sheets.get(ЛИСТ_ЮНИТ, pd.DataFrame()), КОЛОНКИ_ЮНИТ),
-            ЛИСТ_ФАКТ: очистить_схему(sheets.get(ЛИСТ_ФАКТ, pd.DataFrame()), КОЛОНКИ_ФАКТ),
-            ЛИСТ_АНАЛИЗ: очистить_схему(sheets.get(ЛИСТ_АНАЛИЗ, pd.DataFrame()), КОЛОНКИ_АНАЛИЗ),
-            ЛИСТ_СКЛАДЫ: очистить_схему(sheets.get(ЛИСТ_СКЛАДЫ, pd.DataFrame()), КОЛОНКИ_СКЛАДЫ),
-        }
-    except Exception as e:
-        лог(f"⚠️ Не удалось прочитать существующий Экономика.xlsx: {e}")
-        return {
-            ЛИСТ_ЮНИТ: подготовить_пустую_схему(КОЛОНКИ_ЮНИТ),
-            ЛИСТ_ФАКТ: подготовить_пустую_схему(КОЛОНКИ_ФАКТ),
-            ЛИСТ_АНАЛИЗ: подготовить_пустую_схему(КОЛОНКИ_АНАЛИЗ),
-            ЛИСТ_СКЛАДЫ: подготовить_пустую_схему(КОЛОНКИ_СКЛАДЫ),
-        }
-
-
-# =========================================================
-# ОКРУГЛЕНИЕ
-# =========================================================
-
-def округлить_таблицу(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    out = df.copy()
-    for col in out.columns:
-        if pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = out[col].apply(lambda x: округлить(x, 2))
-    return out
-
-
-# =========================================================
-# ОСНОВНОЙ КЛАСС
-# =========================================================
-
-class КалькуляторЭкономики:
-    def __init__(self, s3: S3Storage):
-        self.s3 = s3
-
-    def run(self):
-        начало_недели, конец_недели = последняя_полная_неделя()
-        начало_пред = начало_недели - timedelta(days=7)
-        конец_пред = конец_недели - timedelta(days=7)
-
-        лог("=" * 80)
-        лог(f"📌 Запуск weekly-экономики для магазина {МАГАЗИН}")
-        лог(f"📅 Целевая неделя: {неделя_код(начало_недели)}")
-        лог("=" * 80)
-
-        # Разовый пересчёт всех последних недель
-        if ПЕРЕСЧИТАТЬ_ИСТОРИЮ:
-            лог("🔄 Режим пересчёта истории: будут пересчитаны все недели за последние 13 недель")
-            недели_для_пересчёта = список_недель(начало_недели, ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ)
-            все_факт = []
-            все_юнит = []
-            все_склады = []
-            for nd in недели_для_пересчёта:
-                лог(f"⏳ Пересчёт недели {неделя_код(nd)}")
-                фин = прочитать_финансы_недели(self.s3, nd)
-                if фин.empty:
-                    лог(f"⚠️ Нет финансов за неделю {неделя_код(nd)}, пропускаем")
-                    continue
-                ост = прочитать_остатки_недели(self.s3, nd)
-                рек = прочитать_рекламу_недели(self.s3, nd, nd + timedelta(days=6))
-                себест = прочитать_себестоимость(self.s3)
-                ф, у, ск = посчитать_факт_и_юнит(
-                    fin_df=фин,
-                    advert_df=рек,
-                    cost_df=себест,
-                    stocks_df=ост,
-                    начало_недели=nd,
-                    конец_недели=nd + timedelta(days=6),
+def make_storage(root: str) -> BaseStorage:
+    bucket = os.getenv("YC_BUCKET_NAME", "").strip()
+    access_key = os.getenv("YC_ACCESS_KEY_ID", "").strip()
+    secret_key = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+    if bucket and access_key and secret_key:
+        log("Using Yandex Object Storage (S3)")
+        return S3Storage(bucket=bucket, access_key=access_key, secret_key=secret_key)
+    log("Using local filesystem")
+    return LocalStorage(root=root)
+
+# =========================
+# Aliases
+# =========================
+
+ALIASES = {
+    "day": ["Дата", "dt", "date", "Дата заказа"],
+    "week_code": ["Неделя"],
+    "nm_id": ["Артикул WB", "Артикул ВБ", "nmID", "nmId"],
+    "supplier_article": ["Артикул продавца", "supplierArticle", "Артикул WB продавца"],
+    "subject": ["Предмет", "subject", "Название предмета"],
+    "brand": ["Бренд", "brand"],
+    "title": ["Название", "Название товара", "Товар"],
+    "orders": ["Заказы", "Заказали", "orders", "ordersCount", "Кол-во продаж", "Чистые продажи, шт"],
+    "gross_profit_unit": ["Валовая прибыль, руб/ед"],
+    "gross_profit": ["Валовая прибыль"],
+}
+
+# =========================
+# Loaded data
+# =========================
+
+@dataclass
+class LoadedData:
+    orders: pd.DataFrame
+    economics: pd.DataFrame
+    abc: pd.DataFrame
+
+# =========================
+# Loader
+# =========================
+
+class Loader:
+    def __init__(self, storage: BaseStorage, store: str, reports_root: str = "Отчёты"):
+        self.storage = storage
+        self.store = store
+        self.reports_root = reports_root.rstrip("/")
+
+    def _prefix(self, *parts: str) -> str:
+        return "/".join([self.reports_root, *parts]).replace("//", "/")
+
+    def _list_xlsx(self, prefix: str) -> List[str]:
+        return [p for p in self.storage.list_files(prefix) if p.lower().endswith(".xlsx") and "/~$" not in p]
+
+    def load_orders(self) -> pd.DataFrame:
+        log("Этап 1.1. Загружаю заказы")
+        files = self._list_xlsx(self._prefix("Заказы", self.store, "Недельные"))
+        if not files:
+            files = self._list_xlsx(self._prefix("Заказы", self.store))
+        dfs = []
+        for path in files:
+            try:
+                raw, _, _ = read_excel_flexible(
+                    self.storage.read_bytes(path),
+                    path,
+                    preferred_sheets=None,
+                    header_candidates=(0, 1, 2),
+                    expected_aliases={
+                        "day": ALIASES["day"],
+                        "supplier_article": ALIASES["supplier_article"],
+                        "nm_id": ALIASES["nm_id"],
+                        "subject": ALIASES["subject"],
+                    },
                 )
-                if not ф.empty:
-                    все_факт.append(ф)
-                    все_юнит.append(у)
-                    все_склады.append(ск)
+                df = rename_using_aliases(raw, {
+                    **ALIASES,
+                    "warehouse": ["Склад", "warehouseName"],
+                    "finished_price": ["finishedPrice", "Ср. цена продажи", "Цена с учетом всех скидок, кроме суммы по WB Кошельку"],
+                    "price_with_disc": ["priceWithDisc", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
+                    "spp": ["SPP", "СПП", "Скидка WB, %"],
+                    "is_cancel": ["isCancel", "Отмена заказа"],
+                })
+                df["day"] = to_dt(df["day"]).dt.normalize()
+                df["supplier_article"] = df["supplier_article"].map(normalize_supplier_article)
+                df["nm_id"] = to_numeric(df["nm_id"])
+                df["subject"] = df["subject"].map(normalize_text)
+                df["brand"] = df["brand"].map(normalize_text)
+                df["warehouse"] = df["warehouse"].map(normalize_text)
+                df["finished_price"] = to_numeric(df["finished_price"])
+                df["price_with_disc"] = to_numeric(df["price_with_disc"])
+                df["spp"] = to_numeric(df["spp"])
+                if "is_cancel" in df.columns:
+                    df["is_cancel"] = df["is_cancel"].fillna(False).astype(str).str.lower().isin({"true", "1"})
+                else:
+                    df["is_cancel"] = False
+                df = df[df["day"].notna()].copy()
+                df["code"] = df["supplier_article"].map(extract_code)
+                dfs.append(df[["day","supplier_article","nm_id","subject","brand","warehouse","finished_price","price_with_disc","spp","is_cancel","code"]])
+            except Exception as e:
+                log(f"WARN: orders read error {path}: {e}")
+        if not dfs:
+            return pd.DataFrame(columns=["day","supplier_article","nm_id","subject","brand","warehouse","finished_price","price_with_disc","spp","is_cancel","code"])
+        out = pd.concat(dfs, ignore_index=True)
+        out = out[(out["supplier_article"] != "") & out["subject"].isin(TARGET_SUBJECTS)].copy()
+        out = out[~out["is_cancel"]].copy()
+        log(f"  orders rows: {len(out):,}")
+        return out
 
-            if все_факт:
-                факт = pd.concat(все_факт, ignore_index=True)
-                юнит = pd.concat(все_юнит, ignore_index=True)
-                склады = pd.concat(все_склады, ignore_index=True)
-                # Применим норматив приёмки ко всем юнитам
-                приемка_норм_9н = норматив_приемки_за_9_недель(self.s3, начало_недели)
-                лог(f"📦 Норматив приёмки за {ГЛУБИНА_ПРИЕМКИ_НЕДЕЛЬ} недель: {приемка_норм_9н:.6f} руб/ед")
-                юнит = применить_норматив_приемки(юнит, приемка_норм_9н)
-                # Анализ строить не будем, так как для истории он не нужен (или можно построить для последней недели)
-                анализ = подготовить_пустую_схему(КОЛОНКИ_АНАЛИЗ)
-                # Сохраняем, игнорируя существующий файл
-                sheets_to_write = {
-                    ЛИСТ_ЮНИТ: округлить_таблицу(юнит.sort_values(["Неделя", "Чистая прибыль, руб/ед"], ascending=[False, False]).reset_index(drop=True)),
-                    ЛИСТ_ФАКТ: округлить_таблицу(факт.sort_values(["Неделя", "Чистая прибыль"], ascending=[False, False]).reset_index(drop=True)),
-                    ЛИСТ_АНАЛИЗ: округлить_таблицу(анализ),
-                    ЛИСТ_СКЛАДЫ: округлить_таблицу(склады.sort_values(["Неделя", "Переплата"], ascending=[False, False]).reset_index(drop=True)),
-                }
-                лог("💾 Шаг: запись пересчитанной истории в Экономика.xlsx")
-                self.s3.write_excel_sheets(ПУТЬ_ЭКОНОМИКА, sheets_to_write)
-                лог("✅ Пересчёт истории завершён.")
-                return
-            else:
-                лог("❌ Не удалось пересчитать ни одной недели, завершаю работу.")
-                return
+    def load_economics(self) -> pd.DataFrame:
+        log("Этап 1.2. Загружаю Экономику")
+        candidates = [
+            self._prefix("Финансовые показатели", self.store, "Экономика.xlsx"),
+            self._prefix("Финансовые показатели", self.store, "Недельные", "Экономика.xlsx"),
+        ]
+        path = None
+        for c in candidates:
+            if self.storage.exists(c):
+                path = c
+                break
+        if path is None:
+            raise FileNotFoundError("Не найден файл Экономика.xlsx")
+        raw, sheet, _ = read_excel_flexible(
+            self.storage.read_bytes(path),
+            path,
+            preferred_sheets=["Юнит экономика"],
+            header_candidates=(0, 1, 2),
+            expected_aliases={
+                "week_code": ALIASES["week_code"],
+                "supplier_article": ALIASES["supplier_article"],
+                "nm_id": ALIASES["nm_id"],
+                "subject": ALIASES["subject"],
+                "orders": ["Чистые продажи, шт", "Заказы"],
+                "gross_profit_unit": ["Валовая прибыль, руб/ед"],
+            },
+        )
+        df = rename_using_aliases(raw, {
+            **ALIASES,
+        })
+        df["week_code"] = df["week_code"].map(normalize_text)
+        df["supplier_article"] = df["supplier_article"].map(normalize_supplier_article)
+        df["nm_id"] = to_numeric(df["nm_id"])
+        df["subject"] = df["subject"].map(normalize_text)
+        df["brand"] = df["brand"].map(normalize_text)
+        df["orders"] = to_numeric(df["orders"]).fillna(0)
+        df["gross_profit_unit"] = to_numeric(df["gross_profit_unit"]).fillna(0)
+        df["code"] = df["supplier_article"].map(extract_code)
+        df = df[(df["supplier_article"] != "") & df["subject"].isin(TARGET_SUBJECTS)].copy()
+        log(f"  economics rows: {len(df):,}; sheet={sheet}")
+        return df[["week_code","supplier_article","nm_id","subject","brand","orders","gross_profit_unit","code"]]
 
-        # Обычный режим (только текущая неделя)
-        лог("📥 Шаг: чтение финансов")
-        финансы = прочитать_финансы_недели(self.s3, начало_недели)
-        if финансы.empty:
-            raise RuntimeError("Нет финансовых данных за целевую неделю")
-        лог(f"✅ Финансы загружены, строк: {len(финансы)}")
+    def load_abc(self) -> pd.DataFrame:
+        log("Этап 1.3. Загружаю ABC")
+        files = self._list_xlsx(self._prefix("ABC"))
+        files = [f for f in files if "wb_abc_report_goods__" in Path(f).name]
+        dfs = []
+        for path in files:
+            try:
+                raw, _, _ = read_excel_flexible(
+                    self.storage.read_bytes(path),
+                    path,
+                    preferred_sheets=None,
+                    header_candidates=(0, 1, 2),
+                    expected_aliases={
+                        "supplier_article": ALIASES["supplier_article"],
+                        "nm_id": ALIASES["nm_id"],
+                        "subject": ALIASES["subject"],
+                        "gross_profit": ALIASES["gross_profit"],
+                    },
+                )
+                df = rename_using_aliases(raw, {
+                    **ALIASES,
+                    "gross_revenue": ["Валовая выручка"],
+                })
+                start, end = parse_abc_period_from_name(Path(path).name)
+                week_code = week_code_from_date(pd.Timestamp(start)) if start else None
+                df["week_code"] = week_code
+                df["week_start"] = pd.Timestamp(start) if start else pd.NaT
+                df["week_end"] = pd.Timestamp(end) if end else pd.NaT
+                df["supplier_article"] = df["supplier_article"].map(normalize_supplier_article)
+                df["nm_id"] = to_numeric(df["nm_id"])
+                df["subject"] = df["subject"].map(normalize_text)
+                df["brand"] = df["brand"].map(normalize_text)
+                df["gross_profit"] = to_numeric(df["gross_profit"]).fillna(0)
+                df["gross_revenue"] = to_numeric(df["gross_revenue"]).fillna(0)
+                df["orders"] = to_numeric(df["orders"]).fillna(0)
+                df["code"] = df["supplier_article"].map(extract_code)
+                df = df[(df["supplier_article"] != "") & df["subject"].isin(TARGET_SUBJECTS)].copy()
+                dfs.append(df[["week_code","week_start","week_end","supplier_article","nm_id","subject","brand","gross_profit","gross_revenue","orders","code"]])
+            except Exception as e:
+                log(f"WARN: abc read error {path}: {e}")
+        if not dfs:
+            return pd.DataFrame(columns=["week_code","week_start","week_end","supplier_article","nm_id","subject","brand","gross_profit","gross_revenue","orders","code"])
+        out = pd.concat(dfs, ignore_index=True)
+        log(f"  abc rows: {len(out):,}")
+        return out
 
-        лог("📥 Шаг: чтение остатков")
-        остатки = прочитать_остатки_недели(self.s3, начало_недели)
-        лог(f"ℹ️ Остатки: строк {len(остатки)}")
+    def load_all(self) -> LoadedData:
+        orders = self.load_orders()
+        economics = self.load_economics()
+        abc = self.load_abc()
+        return LoadedData(orders=orders, economics=economics, abc=abc)
 
-        реклама = прочитать_рекламу_недели(self.s3, начало_недели, конец_недели)
-        себестоимость = прочитать_себестоимость(self.s3)
+# =========================
+# Stage 1 builder
+# =========================
 
-        факт, юнит, склады = посчитать_факт_и_юнит(
-            fin_df=финансы,
-            advert_df=реклама,
-            cost_df=себестоимость,
-            stocks_df=остатки,
-            начало_недели=начало_недели,
-            конец_недели=конец_недели,
+class Stage1Builder:
+    def __init__(self, data: LoadedData):
+        self.data = data
+        self.daily = self.build_daily_gp()
+        self.current_week_dates = self.get_current_week_dates()
+        self.current_month_weeks = self.get_current_month_weeks()
+        self.last_three_months = self.get_last_three_months()
+        self.daily_plan = self.build_daily_plan()
+        self.weekly_actual = self.build_weekly_actual()
+        self.weekly_plan = self.build_weekly_plan()
+        self.monthly_actual = self.build_monthly_actual()
+        self.monthly_plan = self.build_monthly_plan()
+
+    def build_daily_gp(self) -> pd.DataFrame:
+        log("Этап 1.4. Считаю дневную валовую прибыль (Экономика × заказы)")
+        o = self.data.orders.copy()
+        e = self.data.economics.copy()
+        if o.empty or e.empty:
+            return pd.DataFrame(columns=["day","supplier_article","nm_id","subject","brand","code","gross_profit_day"])
+        o["week_code"] = o["day"].map(week_code_from_date)
+        o["one_order"] = 1
+
+        daily_orders = (
+            o.groupby(["day","week_code","supplier_article","nm_id","subject","brand","code"], dropna=False)
+             .agg(order_count=("one_order","sum"))
+             .reset_index()
         )
 
-        if факт.empty:
-            raise RuntimeError("Не удалось сформировать weekly fact")
+        econ = (
+            e.groupby(["week_code","supplier_article","nm_id","subject","brand","code"], dropna=False)
+             .agg(gross_profit_unit=("gross_profit_unit","mean"))
+             .reset_index()
+        )
 
-        приемка_норм_9н = норматив_приемки_за_9_недель(self.s3, начало_недели)
-        лог(f"📦 Норматив приёмки за {ГЛУБИНА_ПРИЕМКИ_НЕДЕЛЬ} недель: {приемка_норм_9н:.6f} руб/ед")
-
-        юнит = применить_норматив_приемки(юнит, приемка_норм_9н)
-
-        лог("📥 Шаг: чтение предыдущей недели")
-        финансы_пред = прочитать_финансы_недели(self.s3, начало_пред)
-        if not финансы_пред.empty:
-            остатки_пред = прочитать_остатки_недели(self.s3, начало_пред)
-            реклама_пред = прочитать_рекламу_недели(self.s3, начало_пред, конец_пред)
-            факт_пред, _, _ = посчитать_факт_и_юнит(
-                fin_df=финансы_пред,
-                advert_df=реклама_пред,
-                cost_df=себестоимость,
-                stocks_df=остатки_пред,
-                начало_недели=начало_пред,
-                конец_недели=конец_пред,
+        cur = daily_orders.merge(
+            econ[["week_code","supplier_article","gross_profit_unit"]],
+            on=["week_code","supplier_article"],
+            how="left",
+        )
+        missing = cur["gross_profit_unit"].isna()
+        if missing.any():
+            fallback = daily_orders.loc[missing, ["week_code","nm_id"]].merge(
+                econ[["week_code","nm_id","gross_profit_unit"]].dropna(subset=["nm_id"]),
+                on=["week_code","nm_id"],
+                how="left",
             )
-        else:
-            факт_пред = подготовить_пустую_схему(КОЛОНКИ_ФАКТ)
+            cur.loc[missing, "gross_profit_unit"] = fallback["gross_profit_unit"].values
 
-        лог("📊 Шаг: построение анализа")
-        анализ = построить_анализ_неделя_к_неделе(факт, факт_пред)
+        cur["gross_profit_unit"] = cur["gross_profit_unit"].fillna(0)
+        cur["gross_profit_day"] = cur["order_count"] * cur["gross_profit_unit"]
+        log(f"  daily gp rows: {len(cur):,}")
+        return cur
 
-        лог("📂 Шаг: загрузка существующего файла Экономика.xlsx")
-        existing = загрузить_существующую_экономику(self.s3)
+    def get_current_week_dates(self) -> List[pd.Timestamp]:
+        if self.daily.empty:
+            return []
+        max_day = pd.to_datetime(self.daily["day"], errors="coerce").max()
+        week_start = max_day - pd.Timedelta(days=int(max_day.weekday()))
+        return [week_start + pd.Timedelta(days=i) for i in range(7)]
 
-        лог("🧩 Шаг: объединение истории")
-        юнит_all = объединить_с_удержанием(
-            existing[ЛИСТ_ЮНИТ], юнит,
-            key_cols=["Неделя", "Артикул WB"],
-            retention_weeks=ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ,
+    def get_current_month_weeks(self) -> List[Tuple[pd.Timestamp, pd.Timestamp, str]]:
+        if self.data.abc.empty:
+            return []
+        max_week_end = pd.to_datetime(self.data.abc["week_end"], errors="coerce").max()
+        month = max_week_end.month
+        year = max_week_end.year
+        abc = self.data.abc.copy()
+        abc["week_start"] = to_dt(abc["week_start"])
+        abc["week_end"] = to_dt(abc["week_end"])
+        weeks = (
+            abc.loc[(abc["week_start"].dt.month == month) | (abc["week_end"].dt.month == month), ["week_code","week_start","week_end"]]
+               .drop_duplicates()
+               .sort_values("week_start", ascending=False)
         )
+        result = []
+        seen = set()
+        for _, r in weeks.iterrows():
+            wk = r["week_code"]
+            if wk in seen:
+                continue
+            seen.add(wk)
+            result.append((pd.Timestamp(r["week_start"]), pd.Timestamp(r["week_end"]), wk))
+        return result
 
-        факт_all = объединить_с_удержанием(
-            existing[ЛИСТ_ФАКТ], факт,
-            key_cols=["Неделя", "Артикул WB"],
-            retention_weeks=ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ,
+    def get_last_three_months(self) -> List[pd.Timestamp]:
+        if self.data.abc.empty:
+            return []
+        max_week_end = pd.to_datetime(self.data.abc["week_end"], errors="coerce").max()
+        current_month = pd.Timestamp(max_week_end.year, max_week_end.month, 1)
+        months = [current_month]
+        for i in range(1, 3):
+            prev = (current_month.to_period("M") - i).to_timestamp()
+            months.append(prev)
+        return months
+
+    def build_daily_plan(self) -> pd.DataFrame:
+        log("Этап 1.5. Считаю дневной план по валовой прибыли")
+        df = self.daily.copy()
+        if df.empty:
+            return pd.DataFrame(columns=["level","entity","weekday","plan_day"])
+        rows = []
+
+        def plans_for(group_df: pd.DataFrame, entity: str, level: str):
+            g = group_df.copy()
+            g["weekday"] = pd.to_datetime(g["day"]).dt.weekday
+            for wd, s in g.groupby("weekday")["gross_profit_day"]:
+                rows.append({
+                    "level": level,
+                    "entity": entity,
+                    "weekday": int(wd),
+                    "plan_day": target_from_series(s.tail(90)),
+                })
+
+        for subject, g in df.groupby("subject", dropna=False):
+            plans_for(g, subject, "category")
+        for code, g in df.groupby("code", dropna=False):
+            plans_for(g, code, "product")
+        for art, g in df.groupby("supplier_article", dropna=False):
+            plans_for(g, art, "article")
+
+        return pd.DataFrame(rows)
+
+    def build_weekly_actual(self) -> pd.DataFrame:
+        log("Этап 1.6. Считаю недельную валовую прибыль по ABC")
+        a = self.data.abc.copy()
+        if a.empty:
+            return pd.DataFrame(columns=["week_code","week_start","week_end","supplier_article","code","subject","gross_profit_week"])
+        g = (
+            a.groupby(["week_code","week_start","week_end","supplier_article","code","subject"], dropna=False)
+             .agg(gross_profit_week=("gross_profit","sum"))
+             .reset_index()
         )
+        return g
 
-        анализ_all = объединить_с_удержанием(
-            existing[ЛИСТ_АНАЛИЗ], анализ,
-            key_cols=["Неделя", "Раздел", "Артикул WB", "Показатель"],
-            retention_weeks=ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ,
+    def build_weekly_plan(self) -> pd.DataFrame:
+        log("Этап 1.7. Считаю недельный план")
+        w = self.weekly_actual.copy()
+        if w.empty:
+            return pd.DataFrame(columns=["level","entity","plan_week"])
+        rows = []
+        for subject, g in w.groupby("subject", dropna=False):
+            rows.append({"level":"category","entity":subject,"plan_week":target_from_series(g["gross_profit_week"].tail(12))})
+        for code, g in w.groupby("code", dropna=False):
+            rows.append({"level":"product","entity":code,"plan_week":target_from_series(g["gross_profit_week"].tail(12))})
+        for art, g in w.groupby("supplier_article", dropna=False):
+            rows.append({"level":"article","entity":art,"plan_week":target_from_series(g["gross_profit_week"].tail(12))})
+        return pd.DataFrame(rows)
+
+    def build_monthly_actual(self) -> pd.DataFrame:
+        log("Этап 1.8. Считаю месячную валовую прибыль по ABC")
+        w = self.weekly_actual.copy()
+        if w.empty:
+            return pd.DataFrame(columns=["month_start","supplier_article","code","subject","gross_profit_month"])
+        w["month_start"] = pd.to_datetime(w["week_end"]).dt.to_period("M").dt.to_timestamp()
+        g = (
+            w.groupby(["month_start","supplier_article","code","subject"], dropna=False)
+             .agg(gross_profit_month=("gross_profit_week","sum"))
+             .reset_index()
         )
+        return g
 
-        склады_all = объединить_с_удержанием(
-            existing[ЛИСТ_СКЛАДЫ], склады,
-            key_cols=["Неделя", "Склад"],
-            retention_weeks=ГЛУБИНА_ХРАНЕНИЯ_НЕДЕЛЬ,
+    def build_monthly_plan(self) -> pd.DataFrame:
+        log("Этап 1.9. Считаю месячный план")
+        m = self.monthly_actual.copy()
+        if m.empty:
+            return pd.DataFrame(columns=["level","entity","plan_month"])
+        rows = []
+        for subject, g in m.groupby("subject", dropna=False):
+            rows.append({"level":"category","entity":subject,"plan_month":target_from_series(g["gross_profit_month"].tail(6))})
+        for code, g in m.groupby("code", dropna=False):
+            rows.append({"level":"product","entity":code,"plan_month":target_from_series(g["gross_profit_month"].tail(6))})
+        for art, g in m.groupby("supplier_article", dropna=False):
+            rows.append({"level":"article","entity":art,"plan_month":target_from_series(g["gross_profit_month"].tail(6))})
+        return pd.DataFrame(rows)
+
+    def build_hierarchy(self) -> List[Dict[str, str]]:
+        log("Этап 1.10. Собираю иерархию категория → товар → артикул")
+        articles = (
+            self.daily[["supplier_article","code","subject"]]
+            .drop_duplicates()
+            .query("supplier_article != '' and code != '' and subject != ''")
         )
+        if articles.empty:
+            # fallback from abc/economics
+            frames = []
+            for df in [self.weekly_actual, self.data.economics]:
+                cols = [c for c in ["supplier_article","code","subject"] if c in df.columns]
+                if cols:
+                    frames.append(df[cols].drop_duplicates())
+            if frames:
+                articles = pd.concat(frames, ignore_index=True).drop_duplicates()
+                articles = articles.query("supplier_article != '' and code != '' and subject != ''")
+        rows: List[Dict[str, str]] = []
+        for subject in TARGET_SUBJECTS:
+            sub = articles[articles["subject"] == subject].copy()
+            if sub.empty:
+                # still keep category
+                rows.append({"level":"category","subject":subject,"code":"","supplier_article":"","label":subject})
+                continue
+            rows.append({"level":"category","subject":subject,"code":"","supplier_article":"","label":subject})
+            for code in sorted(sub["code"].dropna().astype(str).unique(), key=lambda x: (len(x), x)):
+                rows.append({"level":"product","subject":subject,"code":code,"supplier_article":"","label":code})
+                arts = sorted(sub.loc[sub["code"] == code, "supplier_article"].dropna().astype(str).unique())
+                for art in arts:
+                    rows.append({"level":"article","subject":subject,"code":code,"supplier_article":art,"label":art})
+        return rows
 
-        юнит_all = очистить_схему(юнит_all, КОЛОНКИ_ЮНИТ)
-        факт_all = очистить_схему(факт_all, КОЛОНКИ_ФАКТ)
-        анализ_all = очистить_схему(анализ_all, КОЛОНКИ_АНАЛИЗ)
-        склады_all = очистить_схему(склады_all, КОЛОНКИ_СКЛАДЫ)
+# =========================
+# Writer
+# =========================
 
-        sheets_to_write = {
-            ЛИСТ_ЮНИТ: округлить_таблицу(
-                юнит_all.sort_values(["Неделя", "Чистая прибыль, руб/ед"], ascending=[False, False]).reset_index(drop=True)
-            ),
-            ЛИСТ_ФАКТ: округлить_таблицу(
-                факт_all.sort_values(["Неделя", "Чистая прибыль"], ascending=[False, False]).reset_index(drop=True)
-            ),
-            ЛИСТ_АНАЛИЗ: округлить_таблицу(
-                анализ_all.sort_values(["Неделя", "Раздел"], ascending=[False, True]).reset_index(drop=True)
-            ),
-            ЛИСТ_СКЛАДЫ: округлить_таблицу(
-                склады_all.sort_values(["Неделя", "Переплата"], ascending=[False, False]).reset_index(drop=True)
-            ),
-        }
+class Stage1Workbook:
+    def __init__(self, builder: Stage1Builder):
+        self.b = builder
+        self.wb = Workbook()
+        self.ws = self.wb.active
+        self.ws.title = "Сводка"
+        self.row = 1
+        self.rows_meta: List[Tuple[int, str, str, str]] = []  # row, level, subject, code
 
-        лог("💾 Шаг: запись Экономика.xlsx")
-        self.s3.write_excel_sheets(ПУТЬ_ЭКОНОМИКА, sheets_to_write)
+    def write(self) -> Workbook:
+        ws = self.ws
+        ws.sheet_properties.outlinePr.summaryBelow = True
+        self.write_title("Показатели Валовой прибыли")
+        self.row += 1
+        self.write_daily_section()
+        self.row += 2
+        self.write_weekly_section()
+        self.row += 2
+        self.write_monthly_section()
+        self.apply_formatting()
+        return self.wb
 
-        total_revenue = факт["Валовая выручка"].sum()
-        total_gp = факт["Валовая прибыль"].sum()
-        total_net = факт["Чистая прибыль"].sum()
+    def write_title(self, title: str) -> None:
+        ws = self.ws
+        ws.cell(self.row, 1, title)
+        ws.cell(self.row, 1).font = Font(bold=True, size=14)
+        ws.cell(self.row, 1).fill = TITLE_FILL
+        self.row += 1
+        subtitle = f"Сформировано: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+        ws.cell(self.row, 1, subtitle)
+        self.row += 1
 
-        лог(f"✅ Экономика сохранена: {ПУТЬ_ЭКОНОМИКА}")
-        лог(f"📊 Выручка недели: {total_revenue:,.2f}")
-        лог(f"📊 Валовая прибыль недели: {total_gp:,.2f}")
-        лог(f"📊 Чистая прибыль недели: {total_net:,.2f}")
+    def _entity_value(self, level: str, subject: str, code: str, article: str, metric_df: pd.DataFrame, key_cols: List[str], value_col: str) -> pd.DataFrame:
+        df = metric_df.copy()
+        if df.empty:
+            return df
+        if level == "category":
+            return df[df["subject"] == subject]
+        if level == "product":
+            return df[df["code"] == code]
+        return df[df["supplier_article"] == article]
 
+    def _plan_value(self, level: str, entity: str, plan_df: pd.DataFrame, col: str, weekdays: Optional[List[int]] = None) -> float:
+        if plan_df.empty:
+            return 0.0
+        x = plan_df[(plan_df["level"] == level) & (plan_df["entity"] == entity)]
+        if x.empty:
+            return 0.0
+        if weekdays is not None and "weekday" in x.columns:
+            x = x[x["weekday"].isin(weekdays)]
+            if x.empty:
+                return 0.0
+        return float(x[col].mean()) if col in x.columns else 0.0
 
-# =========================================================
-# ENTRYPOINT
-# =========================================================
+    def write_daily_section(self) -> None:
+        ws = self.ws
+        start_row = self.row
+        ws.cell(self.row, 1, "Текущая неделя по дням (дневная валовая прибыль из Экономики)")
+        ws.cell(self.row, 1).font = Font(bold=True)
+        ws.cell(self.row, 1).fill = SECTION_FILL
+        self.row += 1
 
-def main():
-    required_env = ["YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY", "YC_BUCKET_NAME"]
-    missing = [var for var in required_env if not os.environ.get(var)]
-    if missing:
-        raise RuntimeError(f"Отсутствуют переменные окружения: {missing}")
+        dates = self.b.current_week_dates
+        headers = ["Категория / Товар / Артикул"] + [f"{russian_weekday_name(d)}\n{d.strftime('%d.%m')}" for d in dates] + ["План по валовой прибыли, день"]
+        self._write_header(headers)
 
-    s3 = S3Storage(
-        access_key=os.environ["YC_ACCESS_KEY_ID"],
-        secret_key=os.environ["YC_SECRET_ACCESS_KEY"],
-        bucket_name=os.environ["YC_BUCKET_NAME"],
-    )
+        hierarchy = self.b.build_hierarchy()
+        for item in hierarchy:
+            row_idx = self.row
+            ws.cell(self.row, 1, item["label"])
+            level = item["level"]
+            if level == "category":
+                vals = []
+                df = self._entity_value(level, item["subject"], item["code"], item["supplier_article"], self.b.daily, [], "gross_profit_day")
+                for d in dates:
+                    vals.append(float(df.loc[df["day"] == d, "gross_profit_day"].sum()))
+                plan = self._plan_value("category", item["subject"], self.b.daily_plan, "plan_day", weekdays=[int(d.weekday()) for d in dates])
+            elif level == "product":
+                df = self._entity_value(level, item["subject"], item["code"], item["supplier_article"], self.b.daily, [], "gross_profit_day")
+                vals = [float(df.loc[df["day"] == d, "gross_profit_day"].sum()) for d in dates]
+                plan = self._plan_value("product", item["code"], self.b.daily_plan, "plan_day", weekdays=[int(d.weekday()) for d in dates])
+            else:
+                df = self._entity_value(level, item["subject"], item["code"], item["supplier_article"], self.b.daily, [], "gross_profit_day")
+                vals = [float(df.loc[df["day"] == d, "gross_profit_day"].sum()) for d in dates]
+                plan = self._plan_value("article", item["supplier_article"], self.b.daily_plan, "plan_day", weekdays=[int(d.weekday()) for d in dates])
+            for i, val in enumerate(vals, start=2):
+                ws.cell(self.row, i, val)
+            ws.cell(self.row, len(headers), plan)
+            self._style_data_row(self.row, len(headers), level)
+            self.rows_meta.append((row_idx, level, item["subject"], item["code"]))
+            self.row += 1
 
-    calc = КалькуляторЭкономики(s3)
-    calc.run()
+        # total
+        total_row = self.row
+        ws.cell(self.row, 1, "ИТОГО")
+        for idx, d in enumerate(dates, start=2):
+            total = float(self.b.daily.loc[self.b.daily["day"] == d, "gross_profit_day"].sum())
+            ws.cell(self.row, idx, total)
+        total_plan = sum(self._plan_value("category", s, self.b.daily_plan, "plan_day", weekdays=[int(d.weekday()) for d in dates]) for s in TARGET_SUBJECTS)
+        ws.cell(self.row, len(headers), total_plan)
+        self._style_total_row(self.row, len(headers))
+        self.row += 1
 
+    def write_weekly_section(self) -> None:
+        ws = self.ws
+        ws.cell(self.row, 1, "Текущий месяц по неделям (недельная валовая прибыль из ABC)")
+        ws.cell(self.row, 1).font = Font(bold=True)
+        ws.cell(self.row, 1).fill = SECTION_FILL
+        self.row += 1
+
+        weeks = self.b.current_month_weeks
+        headers = ["Категория / Товар / Артикул"] + [week_label(s, e) for s, e, _ in weeks] + ["План по валовой прибыли, неделя"]
+        self._write_header(headers)
+
+        hierarchy = self.b.build_hierarchy()
+        for item in hierarchy:
+            row_idx = self.row
+            ws.cell(self.row, 1, item["label"])
+            level = item["level"]
+            vals = []
+            if level == "category":
+                df = self.b.weekly_actual[self.b.weekly_actual["subject"] == item["subject"]]
+                plan = self._plan_value("category", item["subject"], self.b.weekly_plan, "plan_week")
+            elif level == "product":
+                df = self.b.weekly_actual[self.b.weekly_actual["code"] == item["code"]]
+                plan = self._plan_value("product", item["code"], self.b.weekly_plan, "plan_week")
+            else:
+                df = self.b.weekly_actual[self.b.weekly_actual["supplier_article"] == item["supplier_article"]]
+                plan = self._plan_value("article", item["supplier_article"], self.b.weekly_plan, "plan_week")
+            for s, e, wk in weeks:
+                vals.append(float(df.loc[df["week_code"] == wk, "gross_profit_week"].sum()))
+            for i, val in enumerate(vals, start=2):
+                ws.cell(self.row, i, val)
+            ws.cell(self.row, len(headers), plan)
+            self._style_data_row(self.row, len(headers), level)
+            self.rows_meta.append((row_idx, level, item["subject"], item["code"]))
+            self.row += 1
+
+        ws.cell(self.row, 1, "ИТОГО")
+        for idx, (_, _, wk) in enumerate(weeks, start=2):
+            total = float(self.b.weekly_actual.loc[self.b.weekly_actual["week_code"] == wk, "gross_profit_week"].sum())
+            ws.cell(self.row, idx, total)
+        total_plan = sum(self._plan_value("category", s, self.b.weekly_plan, "plan_week") for s in TARGET_SUBJECTS)
+        ws.cell(self.row, len(headers), total_plan)
+        self._style_total_row(self.row, len(headers))
+        self.row += 1
+
+    def write_monthly_section(self) -> None:
+        ws = self.ws
+        ws.cell(self.row, 1, "Последние 3 месяца (месячная валовая прибыль из ABC)")
+        ws.cell(self.row, 1).font = Font(bold=True)
+        ws.cell(self.row, 1).fill = SECTION_FILL
+        self.row += 1
+
+        months = self.b.last_three_months
+        headers = ["Категория / Товар / Артикул"] + [month_label(m) for m in months] + ["План по валовой прибыли, месяц"]
+        self._write_header(headers)
+
+        hierarchy = self.b.build_hierarchy()
+        for item in hierarchy:
+            row_idx = self.row
+            ws.cell(self.row, 1, item["label"])
+            level = item["level"]
+            vals = []
+            if level == "category":
+                df = self.b.monthly_actual[self.b.monthly_actual["subject"] == item["subject"]]
+                plan = self._plan_value("category", item["subject"], self.b.monthly_plan, "plan_month")
+            elif level == "product":
+                df = self.b.monthly_actual[self.b.monthly_actual["code"] == item["code"]]
+                plan = self._plan_value("product", item["code"], self.b.monthly_plan, "plan_month")
+            else:
+                df = self.b.monthly_actual[self.b.monthly_actual["supplier_article"] == item["supplier_article"]]
+                plan = self._plan_value("article", item["supplier_article"], self.b.monthly_plan, "plan_month")
+            for m in months:
+                vals.append(float(df.loc[df["month_start"] == m, "gross_profit_month"].sum()))
+            for i, val in enumerate(vals, start=2):
+                ws.cell(self.row, i, val)
+            ws.cell(self.row, len(headers), plan)
+            self._style_data_row(self.row, len(headers), level)
+            self.rows_meta.append((row_idx, level, item["subject"], item["code"]))
+            self.row += 1
+
+        ws.cell(self.row, 1, "ИТОГО")
+        for idx, m in enumerate(months, start=2):
+            total = float(self.b.monthly_actual.loc[self.b.monthly_actual["month_start"] == m, "gross_profit_month"].sum())
+            ws.cell(self.row, idx, total)
+        total_plan = sum(self._plan_value("category", s, self.b.monthly_plan, "plan_month") for s in TARGET_SUBJECTS)
+        ws.cell(self.row, len(headers), total_plan)
+        self._style_total_row(self.row, len(headers))
+        self.row += 1
+
+    def _write_header(self, headers: List[str]) -> None:
+        for col_idx, header in enumerate(headers, start=1):
+            c = self.ws.cell(self.row, col_idx, header)
+            c.fill = HEADER_FILL
+            c.font = Font(bold=True)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = BORDER
+        self.row += 1
+
+    def _style_data_row(self, row_idx: int, max_col: int, level: str) -> None:
+        ws = self.ws
+        indent = {"category":0, "product":1, "article":2}[level]
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row_idx, c)
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if c == 1:
+                cell.alignment = Alignment(horizontal="left", vertical="center", indent=indent)
+                if level == "category":
+                    cell.font = Font(bold=True)
+                elif level == "product":
+                    cell.font = Font(bold=True, italic=True)
+            else:
+                cell.number_format = MONEY_FMT
+        if level == "product":
+            ws.row_dimensions[row_idx].outlineLevel = 1
+            ws.row_dimensions[row_idx].hidden = True
+        elif level == "article":
+            ws.row_dimensions[row_idx].outlineLevel = 2
+            ws.row_dimensions[row_idx].hidden = True
+
+    def _style_total_row(self, row_idx: int, max_col: int) -> None:
+        ws = self.ws
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row_idx, c)
+            cell.fill = TOTAL_FILL
+            cell.font = Font(bold=True)
+            cell.border = BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if c > 1:
+                cell.number_format = MONEY_FMT
+
+    def apply_formatting(self) -> None:
+        ws = self.ws
+        ws.freeze_panes = "A4"
+        widths = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                val = "" if cell.value is None else str(cell.value)
+                widths[cell.column] = max(widths.get(cell.column, 0), len(val))
+        for idx, width in widths.items():
+            if idx == 1:
+                ws.column_dimensions[get_column_letter(idx)].width = 28
+            else:
+                ws.column_dimensions[get_column_letter(idx)].width = max(13, min(width + 2, 18))
+        # group rows are already hidden, Excel will show outline controls
+
+def workbook_to_bytes(wb: Workbook) -> bytes:
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+# =========================
+# CLI
+# =========================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="WB report - stage 1 only")
+    p.add_argument("--root", default=".", help="Project root for local mode")
+    p.add_argument("--reports-root", default="Отчёты", help="Root folder with reports")
+    p.add_argument("--store", default="TOPFACE", help="Store name")
+    p.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE", help="Output folder")
+    return p.parse_args()
+
+def main() -> int:
+    args = parse_args()
+    storage = make_storage(args.root)
+    loader = Loader(storage=storage, store=args.store, reports_root=args.reports_root)
+
+    log("Loading data")
+    data = loader.load_all()
+
+    log("Building stage 1 analytics")
+    builder = Stage1Builder(data)
+    wb = Stage1Workbook(builder).write()
+
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    out_path = f"{args.out_subdir}/Объединенный_отчет_{args.store}_{stamp}.xlsx"
+    log(f"Saving workbook: {out_path}")
+    storage.write_bytes(out_path, workbook_to_bytes(wb))
+    log(f"Saved: {out_path}")
+    return 0
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        лог(f"❌ Критическая ошибка: {e}")
-        traceback.print_exc()
-        raise
+    raise SystemExit(main())
