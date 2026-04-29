@@ -512,6 +512,7 @@ class Builder:
         self.master=self.build_master()
         self.buyout90=self.build_buyout90()
         self.econ=self.prepare_economics()
+        self.subject_week_commission_pct, self.subject_latest_commission_pct = self.build_commission_fallback_maps()
         self.ads=self.prepare_ads()
 
     def filter_targets(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -602,6 +603,28 @@ class Builder:
         econ=econ.sort_values(["supplier_article","week_start"], ascending=[True,False])
         log(f"Economics usable rows: {len(econ):,}; articles {econ['supplier_article'].nunique():,}")
         return econ
+
+    def build_commission_fallback_maps(self) -> Tuple[Dict[Tuple[str,str], float], Dict[str,float]]:
+        econ = self.econ.copy()
+        if econ.empty:
+            return {}, {}
+        econ["subject"] = econ["subject"].map(canonical_subject)
+        econ["commission_pct"] = pd.to_numeric(econ.get("commission_pct", np.nan), errors="coerce")
+        valid = econ[econ["commission_pct"].fillna(0) > 0].copy()
+        if valid.empty:
+            return {}, {}
+        # subject + week fallback: median of non-zero commission for that subject/week
+        sw = valid.groupby(["subject", "week"], dropna=False)["commission_pct"].median().reset_index()
+        subject_week = {(normalize_text(r.subject), str(r.week)): float(r.commission_pct) for r in sw.itertuples(index=False)}
+        # latest non-zero by subject
+        if "week_start" in valid.columns:
+            valid = valid.sort_values(["subject", "week_start"], ascending=[True, False])
+        else:
+            valid = valid.sort_values(["subject"], ascending=[True])
+        sl = valid.drop_duplicates(subset=["subject"], keep="first")[["subject", "commission_pct"]].copy()
+        subject_latest = {normalize_text(r.subject): float(r.commission_pct) for r in sl.itertuples(index=False)}
+        log(f"Commission fallback maps: subject_week={len(subject_week):,}, subject_latest={len(subject_latest):,}")
+        return subject_week, subject_latest
 
     def prepare_ads(self) -> pd.DataFrame:
         ads=self.data.ads_daily.copy()
