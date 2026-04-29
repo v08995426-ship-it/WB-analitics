@@ -444,6 +444,13 @@ class Stage1Loader:
         df["supplier_article"] = df["supplier_article"].map(clean_article)
         df["nm_id"] = to_numeric(df["nm_id"])
         df["subject"] = df["subject"].map(normalize_text)
+        if "title" not in df.columns:
+            df["title"] = ""
+        df["title"] = df["title"].map(normalize_text)
+        if "code" not in df.columns:
+            df["code"] = df["supplier_article"].map(clean_code_from_article)
+        else:
+            df["code"] = df["code"].where(df["code"].astype(str).str.strip() != "", df["supplier_article"].map(clean_code_from_article))
         for c in [
             "Процент выкупа", "Комиссия WB, %", "Эквайринг, %", "Логистика прямая, руб/ед",
             "Логистика обратная, руб/ед", "Хранение, руб/ед", "Прочие расходы, руб/ед", "Себестоимость, руб",
@@ -454,7 +461,7 @@ class Stage1Loader:
             df[c] = to_numeric(df[c])
         df["week_code"] = df.get("Неделя", pd.Series([None] * len(df))).astype(str).str.strip()
         return df[[
-            "week_code", "supplier_article", "nm_id", "subject", "Процент выкупа", "Комиссия WB, %", "Эквайринг, %",
+            "week_code", "supplier_article", "nm_id", "subject", "code", "title", "Процент выкупа", "Комиссия WB, %", "Эквайринг, %",
             "Логистика прямая, руб/ед", "Логистика обратная, руб/ед", "Хранение, руб/ед",
             "Прочие расходы, руб/ед", "Себестоимость, руб", "НДС, руб/ед", "Валовая прибыль, руб/ед"
         ]]
