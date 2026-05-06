@@ -39,6 +39,7 @@ import tempfile
 import time
 import traceback
 from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -65,6 +66,39 @@ DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничен
 DEFAULT_FALLBACK_DAYS = 21
 
 EXCLUDED_SUBJECTS = {"помады", "блески"}
+
+# Когда WB price API не отдаёт subject, запрещённые группы дополнительно определяем
+# по названию в файле РРЦ. Не используем общий признак "губ", потому что
+# карандаши для губ должны остаться в обработке.
+EXCLUDED_RRC_NAME_KEYWORDS = (
+    "помада",
+    "lipstick",
+    "lip stick",
+    "lip paint",
+    "lippaint",
+    "блеск для губ",
+    "блеск-бустер",
+    "блеск бустер",
+    "lipgloss",
+    "lip gloss",
+)
+
+
+def excluded_by_rrc_name(value: Any) -> bool:
+    text = normalize_text(value)
+    if not text:
+        return False
+    return any(k in text for k in EXCLUDED_RRC_NAME_KEYWORDS)
+
+
+def excluded_rrc_keyword(value: Any) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    for k in EXCLUDED_RRC_NAME_KEYWORDS:
+        if k in text:
+            return k
+    return ""
 
 
 # ========================== S3 / Yandex Object Storage ==========================
@@ -239,8 +273,13 @@ def autofit_openpyxl(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame):
             width = min(max(max(len(v) for v in values) + 2, 10), 45)
             ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = width
         for cell in ws[1]:
-            cell.font = cell.font.copy(bold=True)
-            cell.alignment = cell.alignment.copy(wrap_text=True, horizontal="center")
+            new_font = copy(cell.font)
+            new_font.bold = True
+            cell.font = new_font
+            new_alignment = copy(cell.alignment)
+            new_alignment.wrap_text = True
+            new_alignment.horizontal = "center"
+            cell.alignment = new_alignment
     except Exception:
         pass
 
@@ -708,8 +747,10 @@ class WBPriceCorrector:
             if subj_col:
                 tmp = goods_df[["nmID", subj_col]].copy()
                 tmp.columns = ["nmID", "subject"]
-                tmp["subject_source"] = "prices_api"
-                rows.append(tmp)
+                tmp = tmp[tmp["subject"].notna() & (tmp["subject"].astype(str).str.strip() != "")].copy()
+                if not tmp.empty:
+                    tmp["subject_source"] = "prices_api"
+                    rows.append(tmp)
 
         if not orders_history.empty:
             subj_col = first_existing_col(orders_history, ["subject", "Предмет", "subjectName", "Название предмета"])
@@ -901,8 +942,17 @@ class WBPriceCorrector:
         # Если subject из goods API есть, а subject_map не дал, используем API.
         if "subject_api" in calc.columns:
             empty_subject = calc["subject"].isna() | (calc["subject"].astype(str).str.strip() == "")
-            calc.loc[empty_subject, "subject"] = calc.loc[empty_subject, "subject_api"]
+            api_subject_present = calc["subject_api"].notna() & (calc["subject_api"].astype(str).str.strip() != "")
+            fill_from_api = empty_subject & api_subject_present
+            calc.loc[fill_from_api, "subject"] = calc.loc[fill_from_api, "subject_api"]
+            if "subject_source" in calc.columns:
+                calc.loc[fill_from_api, "subject_source"] = "prices_api"
             calc["subject_norm"] = calc["subject"].map(normalize_text)
+
+        # Если subject всё равно неизвестен, не блокируем товар автоматически:
+        # помады/блески дополнительно отсекаются по названию из РРЦ.
+        calc["excluded_by_rrc_name"] = calc["rrc_name"].map(excluded_by_rrc_name) if "rrc_name" in calc.columns else False
+        calc["excluded_rrc_keyword"] = calc["rrc_name"].map(excluded_rrc_keyword) if "rrc_name" in calc.columns else ""
 
         # SPP.
         spp = self.build_spp_table(today_orders, orders_history)
@@ -932,7 +982,8 @@ class WBPriceCorrector:
             "subject", "subject_source", "rrc", "target_factor", "target_finishedPrice", "avg_spp", "spp_source",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
             "current_wb_discounted_price", "old_priceWithDisc_calc", "delta_price", "delta_price_pct",
-            "orders_3h", "orders_today", "orders_history", "name_api", "rrc_name", "currencyIsoCode4217",
+            "orders_3h", "orders_today", "orders_history", "name_api", "rrc_name", "excluded_by_rrc_name",
+            "excluded_rrc_keyword", "currencyIsoCode4217",
         ]
         existing = [c for c in columns_order if c in calc.columns]
         rest = [c for c in calc.columns if c not in existing]
@@ -992,15 +1043,28 @@ class WBPriceCorrector:
             if rrc is None or rrc <= 0:
                 decision = "skip"
                 reason_parts.append("нет РРЦ")
-            if not subject_norm:
-                if not self.cfg.allow_unknown_subject:
-                    decision = "skip"
-                    reason_parts.append("неизвестный subject")
-                else:
-                    reason_parts.append("subject неизвестен, но разрешён параметром")
-            elif subject_norm in EXCLUDED_SUBJECTS:
+            excluded_by_name = bool(r.get("excluded_by_rrc_name")) or excluded_by_rrc_name(r.get("rrc_name")) or excluded_by_rrc_name(r.get("name_api"))
+            excluded_keyword = str(r.get("excluded_rrc_keyword") or excluded_rrc_keyword(r.get("rrc_name")) or excluded_rrc_keyword(r.get("name_api")) or "")
+
+            if subject_norm in EXCLUDED_SUBJECTS:
                 decision = "skip"
                 reason_parts.append("исключённый subject: Помады/Блески")
+            elif excluded_by_name:
+                decision = "skip"
+                if excluded_keyword:
+                    reason_parts.append(f"исключено по названию РРЦ/товара: {excluded_keyword}")
+                else:
+                    reason_parts.append("исключено по названию РРЦ/товара: Помады/Блески")
+            elif not subject_norm:
+                # WB price API часто не отдаёт subject. Если РРЦ есть и название не похоже
+                # на помаду/блеск, товар можно корректировать: иначе весь прайс-лист будет пропущен.
+                if rrc is None or rrc <= 0:
+                    decision = "skip"
+                    reason_parts.append("неизвестный subject")
+                elif not self.cfg.allow_unknown_subject:
+                    reason_parts.append("subject неизвестен, разрешено по РРЦ: не Помады/Блески")
+                else:
+                    reason_parts.append("subject неизвестен, но разрешён параметром")
             if spp is None or spp < 0 or spp >= 95:
                 decision = "skip"
                 reason_parts.append("нет корректного SPP")
