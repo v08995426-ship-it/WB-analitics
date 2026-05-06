@@ -1031,7 +1031,7 @@ def load_ads(provider: BaseProvider) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         campaigns["placement"] = campaigns.apply(_placement, axis=1)
         campaigns["current_bid_rub"] = campaigns.apply(lambda r: r["bid_search_rub"] if r["placement"] in {"search", "combined"} else r["bid_reco_rub"], axis=1)
-        campaigns["campaign_status"] = campaigns.get("Статус", "").astype(str)
+        campaigns["campaign_status"] = series_or_default(campaigns, "Статус", "").astype(str)
         campaigns["campaign_is_active"] = campaigns["campaign_status"].map(is_active_campaign_status)
         campaigns = campaigns[campaigns["campaign_is_active"]].copy()
 
@@ -1076,7 +1076,7 @@ def load_ads(provider: BaseProvider) -> Tuple[pd.DataFrame, pd.DataFrame]:
             return "search"
         campaigns["placement"] = campaigns.apply(_placement, axis=1)
         campaigns["current_bid_rub"] = campaigns.apply(lambda r: r["bid_search_rub"] if r["placement"] in {"search","combined"} else r["bid_reco_rub"], axis=1)
-        campaigns["campaign_status"] = campaigns.get("Статус", "").astype(str)
+        campaigns["campaign_status"] = series_or_default(campaigns, "Статус", "").astype(str)
     return daily, campaigns
 
 
@@ -2433,8 +2433,8 @@ def _normalize_abc_df(df: pd.DataFrame) -> pd.DataFrame:
         "Конверсия в заказ (из корзины), %":"order_conv_pct",
     })
     out["nmId"] = pd.to_numeric(out.get("nmId"), errors="coerce")
-    out["supplier_article"] = out.get("supplier_article", "").fillna("").astype(str)
-    out["subject"] = out.get("subject", "").fillna("").astype(str)
+    out["supplier_article"] = series_or_default(out, "supplier_article", "").fillna("").astype(str)
+    out["subject"] = series_or_default(out, "subject", "").fillna("").astype(str)
     out["subject_norm"] = out["subject"].map(canonical_subject)
     out = out[out["subject_norm"].isin(TARGET_SUBJECTS)].copy()
     out["product_root"] = out["supplier_article"].map(product_root_from_supplier_article)
@@ -3251,8 +3251,8 @@ def load_keywords(provider: BaseProvider) -> pd.DataFrame:
                 if c not in df.columns:
                     df[c] = 0
                 df[c] = df[c].map(safe_float)
-            df['query_text'] = df.get('query_text', '').fillna('').astype(str)
-            df['query_filter'] = df.get('query_filter', '').fillna('').astype(str)
+            df['query_text'] = series_or_default(df, 'query_text', '').fillna('').astype(str)
+            df['query_filter'] = series_or_default(df, 'query_filter', '').fillna('').astype(str)
             frames.append(df)
         except Exception:
             continue
@@ -3450,7 +3450,7 @@ def build_previous_month_plan(orders: pd.DataFrame, funnel: pd.DataFrame, ads_da
             ads_window.merge(key_map[['nmId', 'subject_norm']].drop_duplicates(), on='nmId', how='left', suffixes=('', '_m'))
         )
         ads_window_subject['subject_norm'] = ads_window_subject.get('subject_norm', '').where(
-            ads_window_subject.get('subject_norm', '').astype(str).str.len() > 0,
+            series_or_default(ads_window_subject, 'subject_norm', '').astype(str).str.len() > 0,
             ads_window_subject.get('subject_norm_m', '')
         )
         ads_window_subject['subject_norm'] = ads_window_subject['subject_norm'].map(canonical_subject)
@@ -3654,7 +3654,7 @@ def build_channel_balance(ads_daily: pd.DataFrame, campaigns: pd.DataFrame, mast
         df['subject'] = df.get('subject_norm', '')
 
     df['buyout_rate'] = pd.to_numeric(df['subject_norm'].map(get_subject_buyout_rate), errors='coerce').fillna(0.0)
-    df['payment_type'] = df.get('payment_type', '').astype(str)
+    df['payment_type'] = series_or_default(df, 'payment_type', '').astype(str)
     df['channel'] = np.where(df['payment_type'].str.lower().eq('cpc'), 'CPC', 'CPM')
 
     for col in ['Расход', 'Заказы', 'Сумма заказов', 'Клики', 'Показы', 'np_unit']:
@@ -4056,7 +4056,7 @@ def prepare_metrics(provider: BaseProvider, cfg: Config, as_of_date: date) -> Di
         })
     decisions_df = pd.DataFrame(decisions).drop_duplicates(['ID кампании','Артикул WB','Плейсмент'])
 
-    weak = decisions_df[(decisions_df['Действие'].isin(['Снизить','Предел эффективности ставки'])) | (decisions_df.get('Статус риска', '').astype(str).eq('Критический'))].copy() if not decisions_df.empty else pd.DataFrame()
+    weak = decisions_df[(decisions_df['Действие'].isin(['Снизить','Предел эффективности ставки'])) | (series_or_default(decisions_df, 'Статус риска', '').astype(str).eq('Критический'))].copy() if not decisions_df.empty else pd.DataFrame()
     if not weak.empty:
         weak['Комментарий'] = weak['Причина']
         weak = weak[['Артикул продавца','Артикул WB','ID кампании','Тип кампании','Плейсмент','Действие','Комментарий']].drop_duplicates()
@@ -5284,14 +5284,14 @@ def _build_bid_change_events(hist: pd.DataFrame) -> pd.DataFrame:
         df['new_bid'] = pd.to_numeric(df.get('Новая ставка, ₽'), errors='coerce')
         df['direction'] = np.where(df['new_bid'] > df['old_bid'], 'up', np.where(df['new_bid'] < df['old_bid'], 'down', 'hold'))
         df['campaign_type'] = df.get('campaign_type', df.get('Тип кампании', ''))
-        df['supplier_article'] = df.get('Артикул продавца', df.get('supplier_article', '')).fillna('').astype(str)
+        df['supplier_article'] = series_or_default(df, 'Артикул продавца', series_or_default(df, 'supplier_article', '')).fillna('').astype(str)
         events = df[df['direction'].isin(['up', 'down'])].copy()
         if events.empty:
             return pd.DataFrame(columns=['run_ts', 'change_date', 'id_campaign', 'nmId', 'supplier_article', 'campaign_type', 'old_bid', 'new_bid', 'direction'])
         events['change_date'] = pd.to_datetime(events.get('run_ts'), errors='coerce').dt.date
         events = events.dropna(subset=['change_date']).copy()
         return events[['run_ts', 'change_date', 'id_campaign', 'nmId', 'supplier_article', 'campaign_type', 'old_bid', 'new_bid', 'direction']].drop_duplicates()
-    df['supplier_article'] = df.get('supplier_article', '').fillna('').astype(str)
+    df['supplier_article'] = series_or_default(df, 'supplier_article', '').fillna('').astype(str)
     df = df.sort_values(['id_campaign', 'nmId', 'run_ts'])
     parts = []
     for (cid, nm), g in df.groupby(['id_campaign', 'nmId']):
@@ -5470,7 +5470,7 @@ def _apply_decision_guardrails(decisions: pd.DataFrame, effects: pd.DataFrame) -
     df.loc[bad_recent_cut, 'Причина'] = df.loc[bad_recent_cut, 'Причина'].astype(str) + ' | Снижение не повторяем: прошлое снижение было вредным'
 
     if 'CPO кампании, ₽' in df.columns:
-        df['_block_key'] = df.get('Товар', '').astype(str)
+        df['_block_key'] = series_or_default(df, 'Товар', '').fillna('').astype(str)
         block_cpo = df.groupby('_block_key', as_index=False).agg(block_cpo_min=('CPO кампании, ₽', 'min'), block_cpo_avg=('CPO кампании, ₽', 'mean'))
         df = df.merge(block_cpo, on='_block_key', how='left')
         risky_raise = crisis & df['Действие'].astype(str).isin(['Повысить', 'Тест роста']) & ((df['ВП кампании текущее окно после рекламы, ₽'].fillna(0) <= 0) | (df['CPO кампании, ₽'].fillna(0) > df['block_cpo_avg'].fillna(np.inf)))
@@ -5553,8 +5553,8 @@ def _build_pause_candidates(decisions: pd.DataFrame) -> pd.DataFrame:
     df['current_bid'] = pd.to_numeric(df.get('Текущая ставка, ₽'), errors='coerce').fillna(0.0)
     df['min_bid'] = pd.to_numeric(df.get('Минимальная ставка WB, ₽'), errors='coerce').fillna(0.0)
     df['Показы'] = pd.to_numeric(df.get('Показы'), errors='coerce').fillna(0.0)
-    df['block_key'] = df.get('Товар', '').astype(str)
-    is_brush = df.get('Предмет', '').astype(str).str.lower().eq('кисти косметические') | df.get('Артикул продавца', '').astype(str).str.startswith('901')
+    df['block_key'] = series_or_default(df, 'Товар', '').fillna('').astype(str)
+    is_brush = series_or_default(df, 'Предмет', '').fillna('').astype(str).str.lower().eq('кисти косметические') | series_or_default(df, 'Артикул продавца', '').fillna('').astype(str).str.startswith('901')
     df['CPO кампании, ₽'] = pd.to_numeric(df.get('CPO кампании, ₽'), errors='coerce').fillna(np.inf)
     df['rank_in_block'] = df.groupby('block_key')['CPO кампании, ₽'].rank(method='dense', ascending=True)
     candidate = (~is_brush) & (df['rank_in_block'] > 1) & (df['campaign_gp'] < 0) & (df['campaign_drr'] >= 18.0) & (df['current_bid'] <= df['min_bid'].replace(0, np.nan).fillna(df['current_bid'])) & (df['Показы'] >= 10000)
