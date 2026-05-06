@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Корректировка цен Wildberries под целевую цену покупателя = РРЦ * 0.9.
+Корректировка цен Wildberries под целевую цену покупателя:
+- с 23:00 до 04:59 по Москве: РРЦ * 0.8;
+- с 05:00 до 22:59 по Москве: РРЦ * 0.9.
 
 Логика:
 - каждые 3 часа забирает заказы за сегодняшний день через statistics-api;
@@ -10,6 +12,7 @@
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
 - читает справочник артикулов 1С из S3;
 - исключает subject: Помады, Блески;
+- выбирает целевой коэффициент по московскому времени: ночь 0.8, день 0.9;
 - считает новую WB price при фиксированной скидке продавца 26%;
 - отправляет price + discount в /api/v2/upload/task только в режиме --apply;
 - в режиме --dry-run только сохраняет расчёт.
@@ -59,7 +62,11 @@ PRICES_LIST_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/g
 PRICE_UPLOAD_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/upload/task"
 
 DEFAULT_STORE = "TOPFACE"
-DEFAULT_TARGET_FACTOR = 0.90
+DEFAULT_DAY_TARGET_FACTOR = 0.90
+DEFAULT_NIGHT_TARGET_FACTOR = 0.80
+DEFAULT_NIGHT_START_HOUR = 23
+DEFAULT_NIGHT_END_HOUR = 5
+DEFAULT_TARGET_FACTOR = DEFAULT_DAY_TARGET_FACTOR  # legacy/fixed override value
 DEFAULT_SELLER_DISCOUNT = 26
 DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
@@ -367,7 +374,14 @@ def get_weekly_orders_key(store: str, dt: datetime) -> str:
 @dataclass
 class PriceCorrectorConfig:
     store: str = DEFAULT_STORE
-    target_factor: float = DEFAULT_TARGET_FACTOR
+    # Если target_factor задан явно, скрипт работает в фиксированном режиме.
+    # Если None — выбирает коэффициент автоматически по московскому времени:
+    # 23:00..04:59 => night_target_factor, 05:00..22:59 => day_target_factor.
+    target_factor: Optional[float] = None
+    day_target_factor: float = DEFAULT_DAY_TARGET_FACTOR
+    night_target_factor: float = DEFAULT_NIGHT_TARGET_FACTOR
+    night_start_hour: int = DEFAULT_NIGHT_START_HOUR
+    night_end_hour: int = DEFAULT_NIGHT_END_HOUR
     seller_discount: int = DEFAULT_SELLER_DISCOUNT
     price_tolerance_rub: int = DEFAULT_PRICE_TOLERANCE_RUB
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
@@ -383,6 +397,38 @@ class WBPriceCorrector:
         self.cfg = cfg
         self.session = requests.Session()
         self.service_prefix = f"Служебные файлы/Корректировка цен/{self.cfg.store}"
+        self.run_datetime_msk = now_msk()
+        self.active_target_factor, self.active_pricing_period = self.get_active_target_factor(self.run_datetime_msk)
+
+    def get_active_target_factor(self, dt_msk: Optional[datetime] = None) -> Tuple[float, str]:
+        """
+        Возвращает целевой коэффициент к РРЦ для текущего московского времени.
+
+        Ночной режим действует с night_start_hour:00 включительно до
+        night_end_hour:00 НЕ включительно. При стандартных настройках:
+        23:00..04:59 => 0.8, 05:00..22:59 => 0.9.
+
+        Если --target-factor задан явно, автоматический график отключается.
+        """
+        if self.cfg.target_factor is not None:
+            return float(self.cfg.target_factor), "fixed_override"
+
+        dt_msk = dt_msk or now_msk()
+        hour = int(dt_msk.hour)
+        start = int(self.cfg.night_start_hour) % 24
+        end = int(self.cfg.night_end_hour) % 24
+
+        if start == end:
+            is_night = True
+        elif start < end:
+            is_night = start <= hour < end
+        else:
+            # Период через полночь: например 23..5.
+            is_night = hour >= start or hour < end
+
+        if is_night:
+            return float(self.cfg.night_target_factor), f"night_{start:02d}_to_{end:02d}"
+        return float(self.cfg.day_target_factor), f"day_{end:02d}_to_{start:02d}"
 
     # ---------- API ----------
 
@@ -960,8 +1006,10 @@ class WBPriceCorrector:
         calc = self.add_subject_and_global_spp_fallback(calc, orders_history)
 
         # Расчёт цен.
-        calc["target_factor"] = self.cfg.target_factor
-        calc["target_finishedPrice"] = calc["rrc"].apply(lambda x: int(round(float(x) * self.cfg.target_factor)) if pd.notna(x) else None)
+        target_factor = self.active_target_factor
+        calc["pricing_period"] = self.active_pricing_period
+        calc["target_factor"] = target_factor
+        calc["target_finishedPrice"] = calc["rrc"].apply(lambda x: int(round(float(x) * target_factor)) if pd.notna(x) else None)
         calc["new_discount"] = int(self.cfg.seller_discount)
         calc["target_priceWithDisc"] = calc.apply(self._calc_target_price_with_disc, axis=1)
         calc["new_price"] = calc.apply(self._calc_new_price, axis=1)
@@ -979,7 +1027,7 @@ class WBPriceCorrector:
         # Удобный порядок колонок.
         columns_order = [
             "decision", "reason", "nmID", "supplierArticle_api", "supplierArticle_ref", "article_1c", "article_rrc",
-            "subject", "subject_source", "rrc", "target_factor", "target_finishedPrice", "avg_spp", "spp_source",
+            "subject", "subject_source", "rrc", "pricing_period", "target_factor", "target_finishedPrice", "avg_spp", "spp_source",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
             "current_wb_discounted_price", "old_priceWithDisc_calc", "delta_price", "delta_price_pct",
             "orders_3h", "orders_today", "orders_history", "name_api", "rrc_name", "excluded_by_rrc_name",
@@ -1093,7 +1141,9 @@ class WBPriceCorrector:
                     reason_parts.append(f"изменение price {delta_pct}% больше лимита {self.cfg.max_price_change_pct}%")
 
             if decision == "send":
-                reason_parts.append(f"РРЦ*{self.cfg.target_factor:.2f}, discount={self.cfg.seller_discount}%, SPP={spp:.2f}%")
+                factor = to_float_or_none(r.get("target_factor")) or self.active_target_factor
+                period = str(r.get("pricing_period") or self.active_pricing_period)
+                reason_parts.append(f"РРЦ*{factor:.2f}, режим={period}, discount={self.cfg.seller_discount}%, SPP={spp:.2f}%")
 
             decisions.append(decision)
             reasons.append("; ".join(reason_parts))
@@ -1142,7 +1192,11 @@ class WBPriceCorrector:
             self.s3.write_excel(hist_key, hist_combined, sheet_name="История")
 
     def run(self, apply: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        log(f"Старт корректировки цен: store={self.cfg.store}, apply={apply}")
+        log(
+            f"Старт корректировки цен: store={self.cfg.store}, apply={apply}, "
+            f"target_factor={self.active_target_factor:.2f}, режим={self.active_pricing_period}, "
+            f"время МСК={self.run_datetime_msk.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
         today_orders = self.fetch_today_orders()
         log(f"Заказы сегодня: строк={len(today_orders)}")
@@ -1188,7 +1242,7 @@ def build_s3_from_env() -> S3Storage:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WB price corrector: target finishedPrice = РРЦ * 0.9")
+    parser = argparse.ArgumentParser(description="WB price corrector: day РРЦ*0.9, night 23:00-04:59 МСК РРЦ*0.8")
     sub = parser.add_subparsers(dest="command")
 
     run_parser = sub.add_parser("run", help="Сделать расчёт и при --apply отправить цены в WB")
@@ -1196,7 +1250,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     mode = run_parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="Отправить изменения цен в WB")
     mode.add_argument("--dry-run", action="store_true", help="Только расчёт без отправки")
-    run_parser.add_argument("--target-factor", type=float, default=DEFAULT_TARGET_FACTOR, help="Целевой коэффициент к РРЦ, по умолчанию 0.9")
+    run_parser.add_argument("--target-factor", type=float, default=None, help="Фиксированный коэффициент к РРЦ. Если не задан, работает график: 23:00-04:59 МСК = 0.8, остальное время = 0.9")
+    run_parser.add_argument("--day-target-factor", type=float, default=DEFAULT_DAY_TARGET_FACTOR, help="Дневной коэффициент к РРЦ, по умолчанию 0.9")
+    run_parser.add_argument("--night-target-factor", type=float, default=DEFAULT_NIGHT_TARGET_FACTOR, help="Ночной коэффициент к РРЦ, по умолчанию 0.8")
+    run_parser.add_argument("--night-start-hour", type=int, default=DEFAULT_NIGHT_START_HOUR, help="Час начала ночного режима по Москве, по умолчанию 23")
+    run_parser.add_argument("--night-end-hour", type=int, default=DEFAULT_NIGHT_END_HOUR, help="Час окончания ночного режима по Москве, по умолчанию 5; в 05:00 уже дневной коэффициент")
     run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца, %, по умолчанию 26")
     run_parser.add_argument("--price-tolerance-rub", type=int, default=DEFAULT_PRICE_TOLERANCE_RUB, help="Не отправлять, если отличие price <= N рублей")
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
@@ -1211,7 +1269,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.store = DEFAULT_STORE
         args.apply = False
         args.dry_run = True
-        args.target_factor = DEFAULT_TARGET_FACTOR
+        args.target_factor = None
+        args.day_target_factor = DEFAULT_DAY_TARGET_FACTOR
+        args.night_target_factor = DEFAULT_NIGHT_TARGET_FACTOR
+        args.night_start_hour = DEFAULT_NIGHT_START_HOUR
+        args.night_end_hour = DEFAULT_NIGHT_END_HOUR
         args.seller_discount = DEFAULT_SELLER_DISCOUNT
         args.price_tolerance_rub = DEFAULT_PRICE_TOLERANCE_RUB
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
@@ -1230,6 +1292,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = PriceCorrectorConfig(
         store=args.store,
         target_factor=args.target_factor,
+        day_target_factor=args.day_target_factor,
+        night_target_factor=args.night_target_factor,
+        night_start_hour=args.night_start_hour,
+        night_end_hour=args.night_end_hour,
         seller_discount=args.seller_discount,
         price_tolerance_rub=args.price_tolerance_rub,
         max_price_change_pct=args.max_price_change_pct,
