@@ -1,0 +1,58 @@
+name: WB Price Corrector 3H
+
+on:
+  schedule:
+    # Каждые 3 часа. Время cron указано в UTC; Москва = UTC+3.
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Только расчёт без отправки цен в WB'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      max_price_change_pct:
+        description: 'Максимальное изменение price за запуск, 0 = отключить'
+        required: false
+        default: '80'
+
+jobs:
+  correct-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests boto3 openpyxl pytz
+
+      - name: Run WB price corrector
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          MAX_CHANGE="${{ github.event.inputs.max_price_change_pct }}"
+          if [ -z "$MAX_CHANGE" ]; then
+            MAX_CHANGE="80"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Manual dry-run: prices will not be sent"
+            python wb_price_corrector.py run --store TOPFACE --dry-run --target-factor 0.9 --seller-discount 26 --max-price-change-pct "$MAX_CHANGE"
+          else
+            echo "Scheduled/apply run: prices will be sent to WB"
+            python wb_price_corrector.py run --store TOPFACE --apply --target-factor 0.9 --seller-discount 26 --max-price-change-pct "$MAX_CHANGE"
+          fi
