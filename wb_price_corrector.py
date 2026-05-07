@@ -1228,10 +1228,11 @@ class WBPriceCorrector:
         sku_prev = self._agg_spp(prev, "spp_previous_day")
         sku_hist = self._agg_spp(hist_prev_period, "spp_history")
 
-        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
-        group_today = self._agg_spp_group(byt, "group_today", min_n)
-        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
-        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
+        group_spread_threshold = float(getattr(self.cfg, "small_spp_spread_points", DEFAULT_SMALL_SPP_SPREAD_POINTS) or DEFAULT_SMALL_SPP_SPREAD_POINTS)
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n, group_spread_threshold)
+        group_today = self._agg_spp_group(byt, "group_today", min_n, group_spread_threshold)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n, group_spread_threshold)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n, group_spread_threshold)
 
         nm_group = (
             all_rows[["nmID", "spp_shade_group"]]
@@ -1343,12 +1344,34 @@ class WBPriceCorrector:
         return g
 
     @staticmethod
-    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
+    def _empty_spp_group_df(suffix: str) -> pd.DataFrame:
+        """Пустая таблица групп SPP с полным набором колонок для безопасных merge."""
+        return pd.DataFrame(columns=[
+            "spp_shade_group",
+            f"avg_spp_{suffix}",
+            f"orders_{suffix}",
+            f"group_mean_min_{suffix}",
+            f"group_mean_max_{suffix}",
+            f"group_mean_spread_{suffix}",
+            f"group_shades_count_{suffix}",
+        ])
+
+    @staticmethod
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, spread_threshold: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
+        """
+        Агрегирует SPP по группам оттенков.
+
+        Важно: даже при отсутствии валидных групп возвращаем DataFrame с колонкой
+        spp_shade_group и всеми диагностическими колонками. Иначе последующие
+        merge(..., on="spp_shade_group") падают с KeyError.
+        """
+        empty = WBPriceCorrector._empty_spp_group_df(suffix)
         if df.empty or "spp_shade_group" not in df.columns:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return empty
+
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return empty
 
         shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
             shade_mean=("spp_num", "mean"),
@@ -1357,6 +1380,7 @@ class WBPriceCorrector:
         eligible = shade[shade["shade_orders"] >= min_n].copy()
 
         rows = []
+        threshold = float(spread_threshold if spread_threshold is not None else DEFAULT_SMALL_SPP_SPREAD_POINTS)
         for group, gdf in tmp.groupby("spp_shade_group"):
             total_orders = int(len(gdf))
             elig = eligible[eligible["spp_shade_group"] == group]
@@ -1365,8 +1389,8 @@ class WBPriceCorrector:
             mean_min = float(elig["shade_mean"].min())
             mean_max = float(elig["shade_mean"].max())
             mean_spread = mean_max - mean_min
-            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
-            if mean_spread > 3.0:
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше заданного порога.
+            if mean_spread > threshold:
                 continue
             rows.append({
                 "spp_shade_group": group,
@@ -1377,7 +1401,10 @@ class WBPriceCorrector:
                 f"group_mean_spread_{suffix}": mean_spread,
                 f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows)
+
+        if not rows:
+            return empty
+        return pd.DataFrame(rows).reindex(columns=empty.columns)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
