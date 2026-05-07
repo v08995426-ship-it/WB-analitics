@@ -2,9 +2,7 @@ name: WB Price Corrector 3H
 
 on:
   schedule:
-    # График по Москве: 03:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00.
-    # В GitHub cron время указано в UTC; Москва = UTC+3.
-    # UTC: 00:00, 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00.
+    # Москва = UTC+3. Запуски по МСК: 03:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00.
     - cron: '0 0,2,5,8,11,14,17,20 * * *'
   workflow_dispatch:
     inputs:
@@ -20,6 +18,10 @@ on:
         description: 'Максимальное изменение price за запуск, 0 = отключить'
         required: false
         default: '80'
+      target_factor:
+        description: 'Опционально: вручную задать коэффициент РРЦ. Пусто = авто 0.8 ночью / 0.9 днем'
+        required: false
+        default: ''
 
 jobs:
   correct-prices:
@@ -51,12 +53,16 @@ jobs:
             MAX_CHANGE="80"
           fi
 
-          COMMON_ARGS="--store TOPFACE --seller-discount 26 --day-target-factor 0.9 --night-target-factor 0.8 --night-start-hour 23 --night-end-hour 5 --max-price-change-pct $MAX_CHANGE"
+          TARGET_FACTOR="${{ github.event.inputs.target_factor }}"
+          EXTRA_ARGS=""
+          if [ -n "$TARGET_FACTOR" ]; then
+            EXTRA_ARGS="--target-factor $TARGET_FACTOR"
+          fi
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "Manual dry-run: prices will not be sent"
-            python wb_price_corrector.py run --dry-run $COMMON_ARGS
+            python wb_price_corrector.py run --store TOPFACE --dry-run --seller-discount 26 --max-price-change-pct "$MAX_CHANGE" $EXTRA_ARGS
           else
             echo "Scheduled/apply run: prices will be sent to WB"
-            python wb_price_corrector.py run --apply $COMMON_ARGS
+            python wb_price_corrector.py run --store TOPFACE --apply --seller-discount 26 --max-price-change-pct "$MAX_CHANGE" $EXTRA_ARGS
           fi
