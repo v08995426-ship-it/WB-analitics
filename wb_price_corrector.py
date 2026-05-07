@@ -10,7 +10,7 @@
 - забирает заказы за сегодняшний и предыдущий день через statistics-api;
 - SPP считает самостоятельно по строкам заказов: (1 - finishedPrice / priceWithDisc) * 100;
 - базовый SPP берёт как spp_raw_max, округлённый вверх;
-- к найденному SPP добавляет поправку -1.5 п.п. по умолчанию;
+- к найденному SPP добавляет поправку +1.5 п.п. по умолчанию;
 - для оттенков одной группы, например 501/5 и 501/19, сначала пытается использовать общий SPP группы;
 - group fallback применяется только если средний SPP между оттенками отличается не больше чем на 3 п.п.;
 - если по товару/группе меньше 10 значений SPP, период не используется.
@@ -79,7 +79,6 @@ DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
 DEFAULT_FALLBACK_DAYS = 21
 DEFAULT_MIN_SPP_SAMPLE_ORDERS = 10
-DEFAULT_SMALL_SPP_SPREAD_POINTS = float(os.environ.get("WB_SMALL_SPP_SPREAD_POINTS", "3") or 3)
 DEFAULT_PRICE_SOURCE = "orders-spp"  # боевой режим: считаем по заказам, сайт WB не используем
 DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # Экстренная защита от занижения: если фактическая WB-скидка/SPP из заказов
@@ -87,6 +86,7 @@ DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # Рекомендованный аварийный режим: 45.
 DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT = float(os.environ.get("WB_SAFE_WB_DISCOUNT_FLOOR_PCT", "0") or 0)
 DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "-1.5") or 0)
+DEFAULT_SMALL_SPP_SPREAD_POINTS = float(os.environ.get("WB_SMALL_SPP_SPREAD_POINTS", "3") or 3)
 DEFAULT_USE_SAFE_FLOOR_FOR_MISSING = (os.environ.get("WB_USE_SAFE_FLOOR_FOR_MISSING", "false").strip().lower() in {"1", "true", "yes", "y", "да"})
 DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
 DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = 80
@@ -577,12 +577,12 @@ class PriceCorrectorConfig:
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
     fallback_days: int = DEFAULT_FALLBACK_DAYS
     min_spp_sample_orders: int = DEFAULT_MIN_SPP_SAMPLE_ORDERS
-    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     price_source: str = DEFAULT_PRICE_SOURCE
     public_dest: str = DEFAULT_PUBLIC_DEST
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
     safe_wb_discount_floor_pct: float = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
     spp_adjustment_pct: float = DEFAULT_SPP_ADJUSTMENT_PCT
+    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     use_safe_floor_for_missing: bool = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
     allow_unknown_subject: bool = False
     update_weekly_orders: bool = False
@@ -1228,10 +1228,10 @@ class WBPriceCorrector:
         sku_prev = self._agg_spp(prev, "spp_previous_day")
         sku_hist = self._agg_spp(hist_prev_period, "spp_history")
 
-        group_3h = self._agg_spp_group(by3, "group_3h", min_n, self.cfg.small_spp_spread_points)
-        group_today = self._agg_spp_group(byt, "group_today", min_n, self.cfg.small_spp_spread_points)
-        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n, self.cfg.small_spp_spread_points)
-        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n, self.cfg.small_spp_spread_points)
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
+        group_today = self._agg_spp_group(byt, "group_today", min_n)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
 
         nm_group = (
             all_rows[["nmID", "spp_shade_group"]]
@@ -1343,22 +1343,12 @@ class WBPriceCorrector:
         return g
 
     @staticmethod
-    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, small_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
-        schema = [
-            "spp_shade_group",
-            f"avg_spp_{suffix}",
-            f"orders_{suffix}",
-            f"group_mean_min_{suffix}",
-            f"group_mean_max_{suffix}",
-            f"group_mean_spread_{suffix}",
-            f"group_shades_count_{suffix}",
-        ]
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
         if df.empty or "spp_shade_group" not in df.columns:
-            return pd.DataFrame(columns=schema)
-
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=schema)
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
 
         shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
             shade_mean=("spp_num", "mean"),
@@ -1375,8 +1365,8 @@ class WBPriceCorrector:
             mean_min = float(elig["shade_mean"].min())
             mean_max = float(elig["shade_mean"].max())
             mean_spread = mean_max - mean_min
-            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше заданного порога.
-            if mean_spread > float(small_spread_points):
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
+            if mean_spread > 3.0:
                 continue
             rows.append({
                 "spp_shade_group": group,
@@ -1387,7 +1377,7 @@ class WBPriceCorrector:
                 f"group_mean_spread_{suffix}": mean_spread,
                 f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows, columns=schema)
+        return pd.DataFrame(rows)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
@@ -1600,6 +1590,9 @@ class WBPriceCorrector:
         calc.loc[use_orders, "target_priceWithDisc"] = calc.loc[use_orders, "target_priceWithDisc_orders_spp"]
         calc.loc[use_orders, "new_price"] = calc.loc[use_orders, "new_price_orders_spp"]
 
+        # Финально фиксируем одинаковую цену для оттенков одного товара с одинаковым РРЦ.
+        calc = self.apply_final_shade_group_price_lock(calc)
+
         calc["delta_price"] = calc.apply(lambda r: (r["new_price"] - r["current_wb_price"]) if pd.notna(r.get("new_price")) and pd.notna(r.get("current_wb_price")) else None, axis=1)
         calc["delta_price_pct"] = calc.apply(self._calc_delta_pct, axis=1)
 
@@ -1620,6 +1613,7 @@ class WBPriceCorrector:
             "orders_3h", "orders_today", "orders_previous_day", "orders_history",
             "orders_group_3h", "orders_group_today", "orders_group_previous_day", "orders_group_history",
             "spp_shade_group", "spp_reference_period", "spp_sample_min",
+            "shade_group_price_locked", "shade_group_locked_new_price", "shade_group_locked_spp", "shade_group_price_lock_rule",
             "site_price_source", "site_dest", "site_checked_at", "site_name",
             "name_api", "rrc_name", "excluded_by_rrc_name",
             "excluded_rrc_keyword", "currencyIsoCode4217",
@@ -1627,6 +1621,118 @@ class WBPriceCorrector:
         existing = [c for c in columns_order if c in calc.columns]
         rest = [c for c in calc.columns if c not in existing]
         return calc[existing + rest]
+
+
+    def apply_final_shade_group_price_lock(self, calc: pd.DataFrame) -> pd.DataFrame:
+        """
+        Жёсткая финальная синхронизация оттенков.
+
+        Бизнес-правило: оттенки одного товара, например 551/2, 551/3, 551/4,
+        должны получить одинаковую WB price, если у них одинаковые РРЦ, target
+        и скидка продавца. Исключение — когда средний SPP между оттенками
+        расходится больше small_spp_spread_points.
+
+        Даже если выше по цепочке часть оттенков получила SKU-SPP, а часть —
+        group-SPP/history-SPP, здесь мы финально выравниваем группу по самому
+        большому использованному SPP/new_price внутри группы. Это убирает
+        ситуацию, когда одинаковые оттенки 551 или 501 уходят на сайт разными
+        ценами.
+        """
+        if calc.empty:
+            return calc
+        required = {"spp_shade_group", "rrc", "target_finishedPrice", "new_discount", "new_price", "avg_spp"}
+        if not required.issubset(set(calc.columns)):
+            return calc
+
+        out = calc.copy()
+        threshold = float(getattr(self.cfg, "small_spp_spread_points", DEFAULT_SMALL_SPP_SPREAD_POINTS) or DEFAULT_SMALL_SPP_SPREAD_POINTS)
+
+        if "shade_group_price_locked" not in out.columns:
+            out["shade_group_price_locked"] = False
+        out["shade_group_locked_new_price"] = None
+        out["shade_group_locked_spp"] = None
+        out["shade_group_price_lock_rule"] = ""
+
+        def _num(v):
+            return to_float_or_none(v)
+
+        key_cols = ["spp_shade_group", "rrc", "target_finishedPrice", "new_discount"]
+        candidates = out[
+            out["spp_shade_group"].notna()
+            & (out["spp_shade_group"].astype(str).str.strip() != "")
+            & out["rrc"].map(_num).notna()
+            & out["target_finishedPrice"].map(_num).notna()
+            & out["new_discount"].map(_num).notna()
+        ].copy()
+
+        if candidates.empty:
+            return out
+
+        for key, g in candidates.groupby(key_cols, dropna=False):
+            idx = g.index
+            if len(idx) < 2:
+                continue
+
+            valid_price = g["new_price"].map(_num).dropna()
+            valid_spp = g["avg_spp"].map(_num).dropna()
+            if valid_price.empty or valid_spp.empty:
+                continue
+
+            # Проверяем правило 3 п.п. Сначала используем диагностический spread группы,
+            # если он есть. Если его нет — смотрим разбег уже выбранного avg_spp.
+            consensus = False
+            spread_values = []
+            for c in [
+                "group_mean_spread_group_3h",
+                "group_mean_spread_group_today",
+                "group_mean_spread_group_previous_day",
+                "group_mean_spread_group_history",
+            ]:
+                if c in g.columns:
+                    vals = g[c].map(_num).dropna()
+                    if not vals.empty:
+                        spread_values.extend(vals.tolist())
+            if spread_values and min(spread_values) <= threshold:
+                consensus = True
+                used_spread = min(spread_values)
+                rule = f"group_spread_{used_spread:.2f}_le_{threshold:g}"
+            else:
+                used_spread = float(valid_spp.max() - valid_spp.min()) if len(valid_spp) > 1 else 0.0
+                if used_spread <= threshold:
+                    consensus = True
+                    rule = f"selected_spp_spread_{used_spread:.2f}_le_{threshold:g}"
+                else:
+                    consensus = False
+                    rule = f"skip_lock_spread_{used_spread:.2f}_gt_{threshold:g}"
+
+            if not consensus:
+                out.loc[idx, "shade_group_price_lock_rule"] = rule
+                continue
+
+            # Берём максимум, как договорились по оттенкам: safer side, единая цена по группе.
+            chosen_spp = float(valid_spp.max())
+            chosen_new_price = int(round(float(valid_price.max())))
+
+            max_price_idx = g.loc[g["new_price"].map(_num) == valid_price.max()].index
+            chosen_pwd = None
+            if len(max_price_idx) > 0 and "target_priceWithDisc" in out.columns:
+                chosen_pwd = to_float_or_none(out.loc[max_price_idx[0], "target_priceWithDisc"])
+
+            out.loc[idx, "avg_spp"] = chosen_spp
+            out.loc[idx, "new_price"] = chosen_new_price
+            if chosen_pwd is not None and "target_priceWithDisc" in out.columns:
+                out.loc[idx, "target_priceWithDisc"] = int(round(float(chosen_pwd)))
+            if "price_calc_source" in out.columns:
+                out.loc[idx, "price_calc_source"] = out.loc[idx, "price_calc_source"].astype(str) + "+shade_group_price_lock"
+            if "spp_source" in out.columns:
+                out.loc[idx, "spp_source"] = out.loc[idx, "spp_source"].astype(str) + "+shade_group_price_lock"
+            out.loc[idx, "shade_group_price_locked"] = True
+            out.loc[idx, "shade_group_locked_new_price"] = chosen_new_price
+            out.loc[idx, "shade_group_locked_spp"] = chosen_spp
+            out.loc[idx, "shade_group_price_lock_rule"] = rule
+
+        return out
+
 
     def _calc_target_price_with_disc(self, row: pd.Series) -> Optional[int]:
         target = to_float_or_none(row.get("target_finishedPrice"))
@@ -1902,17 +2008,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--night-target-factor", type=float, default=DEFAULT_NIGHT_TARGET_FACTOR, help="Ночной коэффициент к РРЦ, по умолчанию 0.8")
     run_parser.add_argument("--night-start-hour", type=int, default=DEFAULT_NIGHT_START_HOUR, help="Час начала ночного режима по Москве, по умолчанию 23")
     run_parser.add_argument("--night-end-hour", type=int, default=DEFAULT_NIGHT_END_HOUR, help="Час окончания ночного режима по Москве, по умолчанию 5; в 05:00 уже дневной коэффициент")
-    run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца в процентах, по умолчанию 26")
+    run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца, процентов, по умолчанию 26")
     run_parser.add_argument("--price-tolerance-rub", type=int, default=DEFAULT_PRICE_TOLERANCE_RUB, help="Не отправлять, если отличие price <= N рублей")
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
     run_parser.add_argument("--fallback-days", type=int, default=DEFAULT_FALLBACK_DAYS, help="Сколько последних дней заказов читать для fallback SPP")
     run_parser.add_argument("--min-spp-sample-orders", type=int, default=DEFAULT_MIN_SPP_SAMPLE_ORDERS, help="Минимум заказов для использования SPP из периода")
-    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Максимальный разбег среднего SPP между оттенками для склейки группы, п.п.; по умолчанию 3")
     run_parser.add_argument("--price-source", choices=["hybrid", "site", "orders-spp"], default=DEFAULT_PRICE_SOURCE, help="Источник расчёта: hybrid=сначала цена сайта, потом SPP; site=только цена сайта; orders-spp=только SPP из заказов")
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
     run_parser.add_argument("--safe-wb-discount-floor-pct", type=float, default=DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT, help="Консервативный floor WB-скидки/SPP для расчёта price. 0 = отключить")
     run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию -1.5")
+    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Порог разбега среднего SPP между оттенками для склейки группы, п.п.; по умолчанию 3")
     run_parser.add_argument("--use-safe-floor-for-missing", action="store_true", default=DEFAULT_USE_SAFE_FLOOR_FOR_MISSING, help="Если по товару нет достаточной выборки, использовать safe-wb-discount-floor-pct вместо пропуска")
     run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
     run_parser.add_argument("--update-weekly-orders", action="store_true", help="Опционально обновлять сегодняшний день в обычном недельном файле заказов")
@@ -1938,12 +2044,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
         args.fallback_days = DEFAULT_FALLBACK_DAYS
         args.min_spp_sample_orders = DEFAULT_MIN_SPP_SAMPLE_ORDERS
-        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.price_source = DEFAULT_PRICE_SOURCE
         args.public_dest = DEFAULT_PUBLIC_DEST
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
         args.safe_wb_discount_floor_pct = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
         args.spp_adjustment_pct = DEFAULT_SPP_ADJUSTMENT_PCT
+        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.use_safe_floor_for_missing = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
         args.allow_unknown_subject = False
         args.update_weekly_orders = False
@@ -1982,12 +2088,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_price_change_pct=args.max_price_change_pct,
         fallback_days=args.fallback_days,
         min_spp_sample_orders=args.min_spp_sample_orders,
-        small_spp_spread_points=args.small_spp_spread_points,
         price_source=args.price_source,
         public_dest=args.public_dest,
         site_price_tolerance_rub=args.site_price_tolerance_rub,
         safe_wb_discount_floor_pct=args.safe_wb_discount_floor_pct,
         spp_adjustment_pct=args.spp_adjustment_pct,
+        small_spp_spread_points=args.small_spp_spread_points,
         use_safe_floor_for_missing=args.use_safe_floor_for_missing,
         allow_unknown_subject=args.allow_unknown_subject,
         update_weekly_orders=args.update_weekly_orders,
