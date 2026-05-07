@@ -9,9 +9,10 @@
 - каждые 3 часа забирает заказы за сегодняшний день через statistics-api;
 - дополнительно проверяет фактическую цену карточки WB по nmID через публичный endpoint сайта;
 - если цена сайта доступна, корректирует базовую WB price от фактической цены покупателя, без вывода по 1-2 заказам;
-- если цена сайта недоступна, считает средний SPP за последние 3 часа по nmID только если выборка >= 10 заказов;
-- если за последние 3 часа по nmID меньше 10 заказов, берёт средний SPP по этому же nmID за предыдущий день только при выборке >= 10;
-- если предыдущего дня недостаточно, использует только SKU-историю за прошлый период при выборке >= 10; subject/global SPP не применяется.
+- если цена сайта недоступна, считает не только поле spp, а фактический коэффициент WB-скидки из заказов: finishedPrice / priceWithDisc;
+- если за последние 3 часа по nmID меньше 10 заказов, берёт предыдущий день, затем SKU-историю;
+- subject/global SPP не применяется, потому что средняя категория может сломать цену конкретного товара;
+- никаких искусственных floor по SPP/WB-скидке не используется.
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
 - читает справочник артикулов 1С из S3;
 - исключает subject: Помады, Блески;
@@ -46,6 +47,7 @@ import tempfile
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
@@ -65,6 +67,8 @@ ORDERS_API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 PRICES_LIST_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
 PRICE_UPLOAD_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/upload/task"
 PUBLIC_CARD_DETAIL_API_URL = "https://card.wb.ru/cards/v2/detail"
+PUBLIC_CARD_DETAIL_OLD_API_URL = "https://card.wb.ru/cards/detail"
+PUBLIC_PRODUCT_PAGE_URL = "https://www.wildberries.ru/catalog/{nm}/detail.aspx"
 
 DEFAULT_STORE = "TOPFACE"
 DEFAULT_DAY_TARGET_FACTOR = 0.90
@@ -79,8 +83,13 @@ DEFAULT_FALLBACK_DAYS = 21
 DEFAULT_MIN_SPP_SAMPLE_ORDERS = 10
 DEFAULT_PRICE_SOURCE = "hybrid"  # hybrid = public site price first, then SKU SPP fallback
 DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
-DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
-DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = 80
+DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "") or "-1257786"
+DEFAULT_PUBLIC_REGIONS = os.environ.get("WB_PUBLIC_REGIONS", "")
+DEFAULT_PUBLIC_STORES = os.environ.get("WB_PUBLIC_STORES", "")
+DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = int(os.environ.get("WB_PUBLIC_PRICE_CHUNK_SIZE", "50") or 50)
+DEFAULT_PUBLIC_PAGE_PARSE = os.environ.get("WB_PUBLIC_PAGE_PARSE", "true").strip().lower() in {"1", "true", "yes", "y", "да"}
+DEFAULT_PUBLIC_PAGE_WORKERS = int(os.environ.get("WB_PUBLIC_PAGE_WORKERS", "8") or 8)
+DEFAULT_PUBLIC_PAGE_TIMEOUT = int(os.environ.get("WB_PUBLIC_PAGE_TIMEOUT", "20") or 20)
 
 EXCLUDED_SUBJECTS = {"помады", "блески"}
 
@@ -437,17 +446,136 @@ def extract_public_price_from_product(product: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+
+def _extract_products_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Универсально достаёт products из разных форматов public WB JSON."""
+    if not isinstance(payload, dict):
+        return []
+    candidates = [payload]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.append(data)
+    for obj in candidates:
+        products = obj.get("products")
+        if isinstance(products, list):
+            return [x for x in products if isinstance(x, dict)]
+    return []
+
+
+def _extract_price_from_html(html: str, nm: int) -> Dict[str, Any]:
+    """Пробует достать цену из HTML/встроенного JSON страницы товара."""
+    if not html:
+        return {"nmID": nm, "site_final_price": None, "site_price_raw": ""}
+
+    nm_s = str(nm)
+    windows: List[str] = []
+    for m in re.finditer(re.escape(nm_s), html):
+        start = max(0, m.start() - 8000)
+        end = min(len(html), m.end() + 12000)
+        windows.append(html[start:end])
+        if len(windows) >= 8:
+            break
+    if not windows:
+        windows = [html[:50000]]
+
+    # Поля с максимальным приоритетом именно для финальной цены.
+    patterns_by_priority = [
+        ("price.total", r'"price"\s*:\s*\{[^{}]{0,2000}?"total"\s*:\s*(\d+(?:\.\d+)?)'),
+        ("total", r'"total"\s*:\s*(\d+(?:\.\d+)?)'),
+        ("salePriceU", r'"salePriceU"\s*:\s*(\d+(?:\.\d+)?)'),
+        ("salePrice", r'"salePrice"\s*:\s*(\d+(?:\.\d+)?)'),
+        ("finalPrice", r'"finalPrice"\s*:\s*(\d+(?:\.\d+)?)'),
+        ("productPrice", r'"productPrice"\s*:\s*(\d+(?:\.\d+)?)'),
+    ]
+
+    for source, pattern in patterns_by_priority:
+        vals: List[float] = []
+        raw_match = ""
+        for w in windows:
+            for mm in re.finditer(pattern, w, flags=re.IGNORECASE | re.DOTALL):
+                price = wb_public_price_to_rub(mm.group(1))
+                if price is not None and 20 <= price <= 50000:
+                    vals.append(price)
+                    raw_match = mm.group(0)[:500]
+        if vals:
+            # На странице могут встречаться старая и финальная цены. Для total/salePrice берём минимальную положительную.
+            return {
+                "nmID": nm,
+                "site_final_price": min(vals),
+                "site_product_price": None,
+                "site_basic_price": None,
+                "site_name": "",
+                "site_brand": "",
+                "site_price_raw": raw_match,
+                "site_price_source": f"wildberries_page_html:{source}",
+            }
+
+    # Последний резерв — видимые цены с ₽. Используем только если рядом в HTML есть nmID.
+    rub_vals: List[float] = []
+    for w in windows:
+        for mm in re.finditer(r'([0-9][0-9\s]{1,8})\s*(?:₽|руб)', w, flags=re.IGNORECASE):
+            raw = re.sub(r'\s+', '', mm.group(1))
+            price = to_float_or_none(raw)
+            if price is not None and 20 <= price <= 50000:
+                rub_vals.append(float(price))
+    if rub_vals:
+        return {
+            "nmID": nm,
+            "site_final_price": min(rub_vals),
+            "site_product_price": None,
+            "site_basic_price": None,
+            "site_name": "",
+            "site_brand": "",
+            "site_price_raw": "visible_rub_price",
+            "site_price_source": "wildberries_page_html:visible_rub",
+        }
+
+    return {"nmID": nm, "site_final_price": None, "site_price_raw": ""}
+
+
+def _fetch_single_product_page_price(sess: requests.Session, nm: int, dest: str, headers: Dict[str, str], timeout: int) -> Dict[str, Any]:
+    url = PUBLIC_PRODUCT_PAGE_URL.format(nm=nm)
+    params = {"targetUrl": "EX"}
+    try:
+        resp = sess.get(url, headers=headers, params=params, timeout=timeout)
+        checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+        if resp.status_code != 200:
+            return {
+                "nmID": nm,
+                "site_final_price": None,
+                "site_price_source": f"wildberries_page_http_{resp.status_code}",
+                "site_dest": str(dest),
+                "site_checked_at": checked_at,
+            }
+        row = _extract_price_from_html(resp.text, nm)
+        row["site_dest"] = str(dest)
+        row["site_checked_at"] = checked_at
+        if not row.get("site_price_source"):
+            row["site_price_source"] = "wildberries_page_no_price"
+        return row
+    except Exception as e:
+        return {
+            "nmID": nm,
+            "site_final_price": None,
+            "site_price_source": f"wildberries_page_error: {str(e)[:120]}",
+            "site_dest": str(dest),
+            "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
 def fetch_public_site_prices_for_nmids(
     nmids: Sequence[int],
     dest: str = DEFAULT_PUBLIC_DEST,
     session: Optional[requests.Session] = None,
     chunk_size: int = DEFAULT_PUBLIC_PRICE_CHUNK_SIZE,
     timeout: int = 30,
+    enable_page_parse: bool = DEFAULT_PUBLIC_PAGE_PARSE,
 ) -> pd.DataFrame:
-    """Получает фактические цены карточек WB по nmID через публичный endpoint сайта.
+    """Получает фактические цены карточек WB по nmID.
 
-    Это не seller API и не официальный метод WB API. Используем только как контроль/обратную связь
-    по цене, которую видит покупатель для выбранного dest.
+    Сначала пробует пакетные JSON endpoints WB, потом — HTML страницы товара.
+    Это не seller API, поэтому используется только как контроль фактической цены покупателя.
+    Если цену не удалось получить, товар не должен пересчитываться по сайту.
     """
     ids = []
     for x in nmids:
@@ -455,70 +583,143 @@ def fetch_public_site_prices_for_nmids(
         if nm:
             ids.append(nm)
     ids = sorted(set(ids))
+    base_cols = [
+        "nmID", "site_final_price", "site_product_price", "site_basic_price",
+        "site_name", "site_brand", "site_price_raw", "site_price_source", "site_dest", "site_checked_at"
+    ]
     if not ids:
-        return pd.DataFrame(columns=[
-            "nmID", "site_final_price", "site_product_price", "site_basic_price",
-            "site_name", "site_brand", "site_price_raw", "site_price_source", "site_dest", "site_checked_at"
-        ])
+        return pd.DataFrame(columns=base_cols)
 
     sess = session or requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
         "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Origin": "https://www.wildberries.ru",
         "Referer": "https://www.wildberries.ru/",
+        "Connection": "keep-alive",
     }
-    rows: List[Dict[str, Any]] = []
-    for chunk in chunked_list(ids, max(1, int(chunk_size))):
-        params = {
-            "appType": 1,
-            "curr": "rub",
-            "dest": str(dest),
-            "lang": "ru",
-            "ab_testing": "false",
-            "nm": ",".join(str(x) for x in chunk),
-        }
-        try:
-            resp = sess.get(PUBLIC_CARD_DETAIL_API_URL, headers=headers, params=params, timeout=timeout)
-            if resp.status_code != 200:
-                for nm in chunk:
-                    rows.append({
-                        "nmID": nm,
-                        "site_final_price": None,
-                        "site_price_source": f"card.wb.ru_http_{resp.status_code}",
-                        "site_dest": str(dest),
-                        "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                continue
-            payload = resp.json()
-            products = payload.get("data", {}).get("products", []) if isinstance(payload, dict) else []
-            by_id = {}
-            for product in products:
-                if isinstance(product, dict):
+    # Небольшой прогрев cookies. Ошибка не критична.
+    try:
+        sess.get("https://www.wildberries.ru/", headers=headers, timeout=10)
+    except Exception:
+        pass
+
+    rows_by_nm: Dict[int, Dict[str, Any]] = {}
+    diagnostics: Dict[int, str] = {nm: "not_requested" for nm in ids}
+
+    endpoint_specs = [
+        (PUBLIC_CARD_DETAIL_API_URL, "card.wb.ru/cards/v2/detail"),
+        (PUBLIC_CARD_DETAIL_OLD_API_URL, "card.wb.ru/cards/detail"),
+    ]
+
+    for url, source_name in endpoint_specs:
+        missing = [nm for nm in ids if nm not in rows_by_nm or not to_float_or_none(rows_by_nm[nm].get("site_final_price"))]
+        if not missing:
+            break
+        for chunk in chunked_list(missing, max(1, int(chunk_size))):
+            params = {
+                "appType": 1,
+                "curr": "rub",
+                "dest": str(dest),
+                "lang": "ru",
+                "ab_testing": "false",
+                "nm": ",".join(str(x) for x in chunk),
+            }
+            if DEFAULT_PUBLIC_REGIONS:
+                params["regions"] = DEFAULT_PUBLIC_REGIONS
+            if DEFAULT_PUBLIC_STORES:
+                params["stores"] = DEFAULT_PUBLIC_STORES
+            try:
+                resp = sess.get(url, headers=headers, params=params, timeout=timeout)
+                checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+                if resp.status_code != 200:
+                    for nm in chunk:
+                        diagnostics[nm] = f"{source_name}_http_{resp.status_code}"
+                    continue
+                try:
+                    payload = resp.json()
+                except Exception as e:
+                    for nm in chunk:
+                        diagnostics[nm] = f"{source_name}_json_error:{str(e)[:80]}"
+                    continue
+                products = _extract_products_from_payload(payload)
+                if not products:
+                    for nm in chunk:
+                        diagnostics[nm] = f"{source_name}_empty_products"
+                    continue
+                by_id: Dict[int, Dict[str, Any]] = {}
+                for product in products:
                     row = extract_public_price_from_product(product)
-                    if row.get("nmID"):
-                        by_id[int(row["nmID"])] = row
-            for nm in chunk:
-                row = by_id.get(nm, {"nmID": nm, "site_final_price": None})
-                row["site_price_source"] = "card.wb.ru/cards/v2/detail"
-                row["site_dest"] = str(dest)
-                row["site_checked_at"] = now_msk().strftime("%Y-%m-%d %H:%M:%S")
-                rows.append(row)
-        except Exception as e:
-            for nm in chunk:
-                rows.append({
-                    "nmID": nm,
-                    "site_final_price": None,
-                    "site_price_source": f"card.wb.ru_error: {str(e)[:120]}",
-                    "site_dest": str(dest),
-                    "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
-                })
-        time.sleep(0.25)
+                    nm_row = to_int_or_none(row.get("nmID"))
+                    if nm_row:
+                        by_id[int(nm_row)] = row
+                for nm in chunk:
+                    row = by_id.get(nm)
+                    if row and to_float_or_none(row.get("site_final_price")):
+                        row["site_price_source"] = source_name
+                        row["site_dest"] = str(dest)
+                        row["site_checked_at"] = checked_at
+                        rows_by_nm[nm] = row
+                    else:
+                        diagnostics[nm] = f"{source_name}_no_price_or_no_match"
+            except Exception as e:
+                for nm in chunk:
+                    diagnostics[nm] = f"{source_name}_error:{str(e)[:120]}"
+            time.sleep(0.35)
+
+    if enable_page_parse:
+        missing = [nm for nm in ids if nm not in rows_by_nm or not to_float_or_none(rows_by_nm[nm].get("site_final_price"))]
+        if missing:
+            workers = max(1, int(DEFAULT_PUBLIC_PAGE_WORKERS or 1))
+            workers = min(workers, 12)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {
+                    ex.submit(_fetch_single_product_page_price, sess, nm, str(dest), headers, DEFAULT_PUBLIC_PAGE_TIMEOUT): nm
+                    for nm in missing
+                }
+                for fut in as_completed(futs):
+                    nm = futs[fut]
+                    try:
+                        row = fut.result()
+                    except Exception as e:
+                        row = {
+                            "nmID": nm,
+                            "site_final_price": None,
+                            "site_price_source": f"wildberries_page_future_error:{str(e)[:120]}",
+                            "site_dest": str(dest),
+                            "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    if to_float_or_none(row.get("site_final_price")):
+                        rows_by_nm[nm] = row
+                    else:
+                        diagnostics[nm] = str(row.get("site_price_source") or "wildberries_page_no_price")
+
+    rows: List[Dict[str, Any]] = []
+    checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+    for nm in ids:
+        row = rows_by_nm.get(nm)
+        if not row:
+            row = {
+                "nmID": nm,
+                "site_final_price": None,
+                "site_product_price": None,
+                "site_basic_price": None,
+                "site_name": "",
+                "site_brand": "",
+                "site_price_raw": "",
+                "site_price_source": diagnostics.get(nm, "not_found"),
+                "site_dest": str(dest),
+                "site_checked_at": checked_at,
+            }
+        for c in base_cols:
+            row.setdefault(c, None)
+        rows.append(row)
+
     out = pd.DataFrame(rows)
     if not out.empty:
         out = out.drop_duplicates(subset=["nmID"], keep="last")
-    return out
-
+    return out[base_cols]
 
 def is_cancelled_series(series: pd.Series) -> pd.Series:
     return series.astype(str).str.lower().isin(["true", "1", "да", "yes", "истина"])
@@ -773,9 +974,18 @@ class WBPriceCorrector:
             session=self.session,
             chunk_size=DEFAULT_PUBLIC_PRICE_CHUNK_SIZE,
             timeout=30,
+            enable_page_parse=DEFAULT_PUBLIC_PAGE_PARSE,
         )
         ok_count = int(df["site_final_price"].notna().sum()) if not df.empty and "site_final_price" in df.columns else 0
         log(f"Цены сайта WB: найдено={ok_count}/{len(set(ids))}")
+        if not df.empty:
+            try:
+                self.s3.write_excel(f"{self.service_prefix}/Цены_сайта_WB_последний.xlsx", df, sheet_name="Цены_сайта")
+            except Exception as e:
+                log(f"Не удалось сохранить диагностику цен сайта WB: {e}", "WARN")
+            if "site_price_source" in df.columns:
+                diag = df["site_price_source"].fillna("empty_source").astype(str).value_counts().head(10).to_dict()
+                log(f"Диагностика цен сайта WB: {diag}")
         return df
 
     def upload_prices(self, to_upload: pd.DataFrame) -> pd.DataFrame:
@@ -1069,11 +1279,18 @@ class WBPriceCorrector:
         """
         Возвращает avg_spp по nmID с правилом минимальной выборки.
 
+        Важно: для расчёта используется не только поле spp. Если в заказах есть
+        finishedPrice и priceWithDisc, сначала считаем фактическую WB-скидку:
+            effective_discount = 1 - finishedPrice / priceWithDisc
+        Это надёжнее, чем blindly верить полю spp, потому что нам важен именно
+        итоговый коэффициент между ценой до WB-скидки и ценой покупателя.
+
         Правило:
-        1) SPP за последние 3 часа используем только если по nmID >= min_spp_sample_orders заказов.
-        2) Если за 3 часа заказов меньше минимума, берём средний SPP по этому же nmID за предыдущий день.
-        3) Если предыдущего дня нет, берём SKU-историю за прошлый период только при выборке >= min_spp_sample_orders.
-        4) Subject/global fallback не применяется, потому что по 1-2 заказам или по средней категории цену ставить опасно.
+        1) Последние 3 часа используем только если по nmID >= min_spp_sample_orders заказов.
+        2) Если за 3 часа заказов меньше минимума, берём средний коэффициент по этому же nmID за предыдущий день.
+        3) Если предыдущего дня недостаточно, берём SKU-историю за прошлый период только при выборке >= min_spp_sample_orders.
+        4) Subject/global fallback не применяется.
+        5) Искусственный floor по SPP/WB-скидке не применяется.
         """
         min_n = max(1, int(self.cfg.min_spp_sample_orders or 1))
 
@@ -1108,10 +1325,37 @@ class WBPriceCorrector:
         all_rows = all_rows[all_rows["nmID"].notna()].copy()
         all_rows["nmID"] = all_rows["nmID"].astype(int)
 
+        # Основной показатель для расчёта — фактическая WB-скидка между priceWithDisc
+        # и finishedPrice. Поле spp используем только как запасной источник.
         if "spp" not in all_rows.columns:
             all_rows["spp"] = None
-        all_rows["spp_num"] = all_rows["spp"].map(to_float_or_none)
+        all_rows["spp_api_num"] = all_rows["spp"].map(to_float_or_none)
+
+        if "finishedPrice" in all_rows.columns and "priceWithDisc" in all_rows.columns:
+            all_rows["finished_num"] = all_rows["finishedPrice"].map(to_float_or_none)
+            all_rows["price_with_disc_num"] = all_rows["priceWithDisc"].map(to_float_or_none)
+            valid_coef = (
+                all_rows["finished_num"].notna()
+                & all_rows["price_with_disc_num"].notna()
+                & (all_rows["finished_num"] > 0)
+                & (all_rows["price_with_disc_num"] > 0)
+                # допускаем небольшие расхождения/округления, но не абсурдные строки
+                & (all_rows["finished_num"] <= all_rows["price_with_disc_num"] * 1.05)
+            )
+            all_rows["spp_effective_num"] = None
+            all_rows.loc[valid_coef, "spp_effective_num"] = (
+                (1 - all_rows.loc[valid_coef, "finished_num"] / all_rows.loc[valid_coef, "price_with_disc_num"]) * 100
+            )
+        else:
+            all_rows["spp_effective_num"] = None
+
+        all_rows["spp_num"] = all_rows["spp_effective_num"].map(to_float_or_none)
+        missing_eff = all_rows["spp_num"].isna()
+        all_rows.loc[missing_eff, "spp_num"] = all_rows.loc[missing_eff, "spp_api_num"].map(to_float_or_none)
+
+        # Убираем явный мусор. Верхнюю границу 95 оставляем, чтобы не делить почти на ноль.
         all_rows = all_rows[all_rows["spp_num"].notna()].copy()
+        all_rows = all_rows[(all_rows["spp_num"] >= 0) & (all_rows["spp_num"] < 95)].copy()
 
         if "date" in all_rows.columns:
             all_rows["date"] = pd.to_datetime(all_rows["date"], errors="coerce")
@@ -1120,21 +1364,6 @@ class WBPriceCorrector:
 
         if "isCancel" in all_rows.columns:
             all_rows = all_rows[~is_cancelled_series(all_rows["isCancel"])].copy()
-
-        # Важно: today_orders / previous_day_orders могут одновременно попасть в orders_history.
-        # Если не убрать дубли, выборка SPP искусственно раздувается и товар может пройти
-        # порог min_spp_sample_orders за счёт повторов одних и тех же заказов.
-        before_dedup = len(all_rows)
-        if "srid" in all_rows.columns and all_rows["srid"].notna().any():
-            all_rows["_srid_norm"] = all_rows["srid"].astype(str).str.strip()
-            all_rows = all_rows[all_rows["_srid_norm"] != ""].drop_duplicates(subset=["_srid_norm"], keep="last").copy()
-            all_rows = all_rows.drop(columns=["_srid_norm"], errors="ignore")
-        else:
-            fallback_dedup_cols = [c for c in ["nmID", "date", "gNumber", "spp_num", "finishedPrice", "priceWithDisc"] if c in all_rows.columns]
-            if "nmID" in fallback_dedup_cols and "date" in fallback_dedup_cols and len(fallback_dedup_cols) >= 3:
-                all_rows = all_rows.drop_duplicates(subset=fallback_dedup_cols, keep="last").copy()
-        if before_dedup != len(all_rows):
-            log(f"SPP: удалено дублей заказов перед расчётом выборки: {before_dedup - len(all_rows)}")
 
         if all_rows.empty:
             return pd.DataFrame(columns=[
@@ -1168,13 +1397,9 @@ class WBPriceCorrector:
         )
 
         def choose(row):
-            def safe_count(col: str) -> int:
-                value = to_float_or_none(row.get(col))
-                return int(value) if value is not None and value > 0 else 0
-
-            n3 = safe_count("orders_spp_3h")
-            n_prev = safe_count("orders_spp_previous_day")
-            n_hist = safe_count("orders_spp_history")
+            n3 = int(row.get("orders_spp_3h") or 0)
+            n_prev = int(row.get("orders_spp_previous_day") or 0)
+            n_hist = int(row.get("orders_spp_history") or 0)
 
             if pd.notna(row.get("avg_spp_spp_3h")) and n3 >= min_n:
                 return row.get("avg_spp_spp_3h"), "sku_3h_min10", "3h"
@@ -1191,16 +1416,10 @@ class WBPriceCorrector:
         out["spp_source"] = chosen[1]
         out["spp_reference_period"] = chosen[2]
         out["spp_sample_min"] = min_n
-        for src_col, dst_col in [
-            ("orders_spp_3h", "orders_3h"),
-            ("orders_spp_today", "orders_today"),
-            ("orders_spp_previous_day", "orders_previous_day"),
-            ("orders_spp_history", "orders_history"),
-        ]:
-            if src_col in out.columns:
-                out[dst_col] = pd.to_numeric(out[src_col], errors="coerce").fillna(0).astype(int)
-            else:
-                out[dst_col] = 0
+        out["orders_3h"] = out.get("orders_spp_3h", 0).fillna(0).astype(int)
+        out["orders_today"] = out.get("orders_spp_today", 0).fillna(0).astype(int)
+        out["orders_previous_day"] = out.get("orders_spp_previous_day", 0).fillna(0).astype(int)
+        out["orders_history"] = out.get("orders_spp_history", 0).fillna(0).astype(int)
 
         return out[[
             "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min",
@@ -1337,7 +1556,7 @@ class WBPriceCorrector:
         calc["excluded_by_rrc_name"] = calc["rrc_name"].map(excluded_by_rrc_name) if "rrc_name" in calc.columns else False
         calc["excluded_rrc_keyword"] = calc["rrc_name"].map(excluded_rrc_keyword) if "rrc_name" in calc.columns else ""
 
-        # SPP. Используем только SKU-уровень: 3h при выборке >= min_n, иначе предыдущий день/история.
+        # WB-скидка/SPP. Используем только SKU-уровень: 3h при выборке >= min_n, иначе предыдущий день/история.
         spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
         calc = calc.merge(spp, on="nmID", how="left")
 
