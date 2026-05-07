@@ -6,19 +6,14 @@
 - с 05:00 до 22:59 по Москве: РРЦ * 0.9.
 
 Логика:
-- в боевом workflow меняет цены только в 23:00 и 05:00 МСК; заказы при каждом запуске сохраняет в служебный архив;
-- дополнительно проверяет фактическую цену карточки WB по nmID через публичный endpoint сайта;
-- если цена сайта доступна, корректирует базовую WB price от фактической цены покупателя, без вывода по 1-2 заказам;
-- если цена сайта недоступна или отключена, считает фактический коэффициент WB-скидки из заказов: 1 - finishedPrice / priceWithDisc;
-- по заказам использует только выборки от 10 значений SPP;
-- если разбег SPP небольшой (до 3 п.п.), берёт среднее и округляет вверх;
-- если разбег большой, считает среднее, отсекает значения выше среднего, затем снова считает среднее и округляет вверх;
-- ведёт служебный файл заказов текущей недели, чтобы не зависеть только от сегодняшней выгрузки;
-- если по группе оттенков недельная выборка стабильная, использует один общий SPP для всей группы: 617/1, 617/2, 617/3 => группа 617;
-- для стабильной группы оттенков берёт максимальный средний SPP среди оттенков и ставит одинаковую базовую цену для оттенков с одинаковым РРЦ;
-- если средний SPP между оттенками группы отличается больше чем на 3 п.п., группа не склеивается и расчёт идёт по конкретному nmID;
-- subject/global SPP не применяется, потому что средняя категория может сломать цену конкретного товара;
-- никаких искусственных floor по SPP/WB-скидке не используется.
+- плановый запуск: 23:00 и 05:00 по Москве;
+- забирает заказы за сегодняшний и предыдущий день через statistics-api;
+- SPP считает самостоятельно по строкам заказов: (1 - finishedPrice / priceWithDisc) * 100;
+- базовый SPP берёт как spp_raw_max, округлённый вверх;
+- к найденному SPP добавляет поправку +1.5 п.п. по умолчанию;
+- для оттенков одной группы, например 501/5 и 501/19, сначала пытается использовать общий SPP группы;
+- group fallback применяется только если средний SPP между оттенками отличается не больше чем на 3 п.п.;
+- если по товару/группе меньше 10 значений SPP, период не используется.
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
 - читает справочник артикулов 1С из S3;
 - исключает subject: Помады, Блески;
@@ -53,7 +48,6 @@ import tempfile
 import time
 import traceback
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
@@ -73,8 +67,6 @@ ORDERS_API_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders"
 PRICES_LIST_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
 PRICE_UPLOAD_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/upload/task"
 PUBLIC_CARD_DETAIL_API_URL = "https://card.wb.ru/cards/v2/detail"
-PUBLIC_CARD_DETAIL_OLD_API_URL = "https://card.wb.ru/cards/detail"
-PUBLIC_PRODUCT_PAGE_URL = "https://www.wildberries.ru/catalog/{nm}/detail.aspx"
 
 DEFAULT_STORE = "TOPFACE"
 DEFAULT_DAY_TARGET_FACTOR = 0.90
@@ -87,16 +79,16 @@ DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
 DEFAULT_FALLBACK_DAYS = 21
 DEFAULT_MIN_SPP_SAMPLE_ORDERS = 10
-DEFAULT_SMALL_SPP_SPREAD_POINTS = 3.0
-DEFAULT_PRICE_SOURCE = "orders-spp"  # по умолчанию считаем по SPP из заказов: mean/trim по finishedPrice/priceWithDisc; site/hybrid можно включить вручную
+DEFAULT_PRICE_SOURCE = "orders-spp"  # боевой режим: считаем по заказам, сайт WB не используем
 DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
-DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "") or "-1257786"
-DEFAULT_PUBLIC_REGIONS = os.environ.get("WB_PUBLIC_REGIONS", "")
-DEFAULT_PUBLIC_STORES = os.environ.get("WB_PUBLIC_STORES", "")
-DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = int(os.environ.get("WB_PUBLIC_PRICE_CHUNK_SIZE", "50") or 50)
-DEFAULT_PUBLIC_PAGE_PARSE = os.environ.get("WB_PUBLIC_PAGE_PARSE", "true").strip().lower() in {"1", "true", "yes", "y", "да"}
-DEFAULT_PUBLIC_PAGE_WORKERS = int(os.environ.get("WB_PUBLIC_PAGE_WORKERS", "8") or 8)
-DEFAULT_PUBLIC_PAGE_TIMEOUT = int(os.environ.get("WB_PUBLIC_PAGE_TIMEOUT", "20") or 20)
+# Экстренная защита от занижения: если фактическая WB-скидка/SPP из заказов
+# меньше этого значения, в расчёте используется floor. 0 = отключить.
+# Рекомендованный аварийный режим: 45.
+DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT = float(os.environ.get("WB_SAFE_WB_DISCOUNT_FLOOR_PCT", "0") or 0)
+DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "1.5") or 0)
+DEFAULT_USE_SAFE_FLOOR_FOR_MISSING = (os.environ.get("WB_USE_SAFE_FLOOR_FOR_MISSING", "false").strip().lower() in {"1", "true", "yes", "y", "да"})
+DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
+DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = 80
 
 EXCLUDED_SUBJECTS = {"помады", "блески"}
 
@@ -340,41 +332,20 @@ def normalize_article(value: Any) -> str:
 
 
 def extract_shade_group(value: Any) -> str:
-    """
-    Группа оттенков для fallback SPP.
-
-    Примеры:
-    - 617/1, 617/2, 617/3 -> 617
-    - 901_/5 -> 901
-    - PT501R.005K -> 501
-    - PT901.F05 -> 901
-    - Основа_567/001 -> 567
-
-    Если группа не определяется, возвращает нормализованный артикул целиком,
-    чтобы не смешивать несвязанные товары.
-    """
+    """Возвращает базовую группу оттенков: 501/5 -> 501, PT501R.005K -> 501, PT901.F05 -> 901."""
     s = normalize_article(value)
     if not s:
         return ""
-
-    # Сначала специальные vendorCode TOPFACE вида PT501R.005K / PT901.F05.
     m = re.match(r"^PT(\d+)", s)
     if m:
-        return m.group(1)
-
-    # Классический вид оттенков: 617/1, 901/SET1. Берём числовую базу перед slash.
-    if "/" in s:
-        left = s.split("/", 1)[0]
-        m = re.search(r"(\d+)$", left)
-        if m:
-            return m.group(1)
-        return left
-
-    # Если в артикуле есть цифры и буквенный хвост, берём первую числовую группу.
-    m = re.search(r"(\d+)", s)
+        return m.group(1).lstrip("0") or m.group(1)
+    m = re.match(r"^(\d+)[/\.]", s)
     if m:
-        return m.group(1)
-    return s
+        return m.group(1).lstrip("0") or m.group(1)
+    m = re.match(r"^(\d+)", s)
+    if m:
+        return m.group(1).lstrip("0") or m.group(1)
+    return ""
 
 
 def to_int_or_none(value: Any) -> Optional[int]:
@@ -491,136 +462,17 @@ def extract_public_price_from_product(product: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-
-def _extract_products_from_payload(payload: Any) -> List[Dict[str, Any]]:
-    """Универсально достаёт products из разных форматов public WB JSON."""
-    if not isinstance(payload, dict):
-        return []
-    candidates = [payload]
-    data = payload.get("data")
-    if isinstance(data, dict):
-        candidates.append(data)
-    for obj in candidates:
-        products = obj.get("products")
-        if isinstance(products, list):
-            return [x for x in products if isinstance(x, dict)]
-    return []
-
-
-def _extract_price_from_html(html: str, nm: int) -> Dict[str, Any]:
-    """Пробует достать цену из HTML/встроенного JSON страницы товара."""
-    if not html:
-        return {"nmID": nm, "site_final_price": None, "site_price_raw": ""}
-
-    nm_s = str(nm)
-    windows: List[str] = []
-    for m in re.finditer(re.escape(nm_s), html):
-        start = max(0, m.start() - 8000)
-        end = min(len(html), m.end() + 12000)
-        windows.append(html[start:end])
-        if len(windows) >= 8:
-            break
-    if not windows:
-        windows = [html[:50000]]
-
-    # Поля с максимальным приоритетом именно для финальной цены.
-    patterns_by_priority = [
-        ("price.total", r'"price"\s*:\s*\{[^{}]{0,2000}?"total"\s*:\s*(\d+(?:\.\d+)?)'),
-        ("total", r'"total"\s*:\s*(\d+(?:\.\d+)?)'),
-        ("salePriceU", r'"salePriceU"\s*:\s*(\d+(?:\.\d+)?)'),
-        ("salePrice", r'"salePrice"\s*:\s*(\d+(?:\.\d+)?)'),
-        ("finalPrice", r'"finalPrice"\s*:\s*(\d+(?:\.\d+)?)'),
-        ("productPrice", r'"productPrice"\s*:\s*(\d+(?:\.\d+)?)'),
-    ]
-
-    for source, pattern in patterns_by_priority:
-        vals: List[float] = []
-        raw_match = ""
-        for w in windows:
-            for mm in re.finditer(pattern, w, flags=re.IGNORECASE | re.DOTALL):
-                price = wb_public_price_to_rub(mm.group(1))
-                if price is not None and 20 <= price <= 50000:
-                    vals.append(price)
-                    raw_match = mm.group(0)[:500]
-        if vals:
-            # На странице могут встречаться старая и финальная цены. Для total/salePrice берём минимальную положительную.
-            return {
-                "nmID": nm,
-                "site_final_price": min(vals),
-                "site_product_price": None,
-                "site_basic_price": None,
-                "site_name": "",
-                "site_brand": "",
-                "site_price_raw": raw_match,
-                "site_price_source": f"wildberries_page_html:{source}",
-            }
-
-    # Последний резерв — видимые цены с ₽. Используем только если рядом в HTML есть nmID.
-    rub_vals: List[float] = []
-    for w in windows:
-        for mm in re.finditer(r'([0-9][0-9\s]{1,8})\s*(?:₽|руб)', w, flags=re.IGNORECASE):
-            raw = re.sub(r'\s+', '', mm.group(1))
-            price = to_float_or_none(raw)
-            if price is not None and 20 <= price <= 50000:
-                rub_vals.append(float(price))
-    if rub_vals:
-        return {
-            "nmID": nm,
-            "site_final_price": min(rub_vals),
-            "site_product_price": None,
-            "site_basic_price": None,
-            "site_name": "",
-            "site_brand": "",
-            "site_price_raw": "visible_rub_price",
-            "site_price_source": "wildberries_page_html:visible_rub",
-        }
-
-    return {"nmID": nm, "site_final_price": None, "site_price_raw": ""}
-
-
-def _fetch_single_product_page_price(sess: requests.Session, nm: int, dest: str, headers: Dict[str, str], timeout: int) -> Dict[str, Any]:
-    url = PUBLIC_PRODUCT_PAGE_URL.format(nm=nm)
-    params = {"targetUrl": "EX"}
-    try:
-        resp = sess.get(url, headers=headers, params=params, timeout=timeout)
-        checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
-        if resp.status_code != 200:
-            return {
-                "nmID": nm,
-                "site_final_price": None,
-                "site_price_source": f"wildberries_page_http_{resp.status_code}",
-                "site_dest": str(dest),
-                "site_checked_at": checked_at,
-            }
-        row = _extract_price_from_html(resp.text, nm)
-        row["site_dest"] = str(dest)
-        row["site_checked_at"] = checked_at
-        if not row.get("site_price_source"):
-            row["site_price_source"] = "wildberries_page_no_price"
-        return row
-    except Exception as e:
-        return {
-            "nmID": nm,
-            "site_final_price": None,
-            "site_price_source": f"wildberries_page_error: {str(e)[:120]}",
-            "site_dest": str(dest),
-            "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-
 def fetch_public_site_prices_for_nmids(
     nmids: Sequence[int],
     dest: str = DEFAULT_PUBLIC_DEST,
     session: Optional[requests.Session] = None,
     chunk_size: int = DEFAULT_PUBLIC_PRICE_CHUNK_SIZE,
     timeout: int = 30,
-    enable_page_parse: bool = DEFAULT_PUBLIC_PAGE_PARSE,
 ) -> pd.DataFrame:
-    """Получает фактические цены карточек WB по nmID.
+    """Получает фактические цены карточек WB по nmID через публичный endpoint сайта.
 
-    Сначала пробует пакетные JSON endpoints WB, потом — HTML страницы товара.
-    Это не seller API, поэтому используется только как контроль фактической цены покупателя.
-    Если цену не удалось получить, товар не должен пересчитываться по сайту.
+    Это не seller API и не официальный метод WB API. Используем только как контроль/обратную связь
+    по цене, которую видит покупатель для выбранного dest.
     """
     ids = []
     for x in nmids:
@@ -628,143 +480,70 @@ def fetch_public_site_prices_for_nmids(
         if nm:
             ids.append(nm)
     ids = sorted(set(ids))
-    base_cols = [
-        "nmID", "site_final_price", "site_product_price", "site_basic_price",
-        "site_name", "site_brand", "site_price_raw", "site_price_source", "site_dest", "site_checked_at"
-    ]
     if not ids:
-        return pd.DataFrame(columns=base_cols)
+        return pd.DataFrame(columns=[
+            "nmID", "site_final_price", "site_product_price", "site_basic_price",
+            "site_name", "site_brand", "site_price_raw", "site_price_source", "site_dest", "site_checked_at"
+        ])
 
     sess = session or requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
         "Accept": "application/json,text/plain,*/*",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Origin": "https://www.wildberries.ru",
         "Referer": "https://www.wildberries.ru/",
-        "Connection": "keep-alive",
     }
-    # Небольшой прогрев cookies. Ошибка не критична.
-    try:
-        sess.get("https://www.wildberries.ru/", headers=headers, timeout=10)
-    except Exception:
-        pass
-
-    rows_by_nm: Dict[int, Dict[str, Any]] = {}
-    diagnostics: Dict[int, str] = {nm: "not_requested" for nm in ids}
-
-    endpoint_specs = [
-        (PUBLIC_CARD_DETAIL_API_URL, "card.wb.ru/cards/v2/detail"),
-        (PUBLIC_CARD_DETAIL_OLD_API_URL, "card.wb.ru/cards/detail"),
-    ]
-
-    for url, source_name in endpoint_specs:
-        missing = [nm for nm in ids if nm not in rows_by_nm or not to_float_or_none(rows_by_nm[nm].get("site_final_price"))]
-        if not missing:
-            break
-        for chunk in chunked_list(missing, max(1, int(chunk_size))):
-            params = {
-                "appType": 1,
-                "curr": "rub",
-                "dest": str(dest),
-                "lang": "ru",
-                "ab_testing": "false",
-                "nm": ",".join(str(x) for x in chunk),
-            }
-            if DEFAULT_PUBLIC_REGIONS:
-                params["regions"] = DEFAULT_PUBLIC_REGIONS
-            if DEFAULT_PUBLIC_STORES:
-                params["stores"] = DEFAULT_PUBLIC_STORES
-            try:
-                resp = sess.get(url, headers=headers, params=params, timeout=timeout)
-                checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
-                if resp.status_code != 200:
-                    for nm in chunk:
-                        diagnostics[nm] = f"{source_name}_http_{resp.status_code}"
-                    continue
-                try:
-                    payload = resp.json()
-                except Exception as e:
-                    for nm in chunk:
-                        diagnostics[nm] = f"{source_name}_json_error:{str(e)[:80]}"
-                    continue
-                products = _extract_products_from_payload(payload)
-                if not products:
-                    for nm in chunk:
-                        diagnostics[nm] = f"{source_name}_empty_products"
-                    continue
-                by_id: Dict[int, Dict[str, Any]] = {}
-                for product in products:
-                    row = extract_public_price_from_product(product)
-                    nm_row = to_int_or_none(row.get("nmID"))
-                    if nm_row:
-                        by_id[int(nm_row)] = row
-                for nm in chunk:
-                    row = by_id.get(nm)
-                    if row and to_float_or_none(row.get("site_final_price")):
-                        row["site_price_source"] = source_name
-                        row["site_dest"] = str(dest)
-                        row["site_checked_at"] = checked_at
-                        rows_by_nm[nm] = row
-                    else:
-                        diagnostics[nm] = f"{source_name}_no_price_or_no_match"
-            except Exception as e:
-                for nm in chunk:
-                    diagnostics[nm] = f"{source_name}_error:{str(e)[:120]}"
-            time.sleep(0.35)
-
-    if enable_page_parse:
-        missing = [nm for nm in ids if nm not in rows_by_nm or not to_float_or_none(rows_by_nm[nm].get("site_final_price"))]
-        if missing:
-            workers = max(1, int(DEFAULT_PUBLIC_PAGE_WORKERS or 1))
-            workers = min(workers, 12)
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {
-                    ex.submit(_fetch_single_product_page_price, sess, nm, str(dest), headers, DEFAULT_PUBLIC_PAGE_TIMEOUT): nm
-                    for nm in missing
-                }
-                for fut in as_completed(futs):
-                    nm = futs[fut]
-                    try:
-                        row = fut.result()
-                    except Exception as e:
-                        row = {
-                            "nmID": nm,
-                            "site_final_price": None,
-                            "site_price_source": f"wildberries_page_future_error:{str(e)[:120]}",
-                            "site_dest": str(dest),
-                            "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    if to_float_or_none(row.get("site_final_price")):
-                        rows_by_nm[nm] = row
-                    else:
-                        diagnostics[nm] = str(row.get("site_price_source") or "wildberries_page_no_price")
-
     rows: List[Dict[str, Any]] = []
-    checked_at = now_msk().strftime("%Y-%m-%d %H:%M:%S")
-    for nm in ids:
-        row = rows_by_nm.get(nm)
-        if not row:
-            row = {
-                "nmID": nm,
-                "site_final_price": None,
-                "site_product_price": None,
-                "site_basic_price": None,
-                "site_name": "",
-                "site_brand": "",
-                "site_price_raw": "",
-                "site_price_source": diagnostics.get(nm, "not_found"),
-                "site_dest": str(dest),
-                "site_checked_at": checked_at,
-            }
-        for c in base_cols:
-            row.setdefault(c, None)
-        rows.append(row)
-
+    for chunk in chunked_list(ids, max(1, int(chunk_size))):
+        params = {
+            "appType": 1,
+            "curr": "rub",
+            "dest": str(dest),
+            "lang": "ru",
+            "ab_testing": "false",
+            "nm": ",".join(str(x) for x in chunk),
+        }
+        try:
+            resp = sess.get(PUBLIC_CARD_DETAIL_API_URL, headers=headers, params=params, timeout=timeout)
+            if resp.status_code != 200:
+                for nm in chunk:
+                    rows.append({
+                        "nmID": nm,
+                        "site_final_price": None,
+                        "site_price_source": f"card.wb.ru_http_{resp.status_code}",
+                        "site_dest": str(dest),
+                        "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                continue
+            payload = resp.json()
+            products = payload.get("data", {}).get("products", []) if isinstance(payload, dict) else []
+            by_id = {}
+            for product in products:
+                if isinstance(product, dict):
+                    row = extract_public_price_from_product(product)
+                    if row.get("nmID"):
+                        by_id[int(row["nmID"])] = row
+            for nm in chunk:
+                row = by_id.get(nm, {"nmID": nm, "site_final_price": None})
+                row["site_price_source"] = "card.wb.ru/cards/v2/detail"
+                row["site_dest"] = str(dest)
+                row["site_checked_at"] = now_msk().strftime("%Y-%m-%d %H:%M:%S")
+                rows.append(row)
+        except Exception as e:
+            for nm in chunk:
+                rows.append({
+                    "nmID": nm,
+                    "site_final_price": None,
+                    "site_price_source": f"card.wb.ru_error: {str(e)[:120]}",
+                    "site_dest": str(dest),
+                    "site_checked_at": now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+        time.sleep(0.25)
     out = pd.DataFrame(rows)
     if not out.empty:
         out = out.drop_duplicates(subset=["nmID"], keep="last")
-    return out[base_cols]
+    return out
+
 
 def is_cancelled_series(series: pd.Series) -> pd.Series:
     return series.astype(str).str.lower().isin(["true", "1", "да", "yes", "истина"])
@@ -797,10 +576,12 @@ class PriceCorrectorConfig:
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
     fallback_days: int = DEFAULT_FALLBACK_DAYS
     min_spp_sample_orders: int = DEFAULT_MIN_SPP_SAMPLE_ORDERS
-    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     price_source: str = DEFAULT_PRICE_SOURCE
     public_dest: str = DEFAULT_PUBLIC_DEST
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
+    safe_wb_discount_floor_pct: float = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
+    spp_adjustment_pct: float = DEFAULT_SPP_ADJUSTMENT_PCT
+    use_safe_floor_for_missing: bool = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
     allow_unknown_subject: bool = False
     update_weekly_orders: bool = False
 
@@ -1020,18 +801,9 @@ class WBPriceCorrector:
             session=self.session,
             chunk_size=DEFAULT_PUBLIC_PRICE_CHUNK_SIZE,
             timeout=30,
-            enable_page_parse=DEFAULT_PUBLIC_PAGE_PARSE,
         )
         ok_count = int(df["site_final_price"].notna().sum()) if not df.empty and "site_final_price" in df.columns else 0
         log(f"Цены сайта WB: найдено={ok_count}/{len(set(ids))}")
-        if not df.empty:
-            try:
-                self.s3.write_excel(f"{self.service_prefix}/Цены_сайта_WB_последний.xlsx", df, sheet_name="Цены_сайта")
-            except Exception as e:
-                log(f"Не удалось сохранить диагностику цен сайта WB: {e}", "WARN")
-            if "site_price_source" in df.columns:
-                diag = df["site_price_source"].fillna("empty_source").astype(str).value_counts().head(10).to_dict()
-                log(f"Диагностика цен сайта WB: {diag}")
         return df
 
     def upload_prices(self, to_upload: pd.DataFrame) -> pd.DataFrame:
@@ -1112,103 +884,10 @@ class WBPriceCorrector:
         archive_key = f"{self.service_prefix}/Архив/Заказы_{today_d.strftime('%Y-%m-%d')}.xlsx"
         self.save_orders_snapshot(orders_df, archive_key, "Заказы")
 
-        # Отдельно ведём оперативную неделю в служебной папке. Это не штатный
-        # недельный файл сборщика, поэтому не ломает ежедневный updater, но даёт
-        # стабильную выборку SPP по товарам с низкими продажами.
-        self._upsert_into_service_current_week_orders(orders_df, today_d)
-
         if self.cfg.update_weekly_orders:
             self._upsert_today_into_weekly_orders(orders_df)
         else:
             log("Штатный недельный файл заказов не трогаю: update_weekly_orders=False")
-
-    def _upsert_into_service_current_week_orders(self, orders_df: pd.DataFrame, target_date: date):
-        """Перезаписывает один день внутри служебного файла заказов текущей недели."""
-        if orders_df is None:
-            orders_df = pd.DataFrame()
-        week_start = get_week_start(datetime.combine(target_date, datetime.min.time())).date()
-        year, week, _ = target_date.isocalendar()
-        key = f"{self.service_prefix}/Заказы_текущая_неделя_{year}-W{week:02d}.xlsx"
-
-        old = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
-        if not old.empty and "date" in old.columns:
-            old["date"] = pd.to_datetime(old["date"], errors="coerce")
-            old = old[old["date"].dt.date != target_date].copy()
-
-        combined = pd.concat([old, orders_df], ignore_index=True, sort=False) if not old.empty else orders_df.copy()
-        if not combined.empty:
-            if "date" in combined.columns:
-                combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
-                combined = combined[combined["date"].dt.date >= week_start].copy()
-                combined = combined[combined["date"].dt.date <= target_date].copy()
-            if "srid" in combined.columns:
-                combined = combined.drop_duplicates(subset=["srid"], keep="last")
-            self.save_orders_snapshot(combined, key, "Заказы_неделя")
-            # Для удобства дополнительно сохраняем стабильное имя последней оперативной недели.
-            self.save_orders_snapshot(combined, f"{self.service_prefix}/Заказы_текущая_неделя.xlsx", "Заказы_неделя")
-            log(f"Оперативная неделя заказов обновлена: {len(combined)} строк, неделя {year}-W{week:02d}")
-
-    def load_current_week_orders(self, today_orders: pd.DataFrame, previous_day_orders: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        Собирает текущую неделю для расчёта SPP: служебный недельный файл + архивы дней +
-        штатный недельный файл + свежие today/previous_day.
-        """
-        today_d = self.run_datetime_msk.date()
-        week_start_d = get_week_start(datetime.combine(today_d, datetime.min.time())).date()
-        year, week, _ = today_d.isocalendar()
-        keys = [
-            f"{self.service_prefix}/Заказы_текущая_неделя_{year}-W{week:02d}.xlsx",
-            f"{self.service_prefix}/Заказы_текущая_неделя.xlsx",
-            get_weekly_orders_key(self.cfg.store, datetime.combine(today_d, datetime.min.time())),
-        ]
-        frames = []
-        for key in keys:
-            if self.s3.file_exists(key):
-                try:
-                    df = self.s3.read_excel(key, sheet_name=0)
-                    if not df.empty:
-                        frames.append(df)
-                except Exception as e:
-                    log(f"Не удалось прочитать заказы недели {key}: {e}", "WARN")
-
-        # Архивы по дням текущей недели, чтобы неделя накапливалась даже если штатный
-        # сборщик ещё не закрыл какие-то дни.
-        d = week_start_d
-        while d <= today_d:
-            key = f"{self.service_prefix}/Архив/Заказы_{d.strftime('%Y-%m-%d')}.xlsx"
-            if self.s3.file_exists(key):
-                try:
-                    df = self.s3.read_excel(key, sheet_name=0)
-                    if not df.empty:
-                        frames.append(df)
-                except Exception as e:
-                    log(f"Не удалось прочитать архив заказов {key}: {e}", "WARN")
-            d += timedelta(days=1)
-
-        if previous_day_orders is not None and not previous_day_orders.empty:
-            frames.append(previous_day_orders)
-        if today_orders is not None and not today_orders.empty:
-            frames.append(today_orders)
-
-        if not frames:
-            return pd.DataFrame()
-
-        out = pd.concat(frames, ignore_index=True, sort=False)
-        if "date" in out.columns:
-            out["date"] = pd.to_datetime(out["date"], errors="coerce")
-            out = out[(out["date"].dt.date >= week_start_d) & (out["date"].dt.date <= today_d)].copy()
-        if "nmId" in out.columns and "nmID" not in out.columns:
-            out["nmID"] = out["nmId"]
-        elif "nmID" not in out.columns and "Артикул WB" in out.columns:
-            out["nmID"] = out["Артикул WB"]
-        if "nmID" in out.columns:
-            out["nmID"] = out["nmID"].map(to_int_or_none)
-            out = out[out["nmID"].notna()].copy()
-            out["nmID"] = out["nmID"].astype(int)
-        if "srid" in out.columns:
-            out = out.drop_duplicates(subset=["srid"], keep="last")
-        log(f"Оперативная неделя заказов для SPP: строк={len(out)}, период={week_start_d}..{today_d}")
-        return out
 
     def load_previous_day_orders(self) -> pd.DataFrame:
         """Загружает предыдущий день для fallback SPP: служебный архив -> файл предыдущего дня -> недельный файл -> API."""
@@ -1414,41 +1093,27 @@ class WBPriceCorrector:
         out = out.sort_values(["nmID", "priority"]).drop_duplicates(subset=["nmID"], keep="first")
         return out.drop(columns=["priority"])
 
-    def build_spp_table(
-        self,
-        today_orders: pd.DataFrame,
-        previous_day_orders: pd.DataFrame,
-        current_week_orders: pd.DataFrame,
-        orders_history: pd.DataFrame,
-        ref_df: Optional[pd.DataFrame] = None,
-    ) -> pd.DataFrame:
+    def build_spp_table(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """
-        Возвращает SPP/WB-скидку по nmID с правилом минимальной выборки.
+        Возвращает avg_spp по nmID с правилом минимальной выборки.
 
-        SPP не берём из колонки spp. Считаем сами по каждой строке заказа:
-            effective_spp_pct = (1 - finishedPrice / priceWithDisc) * 100
+        Важно: для расчёта используется не только поле spp. Если в заказах есть
+        finishedPrice и priceWithDisc, сначала считаем фактическую WB-скидку:
+            effective_discount = 1 - finishedPrice / priceWithDisc
+        Это надёжнее, чем blindly верить полю spp, потому что нам важен именно
+        итоговый коэффициент между ценой до WB-скидки и ценой покупателя.
 
-        Агрегация внутри выбранного периода:
-        - берём максимальное фактическое значение SPP в выборке и округляем вверх.
-          Это ближе к публичной цене WB без авторизации, чем средний SPP;
-        - минимум выборки сохраняется: период используется только если есть min_n значений SPP.
-
-        Периоды и fallback:
-        1) Группа оттенков за текущую неделю, если суммарно >= min_n значений и
-           средние SPP между оттенками отличаются не более чем на small_spp_spread_points.
-           Для всей группы берётся максимальный сырой SPP внутри группы, округлённый вверх.
-           Пример: 501/5, 501/19 -> группа 501; при близком SPP оба получают один SPP.
-        2) Если группа оттенков нестабильна (> 3 п.п. между оттенками), берём SKU за текущую неделю, если >= min_n.
-        3) Группа оттенков за историю по тому же правилу стабильности.
-        4) SKU за историю / предыдущий день / сегодня / 3 часа, если >= min_n.
-
-        Subject/global fallback не применяется.
+        Правило:
+        1) Последние 3 часа используем только если по nmID >= min_spp_sample_orders заказов.
+        2) Если за 3 часа заказов меньше минимума, берём средний коэффициент по этому же nmID за предыдущий день.
+        3) Если предыдущего дня недостаточно, берём SKU-историю за прошлый период только при выборке >= min_spp_sample_orders.
+        4) Subject/global fallback не применяется.
+        5) Если задан safe_wb_discount_floor_pct, коэффициент не может быть ниже floor — это защита от занижения цен.
         """
         min_n = max(1, int(self.cfg.min_spp_sample_orders or 1))
-        small_spread = float(self.cfg.small_spp_spread_points if self.cfg.small_spp_spread_points is not None else DEFAULT_SMALL_SPP_SPREAD_POINTS)
 
         frames = []
-        if today_orders is not None and not today_orders.empty:
+        if not today_orders.empty:
             t = today_orders.copy()
             t["_spp_frame"] = "today"
             frames.append(t)
@@ -1456,26 +1121,16 @@ class WBPriceCorrector:
             p = previous_day_orders.copy()
             p["_spp_frame"] = "previous_day"
             frames.append(p)
-        if current_week_orders is not None and not current_week_orders.empty:
-            w = current_week_orders.copy()
-            w["_spp_frame"] = "current_week"
-            frames.append(w)
-        if orders_history is not None and not orders_history.empty:
+        if not orders_history.empty:
             h = orders_history.copy()
             h["_spp_frame"] = h.get("_spp_frame", "history")
             frames.append(h)
 
-        empty_cols = [
-            "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min", "spp_calc_method",
-            "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max", "spp_raw_spread",
-            "spp_trimmed_mean", "spp_shade_group", "spp_group_rule", "spp_group_shades_count",
-            "spp_group_mean_min", "spp_group_mean_max", "spp_group_mean_spread",
-            "orders_3h", "orders_today", "orders_week",
-            "orders_previous_day", "orders_history", "orders_group_week", "orders_group_history",
-            "orders_shade_consensus_week", "orders_shade_consensus_history",
-        ]
         if not frames:
-            return pd.DataFrame(columns=empty_cols)
+            return pd.DataFrame(columns=[
+                "nmID", "avg_spp", "spp_source", "spp_sample_min",
+                "orders_3h", "orders_today", "orders_previous_day", "orders_history"
+            ])
 
         all_rows = pd.concat(frames, ignore_index=True, sort=False)
 
@@ -1488,29 +1143,12 @@ class WBPriceCorrector:
         all_rows = all_rows[all_rows["nmID"].notna()].copy()
         all_rows["nmID"] = all_rows["nmID"].astype(int)
 
-        if "srid" in all_rows.columns:
-            all_rows = all_rows.drop_duplicates(subset=["srid"], keep="last")
+        # Основной показатель для расчёта — фактическая WB-скидка между priceWithDisc
+        # и finishedPrice. Поле spp используем только как запасной источник.
+        if "spp" not in all_rows.columns:
+            all_rows["spp"] = None
+        all_rows["spp_api_num"] = all_rows["spp"].map(to_float_or_none)
 
-        # Подтягиваем артикула из справочника для групп оттенков, если в заказах
-        # supplierArticle пустой или записан в другом формате.
-        if ref_df is not None and not ref_df.empty and "nmID" in ref_df.columns:
-            # Убираем возможные старые справочные колонки, чтобы merge не создал article_1c_x/_y.
-            for c in ["article_1c", "supplierArticle_ref"]:
-                if c in all_rows.columns:
-                    all_rows = all_rows.drop(columns=[c])
-            ref_cols = [c for c in ["nmID", "article_1c", "supplierArticle_ref"] if c in ref_df.columns]
-            ref_small = ref_df[ref_cols].drop_duplicates(subset=["nmID"], keep="last").copy()
-            all_rows = all_rows.merge(ref_small, on="nmID", how="left")
-        else:
-            all_rows["article_1c"] = ""
-            all_rows["supplierArticle_ref"] = ""
-
-        if "supplierArticle" not in all_rows.columns:
-            all_rows["supplierArticle"] = ""
-        all_rows["spp_article_for_group"] = all_rows.apply(self._pick_article_for_shade_group, axis=1)
-        all_rows["spp_shade_group"] = all_rows["spp_article_for_group"].map(extract_shade_group)
-
-        # Основной показатель — фактическая WB-скидка между priceWithDisc и finishedPrice.
         if "finishedPrice" in all_rows.columns and "priceWithDisc" in all_rows.columns:
             all_rows["finished_num"] = all_rows["finishedPrice"].map(to_float_or_none)
             all_rows["price_with_disc_num"] = all_rows["priceWithDisc"].map(to_float_or_none)
@@ -1519,18 +1157,31 @@ class WBPriceCorrector:
                 & all_rows["price_with_disc_num"].notna()
                 & (all_rows["finished_num"] > 0)
                 & (all_rows["price_with_disc_num"] > 0)
+                # допускаем небольшие расхождения/округления, но не абсурдные строки
                 & (all_rows["finished_num"] <= all_rows["price_with_disc_num"] * 1.05)
             )
-            all_rows["spp_num"] = None
-            all_rows.loc[valid_coef, "spp_num"] = (
+            all_rows["spp_effective_num"] = None
+            all_rows.loc[valid_coef, "spp_effective_num"] = (
                 (1 - all_rows.loc[valid_coef, "finished_num"] / all_rows.loc[valid_coef, "price_with_disc_num"]) * 100
             )
         else:
-            all_rows["spp_num"] = None
+            all_rows["spp_effective_num"] = None
 
-        all_rows["spp_num"] = all_rows["spp_num"].map(to_float_or_none)
+        all_rows["spp_num"] = all_rows["spp_effective_num"].map(to_float_or_none)
+        missing_eff = all_rows["spp_num"].isna()
+        all_rows.loc[missing_eff, "spp_num"] = all_rows.loc[missing_eff, "spp_api_num"].map(to_float_or_none)
+
+        # Убираем явный мусор. Верхнюю границу 95 оставляем, чтобы не делить почти на ноль.
         all_rows = all_rows[all_rows["spp_num"].notna()].copy()
         all_rows = all_rows[(all_rows["spp_num"] >= 0) & (all_rows["spp_num"] < 95)].copy()
+
+        floor = float(self.cfg.safe_wb_discount_floor_pct or 0)
+        if floor > 0:
+            floor = min(max(floor, 0.0), 94.0)
+            below_floor = all_rows["spp_num"] < floor
+            if below_floor.any():
+                all_rows.loc[below_floor, "spp_num_raw_before_floor"] = all_rows.loc[below_floor, "spp_num"]
+                all_rows.loc[below_floor, "spp_num"] = floor
 
         if "date" in all_rows.columns:
             all_rows["date"] = pd.to_datetime(all_rows["date"], errors="coerce")
@@ -1541,372 +1192,187 @@ class WBPriceCorrector:
             all_rows = all_rows[~is_cancelled_series(all_rows["isCancel"])].copy()
 
         if all_rows.empty:
-            return pd.DataFrame(columns=empty_cols)
+            return pd.DataFrame(columns=[
+                "nmID", "avg_spp", "spp_source", "spp_sample_min",
+                "orders_3h", "orders_today", "orders_previous_day", "orders_history"
+            ])
 
         current_naive = self.run_datetime_msk.replace(tzinfo=None)
         three_hours_ago = current_naive - timedelta(hours=3)
         today_d = self.run_datetime_msk.date()
         prev_d = today_d - timedelta(days=1)
-        week_start_d = get_week_start(datetime.combine(today_d, datetime.min.time())).date()
 
         by3 = all_rows[(all_rows["date"].notna()) & (all_rows["date"] >= three_hours_ago) & (all_rows["date"] <= current_naive)].copy()
         byt = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date == today_d)].copy()
         prev = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date == prev_d)].copy()
-        week = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date >= week_start_d) & (all_rows["date"].dt.date <= today_d)].copy()
         hist_prev_period = all_rows[(all_rows["date"].isna()) | ((all_rows["date"].notna()) & (all_rows["date"].dt.date < today_d))].copy()
 
-        sku_3h = self._agg_spp(by3, "spp_3h", ["nmID"], min_n, small_spread)
-        sku_today = self._agg_spp(byt, "spp_today", ["nmID"], min_n, small_spread)
-        sku_prev = self._agg_spp(prev, "spp_previous_day", ["nmID"], min_n, small_spread)
-        sku_week = self._agg_spp(week, "spp_week", ["nmID"], min_n, small_spread)
-        sku_hist = self._agg_spp(hist_prev_period, "spp_history", ["nmID"], min_n, small_spread)
-        group_week = self._agg_spp(week[week["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_week", ["spp_shade_group"], min_n, small_spread)
-        group_hist = self._agg_spp(hist_prev_period[hist_prev_period["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_history", ["spp_shade_group"], min_n, small_spread)
+        # Группа оттенков: 501/5, 501/19 -> 501; PT501R.005K -> 501.
+        article_col = first_existing_col(all_rows, ["supplierArticle", "Артикул продавца", "vendorCode", "Артикул", "article", "article_1c", "Артикул 1С"])
+        if article_col:
+            all_rows["spp_shade_group"] = all_rows[article_col].map(extract_shade_group)
+            for _frame in (by3, byt, prev, hist_prev_period):
+                if article_col in _frame.columns:
+                    _frame["spp_shade_group"] = _frame[article_col].map(extract_shade_group)
+                else:
+                    _frame["spp_shade_group"] = ""
+        else:
+            all_rows["spp_shade_group"] = ""
+            for _frame in (by3, byt, prev, hist_prev_period):
+                _frame["spp_shade_group"] = ""
 
-        # Новый основной механизм для оттенков: если средний SPP между оттенками внутри группы
-        # отличается не больше чем на small_spread п.п., используем один общий SPP для всей группы.
-        # Берём максимальный сырой SPP внутри группы, чтобы не занизить цену покупателя.
-        shade_consensus_week = self._agg_shade_group_consensus_spp(
-            week[week["spp_shade_group"].astype(str).str.strip() != ""].copy(),
-            "spp_shade_consensus_week",
-            min_n,
-            small_spread,
+        sku_3h = self._agg_spp(by3, "spp_3h")
+        sku_today = self._agg_spp(byt, "spp_today")
+        sku_prev = self._agg_spp(prev, "spp_previous_day")
+        sku_hist = self._agg_spp(hist_prev_period, "spp_history")
+
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
+        group_today = self._agg_spp_group(byt, "group_today", min_n)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
+
+        nm_group = (
+            all_rows[["nmID", "spp_shade_group"]]
+            .dropna()
+            .drop_duplicates(subset=["nmID"], keep="last")
         )
-        shade_consensus_hist = self._agg_shade_group_consensus_spp(
-            hist_prev_period[hist_prev_period["spp_shade_group"].astype(str).str.strip() != ""].copy(),
-            "spp_shade_consensus_history",
-            min_n,
-            small_spread,
-        )
 
-        base = all_rows[["nmID", "spp_shade_group"]].drop_duplicates(subset=["nmID"], keep="last").copy()
-
-        # Добавляем все nmID из справочника, чтобы оттенки без продаж тоже могли получить
-        # общий SPP группы 501/617/etc., если у группы есть нормальная недельная выборка.
-        ref_base = self._build_ref_spp_base(ref_df)
-        if not ref_base.empty:
-            base = pd.concat([base, ref_base], ignore_index=True, sort=False)
-            base = base.drop_duplicates(subset=["nmID"], keep="last")
-
-        base = base.sort_values("nmID")
+        base_ids = sorted(all_rows["nmID"].dropna().astype(int).unique())
+        base = pd.DataFrame({"nmID": base_ids})
         out = (
             base
+            .merge(nm_group, on="nmID", how="left")
             .merge(sku_3h, on="nmID", how="left")
             .merge(sku_today, on="nmID", how="left")
             .merge(sku_prev, on="nmID", how="left")
-            .merge(sku_week, on="nmID", how="left")
             .merge(sku_hist, on="nmID", how="left")
+            .merge(group_3h, on="spp_shade_group", how="left")
+            .merge(group_today, on="spp_shade_group", how="left")
+            .merge(group_prev, on="spp_shade_group", how="left")
+            .merge(group_hist, on="spp_shade_group", how="left")
         )
-        if not shade_consensus_week.empty:
-            out = out.merge(shade_consensus_week, on="spp_shade_group", how="left")
-        if not shade_consensus_hist.empty:
-            out = out.merge(shade_consensus_hist, on="spp_shade_group", how="left")
-        if not group_week.empty:
-            out = out.merge(group_week, on="spp_shade_group", how="left")
-        if not group_hist.empty:
-            out = out.merge(group_hist, on="spp_shade_group", how="left")
 
-        def safe_count(value: Any) -> int:
-            v = to_int_or_none(value)
-            return int(v) if v is not None else 0
+        def safe_int(value: Any) -> int:
+            try:
+                if value is None or pd.isna(value):
+                    return 0
+                return int(float(value))
+            except Exception:
+                return 0
 
         def choose(row):
-            candidates = [
-                # Главный приоритет: общий SPP группы оттенков за текущую неделю.
-                # Если группа стабильна по правилу <= 3 п.п. между оттенками, все оттенки
-                # 501/5, 501/14, 501/19 и т.д. получают один и тот же SPP.
-                ("spp_shade_consensus_week", "shade_group_week_max_if_spread_ok", "group_week_consensus"),
-                # Если недельная группа не построилась из-за недостатка данных, но история
-                # показывает стабильность группы, сначала используем историю группы. Это
-                # важнее SKU-недельной выборки: иначе часть 501-х считается по SKU,
-                # а часть по группе, и цены расходятся.
-                ("spp_shade_consensus_history", "shade_group_history_max_if_spread_ok", "group_history_consensus"),
-                # Только если группа реально нестабильна или данных по группе нет — SKU отдельно.
-                ("spp_week", "sku_week", "week"),
-                ("spp_history", "sku_history", "history"),
-                ("spp_previous_day", "sku_previous_day", "previous_day"),
-                ("spp_today", "sku_today", "today"),
-                ("spp_3h", "sku_3h", "3h"),
-                # Не используем старый group_distribution без проверки стабильности оттенков,
-                # потому что он может склеить группу даже при разбеге > 3 п.п.
-            ]
-            for suffix, source_prefix, period in candidates:
-                value = row.get(f"avg_spp_{suffix}")
-                cnt = safe_count(row.get(f"orders_{suffix}"))
-                if pd.notna(value) and cnt >= min_n:
-                    method = row.get(f"spp_calc_method_{suffix}") or "mean_ceil"
-                    return (
-                        value,
-                        f"{source_prefix}_{method}_min{min_n}",
-                        period,
-                        cnt,
-                        safe_count(row.get(f"spp_used_count_{suffix}")),
-                        row.get(f"spp_raw_mean_{suffix}"),
-                        row.get(f"spp_raw_min_{suffix}"),
-                        row.get(f"spp_raw_max_{suffix}"),
-                        row.get(f"spp_raw_spread_{suffix}"),
-                        row.get(f"spp_trimmed_mean_{suffix}"),
-                        row.get(f"spp_group_rule_{suffix}"),
-                        safe_count(row.get(f"spp_group_shades_count_{suffix}")),
-                        row.get(f"spp_group_mean_min_{suffix}"),
-                        row.get(f"spp_group_mean_max_{suffix}"),
-                        row.get(f"spp_group_mean_spread_{suffix}"),
-                    )
-            return (None, f"no_spp_min{min_n}", "none", 0, 0, None, None, None, None, None, None, 0, None, None, None)
+            # Сначала общий SPP группы оттенков. Это фиксирует одинаковую цену для оттенков
+            # вроде 501/5, 501/19 при одинаковом РРЦ, если разбег между оттенками <= 3 п.п.
+            ng3 = safe_int(row.get("orders_group_3h"))
+            ngt = safe_int(row.get("orders_group_today"))
+            ngprev = safe_int(row.get("orders_group_previous_day"))
+            nghist = safe_int(row.get("orders_group_history"))
+
+            if pd.notna(row.get("avg_spp_group_3h")) and ng3 >= min_n:
+                return row.get("avg_spp_group_3h"), "shade_group_3h_raw_max", "group_3h"
+            if pd.notna(row.get("avg_spp_group_today")) and ngt >= min_n:
+                return row.get("avg_spp_group_today"), "shade_group_today_raw_max", "group_today"
+            if pd.notna(row.get("avg_spp_group_previous_day")) and ngprev >= min_n:
+                return row.get("avg_spp_group_previous_day"), "shade_group_previous_day_raw_max", "group_previous_day"
+            if pd.notna(row.get("avg_spp_group_history")) and nghist >= min_n:
+                return row.get("avg_spp_group_history"), "shade_group_history_raw_max", "group_history"
+
+            n3 = safe_int(row.get("orders_spp_3h"))
+            nt = safe_int(row.get("orders_spp_today"))
+            n_prev = safe_int(row.get("orders_spp_previous_day"))
+            n_hist = safe_int(row.get("orders_spp_history"))
+
+            if pd.notna(row.get("avg_spp_spp_3h")) and n3 >= min_n:
+                return row.get("avg_spp_spp_3h"), "sku_3h_raw_max", "3h"
+            if pd.notna(row.get("avg_spp_spp_today")) and nt >= min_n:
+                return row.get("avg_spp_spp_today"), "sku_today_raw_max", "today"
+            if pd.notna(row.get("avg_spp_spp_previous_day")) and n_prev >= min_n:
+                return row.get("avg_spp_spp_previous_day"), "sku_previous_day_raw_max", "previous_day"
+            if pd.notna(row.get("avg_spp_spp_history")) and n_hist >= min_n:
+                return row.get("avg_spp_spp_history"), "sku_history_raw_max", "history"
+            return None, "no_spp_min10", "none"
 
         chosen = out.apply(choose, axis=1, result_type="expand")
         out["avg_spp"] = chosen[0]
         out["spp_source"] = chosen[1]
         out["spp_reference_period"] = chosen[2]
-        out["spp_sample_count"] = chosen[3]
-        out["spp_used_count"] = chosen[4]
-        out["spp_raw_mean"] = chosen[5]
-        out["spp_raw_min"] = chosen[6]
-        out["spp_raw_max"] = chosen[7]
-        out["spp_raw_spread"] = chosen[8]
-        out["spp_trimmed_mean"] = chosen[9]
-        out["spp_group_rule"] = chosen[10]
-        out["spp_group_shades_count"] = chosen[11]
-        out["spp_group_mean_min"] = chosen[12]
-        out["spp_group_mean_max"] = chosen[13]
-        out["spp_group_mean_spread"] = chosen[14]
         out["spp_sample_min"] = min_n
-        out["spp_calc_method"] = "effective_spp_raw_max_ceil_by_shade_group_or_sku_from_finishedPrice_priceWithDisc"
-
-        for src_col, dst_col in [
-            ("orders_spp_3h", "orders_3h"),
-            ("orders_spp_today", "orders_today"),
-            ("orders_spp_previous_day", "orders_previous_day"),
-            ("orders_spp_week", "orders_week"),
-            ("orders_spp_history", "orders_history"),
-            ("orders_spp_group_week", "orders_group_week"),
-            ("orders_spp_group_history", "orders_group_history"),
-            ("orders_spp_shade_consensus_week", "orders_shade_consensus_week"),
-            ("orders_spp_shade_consensus_history", "orders_shade_consensus_history"),
+        for c, src in [
+            ("orders_3h", "orders_spp_3h"),
+            ("orders_today", "orders_spp_today"),
+            ("orders_previous_day", "orders_spp_previous_day"),
+            ("orders_history", "orders_spp_history"),
+            ("orders_group_3h", "orders_group_3h"),
+            ("orders_group_today", "orders_group_today"),
+            ("orders_group_previous_day", "orders_group_previous_day"),
+            ("orders_group_history", "orders_group_history"),
         ]:
-            if src_col in out.columns:
-                out[dst_col] = out[src_col].map(lambda x: to_int_or_none(x) or 0).astype(int)
+            if src in out.columns:
+                out[c] = out[src].fillna(0).astype(int)
             else:
-                out[dst_col] = 0
+                out[c] = 0
 
-        return out[empty_cols]
+        cols = [
+            "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min",
+            "spp_shade_group", "orders_3h", "orders_today", "orders_previous_day", "orders_history",
+            "orders_group_3h", "orders_group_today", "orders_group_previous_day", "orders_group_history",
+        ]
+        for c in ["group_mean_spread_group_3h", "group_mean_spread_group_today", "group_mean_spread_group_previous_day", "group_mean_spread_group_history"]:
+            if c in out.columns:
+                cols.append(c)
+        return out[[c for c in cols if c in out.columns]]
 
     @staticmethod
-    def _build_ref_spp_base(ref_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-        """База nmID -> группа оттенков из справочника, чтобы давать group SPP оттенкам без продаж."""
-        cols = ["nmID", "spp_shade_group"]
-        if ref_df is None or ref_df.empty or "nmID" not in ref_df.columns:
-            return pd.DataFrame(columns=cols)
-        tmp = ref_df.copy()
-        tmp["nmID"] = tmp["nmID"].map(to_int_or_none)
-        tmp = tmp[tmp["nmID"].notna()].copy()
+    def _agg_spp(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=["nmID", f"avg_spp_{suffix}", f"orders_{suffix}", f"spp_raw_max_{suffix}"])
+        g = df.groupby("nmID", as_index=False).agg(
+            **{
+                # Базовое значение SPP — максимум по фактическому SPP из строк заказов, округлённый вверх.
+                f"avg_spp_{suffix}": ("spp_num", lambda x: int(math.ceil(float(x.max())))),
+                f"spp_raw_max_{suffix}": ("spp_num", "max"),
+                f"spp_raw_min_{suffix}": ("spp_num", "min"),
+                f"orders_{suffix}": ("spp_num", "size"),
+            }
+        )
+        return g
+
+    @staticmethod
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
+        if df.empty or "spp_shade_group" not in df.columns:
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+        tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=cols)
-        tmp["nmID"] = tmp["nmID"].astype(int)
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
 
-        def pick_article(row: pd.Series) -> str:
-            for col in ["supplierArticle_ref", "article_1c", "article_rrc", "supplierArticle", "vendorCode", "Артикул продавца", "Артикул 1С"]:
-                if col in row.index:
-                    value = row.get(col)
-                    if value is not None and str(value).strip() and str(value).lower() != "nan":
-                        return str(value)
-            return ""
-
-        tmp["spp_shade_group"] = tmp.apply(pick_article, axis=1).map(extract_shade_group)
-        tmp = tmp[tmp["spp_shade_group"].astype(str).str.strip() != ""].copy()
-        if tmp.empty:
-            return pd.DataFrame(columns=cols)
-        return tmp[cols].drop_duplicates(subset=["nmID"], keep="last")
-
-    @classmethod
-    def _agg_shade_group_consensus_spp(cls, df: pd.DataFrame, suffix: str, min_n: int, max_spread_between_shades: float) -> pd.DataFrame:
-        """
-        Строит единый SPP на группу оттенков.
-
-        Логика:
-        - считаем средний SPP по каждому nmID внутри группы;
-        - если разница max(mean_spp_by_nm) - min(mean_spp_by_nm) <= max_spread_between_shades,
-          считаем, что оттенки ведут себя одинаково;
-        - для всей группы берём максимальный сырой SPP внутри группы и округляем вверх;
-        - если разница между оттенками больше порога, группу не склеиваем.
-        """
-        result_cols = [
-            "spp_shade_group",
-            f"avg_spp_{suffix}", f"orders_{suffix}", f"spp_used_count_{suffix}", f"spp_calc_method_{suffix}",
-            f"spp_raw_mean_{suffix}", f"spp_raw_min_{suffix}", f"spp_raw_max_{suffix}",
-            f"spp_raw_spread_{suffix}", f"spp_trimmed_mean_{suffix}",
-            f"spp_group_rule_{suffix}", f"spp_group_shades_count_{suffix}",
-            f"spp_group_mean_min_{suffix}", f"spp_group_mean_max_{suffix}", f"spp_group_mean_spread_{suffix}",
-        ]
-        if df is None or df.empty or "spp_shade_group" not in df.columns or "spp_num" not in df.columns or "nmID" not in df.columns:
-            return pd.DataFrame(columns=result_cols)
+        shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
+            shade_mean=("spp_num", "mean"),
+            shade_orders=("spp_num", "size"),
+        )
+        eligible = shade[shade["shade_orders"] >= min_n].copy()
 
         rows = []
-        data = df.copy()
-        data = data[data["spp_shade_group"].astype(str).str.strip() != ""].copy()
-        data["spp_num"] = data["spp_num"].map(to_float_or_none)
-        data = data[data["spp_num"].notna()].copy()
-        if data.empty:
-            return pd.DataFrame(columns=result_cols)
-
-        for group, sub in data.groupby("spp_shade_group", dropna=False):
-            group = str(group).strip()
-            if not group:
+        for group, gdf in tmp.groupby("spp_shade_group"):
+            total_orders = int(len(gdf))
+            elig = eligible[eligible["spp_shade_group"] == group]
+            if total_orders < min_n or elig.empty:
                 continue
-            total_count = int(len(sub))
-            by_nm = (
-                sub.groupby("nmID", dropna=False)["spp_num"]
-                .agg(["mean", "count"])
-                .reset_index()
-            )
-            by_nm = by_nm[by_nm["count"] > 0].copy()
-            shade_count = int(len(by_nm))
-            if shade_count == 0:
+            mean_min = float(elig["shade_mean"].min())
+            mean_max = float(elig["shade_mean"].max())
+            mean_spread = mean_max - mean_min
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
+            if mean_spread > 3.0:
                 continue
-
-            # Проверку "разница между оттенками <= 3 п.п." нельзя строить по оттенкам
-            # с 1-2 заказами: они дают шум и ломают консенсус группы. Поэтому для
-            # проверки разбега берём только оттенки с выборкой >= min_n. Если таких
-            # оттенков меньше двух, считаем группу стабильной при total_count >= min_n:
-            # это позволяет C-товарам использовать общий SPP группы.
-            stable_by_nm = by_nm[by_nm["count"] >= min_n].copy()
-            if len(stable_by_nm) >= 2:
-                means = stable_by_nm["mean"].astype(float)
-                mean_min = float(means.min())
-                mean_max = float(means.max())
-                mean_spread = mean_max - mean_min
-                spread_basis = "eligible_shades_ge_min"
-            elif len(stable_by_nm) == 1:
-                means = stable_by_nm["mean"].astype(float)
-                mean_min = float(means.min())
-                mean_max = float(means.max())
-                mean_spread = 0.0
-                spread_basis = "one_eligible_shade"
-            else:
-                means = by_nm["mean"].astype(float)
-                mean_min = float(means.min())
-                mean_max = float(means.max())
-                mean_spread = 0.0
-                spread_basis = "no_eligible_shades_total_group_sample"
-
-            raw_mean = float(sub["spp_num"].mean())
-            raw_min = float(sub["spp_num"].min())
-            raw_max = float(sub["spp_num"].max())
-            raw_spread = raw_max - raw_min
-
-            if total_count < min_n:
-                value = None
-                method = "diagnostic_low_group_sample"
-                used_count = 0
-                rule = f"skip_group_total_lt_{min_n}"
-                trimmed_mean = None
-            elif mean_spread <= max_spread_between_shades:
-                # Если оттенки близки, для всей группы берём spp_raw_max и округляем вверх.
-                # Так все оттенки группы с одинаковым РРЦ получают одинаковую базовую цену.
-                value = int(math.ceil(raw_max))
-                method = "shade_group_raw_max_ceil"
-                used_count = total_count
-                rule = f"use_group_raw_max_mean_spread_le_{max_spread_between_shades:g}pp_{spread_basis}"
-                trimmed_mean = raw_max
-            else:
-                value = None
-                method = "shade_group_spread_gt_limit_skip"
-                used_count = 0
-                rule = f"skip_group_spread_gt_{max_spread_between_shades:g}pp_{spread_basis}"
-                trimmed_mean = None
-
             rows.append({
                 "spp_shade_group": group,
-                f"avg_spp_{suffix}": value,
-                f"orders_{suffix}": total_count,
-                f"spp_used_count_{suffix}": used_count,
-                f"spp_calc_method_{suffix}": method,
-                f"spp_raw_mean_{suffix}": round(raw_mean, 4),
-                f"spp_raw_min_{suffix}": round(raw_min, 4),
-                f"spp_raw_max_{suffix}": round(raw_max, 4),
-                f"spp_raw_spread_{suffix}": round(raw_spread, 4),
-                f"spp_trimmed_mean_{suffix}": round(trimmed_mean, 4) if trimmed_mean is not None else None,
-                f"spp_group_rule_{suffix}": rule,
-                f"spp_group_shades_count_{suffix}": shade_count,
-                f"spp_group_mean_min_{suffix}": round(mean_min, 4),
-                f"spp_group_mean_max_{suffix}": round(mean_max, 4),
-                f"spp_group_mean_spread_{suffix}": round(mean_spread, 4),
+                f"avg_spp_{suffix}": int(math.ceil(float(gdf["spp_num"].max()))),
+                f"orders_{suffix}": total_orders,
+                f"group_mean_min_{suffix}": mean_min,
+                f"group_mean_max_{suffix}": mean_max,
+                f"group_mean_spread_{suffix}": mean_spread,
+                f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows, columns=result_cols)
-
-    @staticmethod
-    def _pick_article_for_shade_group(row: pd.Series) -> str:
-        for col in ["supplierArticle", "supplierArticle_ref", "article_1c", "vendorCode", "Артикул продавца", "Артикул 1С"]:
-            if col in row.index:
-                value = row.get(col)
-                if value is not None and str(value).strip() and str(value).lower() != "nan":
-                    return str(value)
-        return ""
-
-    @staticmethod
-    def _calc_spp_stat(values: pd.Series, min_n: int, small_spread: float) -> Dict[str, Any]:
-        vals = pd.Series(values).map(to_float_or_none).dropna().astype(float)
-        vals = vals[(vals >= 0) & (vals < 95)]
-        raw_count = int(len(vals))
-        if raw_count == 0:
-            return {
-                "value": None, "orders": 0, "used_count": 0, "method": "no_values",
-                "raw_mean": None, "raw_min": None, "raw_max": None, "raw_spread": None, "trimmed_mean": None,
-            }
-        raw_min = float(vals.min())
-        raw_max = float(vals.max())
-        raw_mean = float(vals.mean())
-        raw_spread = raw_max - raw_min
-        # Рабочее значение теперь не среднее и не очищенное среднее, а максимальный сырой SPP.
-        # Минимальная выборка по-прежнему контролируется в choose(): период берётся только при orders >= min_n.
-        use_vals = vals
-        trimmed_mean = raw_max
-        if raw_count < min_n:
-            method = "diagnostic_low_sample_raw_max"
-        else:
-            method = "raw_max_ceil"
-        value = int(math.ceil(raw_max)) if raw_max is not None and not math.isnan(raw_max) else None
-        return {
-            "value": value,
-            "orders": raw_count,
-            "used_count": int(len(use_vals)),
-            "method": method,
-            "raw_mean": round(raw_mean, 4),
-            "raw_min": round(raw_min, 4),
-            "raw_max": round(raw_max, 4),
-            "raw_spread": round(raw_spread, 4),
-            "trimmed_mean": round(trimmed_mean, 4) if trimmed_mean is not None else None,
-        }
-
-    @classmethod
-    def _agg_spp(cls, df: pd.DataFrame, suffix: str, group_cols: Sequence[str], min_n: int, small_spread: float) -> pd.DataFrame:
-        cols = list(group_cols)
-        result_cols = cols + [
-            f"avg_spp_{suffix}", f"orders_{suffix}", f"spp_used_count_{suffix}", f"spp_calc_method_{suffix}",
-            f"spp_raw_mean_{suffix}", f"spp_raw_min_{suffix}", f"spp_raw_max_{suffix}",
-            f"spp_raw_spread_{suffix}", f"spp_trimmed_mean_{suffix}",
-        ]
-        if df.empty:
-            return pd.DataFrame(columns=result_cols)
-        rows = []
-        for key, sub in df.groupby(cols, dropna=False):
-            if not isinstance(key, tuple):
-                key = (key,)
-            stat = cls._calc_spp_stat(sub["spp_num"], min_n=min_n, small_spread=small_spread)
-            row = {col: val for col, val in zip(cols, key)}
-            row.update({
-                f"avg_spp_{suffix}": stat["value"],
-                f"orders_{suffix}": stat["orders"],
-                f"spp_used_count_{suffix}": stat["used_count"],
-                f"spp_calc_method_{suffix}": stat["method"],
-                f"spp_raw_mean_{suffix}": stat["raw_mean"],
-                f"spp_raw_min_{suffix}": stat["raw_min"],
-                f"spp_raw_max_{suffix}": stat["raw_max"],
-                f"spp_raw_spread_{suffix}": stat["raw_spread"],
-                f"spp_trimmed_mean_{suffix}": stat["trimmed_mean"],
-            })
-            rows.append(row)
-        return pd.DataFrame(rows, columns=result_cols)
+        return pd.DataFrame(rows)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
@@ -1946,7 +1412,7 @@ class WBPriceCorrector:
             calc.loc[missing, "spp_source"] = "global_history"
         return calc
 
-    def build_calculation(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, current_week_orders: pd.DataFrame, goods_df: pd.DataFrame, site_prices_df: pd.DataFrame, rrc_df: pd.DataFrame, ref_df: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
+    def build_calculation(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, goods_df: pd.DataFrame, site_prices_df: pd.DataFrame, rrc_df: pd.DataFrame, ref_df: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         # Универс товаров: текущие цены WB + справочник + РРЦ.
         if goods_df.empty:
             log("Текущие цены WB не получены; строю универс по справочнику Артикулы 1С", "WARN")
@@ -2027,8 +1493,50 @@ class WBPriceCorrector:
         calc["excluded_rrc_keyword"] = calc["rrc_name"].map(excluded_rrc_keyword) if "rrc_name" in calc.columns else ""
 
         # WB-скидка/SPP. Используем только SKU-уровень: 3h при выборке >= min_n, иначе предыдущий день/история.
-        spp = self.build_spp_table(today_orders, previous_day_orders, current_week_orders, orders_history, ref_df)
+        spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
         calc = calc.merge(spp, on="nmID", how="left")
+
+        # Калибровка SPP по фактической проверке сайта: добавляем +1.5 п.п.
+        # к найденному значению SPP. Применяется одинаково к SKU-SPP и к групповому
+        # SPP оттенков, поэтому 501-е и аналогичные группы остаются синхронизированы.
+        spp_adj = float(self.cfg.spp_adjustment_pct or 0)
+        if abs(spp_adj) > 1e-9 and "avg_spp" in calc.columns:
+            spp_mask = calc["avg_spp"].map(to_float_or_none).notna()
+            if spp_mask.any():
+                calc.loc[spp_mask, "avg_spp_before_adjustment"] = calc.loc[spp_mask, "avg_spp"]
+                calc.loc[spp_mask, "spp_adjustment_pct"] = spp_adj
+                calc.loc[spp_mask, "avg_spp"] = calc.loc[spp_mask, "avg_spp"].map(
+                    lambda v: min(max(float(v) + spp_adj, 0.0), 94.0) if to_float_or_none(v) is not None else v
+                )
+                if "spp_source" not in calc.columns:
+                    calc["spp_source"] = ""
+                calc.loc[spp_mask, "spp_source"] = calc.loc[spp_mask, "spp_source"].astype(str) + f"+adj_{spp_adj:g}pp"
+
+        # Экстренный защитный режим: если по товару вообще нет достаточной выборки,
+        # можно использовать консервативный floor, чтобы цены не оказались ниже цели.
+        safe_floor = float(self.cfg.safe_wb_discount_floor_pct or 0)
+        if safe_floor > 0:
+            safe_floor = min(max(safe_floor, 0.0), 94.0)
+            if "avg_spp" not in calc.columns:
+                calc["avg_spp"] = None
+            if "spp_source" not in calc.columns:
+                calc["spp_source"] = ""
+            has_spp = calc["avg_spp"].map(to_float_or_none).notna()
+            low_spp = has_spp & (calc["avg_spp"].map(to_float_or_none) < safe_floor)
+            if low_spp.any():
+                calc.loc[low_spp, "avg_spp_raw_before_floor"] = calc.loc[low_spp, "avg_spp"]
+                calc.loc[low_spp, "avg_spp"] = safe_floor
+                calc.loc[low_spp, "spp_source"] = calc.loc[low_spp, "spp_source"].astype(str) + f"+safe_floor_{safe_floor:g}"
+            if self.cfg.use_safe_floor_for_missing:
+                missing_spp = calc["avg_spp"].map(to_float_or_none).isna()
+                if missing_spp.any():
+                    calc.loc[missing_spp, "avg_spp"] = safe_floor
+                    calc.loc[missing_spp, "spp_source"] = f"safe_floor_missing_{safe_floor:g}"
+                    calc.loc[missing_spp, "spp_reference_period"] = "safe_floor"
+                    calc.loc[missing_spp, "spp_sample_min"] = int(self.cfg.min_spp_sample_orders or 0)
+                    for c in ["orders_3h", "orders_today", "orders_previous_day", "orders_history"]:
+                        if c not in calc.columns:
+                            calc[c] = 0
 
         # Расчёт цен.
         target_factor = self.active_target_factor
@@ -2089,17 +1597,14 @@ class WBPriceCorrector:
             "decision", "reason", "nmID", "supplierArticle_api", "supplierArticle_ref", "article_1c", "article_rrc",
             "subject", "subject_source", "rrc", "pricing_period", "target_factor", "target_finishedPrice",
             "price_calc_source", "site_final_price", "site_price_delta_to_target", "site_effective_spp",
-            "avg_spp", "spp_source", "spp_calc_method", "spp_shade_group", "spp_group_rule",
-            "spp_group_shades_count", "spp_group_mean_min", "spp_group_mean_max", "spp_group_mean_spread",
-            "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max",
-            "spp_raw_spread", "spp_trimmed_mean",
+            "avg_spp", "avg_spp_before_adjustment", "spp_adjustment_pct", "avg_spp_raw_before_floor", "spp_source",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
             "current_wb_discounted_price", "old_priceWithDisc_calc",
             "target_priceWithDisc_site", "new_price_site", "target_priceWithDisc_orders_spp", "new_price_orders_spp",
             "delta_price", "delta_price_pct",
-            "orders_3h", "orders_today", "orders_week", "orders_previous_day", "orders_history",
-            "orders_group_week", "orders_group_history", "orders_shade_consensus_week", "orders_shade_consensus_history",
-            "spp_reference_period", "spp_sample_min",
+            "orders_3h", "orders_today", "orders_previous_day", "orders_history",
+            "orders_group_3h", "orders_group_today", "orders_group_previous_day", "orders_group_history",
+            "spp_shade_group", "spp_reference_period", "spp_sample_min",
             "site_price_source", "site_dest", "site_checked_at", "site_name",
             "name_api", "rrc_name", "excluded_by_rrc_name",
             "excluded_rrc_keyword", "currencyIsoCode4217",
@@ -2313,8 +1818,10 @@ class WBPriceCorrector:
             f"Старт корректировки цен: store={self.cfg.store}, apply={apply}, "
             f"target_factor={self.active_target_factor:.2f}, режим={self.active_pricing_period}, "
             f"min_spp_sample_orders={self.cfg.min_spp_sample_orders}, "
-            f"small_spp_spread_points={self.cfg.small_spp_spread_points}, "
             f"price_source={self.cfg.price_source}, site_dest={self.cfg.public_dest}, "
+            f"safe_wb_discount_floor={self.cfg.safe_wb_discount_floor_pct:g}, "
+            f"spp_adjustment_pct={self.cfg.spp_adjustment_pct:g}, "
+            f"use_safe_floor_for_missing={self.cfg.use_safe_floor_for_missing}, "
             f"время МСК={self.run_datetime_msk.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
@@ -2329,10 +1836,9 @@ class WBPriceCorrector:
         goods_df = self.fetch_current_goods_prices()
         nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
         site_prices_df = self.fetch_public_site_prices(nmids_for_site)
-        current_week_orders = self.load_current_week_orders(today_orders, previous_day_orders)
         orders_history = self.load_recent_orders_history(today_orders, previous_day_orders)
 
-        calc = self.build_calculation(today_orders, previous_day_orders, current_week_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
+        calc = self.build_calculation(today_orders, previous_day_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
         send_df = calc[calc["decision"] == "send"].copy()
         log(f"Расчёт готов: всего={len(calc)}, к отправке={len(send_df)}, пропущено={len(calc) - len(send_df)}")
 
@@ -2385,10 +1891,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
     run_parser.add_argument("--fallback-days", type=int, default=DEFAULT_FALLBACK_DAYS, help="Сколько последних дней заказов читать для fallback SPP")
     run_parser.add_argument("--min-spp-sample-orders", type=int, default=DEFAULT_MIN_SPP_SAMPLE_ORDERS, help="Минимум заказов для использования SPP из периода")
-    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Разбег SPP в п.п., при котором считаем простую среднюю; выше — отсекаем значения выше среднего")
     run_parser.add_argument("--price-source", choices=["hybrid", "site", "orders-spp"], default=DEFAULT_PRICE_SOURCE, help="Источник расчёта: hybrid=сначала цена сайта, потом SPP; site=только цена сайта; orders-spp=только SPP из заказов")
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
+    run_parser.add_argument("--safe-wb-discount-floor-pct", type=float, default=DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT, help="Консервативный floor WB-скидки/SPP для расчёта price. 0 = отключить")
+    run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию +1.5")
+    run_parser.add_argument("--use-safe-floor-for-missing", action="store_true", default=DEFAULT_USE_SAFE_FLOOR_FOR_MISSING, help="Если по товару нет достаточной выборки, использовать safe-wb-discount-floor-pct вместо пропуска")
     run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
     run_parser.add_argument("--update-weekly-orders", action="store_true", help="Опционально обновлять сегодняшний день в обычном недельном файле заказов")
 
@@ -2413,10 +1921,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
         args.fallback_days = DEFAULT_FALLBACK_DAYS
         args.min_spp_sample_orders = DEFAULT_MIN_SPP_SAMPLE_ORDERS
-        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.price_source = DEFAULT_PRICE_SOURCE
         args.public_dest = DEFAULT_PUBLIC_DEST
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
+        args.safe_wb_discount_floor_pct = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
+        args.spp_adjustment_pct = DEFAULT_SPP_ADJUSTMENT_PCT
+        args.use_safe_floor_for_missing = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
         args.allow_unknown_subject = False
         args.update_weekly_orders = False
     return args
@@ -2454,10 +1964,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_price_change_pct=args.max_price_change_pct,
         fallback_days=args.fallback_days,
         min_spp_sample_orders=args.min_spp_sample_orders,
-        small_spp_spread_points=args.small_spp_spread_points,
         price_source=args.price_source,
         public_dest=args.public_dest,
         site_price_tolerance_rub=args.site_price_tolerance_rub,
+        safe_wb_discount_floor_pct=args.safe_wb_discount_floor_pct,
+        spp_adjustment_pct=args.spp_adjustment_pct,
+        use_safe_floor_for_missing=args.use_safe_floor_for_missing,
         allow_unknown_subject=args.allow_unknown_subject,
         update_weekly_orders=args.update_weekly_orders,
     )
