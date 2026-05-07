@@ -1,11 +1,13 @@
-name: WB Price Corrector 3H
+name: WB Price Corrector 05-23
 
 on:
   schedule:
-    # График по Москве: 03:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00, 23:00.
+    # Боевой график по Москве: 05:00 и 23:00.
+    # 23:00 МСК — переход на ночную цену РРЦ×0.8.
+    # 05:00 МСК — возврат на дневную цену РРЦ×0.9.
     # В GitHub cron время указано в UTC; Москва = UTC+3.
-    # UTC: 00:00, 02:00, 05:00, 08:00, 11:00, 14:00, 17:00, 20:00.
-    - cron: '0 0,2,5,8,11,14,17,20 * * *'
+    # UTC: 02:00 и 20:00.
+    - cron: '0 2,20 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -19,7 +21,20 @@ on:
       max_price_change_pct:
         description: 'Максимальное изменение price за запуск, 0 = отключить'
         required: false
-        default: '80'
+        default: '0'
+      target_factor_override:
+        description: 'Аварийно зафиксировать коэффициент РРЦ, например 0.9. Пусто = график 0.8/0.9'
+        required: false
+        default: ''
+      price_source:
+        description: 'Источник расчёта цены'
+        required: true
+        default: 'orders-spp'
+        type: choice
+        options:
+          - 'site'
+          - 'hybrid'
+          - 'orders-spp'
 
 jobs:
   correct-prices:
@@ -45,13 +60,29 @@ jobs:
           YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
           YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+          # Можно поменять регион публичной цены WB через repository variable/secrets при необходимости.
+          WB_PUBLIC_DEST: ${{ vars.WB_PUBLIC_DEST }}
+          WB_PUBLIC_PRICE_CHUNK_SIZE: '50'
+          WB_PUBLIC_PAGE_PARSE: 'true'
+          WB_PUBLIC_PAGE_WORKERS: '8'
         run: |
           MAX_CHANGE="${{ github.event.inputs.max_price_change_pct }}"
           if [ -z "$MAX_CHANGE" ]; then
-            MAX_CHANGE="80"
+            MAX_CHANGE="0"
           fi
 
-          COMMON_ARGS="--store TOPFACE --seller-discount 26 --day-target-factor 0.9 --night-target-factor 0.8 --night-start-hour 23 --night-end-hour 5 --min-spp-sample-orders 10 --price-source hybrid --site-price-tolerance-rub 3 --max-price-change-pct $MAX_CHANGE"
+          TARGET_OVERRIDE="${{ github.event.inputs.target_factor_override }}"
+
+          PRICE_SOURCE="${{ github.event.inputs.price_source }}"
+          if [ -z "$PRICE_SOURCE" ]; then
+            PRICE_SOURCE="orders-spp"
+          fi
+
+          COMMON_ARGS="--store TOPFACE --seller-discount 26 --day-target-factor 0.9 --night-target-factor 0.8 --night-start-hour 23 --night-end-hour 5 --min-spp-sample-orders 10 --small-spp-spread-points 3 --price-source $PRICE_SOURCE --max-price-change-pct $MAX_CHANGE"
+
+          if [ -n "$TARGET_OVERRIDE" ]; then
+            COMMON_ARGS="$COMMON_ARGS --target-factor $TARGET_OVERRIDE"
+          fi
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             echo "Manual dry-run: prices will not be sent"
