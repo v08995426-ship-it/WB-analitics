@@ -477,7 +477,6 @@ def build_nm_to_subject_map(master: pd.DataFrame) -> Dict[Any, Any]:
 WB_BIDS_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids"
 WB_BIDS_MIN_URL = "https://advert-api.wildberries.ru/api/advert/v1/bids/min"
 WB_NMS_URL = "https://advert-api.wildberries.ru/adv/v0/auction/nms"
-WB_RENAME_URL = "https://advert-api.wildberries.ru/adv/v0/rename"
 
 ADS_ANALYSIS_KEY = f"Отчёты/Реклама/{STORE_NAME}/Анализ рекламы.xlsx"
 ECONOMICS_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/Экономика.xlsx"
@@ -3146,145 +3145,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     if eff_sheets:
         provider.write_excel(OUT_EFF, eff_sheets)
 
-def resolve_campaign_name_series(campaigns: pd.DataFrame) -> pd.Series:
-    for col in ["Название кампании", "Название РК", "Название", "campaign_name", "name"]:
-        if col in campaigns.columns:
-            return series_or_default(campaigns, col, '').fillna('').astype(str)
-    return pd.Series('', index=campaigns.index)
-
-
-def build_campaign_rename_candidates(campaigns: pd.DataFrame, manager_label: str = 'Vladislav') -> pd.DataFrame:
-    if campaigns is None or campaigns.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    df = campaigns.copy()
-    df['campaign_name_current'] = resolve_campaign_name_series(df)
-    df['subject_norm'] = series_or_default(df, 'subject_norm', '').fillna('').astype(str).map(canonical_subject)
-    df = df[df['subject_norm'].isin(TARGET_SUBJECTS)].copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    if 'campaign_status' in df.columns:
-        df = df[df['campaign_status'].map(is_active_campaign_status)].copy()
-    df['nmId'] = pd.to_numeric(series_or_default(df, 'nmId', np.nan), errors='coerce')
-    df['id_campaign'] = pd.to_numeric(series_or_default(df, 'id_campaign', np.nan), errors='coerce')
-    df = df.dropna(subset=['id_campaign']).copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-
-    rows = []
-    for advert_id, g in df.groupby('id_campaign', dropna=False):
-        nm_ids = sorted({safe_int(x) for x in pd.to_numeric(g['nmId'], errors='coerce').dropna().tolist() if safe_int(x) > 0})
-        subject = get_subject_display_name(g['subject_norm'].dropna().iloc[0] if 'subject_norm' in g.columns and not g['subject_norm'].dropna().empty else g.get('subject','').iloc[0] if 'subject' in g.columns and not g.empty else '')
-        current_name = str(g['campaign_name_current'].dropna().iloc[0]).strip() if not g['campaign_name_current'].dropna().empty else ''
-        if len(nm_ids) != 1:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': ', '.join(map(str, nm_ids)) if nm_ids else '',
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': '',
-                'Причина': 'Пропущено: в кампании больше одного Артикул WB',
-                'Статус': 'skip_multi_nm',
-            })
-            continue
-        nm_id = nm_ids[0]
-        target_name = f"{nm_id} - {manager_label}"[:100]
-        if current_name == target_name:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': nm_id,
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': target_name,
-                'Причина': 'Название уже корректное',
-                'Статус': 'already_ok',
-            })
-            continue
-        rows.append({
-            'ID кампании': safe_int(advert_id),
-            'Артикул WB': nm_id,
-            'Предмет': subject,
-            'Текущее название': current_name,
-            'Новое название': target_name,
-            'Причина': 'Переименовать в формат Артикул WB - Vladislav',
-            'Статус': 'pending',
-        })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        out = pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    return out.sort_values(['Статус','Предмет','Артикул WB'], na_position='last').reset_index(drop=True)
-
-
-def apply_campaign_renames(api_key: str, rename_df: pd.DataFrame, dry_run: bool = False, max_renames_per_run: int = 2) -> pd.DataFrame:
-    cols = ['timestamp','ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Статус','http_status','response']
-    if rename_df is None or rename_df.empty:
-        return pd.DataFrame(columns=cols)
-    work = rename_df.copy()
-    pending = work[work['Статус'].eq('pending')].copy()
-    if pending.empty:
-        logs = work.copy()
-        logs['timestamp'] = now_ts()
-        logs['http_status'] = ''
-        logs['response'] = logs['Причина']
-        return trim_to_columns(logs, cols)
-
-    logs = []
-    processed = 0
-    for _, row in pending.iterrows():
-        advert_id = safe_int(row.get('ID кампании'))
-        new_name = str(row.get('Новое название') or '').strip()[:100]
-        if advert_id <= 0 or not new_name:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'skip_invalid',
-                'http_status': '',
-                'response': 'Некорректный advertId или пустое имя',
-            })
-            continue
-        if processed >= max_renames_per_run:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'queued_limit',
-                'http_status': '',
-                'response': f'Отложено: лимит {max_renames_per_run} переименования за запуск',
-            })
-            continue
-        body = {'advertId': advert_id, 'name': new_name}
-        resp = wb_api_request('POST', WB_RENAME_URL, api_key, body, method_name='Переименование кампании', timeout=60, dry_run=dry_run, context={'advert_id': advert_id, 'new_name': new_name})
-        status = 'dry-run' if dry_run and api_key else ('skipped' if not api_key else ('ok' if resp is not None and resp.status_code == 200 else 'failed'))
-        logs.append({
-            'timestamp': now_ts(),
-            'ID кампании': advert_id,
-            'Артикул WB': row.get('Артикул WB',''),
-            'Предмет': row.get('Предмет',''),
-            'Текущее название': row.get('Текущее название',''),
-            'Новое название': new_name,
-            'Статус': status,
-            'http_status': resp.status_code if resp is not None else '',
-            'response': truncate_text(resp.text if resp is not None else ('dry-run' if api_key else 'Нет WB_PROMO_KEY_TOPFACE'), 2000),
-        })
-        processed += 1
-    already = work[~work['Статус'].eq('pending')].copy()
-    if not already.empty:
-        already['timestamp'] = now_ts()
-        already['http_status'] = ''
-        already['response'] = already['Причина']
-        logs.extend(already[cols].to_dict('records'))
-    out = pd.DataFrame(logs)
-    if out.empty:
-        out = pd.DataFrame(columns=cols)
-    return trim_to_columns(out, cols)
-
-
 def run_manager(args: argparse.Namespace) -> None:
     API_CALL_LOGS.clear()
     MIN_BID_ROWS.clear()
@@ -4378,145 +4238,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     eff_sheets = {name: normalize_output_df(df) for name, df in eff_sheets.items()}
     provider.write_excel(OUT_EFF, eff_sheets)
 
-def resolve_campaign_name_series(campaigns: pd.DataFrame) -> pd.Series:
-    for col in ["Название кампании", "Название РК", "Название", "campaign_name", "name"]:
-        if col in campaigns.columns:
-            return series_or_default(campaigns, col, '').fillna('').astype(str)
-    return pd.Series('', index=campaigns.index)
-
-
-def build_campaign_rename_candidates(campaigns: pd.DataFrame, manager_label: str = 'Vladislav') -> pd.DataFrame:
-    if campaigns is None or campaigns.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    df = campaigns.copy()
-    df['campaign_name_current'] = resolve_campaign_name_series(df)
-    df['subject_norm'] = series_or_default(df, 'subject_norm', '').fillna('').astype(str).map(canonical_subject)
-    df = df[df['subject_norm'].isin(TARGET_SUBJECTS)].copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    if 'campaign_status' in df.columns:
-        df = df[df['campaign_status'].map(is_active_campaign_status)].copy()
-    df['nmId'] = pd.to_numeric(series_or_default(df, 'nmId', np.nan), errors='coerce')
-    df['id_campaign'] = pd.to_numeric(series_or_default(df, 'id_campaign', np.nan), errors='coerce')
-    df = df.dropna(subset=['id_campaign']).copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-
-    rows = []
-    for advert_id, g in df.groupby('id_campaign', dropna=False):
-        nm_ids = sorted({safe_int(x) for x in pd.to_numeric(g['nmId'], errors='coerce').dropna().tolist() if safe_int(x) > 0})
-        subject = get_subject_display_name(g['subject_norm'].dropna().iloc[0] if 'subject_norm' in g.columns and not g['subject_norm'].dropna().empty else g.get('subject','').iloc[0] if 'subject' in g.columns and not g.empty else '')
-        current_name = str(g['campaign_name_current'].dropna().iloc[0]).strip() if not g['campaign_name_current'].dropna().empty else ''
-        if len(nm_ids) != 1:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': ', '.join(map(str, nm_ids)) if nm_ids else '',
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': '',
-                'Причина': 'Пропущено: в кампании больше одного Артикул WB',
-                'Статус': 'skip_multi_nm',
-            })
-            continue
-        nm_id = nm_ids[0]
-        target_name = f"{nm_id} - {manager_label}"[:100]
-        if current_name == target_name:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': nm_id,
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': target_name,
-                'Причина': 'Название уже корректное',
-                'Статус': 'already_ok',
-            })
-            continue
-        rows.append({
-            'ID кампании': safe_int(advert_id),
-            'Артикул WB': nm_id,
-            'Предмет': subject,
-            'Текущее название': current_name,
-            'Новое название': target_name,
-            'Причина': 'Переименовать в формат Артикул WB - Vladislav',
-            'Статус': 'pending',
-        })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        out = pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    return out.sort_values(['Статус','Предмет','Артикул WB'], na_position='last').reset_index(drop=True)
-
-
-def apply_campaign_renames(api_key: str, rename_df: pd.DataFrame, dry_run: bool = False, max_renames_per_run: int = 2) -> pd.DataFrame:
-    cols = ['timestamp','ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Статус','http_status','response']
-    if rename_df is None or rename_df.empty:
-        return pd.DataFrame(columns=cols)
-    work = rename_df.copy()
-    pending = work[work['Статус'].eq('pending')].copy()
-    if pending.empty:
-        logs = work.copy()
-        logs['timestamp'] = now_ts()
-        logs['http_status'] = ''
-        logs['response'] = logs['Причина']
-        return trim_to_columns(logs, cols)
-
-    logs = []
-    processed = 0
-    for _, row in pending.iterrows():
-        advert_id = safe_int(row.get('ID кампании'))
-        new_name = str(row.get('Новое название') or '').strip()[:100]
-        if advert_id <= 0 or not new_name:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'skip_invalid',
-                'http_status': '',
-                'response': 'Некорректный advertId или пустое имя',
-            })
-            continue
-        if processed >= max_renames_per_run:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'queued_limit',
-                'http_status': '',
-                'response': f'Отложено: лимит {max_renames_per_run} переименования за запуск',
-            })
-            continue
-        body = {'advertId': advert_id, 'name': new_name}
-        resp = wb_api_request('POST', WB_RENAME_URL, api_key, body, method_name='Переименование кампании', timeout=60, dry_run=dry_run, context={'advert_id': advert_id, 'new_name': new_name})
-        status = 'dry-run' if dry_run and api_key else ('skipped' if not api_key else ('ok' if resp is not None and resp.status_code == 200 else 'failed'))
-        logs.append({
-            'timestamp': now_ts(),
-            'ID кампании': advert_id,
-            'Артикул WB': row.get('Артикул WB',''),
-            'Предмет': row.get('Предмет',''),
-            'Текущее название': row.get('Текущее название',''),
-            'Новое название': new_name,
-            'Статус': status,
-            'http_status': resp.status_code if resp is not None else '',
-            'response': truncate_text(resp.text if resp is not None else ('dry-run' if api_key else 'Нет WB_PROMO_KEY_TOPFACE'), 2000),
-        })
-        processed += 1
-    already = work[~work['Статус'].eq('pending')].copy()
-    if not already.empty:
-        already['timestamp'] = now_ts()
-        already['http_status'] = ''
-        already['response'] = already['Причина']
-        logs.extend(already[cols].to_dict('records'))
-    out = pd.DataFrame(logs)
-    if out.empty:
-        out = pd.DataFrame(columns=cols)
-    return trim_to_columns(out, cols)
-
-
 def run_manager(args: argparse.Namespace) -> None:
     API_CALL_LOGS.clear()
     MIN_BID_ROWS.clear()
@@ -4535,15 +4256,6 @@ def run_manager(args: argparse.Namespace) -> None:
     payload = decisions_to_payload(decisions)
     bid_send_log = send_payload(payload, api_key, dry_run=False)
     log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
-    campaigns_for_rename = load_ads(provider)[1]
-    rename_candidates = build_campaign_rename_candidates(campaigns_for_rename, manager_label='Vladislav')
-    rename_log = apply_campaign_renames(api_key, rename_candidates, dry_run=False, max_renames_per_run=2)
-    if not rename_log.empty:
-        renamed_ok = int(rename_log['Статус'].astype(str).eq('ok').sum()) if 'Статус' in rename_log.columns else 0
-        pending_cnt = int(rename_log['Статус'].astype(str).eq('queued_limit').sum()) if 'Статус' in rename_log.columns else 0
-        log(f"🏷️ Переименование кампаний: успешно {renamed_ok}, отложено {pending_cnt}")
-    results['rename_candidates'] = rename_candidates
-    results['rename_log'] = rename_log
     history_append = build_history_append(decisions, as_of_date)
     save_outputs(provider, results, 'run', bid_send_log, None, history_append)
 
@@ -5142,17 +4854,12 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
     daily_item = trim_to_columns(daily_item, item_cols)
     daily_campaign = trim_to_columns(daily_campaign, campaign_cols)
 
-    rename_log = results.get('rename_log', pd.DataFrame()).copy()
-    rename_candidates = results.get('rename_candidates', pd.DataFrame()).copy()
-
     summary = pd.DataFrame([{
         'Режим': 'run',
         'Дата формирования': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'Всего рекомендаций': int(len(decisions)),
         'Изменённых ставок': int(len(decisions[decisions['Действие'].isin(['Повысить', 'Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])])) if not decisions.empty else 0,
         'Блоков отправки ставок': 0 if bid_send_log is None or bid_send_log.empty else int(len(bid_send_log)),
-        'Переименовано кампаний': int(rename_log['Статус'].astype(str).eq('ok').sum()) if not rename_log.empty and 'Статус' in rename_log.columns else 0,
-        'Кампаний в очереди на переименование': int(rename_log['Статус'].astype(str).eq('queued_limit').sum()) if not rename_log.empty and 'Статус' in rename_log.columns else 0,
         'PDF менеджерам': int(len(manager_index)) if not manager_index.empty else 0,
         'Текущее окно с': results['window']['cur_start'],
         'Текущее окно по': results['window']['cur_end'],
@@ -5209,8 +4916,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
         'Слабые позиции': weak,
         'Эффект изменений': effects,
         'Рекомендации менеджерам': manager_index if not manager_index.empty else pd.DataFrame([{'Комментарий': 'PDF не сформированы'}]),
-        'Переименование кандидаты': rename_candidates if not rename_candidates.empty else pd.DataFrame([{'Комментарий': 'Нет кандидатов на переименование'}]),
-        'Переименование кампаний': rename_log if not rename_log.empty else pd.DataFrame([{'Комментарий': 'Нет выполненных или отложенных переименований'}]),
         'Лог API': pd.DataFrame(API_CALL_LOGS) if API_CALL_LOGS else pd.DataFrame([{'Комментарий': 'Нет вызовов API'}]),
         'История решений день': decisions_hist,
         'История ставок': bid_hist_all,
@@ -5230,145 +4935,6 @@ def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str,
         eff_sheets = {'Комментарий': pd.DataFrame([{'Комментарий': 'Нет данных по эффективности ставки'}])}
     eff_sheets = {name: normalize_output_df(df) for name, df in eff_sheets.items()}
     provider.write_excel(OUT_EFF, eff_sheets)
-
-
-def resolve_campaign_name_series(campaigns: pd.DataFrame) -> pd.Series:
-    for col in ["Название кампании", "Название РК", "Название", "campaign_name", "name"]:
-        if col in campaigns.columns:
-            return series_or_default(campaigns, col, '').fillna('').astype(str)
-    return pd.Series('', index=campaigns.index)
-
-
-def build_campaign_rename_candidates(campaigns: pd.DataFrame, manager_label: str = 'Vladislav') -> pd.DataFrame:
-    if campaigns is None or campaigns.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    df = campaigns.copy()
-    df['campaign_name_current'] = resolve_campaign_name_series(df)
-    df['subject_norm'] = series_or_default(df, 'subject_norm', '').fillna('').astype(str).map(canonical_subject)
-    df = df[df['subject_norm'].isin(TARGET_SUBJECTS)].copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    if 'campaign_status' in df.columns:
-        df = df[df['campaign_status'].map(is_active_campaign_status)].copy()
-    df['nmId'] = pd.to_numeric(series_or_default(df, 'nmId', np.nan), errors='coerce')
-    df['id_campaign'] = pd.to_numeric(series_or_default(df, 'id_campaign', np.nan), errors='coerce')
-    df = df.dropna(subset=['id_campaign']).copy()
-    if df.empty:
-        return pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-
-    rows = []
-    for advert_id, g in df.groupby('id_campaign', dropna=False):
-        nm_ids = sorted({safe_int(x) for x in pd.to_numeric(g['nmId'], errors='coerce').dropna().tolist() if safe_int(x) > 0})
-        subject = get_subject_display_name(g['subject_norm'].dropna().iloc[0] if 'subject_norm' in g.columns and not g['subject_norm'].dropna().empty else g.get('subject','').iloc[0] if 'subject' in g.columns and not g.empty else '')
-        current_name = str(g['campaign_name_current'].dropna().iloc[0]).strip() if not g['campaign_name_current'].dropna().empty else ''
-        if len(nm_ids) != 1:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': ', '.join(map(str, nm_ids)) if nm_ids else '',
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': '',
-                'Причина': 'Пропущено: в кампании больше одного Артикул WB',
-                'Статус': 'skip_multi_nm',
-            })
-            continue
-        nm_id = nm_ids[0]
-        target_name = f"{nm_id} - {manager_label}"[:100]
-        if current_name == target_name:
-            rows.append({
-                'ID кампании': safe_int(advert_id),
-                'Артикул WB': nm_id,
-                'Предмет': subject,
-                'Текущее название': current_name,
-                'Новое название': target_name,
-                'Причина': 'Название уже корректное',
-                'Статус': 'already_ok',
-            })
-            continue
-        rows.append({
-            'ID кампании': safe_int(advert_id),
-            'Артикул WB': nm_id,
-            'Предмет': subject,
-            'Текущее название': current_name,
-            'Новое название': target_name,
-            'Причина': 'Переименовать в формат Артикул WB - Vladislav',
-            'Статус': 'pending',
-        })
-    out = pd.DataFrame(rows)
-    if out.empty:
-        out = pd.DataFrame(columns=['ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Причина','Статус'])
-    return out.sort_values(['Статус','Предмет','Артикул WB'], na_position='last').reset_index(drop=True)
-
-
-def apply_campaign_renames(api_key: str, rename_df: pd.DataFrame, dry_run: bool = False, max_renames_per_run: int = 2) -> pd.DataFrame:
-    cols = ['timestamp','ID кампании','Артикул WB','Предмет','Текущее название','Новое название','Статус','http_status','response']
-    if rename_df is None or rename_df.empty:
-        return pd.DataFrame(columns=cols)
-    work = rename_df.copy()
-    pending = work[work['Статус'].eq('pending')].copy()
-    if pending.empty:
-        logs = work.copy()
-        logs['timestamp'] = now_ts()
-        logs['http_status'] = ''
-        logs['response'] = logs['Причина']
-        return trim_to_columns(logs, cols)
-
-    logs = []
-    processed = 0
-    for _, row in pending.iterrows():
-        advert_id = safe_int(row.get('ID кампании'))
-        new_name = str(row.get('Новое название') or '').strip()[:100]
-        if advert_id <= 0 or not new_name:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'skip_invalid',
-                'http_status': '',
-                'response': 'Некорректный advertId или пустое имя',
-            })
-            continue
-        if processed >= max_renames_per_run:
-            logs.append({
-                'timestamp': now_ts(),
-                'ID кампании': advert_id,
-                'Артикул WB': row.get('Артикул WB',''),
-                'Предмет': row.get('Предмет',''),
-                'Текущее название': row.get('Текущее название',''),
-                'Новое название': new_name,
-                'Статус': 'queued_limit',
-                'http_status': '',
-                'response': f'Отложено: лимит {max_renames_per_run} переименования за запуск',
-            })
-            continue
-        body = {'advertId': advert_id, 'name': new_name}
-        resp = wb_api_request('POST', WB_RENAME_URL, api_key, body, method_name='Переименование кампании', timeout=60, dry_run=dry_run, context={'advert_id': advert_id, 'new_name': new_name})
-        status = 'dry-run' if dry_run and api_key else ('skipped' if not api_key else ('ok' if resp is not None and resp.status_code == 200 else 'failed'))
-        logs.append({
-            'timestamp': now_ts(),
-            'ID кампании': advert_id,
-            'Артикул WB': row.get('Артикул WB',''),
-            'Предмет': row.get('Предмет',''),
-            'Текущее название': row.get('Текущее название',''),
-            'Новое название': new_name,
-            'Статус': status,
-            'http_status': resp.status_code if resp is not None else '',
-            'response': truncate_text(resp.text if resp is not None else ('dry-run' if api_key else 'Нет WB_PROMO_KEY_TOPFACE'), 2000),
-        })
-        processed += 1
-    already = work[~work['Статус'].eq('pending')].copy()
-    if not already.empty:
-        already['timestamp'] = now_ts()
-        already['http_status'] = ''
-        already['response'] = already['Причина']
-        logs.extend(already[cols].to_dict('records'))
-    out = pd.DataFrame(logs)
-    if out.empty:
-        out = pd.DataFrame(columns=cols)
-    return trim_to_columns(out, cols)
 
 
 def run_manager(args: argparse.Namespace) -> None:
@@ -5417,19 +4983,358 @@ def run_manager(args: argparse.Namespace) -> None:
     payload = decisions_to_payload(decisions)
     bid_send_log = send_payload(payload, api_key, dry_run=False)
     log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
-    campaigns_for_rename = load_ads(provider)[1]
-    rename_candidates = build_campaign_rename_candidates(campaigns_for_rename, manager_label='Vladislav')
-    rename_log = apply_campaign_renames(api_key, rename_candidates, dry_run=False, max_renames_per_run=2)
-    if not rename_log.empty:
-        renamed_ok = int(rename_log['Статус'].astype(str).eq('ok').sum()) if 'Статус' in rename_log.columns else 0
-        pending_cnt = int(rename_log['Статус'].astype(str).eq('queued_limit').sum()) if 'Статус' in rename_log.columns else 0
-        log(f"🏷️ Переименование кампаний: успешно {renamed_ok}, отложено {pending_cnt}")
-    results['rename_candidates'] = rename_candidates
-    results['rename_log'] = rename_log
     history_append = build_history_append(decisions, as_of_date)
     save_outputs(provider, results, 'run', bid_send_log, None, history_append)
 
 
+
+
+# ===================== FINAL OVERRIDES: RENAME ALL MANAGED + STRICTER DECISIONS =====================
+WB_RENAME_URL = "https://advert-api.wildberries.ru/adv/v0/rename"
+_API_MIN_INTERVAL_SEC[WB_RENAME_URL] = 0.25
+RENAME_LAST_CANDIDATES = pd.DataFrame()
+RENAME_LAST_RESULTS = pd.DataFrame()
+
+
+def _safe_str_series(df: pd.DataFrame, candidates: List[str], default: str = "") -> pd.Series:
+    for c in candidates:
+        if c in df.columns:
+            return df[c].fillna(default).astype(str)
+    return pd.Series([default] * len(df), index=df.index, dtype="object")
+
+
+def _build_rename_candidates(campaigns: pd.DataFrame) -> pd.DataFrame:
+    if campaigns is None or campaigns.empty:
+        return pd.DataFrame(columns=['ID кампании', 'Артикул WB', 'Предмет', 'Текущее название', 'Желаемое название', 'Нужно переименовать'])
+    work = campaigns.copy()
+    work = normalize_core_columns(work)
+    if 'id_campaign' not in work.columns or 'nmId' not in work.columns:
+        return pd.DataFrame(columns=['ID кампании', 'Артикул WB', 'Предмет', 'Текущее название', 'Желаемое название', 'Нужно переименовать'])
+    work['campaign_status'] = _safe_str_series(work, ['campaign_status', 'Статус'], '')
+    work['campaign_is_active'] = work['campaign_status'].map(is_active_campaign_status)
+    work['subject_norm'] = _safe_str_series(work, ['subject_norm', 'subject', 'Предмет', 'Название предмета'], '').map(canonical_subject)
+    work = work[work['campaign_is_active'] & work['subject_norm'].isin(TARGET_SUBJECTS)].copy()
+    if work.empty:
+        return pd.DataFrame(columns=['ID кампании', 'Артикул WB', 'Предмет', 'Текущее название', 'Желаемое название', 'Нужно переименовать'])
+    work['campaign_name'] = _safe_str_series(work, ['Название', 'campaign_name', 'name'], '')
+    work['nmId'] = pd.to_numeric(work['nmId'], errors='coerce')
+    work = work[pd.notna(work['nmId'])].copy()
+    work['nmId'] = work['nmId'].astype(int)
+    work = work.sort_values(['id_campaign', 'nmId']).drop_duplicates(['id_campaign'])
+    work['desired_name'] = work['nmId'].astype(str) + ' - Vladislav'
+    work['needs_rename'] = work['campaign_name'].str.strip() != work['desired_name'].str.strip()
+    out = pd.DataFrame({
+        'ID кампании': work['id_campaign'].map(safe_int),
+        'Артикул WB': work['nmId'].map(safe_int),
+        'Предмет': work['subject_norm'].map(get_subject_display_name),
+        'Текущее название': work['campaign_name'],
+        'Желаемое название': work['desired_name'],
+        'Нужно переименовать': work['needs_rename'].map(bool),
+    })
+    return out.sort_values(['Нужно переименовать', 'Предмет', 'Артикул WB'], ascending=[False, True, True]).reset_index(drop=True)
+
+
+def rename_managed_campaigns(api_key: str, campaigns: pd.DataFrame, *, dry_run: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    candidates = _build_rename_candidates(campaigns)
+    if candidates.empty:
+        return candidates, pd.DataFrame([{'Комментарий': 'Нет активных управляемых кампаний для переименования'}])
+    need = candidates[candidates['Нужно переименовать']].copy()
+    if need.empty:
+        return candidates, pd.DataFrame([{'Комментарий': 'Все управляемые кампании уже названы правильно'}])
+    results: List[Dict[str, Any]] = []
+    for _, row in need.iterrows():
+        advert_id = safe_int(row['ID кампании'])
+        desired_name = str(row['Желаемое название'])[:100]
+        body = {'advertId': advert_id, 'name': desired_name}
+        resp = wb_api_request(
+            'post', WB_RENAME_URL, api_key, body,
+            method_name='adv_rename',
+            timeout=120,
+            dry_run=dry_run,
+            context={'id_campaign': advert_id, 'nmId': safe_int(row['Артикул WB']), 'desired_name': desired_name},
+        )
+        http_status = '' if resp is None else resp.status_code
+        response_text = '' if resp is None else truncate_text(resp.text, 4000)
+        ok = bool(resp is not None and resp.status_code == 200)
+        results.append({
+            'ID кампании': advert_id,
+            'Артикул WB': safe_int(row['Артикул WB']),
+            'Предмет': row['Предмет'],
+            'Текущее название': row['Текущее название'],
+            'Желаемое название': desired_name,
+            'HTTP статус': http_status,
+            'Успешно': ok,
+            'Ответ API': response_text,
+        })
+    return candidates, pd.DataFrame(results)
+
+
+def determine_action(row: pd.Series, cfg: Config) -> Tuple[str, float, str, bool]:
+    current_bid = safe_float(row.get('current_bid_rub'))
+    payment_type = canonical_payment_type(row.get('payment_type'))
+    min_bid = safe_float(row.get('Минимальная ставка WB, ₽')) if pd.notna(row.get('Минимальная ставка WB, ₽')) else (4.0 if payment_type == 'cpc' else 80.0)
+    floor_bid = max(min_bid, 4.0 if payment_type == 'cpc' else 80.0)
+    step = get_bid_step_rub(payment_type)
+    max_bid = safe_float(row.get('max_bid_rub'))
+    campaign_status = str(row.get('campaign_status', '') or '')
+    campaign_is_active = bool(row.get('campaign_is_active', False))
+
+    subject_norm = canonical_subject(row.get('subject_norm', row.get('subject', '')))
+    subject_name = get_subject_display_name(subject_norm)
+    category_drr = safe_float(row.get('category_drr_cur'))
+    category_target = 0.10
+    category_orders_growth = safe_float(row.get('category_orders_growth_pct'))
+    category_gp_growth = safe_float(row.get('category_gp_growth_pct'))
+    category_demand_growth = safe_float(row.get('category_demand_growth_pct'))
+    category_plan_att = safe_float(row.get('category_plan_attainment_pct', row.get('plan_attainment_pct', 100.0)))
+
+    campaign_drr = safe_float(row.get('campaign_drr_cur'))
+    campaign_gp = safe_float(row.get('campaign_gp_cur'))
+    campaign_gp_growth = safe_float(row.get('campaign_gp_growth_pct'))
+    campaign_orders_growth = safe_float(row.get('campaign_order_growth_pct'))
+    campaign_click_growth = safe_float(row.get('campaign_click_growth_pct'))
+    campaign_impression_growth = safe_float(row.get('campaign_impression_growth_pct'))
+    campaign_roi = safe_float(row.get('campaign_roi_cur'))
+
+    item_gp_growth = safe_float(row.get('item_gp_growth_pct'))
+    item_orders_growth = safe_float(row.get('item_order_growth_pct'))
+    better_channel = str(row.get('better_channel', '') or '').strip().upper()
+    row_channel = 'CPC' if payment_type == 'cpc' else 'CPM'
+
+    def raise_bid() -> float:
+        raw = current_bid + step
+        return round(min(raw, max_bid) if max_bid > 0 else raw, 2)
+
+    def lower_bid() -> float:
+        return round(max(current_bid - step, floor_bid), 2)
+
+    level1 = f"Уровень 1 Категория: {subject_name}; ДРР {category_drr*100:.1f}% при целевом лимите 10.0%, заказы {category_orders_growth:.1f}%, ВП {category_gp_growth:.1f}%, спрос {category_demand_growth:.1f}%"
+    level2 = f"Уровень 2 Кампания: ДРР {campaign_drr*100:.1f}%, ВП {campaign_gp:.0f} ₽, рост показов {campaign_impression_growth:.1f}%, кликов {campaign_click_growth:.1f}%, заказов {campaign_orders_growth:.1f}%, ВП {campaign_gp_growth:.1f}%"
+    level3 = f"Уровень 3 Товар: рост заказов {item_orders_growth:.1f}%, рост чистой/валовой прибыли {item_gp_growth:.1f}%"
+
+    if not campaign_is_active:
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; статус кампании '{campaign_status}' — API не трогаем", False
+    if current_bid <= 0:
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; текущая ставка не определена", False
+
+    has_max_bid = max_bid > 0
+    can_raise_more = has_max_bid and (current_bid + step) <= (max_bid + 1e-9)
+    profitability_ok = campaign_roi >= 0.05
+    trend_confirmed = campaign_impression_growth > 10 and campaign_click_growth > 10 and campaign_orders_growth > 10 and campaign_gp_growth > 10
+    anti_crisis = category_drr > category_target or (category_gp_growth < 0 and category_orders_growth <= 0)
+    item_weak = item_gp_growth < 0 or item_orders_growth < 0
+    expensive_campaign = campaign_drr > category_target
+
+    if campaign_gp <= 0 or campaign_roi < 0.05:
+        if current_bid > floor_bid:
+            return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; кампания убыточна или ниже порога рентабельности 5% — снижаем на 1 шаг ({step:.0f} ₽)", True
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; кампания убыточна, но ставка уже на минимуме", False
+
+    if anti_crisis:
+        if expensive_campaign or item_weak:
+            if current_bid > floor_bid:
+                return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; антикризисный режим: ДРР категории выше 10% или категория слаба, дорогую/слабую кампанию сушим на 1 шаг ({step:.0f} ₽)", True
+            return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; антикризисный режим, но ставка уже минимальная", False
+        if trend_confirmed and not item_weak and campaign_drr <= category_target and can_raise_more:
+            return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; антикризисный режим: усиливаем только дешёвую подтверждённо растущую кампанию на 1 шаг ({step:.0f} ₽)", False
+        if not has_max_bid:
+            return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; max bid не рассчитан — повышение запрещено", False
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; антикризисный режим: недостаточно сильного сигнала для роста", False
+
+    if campaign_drr >= max(cfg.campaign_hard_drr, 0.16) and current_bid > floor_bid:
+        return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; ДРР кампании высокий — снижаем на 1 шаг ({step:.0f} ₽)", True
+
+    if not has_max_bid:
+        return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; max bid не рассчитан — повышение запрещено", False
+
+    if trend_confirmed and not item_weak and campaign_drr <= category_target and can_raise_more:
+        return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; кампания прибыльная и подтверждённо растёт — повышаем на 1 шаг ({step:.0f} ₽)", False
+
+    if category_plan_att < 95 and campaign_drr <= category_target and not item_weak and campaign_gp_growth > 0 and campaign_orders_growth > 0 and can_raise_more:
+        return 'Повысить', raise_bid(), f"{level1}; {level2}; {level3}; отстаём от плана, кампания эффективна — повышаем на 1 шаг ({step:.0f} ₽)", False
+
+    if better_channel and better_channel != row_channel and campaign_drr > category_target and current_bid > floor_bid:
+        return 'Снизить', lower_bid(), f"{level1}; {level2}; {level3}; альтернативный канал сильнее, дорогой канал сушим на 1 шаг ({step:.0f} ₽)", True
+
+    return 'Без изменений', round(current_bid, 2), f"{level1}; {level2}; {level3}; без изменений", False
+
+
+def save_outputs(provider: BaseProvider, results: Dict[str, Any], run_mode: str, bid_send_log: Optional[pd.DataFrame], shade_apply_log: Optional[pd.DataFrame] = None, history_append: Optional[pd.DataFrame] = None) -> None:
+    decisions = results.get('decisions', pd.DataFrame()).copy()
+    plan_sheet = results.get('plan_sheet', pd.DataFrame()).copy()
+    category_plan = results.get('category_plan', pd.DataFrame()).copy()
+    daily_item = results.get('daily_item_history', pd.DataFrame()).copy()
+    daily_campaign = results.get('daily_campaign_history', pd.DataFrame()).copy()
+    product_metrics = results.get('product_metrics', pd.DataFrame()).copy()
+    campaign_profit = results.get('campaign_profit', pd.DataFrame()).copy()
+    effects = results.get('effects', pd.DataFrame()).copy()
+    weak = results.get('weak', pd.DataFrame()).copy()
+    min_bids_df = results.get('min_bids_df', pd.DataFrame()).copy()
+    history_append = history_append.copy() if isinstance(history_append, pd.DataFrame) else pd.DataFrame()
+    rename_candidates = results.get('rename_candidates', pd.DataFrame()).copy()
+    rename_log = results.get('rename_log', pd.DataFrame()).copy()
+
+    abc_ref = globals().get('ABC_REFERENCE_DF', pd.DataFrame())
+    if abc_ref is None or not isinstance(abc_ref, pd.DataFrame):
+        abc_ref = pd.DataFrame()
+    manager_index = save_manager_recommendation_pdfs(provider, decisions, abc_ref, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    if not decisions.empty:
+        decisions = build_manager_recommendations(decisions, abc_ref)
+
+    item_cols = ['Дата', 'Товар', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Заказы', 'Сумма_заказов', '% выкупа', 'Расходы_РК',
+                 'Валовая прибыль после рекламы, ₽', 'Клики', 'CPO, ₽', 'Прогнозная чистая прибыль, ₽', 'Показы', 'Заказы_РК', 'Выручка_РК',
+                 'ДРР, доля', 'Конверсия в корзину, %', 'Конверсия в заказ, %', 'Частота запросов', 'Спрос по ключам', 'Медианная позиция', 'Видимость, %', 'День зрелый']
+    campaign_cols = ['Дата', 'ID кампании', 'Артикул WB', 'Артикул продавца', 'Предмет', 'Тип кампании', 'Тип', 'Плейсмент', 'Ставка, ₽', 'Показы', 'Клики',
+                     'Заказы_РК', 'Выручка_РК', 'Расходы_РК', 'ДРР кампании, доля', 'ВП кампании после рекламы, ₽', 'ROI кампании',
+                     'CPO кампании, ₽', 'Спрос по ключам', 'Частота запросов', 'День зрелый']
+    daily_item = trim_to_columns(daily_item, item_cols)
+    daily_campaign = trim_to_columns(daily_campaign, campaign_cols)
+
+    old_sheets = {}
+    try:
+        if provider.file_exists(OUT_SINGLE_REPORT):
+            old_sheets = provider.read_excel_all_sheets(OUT_SINGLE_REPORT)
+    except Exception:
+        old_sheets = {}
+
+    def append_dedup(old_df: pd.DataFrame, new_df: pd.DataFrame, keys: List[str], final_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        old_df = old_df.copy() if isinstance(old_df, pd.DataFrame) else pd.DataFrame()
+        new_df = new_df.copy() if isinstance(new_df, pd.DataFrame) else pd.DataFrame()
+        if final_cols:
+            old_df = trim_to_columns(old_df, final_cols)
+            new_df = trim_to_columns(new_df, final_cols)
+        if new_df.empty:
+            base = old_df
+        elif old_df.empty:
+            base = new_df
+        else:
+            base = pd.concat([old_df, new_df], ignore_index=True, sort=False)
+        real_keys = [k for k in keys if k in base.columns]
+        base = base.drop_duplicates(real_keys, keep='last') if real_keys else base
+        if final_cols:
+            base = trim_to_columns(base, final_cols)
+        return base
+
+    decisions_hist = append_dedup(old_sheets.get('История решений день', pd.DataFrame()), history_append, ['Дата запуска', 'ID кампании', 'Артикул WB', 'Плейсмент'])
+    item_hist_all = append_dedup(old_sheets.get('История день товар', pd.DataFrame()), daily_item, ['Дата', 'Артикул WB'], item_cols)
+    campaign_hist_all = append_dedup(old_sheets.get('История день кампания', pd.DataFrame()), daily_campaign, ['Дата', 'ID кампании', 'Артикул WB'], campaign_cols)
+    old_bid_hist = old_sheets.get('История ставок', pd.DataFrame())
+    bid_hist_new = decisions[decisions['Действие'].isin(['Повысить', 'Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])].copy() if not decisions.empty else pd.DataFrame()
+    bid_hist_all = append_dedup(old_bid_hist, bid_hist_new, ['ID кампании', 'Артикул WB', 'Плейсмент', 'Дата запуска'])
+    archive_all = append_dedup(old_sheets.get('Архив решений', pd.DataFrame()), decisions, ['Дата запуска', 'ID кампании', 'Артикул WB', 'Плейсмент'])
+    rename_hist_all = append_dedup(old_sheets.get('Переименование кампаний', pd.DataFrame()), rename_log, ['ID кампании', 'Желаемое название'])
+
+    summary = pd.DataFrame([{
+        'Режим': 'run',
+        'Дата формирования': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Всего рекомендаций': int(len(decisions)),
+        'Изменённых ставок': int(len(bid_hist_new)),
+        'Блоков отправки ставок': 0 if bid_send_log is None or bid_send_log.empty else int(len(bid_send_log)),
+        'Переименовано кампаний': int(rename_log['Успешно'].fillna(False).astype(bool).sum()) if not rename_log.empty and 'Успешно' in rename_log.columns else 0,
+        'Кампаний в очереди на переименование': max(0, int(rename_candidates['Нужно переименовать'].fillna(False).astype(bool).sum()) - int(rename_log['Успешно'].fillna(False).astype(bool).sum())) if (not rename_candidates.empty and 'Нужно переименовать' in rename_candidates.columns) else 0,
+        'PDF менеджерам': int(len(manager_index)) if not manager_index.empty else 0,
+        'Текущее окно с': results['window']['cur_start'],
+        'Текущее окно по': results['window']['cur_end'],
+        'База с': results['window']['base_start'],
+        'База по': results['window']['base_end'],
+    }])
+
+    eff_stub = pd.DataFrame([{'Комментарий': 'Детальная эффективность ставки вынесена в отдельный файл Эффективность_ставки_ежедневно.xlsx'}])
+
+    sheets = {
+        'Сводка': summary,
+        'Решения': decisions,
+        'План': plan_sheet,
+        'План категорий': category_plan,
+        'Товар день': daily_item,
+        'Кампания день': daily_campaign,
+        'Товар итог': product_metrics,
+        'Кампании прибыль': campaign_profit,
+        'Фактически изменённые ставки': bid_send_log if bid_send_log is not None and not bid_send_log.empty else pd.DataFrame([{'Комментарий': 'Нет отправленных блоков ставок'}]),
+        'Лимиты ставок': decisions[[c for c in ['Менеджер', 'Артикул продавца', 'ID кампании', 'Тип кампании', 'Статус кампании', 'Активна для API', 'Текущая ставка, ₽', 'Комфортная ставка, ₽', 'Максимальная ставка, ₽', 'Экспериментальная ставка, ₽', 'Тип лимита', 'Причина лимита'] if c in decisions.columns]].copy() if not decisions.empty else pd.DataFrame(),
+        'Минимальные ставки WB': min_bids_df if not min_bids_df.empty else pd.DataFrame([{'Комментарий': 'Нет данных по min bid'}]),
+        'Слабые позиции': weak,
+        'Эффект изменений': effects,
+        'Рекомендации менеджерам': manager_index if not manager_index.empty else pd.DataFrame([{'Комментарий': 'PDF не сформированы'}]),
+        'Лог API': pd.DataFrame(API_CALL_LOGS) if API_CALL_LOGS else pd.DataFrame([{'Комментарий': 'Нет вызовов API'}]),
+        'История решений день': decisions_hist,
+        'История ставок': bid_hist_all,
+        'Архив решений': archive_all,
+        'Эффективность ставки': eff_stub,
+        'История день товар': item_hist_all,
+        'История день кампания': campaign_hist_all,
+        'Переименование кандидаты': rename_candidates if not rename_candidates.empty else pd.DataFrame([{'Комментарий': 'Нет активных управляемых кампаний'}]),
+        'Переименование кампаний': rename_hist_all if not rename_hist_all.empty else pd.DataFrame([{'Комментарий': 'Переименований не было'}]),
+    }
+
+    sheets = {name: normalize_output_df(df) for name, df in sheets.items()}
+    provider.write_excel(OUT_SINGLE_REPORT, sheets)
+    provider.write_excel(OUT_PREVIEW, sheets)
+    provider.write_text(OUT_SUMMARY, json.dumps(summary.iloc[0].to_dict(), ensure_ascii=False, default=str, indent=2))
+
+    eff_sheets = results.get('eff_history_sheets', {})
+    if not eff_sheets:
+        eff_sheets = {'Комментарий': pd.DataFrame([{'Комментарий': 'Нет данных по эффективности ставки'}])}
+    eff_sheets = {name: normalize_output_df(df) for name, df in eff_sheets.items()}
+    provider.write_excel(OUT_EFF, eff_sheets)
+
+
+def run_manager(args: argparse.Namespace) -> None:
+    API_CALL_LOGS.clear()
+    MIN_BID_ROWS.clear()
+    provider = choose_provider(args.local_data_dir)
+    abc_ref, abc_rates = load_latest_abc_reference(provider)
+    funnel_ref, funnel_rates = load_latest_funnel_subject_reference(provider)
+    globals()['ABC_REFERENCE_DF'] = abc_ref
+    globals()['FUNNEL_SUBJECT_REFERENCE_DF'] = funnel_ref
+
+    merged_rates = dict(SUBJECT_FIXED_BUYOUT_RATES)
+    if abc_rates:
+        merged_rates.update(abc_rates)
+    if funnel_rates:
+        merged_rates.update(funnel_rates)
+    globals()['SUBJECT_FIXED_BUYOUT_RATES'] = merged_rates
+
+    if merged_rates:
+        target_rate_text = ', '.join(
+            f"{get_subject_display_name(k)}={v*100:.1f}%"
+            for k, v in sorted(merged_rates.items())
+            if k in TARGET_SUBJECTS
+        )
+        all_subjects_loaded = len([k for k in merged_rates.keys() if str(k).strip()])
+        source_parts = []
+        if abc_rates:
+            source_parts.append(f'ABC={len(abc_rates)}')
+        if funnel_rates:
+            source_parts.append(f'Воронка={len(funnel_rates)}')
+        source_text = ', '.join(source_parts) if source_parts else 'fallback'
+        log(f'📦 Выкуп по всем предметам загружен: {all_subjects_loaded} предметов ({source_text})')
+        if target_rate_text:
+            log(f'📦 Целевые категории: {target_rate_text}')
+    as_of_date = datetime.strptime(args.as_of_date, '%Y-%m-%d').date() if args.as_of_date else datetime.now().date()
+    cfg = Config()
+    results = prepare_metrics(provider, cfg, as_of_date)
+    api_key = os.getenv('WB_PROMO_KEY_TOPFACE','').strip()
+    results = enrich_with_min_bids(results, api_key)
+    decisions = results['decisions'].copy()
+    log(f'✅ Всего строк решений: {len(decisions)}')
+    changed = decisions[decisions['Действие'].isin(['Повысить','Снизить']) & (decisions['Новая ставка, ₽'] != decisions['Текущая ставка, ₽'])].copy()
+    log(f'🔁 Изменённых ставок: {len(changed)}')
+    if not changed.empty:
+        print(changed[['Товар','Артикул продавца','Предмет','ID кампании','Плейсмент','Текущая ставка, ₽','Новая ставка, ₽','Действие','Причина']].head(30).to_string(index=False), flush=True)
+    payload = decisions_to_payload(decisions)
+    bid_send_log = send_payload(payload, api_key, dry_run=False)
+    log(f"📤 Отправлено блоков в WB: {0 if bid_send_log is None or bid_send_log.empty else len(bid_send_log)}")
+    _, campaigns_for_rename = load_ads(provider)
+    rename_candidates, rename_log = rename_managed_campaigns(api_key, campaigns_for_rename, dry_run=False)
+    renamed_ok = int(rename_log['Успешно'].fillna(False).astype(bool).sum()) if not rename_log.empty and 'Успешно' in rename_log.columns else 0
+    rename_pending = max(0, int(rename_candidates['Нужно переименовать'].fillna(False).astype(bool).sum()) - renamed_ok) if not rename_candidates.empty and 'Нужно переименовать' in rename_candidates.columns else 0
+    log(f"🏷️ Переименование кампаний: успешно {renamed_ok}, осталось {rename_pending}")
+    results['rename_candidates'] = rename_candidates
+    results['rename_log'] = rename_log
+    history_append = build_history_append(decisions, as_of_date)
+    save_outputs(provider, results, 'run', bid_send_log, None, history_append)
 
 def main() -> None:
     args = build_parser().parse_args()
