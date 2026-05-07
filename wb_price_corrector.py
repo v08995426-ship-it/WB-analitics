@@ -1121,6 +1121,21 @@ class WBPriceCorrector:
         if "isCancel" in all_rows.columns:
             all_rows = all_rows[~is_cancelled_series(all_rows["isCancel"])].copy()
 
+        # Важно: today_orders / previous_day_orders могут одновременно попасть в orders_history.
+        # Если не убрать дубли, выборка SPP искусственно раздувается и товар может пройти
+        # порог min_spp_sample_orders за счёт повторов одних и тех же заказов.
+        before_dedup = len(all_rows)
+        if "srid" in all_rows.columns and all_rows["srid"].notna().any():
+            all_rows["_srid_norm"] = all_rows["srid"].astype(str).str.strip()
+            all_rows = all_rows[all_rows["_srid_norm"] != ""].drop_duplicates(subset=["_srid_norm"], keep="last").copy()
+            all_rows = all_rows.drop(columns=["_srid_norm"], errors="ignore")
+        else:
+            fallback_dedup_cols = [c for c in ["nmID", "date", "gNumber", "spp_num", "finishedPrice", "priceWithDisc"] if c in all_rows.columns]
+            if "nmID" in fallback_dedup_cols and "date" in fallback_dedup_cols and len(fallback_dedup_cols) >= 3:
+                all_rows = all_rows.drop_duplicates(subset=fallback_dedup_cols, keep="last").copy()
+        if before_dedup != len(all_rows):
+            log(f"SPP: удалено дублей заказов перед расчётом выборки: {before_dedup - len(all_rows)}")
+
         if all_rows.empty:
             return pd.DataFrame(columns=[
                 "nmID", "avg_spp", "spp_source", "spp_sample_min",
@@ -1153,9 +1168,13 @@ class WBPriceCorrector:
         )
 
         def choose(row):
-            n3 = int(row.get("orders_spp_3h") or 0)
-            n_prev = int(row.get("orders_spp_previous_day") or 0)
-            n_hist = int(row.get("orders_spp_history") or 0)
+            def safe_count(col: str) -> int:
+                value = to_float_or_none(row.get(col))
+                return int(value) if value is not None and value > 0 else 0
+
+            n3 = safe_count("orders_spp_3h")
+            n_prev = safe_count("orders_spp_previous_day")
+            n_hist = safe_count("orders_spp_history")
 
             if pd.notna(row.get("avg_spp_spp_3h")) and n3 >= min_n:
                 return row.get("avg_spp_spp_3h"), "sku_3h_min10", "3h"
@@ -1172,10 +1191,16 @@ class WBPriceCorrector:
         out["spp_source"] = chosen[1]
         out["spp_reference_period"] = chosen[2]
         out["spp_sample_min"] = min_n
-        out["orders_3h"] = out.get("orders_spp_3h", 0).fillna(0).astype(int)
-        out["orders_today"] = out.get("orders_spp_today", 0).fillna(0).astype(int)
-        out["orders_previous_day"] = out.get("orders_spp_previous_day", 0).fillna(0).astype(int)
-        out["orders_history"] = out.get("orders_spp_history", 0).fillna(0).astype(int)
+        for src_col, dst_col in [
+            ("orders_spp_3h", "orders_3h"),
+            ("orders_spp_today", "orders_today"),
+            ("orders_spp_previous_day", "orders_previous_day"),
+            ("orders_spp_history", "orders_history"),
+        ]:
+            if src_col in out.columns:
+                out[dst_col] = pd.to_numeric(out[src_col], errors="coerce").fillna(0).astype(int)
+            else:
+                out[dst_col] = 0
 
         return out[[
             "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min",
