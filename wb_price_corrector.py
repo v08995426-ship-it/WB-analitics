@@ -14,7 +14,9 @@
 - если разбег SPP небольшой (до 3 п.п.), берёт среднее и округляет вверх;
 - если разбег большой, считает среднее, отсекает значения выше среднего, затем снова считает среднее и округляет вверх;
 - ведёт служебный файл заказов текущей недели, чтобы не зависеть только от сегодняшней выгрузки;
-- если по конкретному nmID за период нет 10 продаж, использует агрегат по группе оттенков: 617/1, 617/2, 617/3 => группа 617;
+- если по группе оттенков недельная выборка стабильная, использует один общий SPP для всей группы: 617/1, 617/2, 617/3 => группа 617;
+- для стабильной группы оттенков берёт максимальный средний SPP среди оттенков и ставит одинаковую базовую цену для оттенков с одинаковым РРЦ;
+- если средний SPP между оттенками группы отличается больше чем на 3 п.п., группа не склеивается и расчёт идёт по конкретному nmID;
 - subject/global SPP не применяется, потому что средняя категория может сломать цену конкретного товара;
 - никаких искусственных floor по SPP/WB-скидке не используется.
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
@@ -1427,19 +1429,18 @@ class WBPriceCorrector:
             effective_spp_pct = (1 - finishedPrice / priceWithDisc) * 100
 
         Агрегация внутри выбранного периода:
-        - если разница max-min <= small_spp_spread_points (по умолчанию 3 п.п.),
-          считаем среднюю по всем значениям и округляем вверх;
-        - если разбег больше, считаем первичную среднюю, отсекаем значения выше
-          этой средней, затем считаем среднюю по оставшимся и округляем вверх.
+        - берём максимальное фактическое значение SPP в выборке и округляем вверх.
+          Это ближе к публичной цене WB без авторизации, чем средний SPP;
+        - минимум выборки сохраняется: период используется только если есть min_n значений SPP.
 
         Периоды и fallback:
-        1) SKU за последние 3 часа, если >= min_n значений.
-        2) SKU за сегодня, если >= min_n значений.
-        3) SKU за текущую неделю, если >= min_n значений.
-        4) Группа оттенков за текущую неделю, если по nmID нет выборки >= min_n.
-           Пример: 617/1, 617/2, 617/3 -> группа 617.
-        5) SKU за предыдущий день / историю, если >= min_n значений.
-        6) Группа оттенков за историю, если >= min_n значений.
+        1) Группа оттенков за текущую неделю, если суммарно >= min_n значений и
+           средние SPP между оттенками отличаются не более чем на small_spp_spread_points.
+           Для всей группы берётся максимальный сырой SPP внутри группы, округлённый вверх.
+           Пример: 501/5, 501/19 -> группа 501; при близком SPP оба получают один SPP.
+        2) Если группа оттенков нестабильна (> 3 п.п. между оттенками), берём SKU за текущую неделю, если >= min_n.
+        3) Группа оттенков за историю по тому же правилу стабильности.
+        4) SKU за историю / предыдущий день / сегодня / 3 часа, если >= min_n.
 
         Subject/global fallback не применяется.
         """
@@ -1467,8 +1468,11 @@ class WBPriceCorrector:
         empty_cols = [
             "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min", "spp_calc_method",
             "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max", "spp_raw_spread",
-            "spp_trimmed_mean", "spp_shade_group", "orders_3h", "orders_today", "orders_week",
+            "spp_trimmed_mean", "spp_shade_group", "spp_group_rule", "spp_group_shades_count",
+            "spp_group_mean_min", "spp_group_mean_max", "spp_group_mean_spread",
+            "orders_3h", "orders_today", "orders_week",
             "orders_previous_day", "orders_history", "orders_group_week", "orders_group_history",
+            "orders_shade_consensus_week", "orders_shade_consensus_history",
         ]
         if not frames:
             return pd.DataFrame(columns=empty_cols)
@@ -1559,7 +1563,31 @@ class WBPriceCorrector:
         group_week = self._agg_spp(week[week["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_week", ["spp_shade_group"], min_n, small_spread)
         group_hist = self._agg_spp(hist_prev_period[hist_prev_period["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_history", ["spp_shade_group"], min_n, small_spread)
 
+        # Новый основной механизм для оттенков: если средний SPP между оттенками внутри группы
+        # отличается не больше чем на small_spread п.п., используем один общий SPP для всей группы.
+        # Берём максимальный сырой SPP внутри группы, чтобы не занизить цену покупателя.
+        shade_consensus_week = self._agg_shade_group_consensus_spp(
+            week[week["spp_shade_group"].astype(str).str.strip() != ""].copy(),
+            "spp_shade_consensus_week",
+            min_n,
+            small_spread,
+        )
+        shade_consensus_hist = self._agg_shade_group_consensus_spp(
+            hist_prev_period[hist_prev_period["spp_shade_group"].astype(str).str.strip() != ""].copy(),
+            "spp_shade_consensus_history",
+            min_n,
+            small_spread,
+        )
+
         base = all_rows[["nmID", "spp_shade_group"]].drop_duplicates(subset=["nmID"], keep="last").copy()
+
+        # Добавляем все nmID из справочника, чтобы оттенки без продаж тоже могли получить
+        # общий SPP группы 501/617/etc., если у группы есть нормальная недельная выборка.
+        ref_base = self._build_ref_spp_base(ref_df)
+        if not ref_base.empty:
+            base = pd.concat([base, ref_base], ignore_index=True, sort=False)
+            base = base.drop_duplicates(subset=["nmID"], keep="last")
+
         base = base.sort_values("nmID")
         out = (
             base
@@ -1569,6 +1597,10 @@ class WBPriceCorrector:
             .merge(sku_week, on="nmID", how="left")
             .merge(sku_hist, on="nmID", how="left")
         )
+        if not shade_consensus_week.empty:
+            out = out.merge(shade_consensus_week, on="spp_shade_group", how="left")
+        if not shade_consensus_hist.empty:
+            out = out.merge(shade_consensus_hist, on="spp_shade_group", how="left")
         if not group_week.empty:
             out = out.merge(group_week, on="spp_shade_group", how="left")
         if not group_hist.empty:
@@ -1580,15 +1612,20 @@ class WBPriceCorrector:
 
         def choose(row):
             candidates = [
-                ("spp_3h", "sku_3h", "3h"),
-                ("spp_today", "sku_today", "today"),
+                # Главный приоритет: общий SPP группы оттенков, если оттенки действительно близки.
+                # Это заставляет 501/5, 501/19 и прочие оттенки с одинаковым РРЦ считать одинаково.
+                ("spp_shade_consensus_week", "shade_group_week_max_if_spread_ok", "group_week_consensus"),
+                # Если группа отличается больше чем на 3 п.п. — consensus не создаётся, тогда SKU считаем отдельно.
                 ("spp_week", "sku_week", "week"),
-                # Если конкретный оттенок за неделю не набрал 10 продаж,
-                # используем группу оттенков текущей недели раньше старой истории SKU.
-                ("spp_group_week", "shade_group_week", "group_week"),
-                ("spp_previous_day", "sku_previous_day", "previous_day"),
+                ("spp_shade_consensus_history", "shade_group_history_max_if_spread_ok", "group_history_consensus"),
                 ("spp_history", "sku_history", "history"),
-                ("spp_group_history", "shade_group_history", "group_history"),
+                ("spp_previous_day", "sku_previous_day", "previous_day"),
+                ("spp_today", "sku_today", "today"),
+                ("spp_3h", "sku_3h", "3h"),
+                # Старые групповые агрегаты оставлены последним запасным вариантом: если consensus не построился,
+                # но группа как единое распределение имеет достаточную выборку.
+                ("spp_group_week", "shade_group_week_distribution", "group_week"),
+                ("spp_group_history", "shade_group_history_distribution", "group_history"),
             ]
             for suffix, source_prefix, period in candidates:
                 value = row.get(f"avg_spp_{suffix}")
@@ -1606,8 +1643,13 @@ class WBPriceCorrector:
                         row.get(f"spp_raw_max_{suffix}"),
                         row.get(f"spp_raw_spread_{suffix}"),
                         row.get(f"spp_trimmed_mean_{suffix}"),
+                        row.get(f"spp_group_rule_{suffix}"),
+                        safe_count(row.get(f"spp_group_shades_count_{suffix}")),
+                        row.get(f"spp_group_mean_min_{suffix}"),
+                        row.get(f"spp_group_mean_max_{suffix}"),
+                        row.get(f"spp_group_mean_spread_{suffix}"),
                     )
-            return (None, f"no_spp_min{min_n}", "none", 0, 0, None, None, None, None, None)
+            return (None, f"no_spp_min{min_n}", "none", 0, 0, None, None, None, None, None, None, 0, None, None, None)
 
         chosen = out.apply(choose, axis=1, result_type="expand")
         out["avg_spp"] = chosen[0]
@@ -1620,8 +1662,13 @@ class WBPriceCorrector:
         out["spp_raw_max"] = chosen[7]
         out["spp_raw_spread"] = chosen[8]
         out["spp_trimmed_mean"] = chosen[9]
+        out["spp_group_rule"] = chosen[10]
+        out["spp_group_shades_count"] = chosen[11]
+        out["spp_group_mean_min"] = chosen[12]
+        out["spp_group_mean_max"] = chosen[13]
+        out["spp_group_mean_spread"] = chosen[14]
         out["spp_sample_min"] = min_n
-        out["spp_calc_method"] = "effective_spp_mean_or_trim_above_mean_from_finishedPrice_priceWithDisc"
+        out["spp_calc_method"] = "effective_spp_raw_max_ceil_by_shade_group_or_sku_from_finishedPrice_priceWithDisc"
 
         for src_col, dst_col in [
             ("orders_spp_3h", "orders_3h"),
@@ -1631,6 +1678,8 @@ class WBPriceCorrector:
             ("orders_spp_history", "orders_history"),
             ("orders_spp_group_week", "orders_group_week"),
             ("orders_spp_group_history", "orders_group_history"),
+            ("orders_spp_shade_consensus_week", "orders_shade_consensus_week"),
+            ("orders_spp_shade_consensus_history", "orders_shade_consensus_history"),
         ]:
             if src_col in out.columns:
                 out[dst_col] = out[src_col].map(lambda x: to_int_or_none(x) or 0).astype(int)
@@ -1638,6 +1687,128 @@ class WBPriceCorrector:
                 out[dst_col] = 0
 
         return out[empty_cols]
+
+    @staticmethod
+    def _build_ref_spp_base(ref_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """База nmID -> группа оттенков из справочника, чтобы давать group SPP оттенкам без продаж."""
+        cols = ["nmID", "spp_shade_group"]
+        if ref_df is None or ref_df.empty or "nmID" not in ref_df.columns:
+            return pd.DataFrame(columns=cols)
+        tmp = ref_df.copy()
+        tmp["nmID"] = tmp["nmID"].map(to_int_or_none)
+        tmp = tmp[tmp["nmID"].notna()].copy()
+        if tmp.empty:
+            return pd.DataFrame(columns=cols)
+        tmp["nmID"] = tmp["nmID"].astype(int)
+
+        def pick_article(row: pd.Series) -> str:
+            for col in ["supplierArticle_ref", "article_1c", "article_rrc", "supplierArticle", "vendorCode", "Артикул продавца", "Артикул 1С"]:
+                if col in row.index:
+                    value = row.get(col)
+                    if value is not None and str(value).strip() and str(value).lower() != "nan":
+                        return str(value)
+            return ""
+
+        tmp["spp_shade_group"] = tmp.apply(pick_article, axis=1).map(extract_shade_group)
+        tmp = tmp[tmp["spp_shade_group"].astype(str).str.strip() != ""].copy()
+        if tmp.empty:
+            return pd.DataFrame(columns=cols)
+        return tmp[cols].drop_duplicates(subset=["nmID"], keep="last")
+
+    @classmethod
+    def _agg_shade_group_consensus_spp(cls, df: pd.DataFrame, suffix: str, min_n: int, max_spread_between_shades: float) -> pd.DataFrame:
+        """
+        Строит единый SPP на группу оттенков.
+
+        Логика:
+        - считаем средний SPP по каждому nmID внутри группы;
+        - если разница max(mean_spp_by_nm) - min(mean_spp_by_nm) <= max_spread_between_shades,
+          считаем, что оттенки ведут себя одинаково;
+        - для всей группы берём максимальный сырой SPP внутри группы и округляем вверх;
+        - если разница между оттенками больше порога, группу не склеиваем.
+        """
+        result_cols = [
+            "spp_shade_group",
+            f"avg_spp_{suffix}", f"orders_{suffix}", f"spp_used_count_{suffix}", f"spp_calc_method_{suffix}",
+            f"spp_raw_mean_{suffix}", f"spp_raw_min_{suffix}", f"spp_raw_max_{suffix}",
+            f"spp_raw_spread_{suffix}", f"spp_trimmed_mean_{suffix}",
+            f"spp_group_rule_{suffix}", f"spp_group_shades_count_{suffix}",
+            f"spp_group_mean_min_{suffix}", f"spp_group_mean_max_{suffix}", f"spp_group_mean_spread_{suffix}",
+        ]
+        if df is None or df.empty or "spp_shade_group" not in df.columns or "spp_num" not in df.columns or "nmID" not in df.columns:
+            return pd.DataFrame(columns=result_cols)
+
+        rows = []
+        data = df.copy()
+        data = data[data["spp_shade_group"].astype(str).str.strip() != ""].copy()
+        data["spp_num"] = data["spp_num"].map(to_float_or_none)
+        data = data[data["spp_num"].notna()].copy()
+        if data.empty:
+            return pd.DataFrame(columns=result_cols)
+
+        for group, sub in data.groupby("spp_shade_group", dropna=False):
+            group = str(group).strip()
+            if not group:
+                continue
+            total_count = int(len(sub))
+            by_nm = (
+                sub.groupby("nmID", dropna=False)["spp_num"]
+                .agg(["mean", "count"])
+                .reset_index()
+            )
+            by_nm = by_nm[by_nm["count"] > 0].copy()
+            shade_count = int(len(by_nm))
+            if shade_count == 0:
+                continue
+
+            means = by_nm["mean"].astype(float)
+            mean_min = float(means.min())
+            mean_max = float(means.max())
+            mean_spread = mean_max - mean_min
+            raw_mean = float(sub["spp_num"].mean())
+            raw_min = float(sub["spp_num"].min())
+            raw_max = float(sub["spp_num"].max())
+            raw_spread = raw_max - raw_min
+
+            if total_count < min_n:
+                value = None
+                method = "diagnostic_low_group_sample"
+                used_count = 0
+                rule = f"skip_group_total_lt_{min_n}"
+                trimmed_mean = None
+            elif mean_spread <= max_spread_between_shades:
+                # Если оттенки близки, для всей группы берём spp_raw_max и округляем вверх.
+                # Так все оттенки группы с одинаковым РРЦ получают одинаковую базовую цену.
+                value = int(math.ceil(raw_max))
+                method = "shade_group_raw_max_ceil"
+                used_count = total_count
+                rule = f"use_group_raw_max_mean_spread_le_{max_spread_between_shades:g}pp"
+                trimmed_mean = raw_max
+            else:
+                value = None
+                method = "shade_group_spread_gt_limit_skip"
+                used_count = 0
+                rule = f"skip_group_spread_gt_{max_spread_between_shades:g}pp"
+                trimmed_mean = None
+
+            rows.append({
+                "spp_shade_group": group,
+                f"avg_spp_{suffix}": value,
+                f"orders_{suffix}": total_count,
+                f"spp_used_count_{suffix}": used_count,
+                f"spp_calc_method_{suffix}": method,
+                f"spp_raw_mean_{suffix}": round(raw_mean, 4),
+                f"spp_raw_min_{suffix}": round(raw_min, 4),
+                f"spp_raw_max_{suffix}": round(raw_max, 4),
+                f"spp_raw_spread_{suffix}": round(raw_spread, 4),
+                f"spp_trimmed_mean_{suffix}": round(trimmed_mean, 4) if trimmed_mean is not None else None,
+                f"spp_group_rule_{suffix}": rule,
+                f"spp_group_shades_count_{suffix}": shade_count,
+                f"spp_group_mean_min_{suffix}": round(mean_min, 4),
+                f"spp_group_mean_max_{suffix}": round(mean_max, 4),
+                f"spp_group_mean_spread_{suffix}": round(mean_spread, 4),
+            })
+        return pd.DataFrame(rows, columns=result_cols)
 
     @staticmethod
     def _pick_article_for_shade_group(row: pd.Series) -> str:
@@ -1662,20 +1833,15 @@ class WBPriceCorrector:
         raw_max = float(vals.max())
         raw_mean = float(vals.mean())
         raw_spread = raw_max - raw_min
+        # Рабочее значение теперь не среднее и не очищенное среднее, а максимальный сырой SPP.
+        # Минимальная выборка по-прежнему контролируется в choose(): период берётся только при orders >= min_n.
+        use_vals = vals
+        trimmed_mean = raw_max
         if raw_count < min_n:
-            # Значение всё равно считаем и выводим в диагностике, но choose не возьмёт период.
-            use_vals = vals
-            method = "diagnostic_low_sample"
-        elif raw_spread <= small_spread:
-            use_vals = vals
-            method = "mean_ceil_small_spread"
+            method = "diagnostic_low_sample_raw_max"
         else:
-            use_vals = vals[vals <= raw_mean]
-            if use_vals.empty:
-                use_vals = vals
-            method = "trim_above_mean_mean_ceil"
-        trimmed_mean = float(use_vals.mean()) if len(use_vals) else None
-        value = int(math.ceil(trimmed_mean)) if trimmed_mean is not None and not math.isnan(trimmed_mean) else None
+            method = "raw_max_ceil"
+        value = int(math.ceil(raw_max)) if raw_max is not None and not math.isnan(raw_max) else None
         return {
             "value": value,
             "orders": raw_count,
@@ -1899,7 +2065,8 @@ class WBPriceCorrector:
             "decision", "reason", "nmID", "supplierArticle_api", "supplierArticle_ref", "article_1c", "article_rrc",
             "subject", "subject_source", "rrc", "pricing_period", "target_factor", "target_finishedPrice",
             "price_calc_source", "site_final_price", "site_price_delta_to_target", "site_effective_spp",
-            "avg_spp", "spp_source", "spp_calc_method", "spp_shade_group",
+            "avg_spp", "spp_source", "spp_calc_method", "spp_shade_group", "spp_group_rule",
+            "spp_group_shades_count", "spp_group_mean_min", "spp_group_mean_max", "spp_group_mean_spread",
             "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max",
             "spp_raw_spread", "spp_trimmed_mean",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
@@ -1907,7 +2074,8 @@ class WBPriceCorrector:
             "target_priceWithDisc_site", "new_price_site", "target_priceWithDisc_orders_spp", "new_price_orders_spp",
             "delta_price", "delta_price_pct",
             "orders_3h", "orders_today", "orders_week", "orders_previous_day", "orders_history",
-            "orders_group_week", "orders_group_history", "spp_reference_period", "spp_sample_min",
+            "orders_group_week", "orders_group_history", "orders_shade_consensus_week", "orders_shade_consensus_history",
+            "spp_reference_period", "spp_sample_min",
             "site_price_source", "site_dest", "site_checked_at", "site_name",
             "name_api", "rrc_name", "excluded_by_rrc_name",
             "excluded_rrc_keyword", "currencyIsoCode4217",
