@@ -6,11 +6,15 @@
 - с 05:00 до 22:59 по Москве: РРЦ * 0.9.
 
 Логика:
-- каждые 3 часа забирает заказы за сегодняшний день через statistics-api;
+- в боевом workflow меняет цены только в 23:00 и 05:00 МСК; заказы при каждом запуске сохраняет в служебный архив;
 - дополнительно проверяет фактическую цену карточки WB по nmID через публичный endpoint сайта;
 - если цена сайта доступна, корректирует базовую WB price от фактической цены покупателя, без вывода по 1-2 заказам;
-- если цена сайта недоступна, считает не только поле spp, а фактический коэффициент WB-скидки из заказов: finishedPrice / priceWithDisc;
-- если за последние 3 часа по nmID меньше 10 заказов, берёт предыдущий день, затем SKU-историю;
+- если цена сайта недоступна или отключена, считает фактический коэффициент WB-скидки из заказов: 1 - finishedPrice / priceWithDisc;
+- по заказам использует только выборки от 10 значений SPP;
+- если разбег SPP небольшой (до 3 п.п.), берёт среднее и округляет вверх;
+- если разбег большой, считает среднее, отсекает значения выше среднего, затем снова считает среднее и округляет вверх;
+- ведёт служебный файл заказов текущей недели, чтобы не зависеть только от сегодняшней выгрузки;
+- если по конкретному nmID за период нет 10 продаж, использует агрегат по группе оттенков: 617/1, 617/2, 617/3 => группа 617;
 - subject/global SPP не применяется, потому что средняя категория может сломать цену конкретного товара;
 - никаких искусственных floor по SPP/WB-скидке не используется.
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
@@ -81,7 +85,8 @@ DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
 DEFAULT_FALLBACK_DAYS = 21
 DEFAULT_MIN_SPP_SAMPLE_ORDERS = 10
-DEFAULT_PRICE_SOURCE = "hybrid"  # hybrid = public site price first, then SKU SPP fallback
+DEFAULT_SMALL_SPP_SPREAD_POINTS = 3.0
+DEFAULT_PRICE_SOURCE = "orders-spp"  # по умолчанию считаем по SPP из заказов: mean/trim по finishedPrice/priceWithDisc; site/hybrid можно включить вручную
 DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "") or "-1257786"
 DEFAULT_PUBLIC_REGIONS = os.environ.get("WB_PUBLIC_REGIONS", "")
@@ -329,6 +334,44 @@ def normalize_article(value: Any) -> str:
     s = s.replace("-", "-")
     # Часто в отчётах встречается 901_/10 -> после удаления _ станет 901/10.
     s = re.sub(r"/+", "/", s)
+    return s
+
+
+def extract_shade_group(value: Any) -> str:
+    """
+    Группа оттенков для fallback SPP.
+
+    Примеры:
+    - 617/1, 617/2, 617/3 -> 617
+    - 901_/5 -> 901
+    - PT501R.005K -> 501
+    - PT901.F05 -> 901
+    - Основа_567/001 -> 567
+
+    Если группа не определяется, возвращает нормализованный артикул целиком,
+    чтобы не смешивать несвязанные товары.
+    """
+    s = normalize_article(value)
+    if not s:
+        return ""
+
+    # Сначала специальные vendorCode TOPFACE вида PT501R.005K / PT901.F05.
+    m = re.match(r"^PT(\d+)", s)
+    if m:
+        return m.group(1)
+
+    # Классический вид оттенков: 617/1, 901/SET1. Берём числовую базу перед slash.
+    if "/" in s:
+        left = s.split("/", 1)[0]
+        m = re.search(r"(\d+)$", left)
+        if m:
+            return m.group(1)
+        return left
+
+    # Если в артикуле есть цифры и буквенный хвост, берём первую числовую группу.
+    m = re.search(r"(\d+)", s)
+    if m:
+        return m.group(1)
     return s
 
 
@@ -752,6 +795,7 @@ class PriceCorrectorConfig:
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
     fallback_days: int = DEFAULT_FALLBACK_DAYS
     min_spp_sample_orders: int = DEFAULT_MIN_SPP_SAMPLE_ORDERS
+    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     price_source: str = DEFAULT_PRICE_SOURCE
     public_dest: str = DEFAULT_PUBLIC_DEST
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
@@ -1066,10 +1110,103 @@ class WBPriceCorrector:
         archive_key = f"{self.service_prefix}/Архив/Заказы_{today_d.strftime('%Y-%m-%d')}.xlsx"
         self.save_orders_snapshot(orders_df, archive_key, "Заказы")
 
+        # Отдельно ведём оперативную неделю в служебной папке. Это не штатный
+        # недельный файл сборщика, поэтому не ломает ежедневный updater, но даёт
+        # стабильную выборку SPP по товарам с низкими продажами.
+        self._upsert_into_service_current_week_orders(orders_df, today_d)
+
         if self.cfg.update_weekly_orders:
             self._upsert_today_into_weekly_orders(orders_df)
         else:
             log("Штатный недельный файл заказов не трогаю: update_weekly_orders=False")
+
+    def _upsert_into_service_current_week_orders(self, orders_df: pd.DataFrame, target_date: date):
+        """Перезаписывает один день внутри служебного файла заказов текущей недели."""
+        if orders_df is None:
+            orders_df = pd.DataFrame()
+        week_start = get_week_start(datetime.combine(target_date, datetime.min.time())).date()
+        year, week, _ = target_date.isocalendar()
+        key = f"{self.service_prefix}/Заказы_текущая_неделя_{year}-W{week:02d}.xlsx"
+
+        old = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+        if not old.empty and "date" in old.columns:
+            old["date"] = pd.to_datetime(old["date"], errors="coerce")
+            old = old[old["date"].dt.date != target_date].copy()
+
+        combined = pd.concat([old, orders_df], ignore_index=True, sort=False) if not old.empty else orders_df.copy()
+        if not combined.empty:
+            if "date" in combined.columns:
+                combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+                combined = combined[combined["date"].dt.date >= week_start].copy()
+                combined = combined[combined["date"].dt.date <= target_date].copy()
+            if "srid" in combined.columns:
+                combined = combined.drop_duplicates(subset=["srid"], keep="last")
+            self.save_orders_snapshot(combined, key, "Заказы_неделя")
+            # Для удобства дополнительно сохраняем стабильное имя последней оперативной недели.
+            self.save_orders_snapshot(combined, f"{self.service_prefix}/Заказы_текущая_неделя.xlsx", "Заказы_неделя")
+            log(f"Оперативная неделя заказов обновлена: {len(combined)} строк, неделя {year}-W{week:02d}")
+
+    def load_current_week_orders(self, today_orders: pd.DataFrame, previous_day_orders: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        """
+        Собирает текущую неделю для расчёта SPP: служебный недельный файл + архивы дней +
+        штатный недельный файл + свежие today/previous_day.
+        """
+        today_d = self.run_datetime_msk.date()
+        week_start_d = get_week_start(datetime.combine(today_d, datetime.min.time())).date()
+        year, week, _ = today_d.isocalendar()
+        keys = [
+            f"{self.service_prefix}/Заказы_текущая_неделя_{year}-W{week:02d}.xlsx",
+            f"{self.service_prefix}/Заказы_текущая_неделя.xlsx",
+            get_weekly_orders_key(self.cfg.store, datetime.combine(today_d, datetime.min.time())),
+        ]
+        frames = []
+        for key in keys:
+            if self.s3.file_exists(key):
+                try:
+                    df = self.s3.read_excel(key, sheet_name=0)
+                    if not df.empty:
+                        frames.append(df)
+                except Exception as e:
+                    log(f"Не удалось прочитать заказы недели {key}: {e}", "WARN")
+
+        # Архивы по дням текущей недели, чтобы неделя накапливалась даже если штатный
+        # сборщик ещё не закрыл какие-то дни.
+        d = week_start_d
+        while d <= today_d:
+            key = f"{self.service_prefix}/Архив/Заказы_{d.strftime('%Y-%m-%d')}.xlsx"
+            if self.s3.file_exists(key):
+                try:
+                    df = self.s3.read_excel(key, sheet_name=0)
+                    if not df.empty:
+                        frames.append(df)
+                except Exception as e:
+                    log(f"Не удалось прочитать архив заказов {key}: {e}", "WARN")
+            d += timedelta(days=1)
+
+        if previous_day_orders is not None and not previous_day_orders.empty:
+            frames.append(previous_day_orders)
+        if today_orders is not None and not today_orders.empty:
+            frames.append(today_orders)
+
+        if not frames:
+            return pd.DataFrame()
+
+        out = pd.concat(frames, ignore_index=True, sort=False)
+        if "date" in out.columns:
+            out["date"] = pd.to_datetime(out["date"], errors="coerce")
+            out = out[(out["date"].dt.date >= week_start_d) & (out["date"].dt.date <= today_d)].copy()
+        if "nmId" in out.columns and "nmID" not in out.columns:
+            out["nmID"] = out["nmId"]
+        elif "nmID" not in out.columns and "Артикул WB" in out.columns:
+            out["nmID"] = out["Артикул WB"]
+        if "nmID" in out.columns:
+            out["nmID"] = out["nmID"].map(to_int_or_none)
+            out = out[out["nmID"].notna()].copy()
+            out["nmID"] = out["nmID"].astype(int)
+        if "srid" in out.columns:
+            out = out.drop_duplicates(subset=["srid"], keep="last")
+        log(f"Оперативная неделя заказов для SPP: строк={len(out)}, период={week_start_d}..{today_d}")
+        return out
 
     def load_previous_day_orders(self) -> pd.DataFrame:
         """Загружает предыдущий день для fallback SPP: служебный архив -> файл предыдущего дня -> недельный файл -> API."""
@@ -1275,27 +1412,42 @@ class WBPriceCorrector:
         out = out.sort_values(["nmID", "priority"]).drop_duplicates(subset=["nmID"], keep="first")
         return out.drop(columns=["priority"])
 
-    def build_spp_table(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
+    def build_spp_table(
+        self,
+        today_orders: pd.DataFrame,
+        previous_day_orders: pd.DataFrame,
+        current_week_orders: pd.DataFrame,
+        orders_history: pd.DataFrame,
+        ref_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
         """
-        Возвращает avg_spp по nmID с правилом минимальной выборки.
+        Возвращает SPP/WB-скидку по nmID с правилом минимальной выборки.
 
-        Важно: для расчёта используется не только поле spp. Если в заказах есть
-        finishedPrice и priceWithDisc, сначала считаем фактическую WB-скидку:
-            effective_discount = 1 - finishedPrice / priceWithDisc
-        Это надёжнее, чем blindly верить полю spp, потому что нам важен именно
-        итоговый коэффициент между ценой до WB-скидки и ценой покупателя.
+        SPP не берём из колонки spp. Считаем сами по каждой строке заказа:
+            effective_spp_pct = (1 - finishedPrice / priceWithDisc) * 100
 
-        Правило:
-        1) Последние 3 часа используем только если по nmID >= min_spp_sample_orders заказов.
-        2) Если за 3 часа заказов меньше минимума, берём средний коэффициент по этому же nmID за предыдущий день.
-        3) Если предыдущего дня недостаточно, берём SKU-историю за прошлый период только при выборке >= min_spp_sample_orders.
-        4) Subject/global fallback не применяется.
-        5) Искусственный floor по SPP/WB-скидке не применяется.
+        Агрегация внутри выбранного периода:
+        - если разница max-min <= small_spp_spread_points (по умолчанию 3 п.п.),
+          считаем среднюю по всем значениям и округляем вверх;
+        - если разбег больше, считаем первичную среднюю, отсекаем значения выше
+          этой средней, затем считаем среднюю по оставшимся и округляем вверх.
+
+        Периоды и fallback:
+        1) SKU за последние 3 часа, если >= min_n значений.
+        2) SKU за сегодня, если >= min_n значений.
+        3) SKU за текущую неделю, если >= min_n значений.
+        4) Группа оттенков за текущую неделю, если по nmID нет выборки >= min_n.
+           Пример: 617/1, 617/2, 617/3 -> группа 617.
+        5) SKU за предыдущий день / историю, если >= min_n значений.
+        6) Группа оттенков за историю, если >= min_n значений.
+
+        Subject/global fallback не применяется.
         """
         min_n = max(1, int(self.cfg.min_spp_sample_orders or 1))
+        small_spread = float(self.cfg.small_spp_spread_points if self.cfg.small_spp_spread_points is not None else DEFAULT_SMALL_SPP_SPREAD_POINTS)
 
         frames = []
-        if not today_orders.empty:
+        if today_orders is not None and not today_orders.empty:
             t = today_orders.copy()
             t["_spp_frame"] = "today"
             frames.append(t)
@@ -1303,16 +1455,23 @@ class WBPriceCorrector:
             p = previous_day_orders.copy()
             p["_spp_frame"] = "previous_day"
             frames.append(p)
-        if not orders_history.empty:
+        if current_week_orders is not None and not current_week_orders.empty:
+            w = current_week_orders.copy()
+            w["_spp_frame"] = "current_week"
+            frames.append(w)
+        if orders_history is not None and not orders_history.empty:
             h = orders_history.copy()
             h["_spp_frame"] = h.get("_spp_frame", "history")
             frames.append(h)
 
+        empty_cols = [
+            "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min", "spp_calc_method",
+            "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max", "spp_raw_spread",
+            "spp_trimmed_mean", "spp_shade_group", "orders_3h", "orders_today", "orders_week",
+            "orders_previous_day", "orders_history", "orders_group_week", "orders_group_history",
+        ]
         if not frames:
-            return pd.DataFrame(columns=[
-                "nmID", "avg_spp", "spp_source", "spp_sample_min",
-                "orders_3h", "orders_today", "orders_previous_day", "orders_history"
-            ])
+            return pd.DataFrame(columns=empty_cols)
 
         all_rows = pd.concat(frames, ignore_index=True, sort=False)
 
@@ -1325,12 +1484,29 @@ class WBPriceCorrector:
         all_rows = all_rows[all_rows["nmID"].notna()].copy()
         all_rows["nmID"] = all_rows["nmID"].astype(int)
 
-        # Основной показатель для расчёта — фактическая WB-скидка между priceWithDisc
-        # и finishedPrice. Поле spp используем только как запасной источник.
-        if "spp" not in all_rows.columns:
-            all_rows["spp"] = None
-        all_rows["spp_api_num"] = all_rows["spp"].map(to_float_or_none)
+        if "srid" in all_rows.columns:
+            all_rows = all_rows.drop_duplicates(subset=["srid"], keep="last")
 
+        # Подтягиваем артикула из справочника для групп оттенков, если в заказах
+        # supplierArticle пустой или записан в другом формате.
+        if ref_df is not None and not ref_df.empty and "nmID" in ref_df.columns:
+            # Убираем возможные старые справочные колонки, чтобы merge не создал article_1c_x/_y.
+            for c in ["article_1c", "supplierArticle_ref"]:
+                if c in all_rows.columns:
+                    all_rows = all_rows.drop(columns=[c])
+            ref_cols = [c for c in ["nmID", "article_1c", "supplierArticle_ref"] if c in ref_df.columns]
+            ref_small = ref_df[ref_cols].drop_duplicates(subset=["nmID"], keep="last").copy()
+            all_rows = all_rows.merge(ref_small, on="nmID", how="left")
+        else:
+            all_rows["article_1c"] = ""
+            all_rows["supplierArticle_ref"] = ""
+
+        if "supplierArticle" not in all_rows.columns:
+            all_rows["supplierArticle"] = ""
+        all_rows["spp_article_for_group"] = all_rows.apply(self._pick_article_for_shade_group, axis=1)
+        all_rows["spp_shade_group"] = all_rows["spp_article_for_group"].map(extract_shade_group)
+
+        # Основной показатель — фактическая WB-скидка между priceWithDisc и finishedPrice.
         if "finishedPrice" in all_rows.columns and "priceWithDisc" in all_rows.columns:
             all_rows["finished_num"] = all_rows["finishedPrice"].map(to_float_or_none)
             all_rows["price_with_disc_num"] = all_rows["priceWithDisc"].map(to_float_or_none)
@@ -1339,21 +1515,16 @@ class WBPriceCorrector:
                 & all_rows["price_with_disc_num"].notna()
                 & (all_rows["finished_num"] > 0)
                 & (all_rows["price_with_disc_num"] > 0)
-                # допускаем небольшие расхождения/округления, но не абсурдные строки
                 & (all_rows["finished_num"] <= all_rows["price_with_disc_num"] * 1.05)
             )
-            all_rows["spp_effective_num"] = None
-            all_rows.loc[valid_coef, "spp_effective_num"] = (
+            all_rows["spp_num"] = None
+            all_rows.loc[valid_coef, "spp_num"] = (
                 (1 - all_rows.loc[valid_coef, "finished_num"] / all_rows.loc[valid_coef, "price_with_disc_num"]) * 100
             )
         else:
-            all_rows["spp_effective_num"] = None
+            all_rows["spp_num"] = None
 
-        all_rows["spp_num"] = all_rows["spp_effective_num"].map(to_float_or_none)
-        missing_eff = all_rows["spp_num"].isna()
-        all_rows.loc[missing_eff, "spp_num"] = all_rows.loc[missing_eff, "spp_api_num"].map(to_float_or_none)
-
-        # Убираем явный мусор. Верхнюю границу 95 оставляем, чтобы не делить почти на ноль.
+        all_rows["spp_num"] = all_rows["spp_num"].map(to_float_or_none)
         all_rows = all_rows[all_rows["spp_num"].notna()].copy()
         all_rows = all_rows[(all_rows["spp_num"] >= 0) & (all_rows["spp_num"] < 95)].copy()
 
@@ -1366,77 +1537,186 @@ class WBPriceCorrector:
             all_rows = all_rows[~is_cancelled_series(all_rows["isCancel"])].copy()
 
         if all_rows.empty:
-            return pd.DataFrame(columns=[
-                "nmID", "avg_spp", "spp_source", "spp_sample_min",
-                "orders_3h", "orders_today", "orders_previous_day", "orders_history"
-            ])
+            return pd.DataFrame(columns=empty_cols)
 
         current_naive = self.run_datetime_msk.replace(tzinfo=None)
         three_hours_ago = current_naive - timedelta(hours=3)
         today_d = self.run_datetime_msk.date()
         prev_d = today_d - timedelta(days=1)
+        week_start_d = get_week_start(datetime.combine(today_d, datetime.min.time())).date()
 
         by3 = all_rows[(all_rows["date"].notna()) & (all_rows["date"] >= three_hours_ago) & (all_rows["date"] <= current_naive)].copy()
         byt = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date == today_d)].copy()
         prev = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date == prev_d)].copy()
+        week = all_rows[(all_rows["date"].notna()) & (all_rows["date"].dt.date >= week_start_d) & (all_rows["date"].dt.date <= today_d)].copy()
         hist_prev_period = all_rows[(all_rows["date"].isna()) | ((all_rows["date"].notna()) & (all_rows["date"].dt.date < today_d))].copy()
 
-        sku_3h = self._agg_spp(by3, "spp_3h")
-        sku_today = self._agg_spp(byt, "spp_today")
-        sku_prev = self._agg_spp(prev, "spp_previous_day")
-        sku_hist = self._agg_spp(hist_prev_period, "spp_history")
+        sku_3h = self._agg_spp(by3, "spp_3h", ["nmID"], min_n, small_spread)
+        sku_today = self._agg_spp(byt, "spp_today", ["nmID"], min_n, small_spread)
+        sku_prev = self._agg_spp(prev, "spp_previous_day", ["nmID"], min_n, small_spread)
+        sku_week = self._agg_spp(week, "spp_week", ["nmID"], min_n, small_spread)
+        sku_hist = self._agg_spp(hist_prev_period, "spp_history", ["nmID"], min_n, small_spread)
+        group_week = self._agg_spp(week[week["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_week", ["spp_shade_group"], min_n, small_spread)
+        group_hist = self._agg_spp(hist_prev_period[hist_prev_period["spp_shade_group"].astype(str).str.strip() != ""].copy(), "spp_group_history", ["spp_shade_group"], min_n, small_spread)
 
-        base_ids = sorted(all_rows["nmID"].dropna().astype(int).unique())
-        base = pd.DataFrame({"nmID": base_ids})
+        base = all_rows[["nmID", "spp_shade_group"]].drop_duplicates(subset=["nmID"], keep="last").copy()
+        base = base.sort_values("nmID")
         out = (
             base
             .merge(sku_3h, on="nmID", how="left")
             .merge(sku_today, on="nmID", how="left")
             .merge(sku_prev, on="nmID", how="left")
+            .merge(sku_week, on="nmID", how="left")
             .merge(sku_hist, on="nmID", how="left")
         )
+        if not group_week.empty:
+            out = out.merge(group_week, on="spp_shade_group", how="left")
+        if not group_hist.empty:
+            out = out.merge(group_hist, on="spp_shade_group", how="left")
+
+        def safe_count(value: Any) -> int:
+            v = to_int_or_none(value)
+            return int(v) if v is not None else 0
 
         def choose(row):
-            n3 = int(row.get("orders_spp_3h") or 0)
-            n_prev = int(row.get("orders_spp_previous_day") or 0)
-            n_hist = int(row.get("orders_spp_history") or 0)
-
-            if pd.notna(row.get("avg_spp_spp_3h")) and n3 >= min_n:
-                return row.get("avg_spp_spp_3h"), "sku_3h_min10", "3h"
-            if pd.notna(row.get("avg_spp_spp_previous_day")) and n_prev >= min_n:
-                if n3 > 0 and n3 < min_n:
-                    return row.get("avg_spp_spp_previous_day"), "sku_previous_day_min10_after_low_3h", "previous_day"
-                return row.get("avg_spp_spp_previous_day"), "sku_previous_day_min10_no_3h", "previous_day"
-            if pd.notna(row.get("avg_spp_spp_history")) and n_hist >= min_n:
-                return row.get("avg_spp_spp_history"), "sku_history_min10", "history"
-            return None, "no_spp_min10", "none"
+            candidates = [
+                ("spp_3h", "sku_3h", "3h"),
+                ("spp_today", "sku_today", "today"),
+                ("spp_week", "sku_week", "week"),
+                # Если конкретный оттенок за неделю не набрал 10 продаж,
+                # используем группу оттенков текущей недели раньше старой истории SKU.
+                ("spp_group_week", "shade_group_week", "group_week"),
+                ("spp_previous_day", "sku_previous_day", "previous_day"),
+                ("spp_history", "sku_history", "history"),
+                ("spp_group_history", "shade_group_history", "group_history"),
+            ]
+            for suffix, source_prefix, period in candidates:
+                value = row.get(f"avg_spp_{suffix}")
+                cnt = safe_count(row.get(f"orders_{suffix}"))
+                if pd.notna(value) and cnt >= min_n:
+                    method = row.get(f"spp_calc_method_{suffix}") or "mean_ceil"
+                    return (
+                        value,
+                        f"{source_prefix}_{method}_min{min_n}",
+                        period,
+                        cnt,
+                        safe_count(row.get(f"spp_used_count_{suffix}")),
+                        row.get(f"spp_raw_mean_{suffix}"),
+                        row.get(f"spp_raw_min_{suffix}"),
+                        row.get(f"spp_raw_max_{suffix}"),
+                        row.get(f"spp_raw_spread_{suffix}"),
+                        row.get(f"spp_trimmed_mean_{suffix}"),
+                    )
+            return (None, f"no_spp_min{min_n}", "none", 0, 0, None, None, None, None, None)
 
         chosen = out.apply(choose, axis=1, result_type="expand")
         out["avg_spp"] = chosen[0]
         out["spp_source"] = chosen[1]
         out["spp_reference_period"] = chosen[2]
+        out["spp_sample_count"] = chosen[3]
+        out["spp_used_count"] = chosen[4]
+        out["spp_raw_mean"] = chosen[5]
+        out["spp_raw_min"] = chosen[6]
+        out["spp_raw_max"] = chosen[7]
+        out["spp_raw_spread"] = chosen[8]
+        out["spp_trimmed_mean"] = chosen[9]
         out["spp_sample_min"] = min_n
-        out["orders_3h"] = out.get("orders_spp_3h", 0).fillna(0).astype(int)
-        out["orders_today"] = out.get("orders_spp_today", 0).fillna(0).astype(int)
-        out["orders_previous_day"] = out.get("orders_spp_previous_day", 0).fillna(0).astype(int)
-        out["orders_history"] = out.get("orders_spp_history", 0).fillna(0).astype(int)
+        out["spp_calc_method"] = "effective_spp_mean_or_trim_above_mean_from_finishedPrice_priceWithDisc"
 
-        return out[[
-            "nmID", "avg_spp", "spp_source", "spp_reference_period", "spp_sample_min",
-            "orders_3h", "orders_today", "orders_previous_day", "orders_history"
-        ]]
+        for src_col, dst_col in [
+            ("orders_spp_3h", "orders_3h"),
+            ("orders_spp_today", "orders_today"),
+            ("orders_spp_previous_day", "orders_previous_day"),
+            ("orders_spp_week", "orders_week"),
+            ("orders_spp_history", "orders_history"),
+            ("orders_spp_group_week", "orders_group_week"),
+            ("orders_spp_group_history", "orders_group_history"),
+        ]:
+            if src_col in out.columns:
+                out[dst_col] = out[src_col].map(lambda x: to_int_or_none(x) or 0).astype(int)
+            else:
+                out[dst_col] = 0
+
+        return out[empty_cols]
 
     @staticmethod
-    def _agg_spp(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
-        if df.empty:
-            return pd.DataFrame(columns=["nmID", f"avg_spp_{suffix}", f"orders_{suffix}"])
-        g = df.groupby("nmID", as_index=False).agg(
-            **{
-                f"avg_spp_{suffix}": ("spp_num", "mean"),
-                f"orders_{suffix}": ("spp_num", "size"),
+    def _pick_article_for_shade_group(row: pd.Series) -> str:
+        for col in ["supplierArticle", "supplierArticle_ref", "article_1c", "vendorCode", "Артикул продавца", "Артикул 1С"]:
+            if col in row.index:
+                value = row.get(col)
+                if value is not None and str(value).strip() and str(value).lower() != "nan":
+                    return str(value)
+        return ""
+
+    @staticmethod
+    def _calc_spp_stat(values: pd.Series, min_n: int, small_spread: float) -> Dict[str, Any]:
+        vals = pd.Series(values).map(to_float_or_none).dropna().astype(float)
+        vals = vals[(vals >= 0) & (vals < 95)]
+        raw_count = int(len(vals))
+        if raw_count == 0:
+            return {
+                "value": None, "orders": 0, "used_count": 0, "method": "no_values",
+                "raw_mean": None, "raw_min": None, "raw_max": None, "raw_spread": None, "trimmed_mean": None,
             }
-        )
-        return g
+        raw_min = float(vals.min())
+        raw_max = float(vals.max())
+        raw_mean = float(vals.mean())
+        raw_spread = raw_max - raw_min
+        if raw_count < min_n:
+            # Значение всё равно считаем и выводим в диагностике, но choose не возьмёт период.
+            use_vals = vals
+            method = "diagnostic_low_sample"
+        elif raw_spread <= small_spread:
+            use_vals = vals
+            method = "mean_ceil_small_spread"
+        else:
+            use_vals = vals[vals <= raw_mean]
+            if use_vals.empty:
+                use_vals = vals
+            method = "trim_above_mean_mean_ceil"
+        trimmed_mean = float(use_vals.mean()) if len(use_vals) else None
+        value = int(math.ceil(trimmed_mean)) if trimmed_mean is not None and not math.isnan(trimmed_mean) else None
+        return {
+            "value": value,
+            "orders": raw_count,
+            "used_count": int(len(use_vals)),
+            "method": method,
+            "raw_mean": round(raw_mean, 4),
+            "raw_min": round(raw_min, 4),
+            "raw_max": round(raw_max, 4),
+            "raw_spread": round(raw_spread, 4),
+            "trimmed_mean": round(trimmed_mean, 4) if trimmed_mean is not None else None,
+        }
+
+    @classmethod
+    def _agg_spp(cls, df: pd.DataFrame, suffix: str, group_cols: Sequence[str], min_n: int, small_spread: float) -> pd.DataFrame:
+        cols = list(group_cols)
+        result_cols = cols + [
+            f"avg_spp_{suffix}", f"orders_{suffix}", f"spp_used_count_{suffix}", f"spp_calc_method_{suffix}",
+            f"spp_raw_mean_{suffix}", f"spp_raw_min_{suffix}", f"spp_raw_max_{suffix}",
+            f"spp_raw_spread_{suffix}", f"spp_trimmed_mean_{suffix}",
+        ]
+        if df.empty:
+            return pd.DataFrame(columns=result_cols)
+        rows = []
+        for key, sub in df.groupby(cols, dropna=False):
+            if not isinstance(key, tuple):
+                key = (key,)
+            stat = cls._calc_spp_stat(sub["spp_num"], min_n=min_n, small_spread=small_spread)
+            row = {col: val for col, val in zip(cols, key)}
+            row.update({
+                f"avg_spp_{suffix}": stat["value"],
+                f"orders_{suffix}": stat["orders"],
+                f"spp_used_count_{suffix}": stat["used_count"],
+                f"spp_calc_method_{suffix}": stat["method"],
+                f"spp_raw_mean_{suffix}": stat["raw_mean"],
+                f"spp_raw_min_{suffix}": stat["raw_min"],
+                f"spp_raw_max_{suffix}": stat["raw_max"],
+                f"spp_raw_spread_{suffix}": stat["raw_spread"],
+                f"spp_trimmed_mean_{suffix}": stat["trimmed_mean"],
+            })
+            rows.append(row)
+        return pd.DataFrame(rows, columns=result_cols)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
@@ -1476,7 +1756,7 @@ class WBPriceCorrector:
             calc.loc[missing, "spp_source"] = "global_history"
         return calc
 
-    def build_calculation(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, goods_df: pd.DataFrame, site_prices_df: pd.DataFrame, rrc_df: pd.DataFrame, ref_df: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
+    def build_calculation(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, current_week_orders: pd.DataFrame, goods_df: pd.DataFrame, site_prices_df: pd.DataFrame, rrc_df: pd.DataFrame, ref_df: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         # Универс товаров: текущие цены WB + справочник + РРЦ.
         if goods_df.empty:
             log("Текущие цены WB не получены; строю универс по справочнику Артикулы 1С", "WARN")
@@ -1557,7 +1837,7 @@ class WBPriceCorrector:
         calc["excluded_rrc_keyword"] = calc["rrc_name"].map(excluded_rrc_keyword) if "rrc_name" in calc.columns else ""
 
         # WB-скидка/SPP. Используем только SKU-уровень: 3h при выборке >= min_n, иначе предыдущий день/история.
-        spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
+        spp = self.build_spp_table(today_orders, previous_day_orders, current_week_orders, orders_history, ref_df)
         calc = calc.merge(spp, on="nmID", how="left")
 
         # Расчёт цен.
@@ -1619,12 +1899,15 @@ class WBPriceCorrector:
             "decision", "reason", "nmID", "supplierArticle_api", "supplierArticle_ref", "article_1c", "article_rrc",
             "subject", "subject_source", "rrc", "pricing_period", "target_factor", "target_finishedPrice",
             "price_calc_source", "site_final_price", "site_price_delta_to_target", "site_effective_spp",
-            "avg_spp", "spp_source",
+            "avg_spp", "spp_source", "spp_calc_method", "spp_shade_group",
+            "spp_sample_count", "spp_used_count", "spp_raw_mean", "spp_raw_min", "spp_raw_max",
+            "spp_raw_spread", "spp_trimmed_mean",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
             "current_wb_discounted_price", "old_priceWithDisc_calc",
             "target_priceWithDisc_site", "new_price_site", "target_priceWithDisc_orders_spp", "new_price_orders_spp",
             "delta_price", "delta_price_pct",
-            "orders_3h", "orders_today", "orders_previous_day", "orders_history", "spp_reference_period", "spp_sample_min",
+            "orders_3h", "orders_today", "orders_week", "orders_previous_day", "orders_history",
+            "orders_group_week", "orders_group_history", "spp_reference_period", "spp_sample_min",
             "site_price_source", "site_dest", "site_checked_at", "site_name",
             "name_api", "rrc_name", "excluded_by_rrc_name",
             "excluded_rrc_keyword", "currencyIsoCode4217",
@@ -1838,6 +2121,7 @@ class WBPriceCorrector:
             f"Старт корректировки цен: store={self.cfg.store}, apply={apply}, "
             f"target_factor={self.active_target_factor:.2f}, режим={self.active_pricing_period}, "
             f"min_spp_sample_orders={self.cfg.min_spp_sample_orders}, "
+            f"small_spp_spread_points={self.cfg.small_spp_spread_points}, "
             f"price_source={self.cfg.price_source}, site_dest={self.cfg.public_dest}, "
             f"время МСК={self.run_datetime_msk.strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -1853,9 +2137,10 @@ class WBPriceCorrector:
         goods_df = self.fetch_current_goods_prices()
         nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
         site_prices_df = self.fetch_public_site_prices(nmids_for_site)
+        current_week_orders = self.load_current_week_orders(today_orders, previous_day_orders)
         orders_history = self.load_recent_orders_history(today_orders, previous_day_orders)
 
-        calc = self.build_calculation(today_orders, previous_day_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
+        calc = self.build_calculation(today_orders, previous_day_orders, current_week_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
         send_df = calc[calc["decision"] == "send"].copy()
         log(f"Расчёт готов: всего={len(calc)}, к отправке={len(send_df)}, пропущено={len(calc) - len(send_df)}")
 
@@ -1908,6 +2193,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
     run_parser.add_argument("--fallback-days", type=int, default=DEFAULT_FALLBACK_DAYS, help="Сколько последних дней заказов читать для fallback SPP")
     run_parser.add_argument("--min-spp-sample-orders", type=int, default=DEFAULT_MIN_SPP_SAMPLE_ORDERS, help="Минимум заказов для использования SPP из периода")
+    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Разбег SPP в п.п., при котором считаем простую среднюю; выше — отсекаем значения выше среднего")
     run_parser.add_argument("--price-source", choices=["hybrid", "site", "orders-spp"], default=DEFAULT_PRICE_SOURCE, help="Источник расчёта: hybrid=сначала цена сайта, потом SPP; site=только цена сайта; orders-spp=только SPP из заказов")
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
@@ -1935,6 +2221,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
         args.fallback_days = DEFAULT_FALLBACK_DAYS
         args.min_spp_sample_orders = DEFAULT_MIN_SPP_SAMPLE_ORDERS
+        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.price_source = DEFAULT_PRICE_SOURCE
         args.public_dest = DEFAULT_PUBLIC_DEST
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
@@ -1975,6 +2262,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_price_change_pct=args.max_price_change_pct,
         fallback_days=args.fallback_days,
         min_spp_sample_orders=args.min_spp_sample_orders,
+        small_spp_spread_points=args.small_spp_spread_points,
         price_source=args.price_source,
         public_dest=args.public_dest,
         site_price_tolerance_rub=args.site_price_tolerance_rub,
