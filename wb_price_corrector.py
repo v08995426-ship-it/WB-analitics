@@ -1342,11 +1342,20 @@ class WBPriceCorrector:
 
     @staticmethod
     def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
+        cols = [
+            "spp_shade_group",
+            f"avg_spp_{suffix}",
+            f"orders_{suffix}",
+            f"group_mean_min_{suffix}",
+            f"group_mean_max_{suffix}",
+            f"group_mean_spread_{suffix}",
+            f"group_shades_count_{suffix}",
+        ]
         if df.empty or "spp_shade_group" not in df.columns:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return pd.DataFrame(columns=cols)
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return pd.DataFrame(columns=cols)
 
         shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
             shade_mean=("spp_num", "mean"),
@@ -1375,7 +1384,7 @@ class WBPriceCorrector:
                 f"group_mean_spread_{suffix}": mean_spread,
                 f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=cols)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
@@ -1837,8 +1846,13 @@ class WBPriceCorrector:
         rrc_df = self.load_rrc()
         ref_df = self.load_article_reference()
         goods_df = self.fetch_current_goods_prices()
-        nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
-        site_prices_df = self.fetch_public_site_prices(nmids_for_site)
+        price_source_norm = normalize_text(self.cfg.price_source or DEFAULT_PRICE_SOURCE)
+        if price_source_norm in {"hybrid", "site", "site-price", "public-site"}:
+            nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
+            site_prices_df = self.fetch_public_site_prices(nmids_for_site)
+        else:
+            log(f"Пропускаю получение цен сайта WB: price_source={self.cfg.price_source}")
+            site_prices_df = pd.DataFrame()
         orders_history = self.load_recent_orders_history(today_orders, previous_day_orders)
 
         calc = self.build_calculation(today_orders, previous_day_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
