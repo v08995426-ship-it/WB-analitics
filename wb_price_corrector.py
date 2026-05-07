@@ -1612,20 +1612,23 @@ class WBPriceCorrector:
 
         def choose(row):
             candidates = [
-                # Главный приоритет: общий SPP группы оттенков, если оттенки действительно близки.
-                # Это заставляет 501/5, 501/19 и прочие оттенки с одинаковым РРЦ считать одинаково.
+                # Главный приоритет: общий SPP группы оттенков за текущую неделю.
+                # Если группа стабильна по правилу <= 3 п.п. между оттенками, все оттенки
+                # 501/5, 501/14, 501/19 и т.д. получают один и тот же SPP.
                 ("spp_shade_consensus_week", "shade_group_week_max_if_spread_ok", "group_week_consensus"),
-                # Если группа отличается больше чем на 3 п.п. — consensus не создаётся, тогда SKU считаем отдельно.
-                ("spp_week", "sku_week", "week"),
+                # Если недельная группа не построилась из-за недостатка данных, но история
+                # показывает стабильность группы, сначала используем историю группы. Это
+                # важнее SKU-недельной выборки: иначе часть 501-х считается по SKU,
+                # а часть по группе, и цены расходятся.
                 ("spp_shade_consensus_history", "shade_group_history_max_if_spread_ok", "group_history_consensus"),
+                # Только если группа реально нестабильна или данных по группе нет — SKU отдельно.
+                ("spp_week", "sku_week", "week"),
                 ("spp_history", "sku_history", "history"),
                 ("spp_previous_day", "sku_previous_day", "previous_day"),
                 ("spp_today", "sku_today", "today"),
                 ("spp_3h", "sku_3h", "3h"),
-                # Старые групповые агрегаты оставлены последним запасным вариантом: если consensus не построился,
-                # но группа как единое распределение имеет достаточную выборку.
-                ("spp_group_week", "shade_group_week_distribution", "group_week"),
-                ("spp_group_history", "shade_group_history_distribution", "group_history"),
+                # Не используем старый group_distribution без проверки стабильности оттенков,
+                # потому что он может склеить группу даже при разбеге > 3 п.п.
             ]
             for suffix, source_prefix, period in candidates:
                 value = row.get(f"avg_spp_{suffix}")
@@ -1761,10 +1764,31 @@ class WBPriceCorrector:
             if shade_count == 0:
                 continue
 
-            means = by_nm["mean"].astype(float)
-            mean_min = float(means.min())
-            mean_max = float(means.max())
-            mean_spread = mean_max - mean_min
+            # Проверку "разница между оттенками <= 3 п.п." нельзя строить по оттенкам
+            # с 1-2 заказами: они дают шум и ломают консенсус группы. Поэтому для
+            # проверки разбега берём только оттенки с выборкой >= min_n. Если таких
+            # оттенков меньше двух, считаем группу стабильной при total_count >= min_n:
+            # это позволяет C-товарам использовать общий SPP группы.
+            stable_by_nm = by_nm[by_nm["count"] >= min_n].copy()
+            if len(stable_by_nm) >= 2:
+                means = stable_by_nm["mean"].astype(float)
+                mean_min = float(means.min())
+                mean_max = float(means.max())
+                mean_spread = mean_max - mean_min
+                spread_basis = "eligible_shades_ge_min"
+            elif len(stable_by_nm) == 1:
+                means = stable_by_nm["mean"].astype(float)
+                mean_min = float(means.min())
+                mean_max = float(means.max())
+                mean_spread = 0.0
+                spread_basis = "one_eligible_shade"
+            else:
+                means = by_nm["mean"].astype(float)
+                mean_min = float(means.min())
+                mean_max = float(means.max())
+                mean_spread = 0.0
+                spread_basis = "no_eligible_shades_total_group_sample"
+
             raw_mean = float(sub["spp_num"].mean())
             raw_min = float(sub["spp_num"].min())
             raw_max = float(sub["spp_num"].max())
@@ -1782,13 +1806,13 @@ class WBPriceCorrector:
                 value = int(math.ceil(raw_max))
                 method = "shade_group_raw_max_ceil"
                 used_count = total_count
-                rule = f"use_group_raw_max_mean_spread_le_{max_spread_between_shades:g}pp"
+                rule = f"use_group_raw_max_mean_spread_le_{max_spread_between_shades:g}pp_{spread_basis}"
                 trimmed_mean = raw_max
             else:
                 value = None
                 method = "shade_group_spread_gt_limit_skip"
                 used_count = 0
-                rule = f"skip_group_spread_gt_{max_spread_between_shades:g}pp"
+                rule = f"skip_group_spread_gt_{max_spread_between_shades:g}pp_{spread_basis}"
                 trimmed_mean = None
 
             rows.append({
