@@ -85,7 +85,7 @@ DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # меньше этого значения, в расчёте используется floor. 0 = отключить.
 # Рекомендованный аварийный режим: 45.
 DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT = float(os.environ.get("WB_SAFE_WB_DISCOUNT_FLOOR_PCT", "0") or 0)
-DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "1.5") or 0)
+DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "-1.5") or 0)
 DEFAULT_SMALL_SPP_SPREAD_POINTS = 3.0
 DEFAULT_USE_SAFE_FLOOR_FOR_MISSING = (os.environ.get("WB_USE_SAFE_FLOOR_FOR_MISSING", "false").strip().lower() in {"1", "true", "yes", "y", "да"})
 DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
@@ -1508,9 +1508,11 @@ class WBPriceCorrector:
         spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
         calc = calc.merge(spp, on="nmID", how="left")
 
-        # Калибровка SPP по фактической проверке сайта: добавляем +1.5 п.п.
-        # к найденному значению SPP. Применяется одинаково к SKU-SPP и к групповому
-        # SPP оттенков, поэтому 501-е и аналогичные группы остаются синхронизированы.
+        # Калибровка SPP по фактической проверке сайта.
+        # Если значение отрицательное, например -1.5, расчетный SPP уменьшается на 1.5 п.п.
+        # Это снижает базовую price в WB и, соответственно, финальную цену на сайте.
+        # Применяется одинаково к SKU-SPP и к групповому SPP оттенков,
+        # поэтому 501-е и аналогичные группы остаются синхронизированы.
         spp_adj = float(self.cfg.spp_adjustment_pct or 0)
         if abs(spp_adj) > 1e-9 and "avg_spp" in calc.columns:
             spp_mask = calc["avg_spp"].map(to_float_or_none).notna()
@@ -1912,7 +1914,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
     run_parser.add_argument("--safe-wb-discount-floor-pct", type=float, default=DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT, help="Консервативный floor WB-скидки/SPP для расчёта price. 0 = отключить")
-    run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию +1.5")
+    run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию -1.5: снижает расчетный SPP и базовую цену WB")
     run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Максимальный разбег среднего SPP между оттенками для склейки группы, п.п. По умолчанию 3")
     run_parser.add_argument("--use-safe-floor-for-missing", action="store_true", default=DEFAULT_USE_SAFE_FLOOR_FOR_MISSING, help="Если по товару нет достаточной выборки, использовать safe-wb-discount-floor-pct вместо пропуска")
     run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
