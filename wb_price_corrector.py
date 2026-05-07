@@ -86,7 +86,6 @@ DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # Рекомендованный аварийный режим: 45.
 DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT = float(os.environ.get("WB_SAFE_WB_DISCOUNT_FLOOR_PCT", "0") or 0)
 DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "-1.5") or 0)
-DEFAULT_SMALL_SPP_SPREAD_POINTS = 3.0
 DEFAULT_USE_SAFE_FLOOR_FOR_MISSING = (os.environ.get("WB_USE_SAFE_FLOOR_FOR_MISSING", "false").strip().lower() in {"1", "true", "yes", "y", "да"})
 DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
 DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = 80
@@ -582,7 +581,6 @@ class PriceCorrectorConfig:
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
     safe_wb_discount_floor_pct: float = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
     spp_adjustment_pct: float = DEFAULT_SPP_ADJUSTMENT_PCT
-    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     use_safe_floor_for_missing: bool = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
     allow_unknown_subject: bool = False
     update_weekly_orders: bool = False
@@ -1228,11 +1226,10 @@ class WBPriceCorrector:
         sku_prev = self._agg_spp(prev, "spp_previous_day")
         sku_hist = self._agg_spp(hist_prev_period, "spp_history")
 
-        spread_points = float(self.cfg.small_spp_spread_points or 0)
-        group_3h = self._agg_spp_group(by3, "group_3h", min_n, spread_points)
-        group_today = self._agg_spp_group(byt, "group_today", min_n, spread_points)
-        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n, spread_points)
-        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n, spread_points)
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
+        group_today = self._agg_spp_group(byt, "group_today", min_n)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
 
         nm_group = (
             all_rows[["nmID", "spp_shade_group"]]
@@ -1264,12 +1261,19 @@ class WBPriceCorrector:
                 return 0
 
         def choose(row):
-            # Сначала общий SPP группы оттенков. Это фиксирует одинаковую цену для оттенков
-            # вроде 501/5, 501/19 при одинаковом РРЦ, если разбег между оттенками <= 3 п.п.
+            # Приоритет: свежая группа оттенков -> свежий SKU -> историческая группа -> исторический SKU.
+            # Историю нельзя ставить выше вчерашней SKU-выборки: по 551 история дала завышенный SPP
+            # и цена сайта ушла выше цели. Если свежая группа не проходит правило разбега <= 3 п.п.,
+            # это как раз исключение, где корректнее брать конкретный оттенок за свежий период.
             ng3 = safe_int(row.get("orders_group_3h"))
             ngt = safe_int(row.get("orders_group_today"))
             ngprev = safe_int(row.get("orders_group_previous_day"))
             nghist = safe_int(row.get("orders_group_history"))
+
+            n3 = safe_int(row.get("orders_spp_3h"))
+            nt = safe_int(row.get("orders_spp_today"))
+            n_prev = safe_int(row.get("orders_spp_previous_day"))
+            n_hist = safe_int(row.get("orders_spp_history"))
 
             if pd.notna(row.get("avg_spp_group_3h")) and ng3 >= min_n:
                 return row.get("avg_spp_group_3h"), "shade_group_3h_raw_max", "group_3h"
@@ -1277,13 +1281,6 @@ class WBPriceCorrector:
                 return row.get("avg_spp_group_today"), "shade_group_today_raw_max", "group_today"
             if pd.notna(row.get("avg_spp_group_previous_day")) and ngprev >= min_n:
                 return row.get("avg_spp_group_previous_day"), "shade_group_previous_day_raw_max", "group_previous_day"
-            if pd.notna(row.get("avg_spp_group_history")) and nghist >= min_n:
-                return row.get("avg_spp_group_history"), "shade_group_history_raw_max", "group_history"
-
-            n3 = safe_int(row.get("orders_spp_3h"))
-            nt = safe_int(row.get("orders_spp_today"))
-            n_prev = safe_int(row.get("orders_spp_previous_day"))
-            n_hist = safe_int(row.get("orders_spp_history"))
 
             if pd.notna(row.get("avg_spp_spp_3h")) and n3 >= min_n:
                 return row.get("avg_spp_spp_3h"), "sku_3h_raw_max", "3h"
@@ -1291,6 +1288,9 @@ class WBPriceCorrector:
                 return row.get("avg_spp_spp_today"), "sku_today_raw_max", "today"
             if pd.notna(row.get("avg_spp_spp_previous_day")) and n_prev >= min_n:
                 return row.get("avg_spp_spp_previous_day"), "sku_previous_day_raw_max", "previous_day"
+
+            if pd.notna(row.get("avg_spp_group_history")) and nghist >= min_n:
+                return row.get("avg_spp_group_history"), "shade_group_history_raw_max", "group_history"
             if pd.notna(row.get("avg_spp_spp_history")) and n_hist >= min_n:
                 return row.get("avg_spp_spp_history"), "sku_history_raw_max", "history"
             return None, "no_spp_min10", "none"
@@ -1341,21 +1341,12 @@ class WBPriceCorrector:
         return g
 
     @staticmethod
-    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
-        cols = [
-            "spp_shade_group",
-            f"avg_spp_{suffix}",
-            f"orders_{suffix}",
-            f"group_mean_min_{suffix}",
-            f"group_mean_max_{suffix}",
-            f"group_mean_spread_{suffix}",
-            f"group_shades_count_{suffix}",
-        ]
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
         if df.empty or "spp_shade_group" not in df.columns:
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
 
         shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
             shade_mean=("spp_num", "mean"),
@@ -1372,8 +1363,8 @@ class WBPriceCorrector:
             mean_min = float(elig["shade_mean"].min())
             mean_max = float(elig["shade_mean"].max())
             mean_spread = mean_max - mean_min
-            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше лимита, по умолчанию 3 п.п.
-            if mean_spread > float(spread_points):
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
+            if mean_spread > 3.0:
                 continue
             rows.append({
                 "spp_shade_group": group,
@@ -1384,7 +1375,7 @@ class WBPriceCorrector:
                 f"group_mean_spread_{suffix}": mean_spread,
                 f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows, columns=cols)
+        return pd.DataFrame(rows)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
@@ -1508,11 +1499,9 @@ class WBPriceCorrector:
         spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
         calc = calc.merge(spp, on="nmID", how="left")
 
-        # Калибровка SPP по фактической проверке сайта.
-        # Если значение отрицательное, например -1.5, расчетный SPP уменьшается на 1.5 п.п.
-        # Это снижает базовую price в WB и, соответственно, финальную цену на сайте.
-        # Применяется одинаково к SKU-SPP и к групповому SPP оттенков,
-        # поэтому 501-е и аналогичные группы остаются синхронизированы.
+        # Калибровка SPP по фактической проверке сайта: добавляем +1.5 п.п.
+        # к найденному значению SPP. Применяется одинаково к SKU-SPP и к групповому
+        # SPP оттенков, поэтому 501-е и аналогичные группы остаются синхронизированы.
         spp_adj = float(self.cfg.spp_adjustment_pct or 0)
         if abs(spp_adj) > 1e-9 and "avg_spp" in calc.columns:
             spp_mask = calc["avg_spp"].map(to_float_or_none).notna()
@@ -1848,13 +1837,8 @@ class WBPriceCorrector:
         rrc_df = self.load_rrc()
         ref_df = self.load_article_reference()
         goods_df = self.fetch_current_goods_prices()
-        price_source_norm = normalize_text(self.cfg.price_source or DEFAULT_PRICE_SOURCE)
-        if price_source_norm in {"hybrid", "site", "site-price", "public-site"}:
-            nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
-            site_prices_df = self.fetch_public_site_prices(nmids_for_site)
-        else:
-            log(f"Пропускаю получение цен сайта WB: price_source={self.cfg.price_source}")
-            site_prices_df = pd.DataFrame()
+        nmids_for_site = goods_df["nmID"].dropna().astype(int).tolist() if not goods_df.empty and "nmID" in goods_df.columns else ref_df["nmID"].dropna().astype(int).tolist()
+        site_prices_df = self.fetch_public_site_prices(nmids_for_site)
         orders_history = self.load_recent_orders_history(today_orders, previous_day_orders)
 
         calc = self.build_calculation(today_orders, previous_day_orders, goods_df, site_prices_df, rrc_df, ref_df, orders_history)
@@ -1914,8 +1898,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
     run_parser.add_argument("--safe-wb-discount-floor-pct", type=float, default=DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT, help="Консервативный floor WB-скидки/SPP для расчёта price. 0 = отключить")
-    run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию -1.5: снижает расчетный SPP и базовую цену WB")
-    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Максимальный разбег среднего SPP между оттенками для склейки группы, п.п. По умолчанию 3")
+    run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию -1.5")
     run_parser.add_argument("--use-safe-floor-for-missing", action="store_true", default=DEFAULT_USE_SAFE_FLOOR_FOR_MISSING, help="Если по товару нет достаточной выборки, использовать safe-wb-discount-floor-pct вместо пропуска")
     run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
     run_parser.add_argument("--update-weekly-orders", action="store_true", help="Опционально обновлять сегодняшний день в обычном недельном файле заказов")
@@ -1946,7 +1929,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
         args.safe_wb_discount_floor_pct = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
         args.spp_adjustment_pct = DEFAULT_SPP_ADJUSTMENT_PCT
-        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.use_safe_floor_for_missing = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
         args.allow_unknown_subject = False
         args.update_weekly_orders = False
@@ -1990,7 +1972,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         site_price_tolerance_rub=args.site_price_tolerance_rub,
         safe_wb_discount_floor_pct=args.safe_wb_discount_floor_pct,
         spp_adjustment_pct=args.spp_adjustment_pct,
-        small_spp_spread_points=args.small_spp_spread_points,
         use_safe_floor_for_missing=args.use_safe_floor_for_missing,
         allow_unknown_subject=args.allow_unknown_subject,
         update_weekly_orders=args.update_weekly_orders,
