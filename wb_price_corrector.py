@@ -1344,11 +1344,21 @@ class WBPriceCorrector:
 
     @staticmethod
     def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, small_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
+        schema = [
+            "spp_shade_group",
+            f"avg_spp_{suffix}",
+            f"orders_{suffix}",
+            f"group_mean_min_{suffix}",
+            f"group_mean_max_{suffix}",
+            f"group_mean_spread_{suffix}",
+            f"group_shades_count_{suffix}",
+        ]
         if df.empty or "spp_shade_group" not in df.columns:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return pd.DataFrame(columns=schema)
+
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
         if tmp.empty:
-            return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
+            return pd.DataFrame(columns=schema)
 
         shade = tmp.groupby(["spp_shade_group", "nmID"], as_index=False).agg(
             shade_mean=("spp_num", "mean"),
@@ -1377,7 +1387,7 @@ class WBPriceCorrector:
                 f"group_mean_spread_{suffix}": mean_spread,
                 f"group_shades_count_{suffix}": int(elig["nmID"].nunique()),
             })
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=schema)
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """Для товаров без SKU-SPP добавляет fallback по subject/global."""
