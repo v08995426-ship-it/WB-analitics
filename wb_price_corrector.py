@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Корректировка цен Wildberries под целевую цену покупателя:
-- с 23:00 до 04:59 по Москве: РРЦ * 0.8;
-- с 05:00 до 22:59 по Москве: РРЦ * 0.9.
+Корректировка цен Wildberries под целевую цену покупателя = РРЦ * 0.9.
 
 Логика:
 - каждые 3 часа забирает заказы за сегодняшний день через statistics-api;
-- хранит оперативные заказы за сегодня и отдельный срез за предыдущий день;
 - считает средний SPP за последние 3 часа по nmID;
-- если по nmID нет SPP за последние 3 часа, в обычные запуски товар НЕ меняется;
-- в обязательные переходные запуски 23:00 и 05:00, если нет SPP за 3 часа, берётся средний SPP по этому nmID за предыдущий день;
+- если по nmID нет заказов за 3 часа, использует fallback: сегодня -> последние недельные файлы -> subject/global;
 - читает РРЦ из S3: Отчёты/Финансовые показатели/<STORE>/РРЦ.xlsx;
 - читает справочник артикулов 1С из S3;
 - исключает subject: Помады, Блески;
-- выбирает целевой коэффициент по московскому времени: ночь 0.8, день 0.9;
 - считает новую WB price при фиксированной скидке продавца 26%;
 - отправляет price + discount в /api/v2/upload/task только в режиме --apply;
 - в режиме --dry-run только сохраняет расчёт.
@@ -22,7 +17,7 @@
 Важно:
 - штатные недельные файлы "Отчёты/Заказы/..." по умолчанию НЕ перезаписываются,
   чтобы ежедневный сборщик не принял сегодняшний оперативный срез за закрытый день.
-- свежие заказы за сегодня и предыдущий день сохраняются в служебной папке корректировщика.
+- свежие заказы за сегодня сохраняются в служебной папке корректировщика.
 
 Переменные окружения:
 - YC_ACCESS_KEY_ID
@@ -34,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import io
 import json
 import math
@@ -44,7 +40,6 @@ import tempfile
 import time
 import traceback
 from collections import defaultdict
-from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -64,50 +59,20 @@ PRICES_LIST_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/g
 PRICE_UPLOAD_API_URL = "https://discounts-prices-api.wildberries.ru/api/v2/upload/task"
 
 DEFAULT_STORE = "TOPFACE"
-DEFAULT_DAY_TARGET_FACTOR = 0.90
-DEFAULT_NIGHT_TARGET_FACTOR = 0.80
-DEFAULT_NIGHT_START_HOUR = 23
-DEFAULT_NIGHT_END_HOUR = 5
-DEFAULT_TARGET_FACTOR = DEFAULT_DAY_TARGET_FACTOR  # legacy/fixed override value
+DEFAULT_TARGET_FACTOR = 0.90
+NIGHT_TARGET_FACTOR = 0.80
+DAY_TARGET_FACTOR = 0.90
 DEFAULT_SELLER_DISCOUNT = 26
 DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
 DEFAULT_FALLBACK_DAYS = 21
 
 EXCLUDED_SUBJECTS = {"помады", "блески"}
+EXCLUDED_RRC_NAME_KEYWORDS = [
+    "помада", "lipstick", "lip stick", "lip paint", "lip color", "lip colour",
+    "блеск", "lipgloss", "lip gloss", "lip booster", "gloss",
+]
 
-# Когда WB price API не отдаёт subject, запрещённые группы дополнительно определяем
-# по названию в файле РРЦ. Не используем общий признак "губ", потому что
-# карандаши для губ должны остаться в обработке.
-EXCLUDED_RRC_NAME_KEYWORDS = (
-    "помада",
-    "lipstick",
-    "lip stick",
-    "lip paint",
-    "lippaint",
-    "блеск для губ",
-    "блеск-бустер",
-    "блеск бустер",
-    "lipgloss",
-    "lip gloss",
-)
-
-
-def excluded_by_rrc_name(value: Any) -> bool:
-    text = normalize_text(value)
-    if not text:
-        return False
-    return any(k in text for k in EXCLUDED_RRC_NAME_KEYWORDS)
-
-
-def excluded_rrc_keyword(value: Any) -> str:
-    text = normalize_text(value)
-    if not text:
-        return ""
-    for k in EXCLUDED_RRC_NAME_KEYWORDS:
-        if k in text:
-            return k
-    return ""
 
 
 # ========================== S3 / Yandex Object Storage ==========================
@@ -281,14 +246,16 @@ def autofit_openpyxl(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame):
             values = [str(col)] + ["" if pd.isna(v) else str(v) for v in df[col].head(500).tolist()]
             width = min(max(max(len(v) for v in values) + 2, 10), 45)
             ws.column_dimensions[ws.cell(row=1, column=idx).column_letter].width = width
+        from openpyxl.styles import Font, Alignment
         for cell in ws[1]:
-            new_font = copy(cell.font)
-            new_font.bold = True
-            cell.font = new_font
-            new_alignment = copy(cell.alignment)
-            new_alignment.wrap_text = True
-            new_alignment.horizontal = "center"
-            cell.alignment = new_alignment
+            cell.font = Font(
+                name=cell.font.name, size=cell.font.sz, bold=True, italic=cell.font.italic,
+                vertAlign=cell.font.vertAlign, underline=cell.font.underline, strike=cell.font.strike,
+                color=cell.font.color, charset=cell.font.charset, family=cell.font.family,
+                scheme=cell.font.scheme, outline=cell.font.outline, shadow=cell.font.shadow,
+                condense=cell.font.condense, extend=cell.font.extend,
+            )
+            cell.alignment = Alignment(wrap_text=True, horizontal="center", vertical=cell.alignment.vertical)
     except Exception:
         pass
 
@@ -371,26 +338,69 @@ def get_weekly_orders_key(store: str, dt: datetime) -> str:
     return f"Отчёты/Заказы/{store}/Недельные/Заказы_{year}-W{week:02d}.xlsx"
 
 
+def determine_pricing_mode(dt: Optional[datetime] = None) -> Tuple[float, str]:
+    """Возвращает целевой коэффициент РРЦ по московскому времени."""
+    dt = dt or now_msk()
+    hour = int(dt.astimezone(MOSCOW_TZ).hour)
+    if hour >= 23 or hour < 5:
+        return NIGHT_TARGET_FACTOR, "night_23_to_05"
+    return DAY_TARGET_FACTOR, "day_05_to_23"
+
+
+def is_transition_hour(dt: Optional[datetime] = None) -> bool:
+    dt = dt or now_msk()
+    return int(dt.astimezone(MOSCOW_TZ).hour) in {5, 23}
+
+
+def normalize_orders_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Приводит разные выгрузки заказов к nmID/date/spp_num и убирает отмены."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "nmID" not in out.columns:
+        if "nmId" in out.columns:
+            out["nmID"] = out["nmId"]
+        elif "Артикул WB" in out.columns:
+            out["nmID"] = out["Артикул WB"]
+    if "nmID" not in out.columns:
+        return pd.DataFrame()
+    out["nmID"] = out["nmID"].map(to_int_or_none)
+    out = out[out["nmID"].notna()].copy()
+    out["nmID"] = out["nmID"].astype(int)
+    if "spp" not in out.columns:
+        out["spp"] = None
+    out["spp_num"] = out["spp"].map(to_float_or_none)
+    out = out[out["spp_num"].notna()].copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    else:
+        out["date"] = pd.NaT
+    if "isCancel" in out.columns:
+        out = out[~is_cancelled_series(out["isCancel"])].copy()
+    return out
+
+
+def contains_excluded_rrc_name(value: Any) -> Tuple[bool, str]:
+    text = normalize_text(value)
+    for kw in EXCLUDED_RRC_NAME_KEYWORDS:
+        if kw in text:
+            return True, kw
+    return False, ""
+
+
 # ========================== Price corrector ==========================
 
 @dataclass
 class PriceCorrectorConfig:
     store: str = DEFAULT_STORE
-    # Если target_factor задан явно, скрипт работает в фиксированном режиме.
-    # Если None — выбирает коэффициент автоматически по московскому времени:
-    # 23:00..04:59 => night_target_factor, 05:00..22:59 => day_target_factor.
     target_factor: Optional[float] = None
-    day_target_factor: float = DEFAULT_DAY_TARGET_FACTOR
-    night_target_factor: float = DEFAULT_NIGHT_TARGET_FACTOR
-    night_start_hour: int = DEFAULT_NIGHT_START_HOUR
-    night_end_hour: int = DEFAULT_NIGHT_END_HOUR
+    pricing_period: str = "auto"
     seller_discount: int = DEFAULT_SELLER_DISCOUNT
     price_tolerance_rub: int = DEFAULT_PRICE_TOLERANCE_RUB
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
     fallback_days: int = DEFAULT_FALLBACK_DAYS
-    allow_unknown_subject: bool = False
+    allow_unknown_subject: bool = True
     update_weekly_orders: bool = False
-    prev_day_fallback_on_switch: bool = True
 
 
 class WBPriceCorrector:
@@ -400,52 +410,6 @@ class WBPriceCorrector:
         self.cfg = cfg
         self.session = requests.Session()
         self.service_prefix = f"Служебные файлы/Корректировка цен/{self.cfg.store}"
-        self.run_datetime_msk = now_msk()
-        self.active_target_factor, self.active_pricing_period = self.get_active_target_factor(self.run_datetime_msk)
-        self.prev_day_spp_fallback_allowed = (
-            bool(self.cfg.prev_day_fallback_on_switch)
-            and self.is_price_switch_run(self.run_datetime_msk)
-        )
-
-    def get_active_target_factor(self, dt_msk: Optional[datetime] = None) -> Tuple[float, str]:
-        """
-        Возвращает целевой коэффициент к РРЦ для текущего московского времени.
-
-        Ночной режим действует с night_start_hour:00 включительно до
-        night_end_hour:00 НЕ включительно. При стандартных настройках:
-        23:00..04:59 => 0.8, 05:00..22:59 => 0.9.
-
-        Если --target-factor задан явно, автоматический график отключается.
-        """
-        if self.cfg.target_factor is not None:
-            return float(self.cfg.target_factor), "fixed_override"
-
-        dt_msk = dt_msk or now_msk()
-        hour = int(dt_msk.hour)
-        start = int(self.cfg.night_start_hour) % 24
-        end = int(self.cfg.night_end_hour) % 24
-
-        if start == end:
-            is_night = True
-        elif start < end:
-            is_night = start <= hour < end
-        else:
-            # Период через полночь: например 23..5.
-            is_night = hour >= start or hour < end
-
-        if is_night:
-            return float(self.cfg.night_target_factor), f"night_{start:02d}_to_{end:02d}"
-        return float(self.cfg.day_target_factor), f"day_{end:02d}_to_{start:02d}"
-
-    def is_price_switch_run(self, dt_msk: Optional[datetime] = None) -> bool:
-        """
-        Переходные запуски — часы, когда цена обязана переключиться между
-        ночным и дневным режимом. При стандартных настройках это 23:00 и 05:00 МСК.
-        Только в эти часы разрешаем fallback SPP на предыдущий день.
-        """
-        dt_msk = dt_msk or now_msk()
-        hour = int(dt_msk.hour)
-        return hour in {int(self.cfg.night_start_hour) % 24, int(self.cfg.night_end_hour) % 24}
 
     # ---------- API ----------
 
@@ -493,13 +457,25 @@ class WBPriceCorrector:
                 time.sleep(wait)
         return None
 
-    def fetch_today_orders(self) -> pd.DataFrame:
-        """Получает все заказы сегодняшнего дня. date сохраняется с временем."""
-        today_str = now_msk().strftime("%Y-%m-%d")
+    def fetch_orders_for_date(self, target_date: date, label: str = "") -> pd.DataFrame:
+        """Получает все заказы за конкретную дату через flag=1. date сохраняется с временем."""
+        # WB statistics orders API: персональный лимит часто 1 запрос/мин.
+        # Если в этом же запуске уже делали запрос заказов, выдерживаем паузу.
+        last_ts = getattr(self, "_last_orders_api_ts", None)
+        if last_ts is not None:
+            elapsed = time.time() - float(last_ts)
+            if elapsed < 65:
+                wait = int(math.ceil(65 - elapsed))
+                log(f"Пауза {wait} сек перед следующим запросом заказов WB", "INFO")
+                time.sleep(wait)
+
+        date_str = target_date.strftime("%Y-%m-%d")
         headers = {"Authorization": self.wb_key}
-        params = {"dateFrom": today_str, "flag": 1}
-        log(f"Загружаю заказы за сегодня: {today_str}, flag=1")
+        params = {"dateFrom": date_str, "flag": 1}
+        msg_label = f" ({label})" if label else ""
+        log(f"Загружаю заказы за дату: {date_str}{msg_label}, flag=1")
         resp = self._request_with_retry("GET", ORDERS_API_URL, headers=headers, params=params, rate_limit_wait_sec=65)
+        self._last_orders_api_ts = time.time()
         if resp is None:
             raise RuntimeError("Не удалось получить ответ от API заказов WB")
         if resp.status_code == 204:
@@ -516,6 +492,10 @@ class WBPriceCorrector:
         if "lastChangeDate" in df.columns:
             df["lastChangeDate"] = pd.to_datetime(df["lastChangeDate"], errors="coerce")
         return df
+
+    def fetch_today_orders(self) -> pd.DataFrame:
+        """Получает все заказы сегодняшнего дня. date сохраняется с временем."""
+        return self.fetch_orders_for_date(now_msk().date(), label="сегодня")
 
     def fetch_current_goods_prices(self) -> pd.DataFrame:
         """Получает текущие цены всех товаров продавца из Discounts & Prices API."""
@@ -669,127 +649,78 @@ class WBPriceCorrector:
 
     # ---------- Sources ----------
 
-    def _orders_snapshot_key_for_date(self, day: date) -> str:
-        return f"{self.service_prefix}/Оперативные заказы/Заказы_{day.strftime('%Y-%m-%d')}.xlsx"
-
     def save_today_orders_snapshot(self, orders_df: pd.DataFrame):
-        """
-        Сохраняет оперативный срез заказов за сегодня и не теряет вчерашний срез.
-
-        Важно для 05:00: если в последние 3 часа по товару нет заказов, скрипт
-        сможет взять средний SPP за предыдущий день и вернуть цену с РРЦ*0.8 на РРЦ*0.9.
-        """
-        self._roll_existing_today_snapshot_to_previous_day()
-
         today_d = now_msk().date()
-        key_today = f"{self.service_prefix}/Заказы_сегодня.xlsx"
-        key_dated = self._orders_snapshot_key_for_date(today_d)
-
-        self.s3.write_excel(key_today, orders_df, sheet_name="Заказы_сегодня")
-        self.s3.write_excel(key_dated, orders_df, sheet_name="Заказы")
+        key = f"{self.service_prefix}/Заказы_сегодня.xlsx"
+        self.s3.write_excel(key, orders_df, sheet_name="Заказы_сегодня")
+        archive_key = f"{self.service_prefix}/Архив/Заказы_{today_d.strftime('%Y-%m-%d')}.xlsx"
+        self.s3.write_excel(archive_key, orders_df, sheet_name="Заказы")
 
         if self.cfg.update_weekly_orders:
             self._upsert_today_into_weekly_orders(orders_df)
         else:
             log("Штатный недельный файл заказов не трогаю: update_weekly_orders=False")
 
-    def _roll_existing_today_snapshot_to_previous_day(self):
-        """
-        Перед перезаписью Заказы_сегодня.xlsx проверяет, не лежит ли там ещё вчерашний день.
-        Если лежит — копирует его в Заказы_предыдущий_день.xlsx и датированный архив.
-        """
-        key_today = f"{self.service_prefix}/Заказы_сегодня.xlsx"
-        if not self.s3.file_exists(key_today):
-            return
+    def save_previous_day_orders_snapshot(self, orders_df: pd.DataFrame, prev_day: date):
+        if orders_df is None:
+            orders_df = pd.DataFrame()
+        key_prev = f"{self.service_prefix}/Заказы_предыдущий_день.xlsx"
+        archive_key = f"{self.service_prefix}/Архив/Заказы_{prev_day.strftime('%Y-%m-%d')}.xlsx"
+        self.s3.write_excel(key_prev, orders_df, sheet_name="Заказы_предыдущий_день")
+        self.s3.write_excel(archive_key, orders_df, sheet_name="Заказы")
 
-        try:
-            old = self.s3.read_excel(key_today, sheet_name=0)
-        except Exception as e:
-            log(f"Не удалось прочитать прежний оперативный файл заказов: {e}", "WARN")
-            return
-
-        old = self._normalize_orders_frame(old)
-        if old.empty or "date" not in old.columns:
-            return
-
-        yesterday = now_msk().date() - timedelta(days=1)
-        old_dates = old["date"].dropna().dt.date
-        if old_dates.empty:
-            return
-
-        # Если файл полностью или последним срезом относится ко вчерашнему дню — сохраняем его.
-        if old_dates.max() == yesterday:
-            prev = old[old["date"].dt.date == yesterday].copy()
-            if prev.empty:
-                return
-            key_prev = f"{self.service_prefix}/Заказы_предыдущий_день.xlsx"
-            key_dated = self._orders_snapshot_key_for_date(yesterday)
-            self.s3.write_excel(key_prev, prev, sheet_name="Заказы_предыдущий_день")
-            self.s3.write_excel(key_dated, prev, sheet_name="Заказы")
-            log(f"Сохранён оперативный срез предыдущего дня: {yesterday}, строк={len(prev)}")
-
-    def load_previous_day_orders_snapshot(self) -> pd.DataFrame:
-        """Загружает сохранённый оперативный срез заказов за предыдущий день."""
-        yesterday = now_msk().date() - timedelta(days=1)
-        keys = [
-            self._orders_snapshot_key_for_date(yesterday),
-            f"{self.service_prefix}/Заказы_предыдущий_день.xlsx",
-        ]
-
-        for key in keys:
-            if not self.s3.file_exists(key):
-                continue
-            df = self.s3.read_excel(key, sheet_name=0)
-            df = self._normalize_orders_frame(df)
-            if df.empty or "date" not in df.columns:
-                continue
-            df = df[df["date"].dt.date == yesterday].copy()
-            if not df.empty:
-                log(f"Заказы предыдущего дня загружены: {yesterday}, строк={len(df)}, источник={key}")
-                return df
-
-        log(f"Оперативный срез заказов за предыдущий день не найден: {yesterday}", "WARN")
-        return pd.DataFrame()
-
-    def _normalize_orders_frame(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Стандартизирует заказы из API/Excel: nmID, date, spp."""
-        if df is None or df.empty:
+    def read_orders_snapshot(self, key: str) -> pd.DataFrame:
+        if not self.s3.file_exists(key):
             return pd.DataFrame()
-        out = df.copy()
+        df = self.s3.read_excel(key, sheet_name=0)
+        if not df.empty and "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        return df
 
-        if "nmID" not in out.columns:
-            if "nmId" in out.columns:
-                out["nmID"] = out["nmId"]
-            elif "Артикул WB" in out.columns:
-                out["nmID"] = out["Артикул WB"]
-        if "nmID" in out.columns:
-            out["nmID"] = out["nmID"].map(to_int_or_none)
+    def load_previous_day_orders(self, orders_history_hint: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        """Загружает предыдущий день: архив/служебный файл -> старый today snapshot -> API -> недельная история."""
+        prev_day = now_msk().date() - timedelta(days=1)
+        archive_key = f"{self.service_prefix}/Архив/Заказы_{prev_day.strftime('%Y-%m-%d')}.xlsx"
+        prev_key = f"{self.service_prefix}/Заказы_предыдущий_день.xlsx"
 
-        if "date" not in out.columns:
-            date_col = first_existing_col(out, ["Дата", "Дата заказа", "date", "lastChangeDate"])
-            if date_col:
-                out["date"] = out[date_col]
-        if "date" in out.columns:
-            out["date"] = pd.to_datetime(out["date"], errors="coerce")
-            try:
-                if getattr(out["date"].dt, "tz", None) is not None:
-                    out["date"] = out["date"].dt.tz_convert(MOSCOW_TZ).dt.tz_localize(None)
-            except Exception:
-                try:
-                    out["date"] = out["date"].dt.tz_localize(None)
-                except Exception:
-                    pass
+        for key, label in [(archive_key, "архив"), (prev_key, "служебный предыдущий день")]:
+            df = self.read_orders_snapshot(key)
+            if not df.empty and "date" in df.columns:
+                dates = pd.to_datetime(df["date"], errors="coerce").dt.date.dropna().unique()
+                if len(dates) and prev_day in set(dates):
+                    log(f"Предыдущий день загружен из S3 ({label}): {key}, строк={len(df)}")
+                    return df[pd.to_datetime(df["date"], errors="coerce").dt.date == prev_day].copy()
 
-        if "spp" not in out.columns:
-            spp_col = first_existing_col(out, ["spp", "СПП", "Скидка WB"])
-            if spp_col:
-                out["spp"] = out[spp_col]
+        # На первом запуске после смены дня файл Заказы_сегодня.xlsx мог быть ещё вчерашним.
+        today_key = f"{self.service_prefix}/Заказы_сегодня.xlsx"
+        old_today = self.read_orders_snapshot(today_key)
+        if not old_today.empty and "date" in old_today.columns:
+            old_dates = pd.to_datetime(old_today["date"], errors="coerce").dt.date.dropna().unique()
+            if len(old_dates) and set(old_dates) == {prev_day}:
+                log(f"Использую вчерашний Заказы_сегодня.xlsx как предыдущий день, строк={len(old_today)}")
+                self.save_previous_day_orders_snapshot(old_today, prev_day)
+                return old_today.copy()
 
-        if "nmID" in out.columns:
-            out = out[out["nmID"].notna()].copy()
-            if not out.empty:
-                out["nmID"] = out["nmID"].astype(int)
-        return out
+        # Если файла нет, добираем предыдущий день напрямую из WB API. Это критично для 05:00.
+        try:
+            prev_df = self.fetch_orders_for_date(prev_day, label="предыдущий день для SPP fallback")
+            log(f"Заказы предыдущего дня из API: строк={len(prev_df)}")
+            self.save_previous_day_orders_snapshot(prev_df, prev_day)
+            return prev_df
+        except Exception as e:
+            log(f"Не удалось получить предыдущий день из API: {e}", "WARN")
+
+        # Последний резерв — отфильтровать недельную историю, если она уже успела обновиться.
+        if orders_history_hint is not None and not orders_history_hint.empty and "date" in orders_history_hint.columns:
+            hist = orders_history_hint.copy()
+            hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
+            prev_hist = hist[hist["date"].dt.date == prev_day].copy()
+            if not prev_hist.empty:
+                log(f"Предыдущий день найден в недельной истории: строк={len(prev_hist)}")
+                self.save_previous_day_orders_snapshot(prev_hist, prev_day)
+                return prev_hist
+
+        return pd.DataFrame()
 
     def _upsert_today_into_weekly_orders(self, orders_df: pd.DataFrame):
         """Опционально обновляет сегодняшний день в обычном недельном файле заказов."""
@@ -882,14 +813,7 @@ class WBPriceCorrector:
         return out
 
     def load_recent_orders_history(self, today_orders: pd.DataFrame, previous_day_orders: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-        """
-        Берёт заказы из последних недельных файлов для определения subject и служебных проверок.
-
-        ВАЖНО: эта история больше не используется как общий fallback для SPP,
-        чтобы при отсутствии свежего SPP не менять цены вслепую. Для SPP разрешены:
-        - последние 3 часа;
-        - предыдущий день только в переходные запуски 23:00/05:00.
-        """
+        """Берёт заказы из последних недельных файлов + служебные snapshots для fallback по SPP и subject."""
         prefix = f"Отчёты/Заказы/{self.cfg.store}/Недельные/"
         keys = self.s3.list_files(prefix)
         keys = [k for k in keys if k.lower().endswith(".xlsx")]
@@ -898,24 +822,35 @@ class WBPriceCorrector:
         for key in keys:
             try:
                 df = self.s3.read_excel(key, sheet_name=0)
-                df = self._normalize_orders_frame(df)
                 if not df.empty:
                     frames.append(df)
             except Exception as e:
                 log(f"Не удалось прочитать недельный файл заказов {key}: {e}", "WARN")
         if previous_day_orders is not None and not previous_day_orders.empty:
-            frames.append(self._normalize_orders_frame(previous_day_orders))
+            frames.append(previous_day_orders)
         if not today_orders.empty:
-            frames.append(self._normalize_orders_frame(today_orders))
+            frames.append(today_orders)
         if not frames:
             return pd.DataFrame()
         hist = pd.concat(frames, ignore_index=True, sort=False)
-        hist = self._normalize_orders_frame(hist)
         if "date" in hist.columns:
+            hist["date"] = pd.to_datetime(hist["date"], errors="coerce")
             min_dt = now_msk().replace(tzinfo=None) - timedelta(days=self.cfg.fallback_days)
             hist = hist[(hist["date"].isna()) | (hist["date"] >= min_dt)].copy()
-        log(f"История заказов для subject/проверок: строк={len(hist)}")
+        if "nmId" in hist.columns and "nmID" not in hist.columns:
+            hist["nmID"] = hist["nmId"]
+        elif "nmID" not in hist.columns and "Артикул WB" in hist.columns:
+            hist["nmID"] = hist["Артикул WB"]
+        hist["nmID"] = hist["nmID"].map(to_int_or_none) if "nmID" in hist.columns else None
+        hist = hist[hist["nmID"].notna()].copy()
+        hist["nmID"] = hist["nmID"].astype(int)
+        if "srid" in hist.columns:
+            hist = hist.drop_duplicates(subset=["srid"], keep="last")
+        log(f"История заказов для fallback: строк={len(hist)}")
         return hist
+
+    # ---------- Calculations ----------
+    # ---------- Calculations ----------
 
     def build_subject_map(self, orders_history: pd.DataFrame, goods_df: pd.DataFrame) -> pd.DataFrame:
         rows = []
@@ -924,10 +859,8 @@ class WBPriceCorrector:
             if subj_col:
                 tmp = goods_df[["nmID", subj_col]].copy()
                 tmp.columns = ["nmID", "subject"]
-                tmp = tmp[tmp["subject"].notna() & (tmp["subject"].astype(str).str.strip() != "")].copy()
-                if not tmp.empty:
-                    tmp["subject_source"] = "prices_api"
-                    rows.append(tmp)
+                tmp["subject_source"] = "prices_api"
+                rows.append(tmp)
 
         if not orders_history.empty:
             subj_col = first_existing_col(orders_history, ["subject", "Предмет", "subjectName", "Название предмета"])
@@ -951,104 +884,87 @@ class WBPriceCorrector:
         out = out.sort_values(["nmID", "priority"]).drop_duplicates(subset=["nmID"], keep="first")
         return out.drop(columns=["priority"])
 
-    def build_spp_table(self, today_orders: pd.DataFrame, previous_day_orders: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    def build_spp_table(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
         """
-        Возвращает avg_spp по nmID.
+        Возвращает avg_spp по nmID с безопасным SKU-level fallback:
+        1) средний SPP за последние 3 часа;
+        2) если нет — средний SPP по этому же nmID за предыдущий день;
+        3) если нет — средний SPP по этому же nmID за последние fallback_days из недельной истории.
 
-        Правило безопасности:
-        - основной источник всегда последние 3 часа;
-        - если по SKU нет SPP за последние 3 часа, обычный запуск НЕ меняет цену;
-        - исключение: переходные часы 23:00 и 05:00. Там можно взять средний SPP
-          этого же SKU за предыдущий день, чтобы гарантированно переключить режим РРЦ*0.9 <-> РРЦ*0.8.
+        Subject/global fallback намеренно отключён: нельзя ставить цену товара по чужому SPP.
         """
-        today = self._normalize_orders_frame(today_orders)
-        prev = self._normalize_orders_frame(previous_day_orders) if previous_day_orders is not None else pd.DataFrame()
+        today = normalize_orders_frame(today_orders)
+        prev = normalize_orders_frame(previous_day_orders)
+        hist = normalize_orders_frame(orders_history)
 
-        frames = []
-        if not today.empty:
-            frames.append(today)
-        if not prev.empty:
-            frames.append(prev)
-        if not frames:
+        if today.empty and prev.empty and hist.empty:
             return pd.DataFrame(columns=[
-                "nmID", "avg_spp", "spp_source", "orders_3h", "orders_prev_day",
-                "spp_previous_day_fallback_allowed", "spp_reference_date"
+                "nmID", "avg_spp", "spp_source", "orders_3h", "orders_today",
+                "orders_prev_day", "orders_history", "spp_reference_date"
             ])
 
-        all_rows = pd.concat(frames, ignore_index=True, sort=False)
-        all_rows = self._normalize_orders_frame(all_rows)
-        if all_rows.empty:
-            return pd.DataFrame(columns=[
-                "nmID", "avg_spp", "spp_source", "orders_3h", "orders_prev_day",
-                "spp_previous_day_fallback_allowed", "spp_reference_date"
-            ])
-
-        if "spp" not in all_rows.columns:
-            all_rows["spp"] = None
-        all_rows["spp_num"] = all_rows["spp"].map(to_float_or_none)
-        all_rows = all_rows[all_rows["spp_num"].notna()].copy()
-
-        if "date" not in all_rows.columns:
-            all_rows["date"] = pd.NaT
-        else:
-            all_rows["date"] = pd.to_datetime(all_rows["date"], errors="coerce")
-
-        if "isCancel" in all_rows.columns:
-            all_rows = all_rows[~is_cancelled_series(all_rows["isCancel"])].copy()
-
-        if all_rows.empty:
-            return pd.DataFrame(columns=[
-                "nmID", "avg_spp", "spp_source", "orders_3h", "orders_prev_day",
-                "spp_previous_day_fallback_allowed", "spp_reference_date"
-            ])
-
-        current_naive = self.run_datetime_msk.replace(tzinfo=None)
+        current_naive = now_msk().replace(tzinfo=None)
         three_hours_ago = current_naive - timedelta(hours=3)
-        yesterday = self.run_datetime_msk.date() - timedelta(days=1)
+        today_d = now_msk().date()
+        prev_d = today_d - timedelta(days=1)
 
-        by3 = all_rows[
-            (all_rows["date"].notna())
-            & (all_rows["date"] >= three_hours_ago)
-            & (all_rows["date"] <= current_naive + timedelta(minutes=10))
-        ].copy()
+        by3 = today[(today["date"].notna()) & (today["date"] >= three_hours_ago)].copy() if not today.empty else pd.DataFrame()
+        byt = today[(today["date"].notna()) & (today["date"].dt.date == today_d)].copy() if not today.empty else pd.DataFrame()
+        by_prev = prev[(prev["date"].notna()) & (prev["date"].dt.date == prev_d)].copy() if not prev.empty else pd.DataFrame()
 
-        prev_day = all_rows[
-            (all_rows["date"].notna())
-            & (all_rows["date"].dt.date == yesterday)
-        ].copy()
+        # История: последние fallback_days, но без сегодняшнего дня, чтобы она не подменяла 3h.
+        if not hist.empty and "date" in hist.columns:
+            hist_for_fallback = hist[(hist["date"].isna()) | (hist["date"].dt.date < today_d)].copy()
+        else:
+            hist_for_fallback = hist.copy()
 
         sku_3h = self._agg_spp(by3, "spp_3h")
-        sku_prev_day = self._agg_spp(prev_day, "spp_prev_day")
+        sku_today = self._agg_spp(byt, "spp_today")
+        sku_prev = self._agg_spp(by_prev, "spp_prev_day")
+        sku_hist = self._agg_spp(hist_for_fallback, "spp_history")
 
-        nm_values = set(all_rows["nmID"].dropna().astype(int).unique())
-        base = pd.DataFrame({"nmID": sorted(nm_values)})
-        out = base.merge(sku_3h, on="nmID", how="left").merge(sku_prev_day, on="nmID", how="left")
-
-        allow_prev = bool(self.prev_day_spp_fallback_allowed)
+        ids = set()
+        for part in [today, prev, hist]:
+            if not part.empty and "nmID" in part.columns:
+                ids.update(part["nmID"].dropna().astype(int).tolist())
+        base = pd.DataFrame({"nmID": sorted(ids)})
+        out = base.merge(sku_3h, on="nmID", how="left")
+        out = out.merge(sku_today, on="nmID", how="left")
+        out = out.merge(sku_prev, on="nmID", how="left")
+        out = out.merge(sku_hist, on="nmID", how="left")
 
         def choose(row):
             if pd.notna(row.get("avg_spp_spp_3h")):
-                return row.get("avg_spp_spp_3h"), "sku_3h", self.run_datetime_msk.strftime("%Y-%m-%d")
-            if allow_prev and pd.notna(row.get("avg_spp_spp_prev_day")):
-                return row.get("avg_spp_spp_prev_day"), "sku_prev_day_switch_fallback", yesterday.strftime("%Y-%m-%d")
+                return row.get("avg_spp_spp_3h"), "sku_3h", today_d.strftime("%Y-%m-%d")
+            if pd.notna(row.get("avg_spp_spp_prev_day")):
+                return row.get("avg_spp_spp_prev_day"), "sku_previous_day", prev_d.strftime("%Y-%m-%d")
+            if pd.notna(row.get("avg_spp_spp_history")):
+                return row.get("avg_spp_spp_history"), "sku_history", f"last_{self.cfg.fallback_days}_days"
             return None, "no_spp", ""
 
         chosen = out.apply(choose, axis=1, result_type="expand")
         out["avg_spp"] = chosen[0]
         out["spp_source"] = chosen[1]
         out["spp_reference_date"] = chosen[2]
-        out["orders_3h"] = out.get("orders_spp_3h", 0).fillna(0).astype(int)
-        out["orders_prev_day"] = out.get("orders_spp_prev_day", 0).fillna(0).astype(int)
-        out["spp_previous_day_fallback_allowed"] = allow_prev
+        for out_col, src_col in [
+            ("orders_3h", "orders_spp_3h"),
+            ("orders_today", "orders_spp_today"),
+            ("orders_prev_day", "orders_spp_prev_day"),
+            ("orders_history", "orders_spp_history"),
+        ]:
+            if src_col in out.columns:
+                out[out_col] = pd.to_numeric(out[src_col], errors="coerce").fillna(0).astype(int)
+            else:
+                out[out_col] = 0
 
         return out[[
-            "nmID", "avg_spp", "spp_source", "orders_3h", "orders_prev_day",
-            "spp_previous_day_fallback_allowed", "spp_reference_date"
+            "nmID", "avg_spp", "spp_source", "orders_3h", "orders_today",
+            "orders_prev_day", "orders_history", "spp_reference_date"
         ]]
 
     @staticmethod
     def _agg_spp(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame(columns=["nmID", f"avg_spp_{suffix}", f"orders_{suffix}"])
         g = df.groupby("nmID", as_index=False).agg(
             **{
@@ -1059,41 +975,7 @@ class WBPriceCorrector:
         return g
 
     def add_subject_and_global_spp_fallback(self, calc: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
-        """Для товаров без SKU-SPP добавляет fallback по subject/global."""
-        if calc.empty or orders_history.empty:
-            return calc
-        if "spp" not in orders_history.columns:
-            return calc
-
-        hist = orders_history.copy()
-        if "nmID" not in hist.columns and "nmId" in hist.columns:
-            hist["nmID"] = hist["nmId"]
-        hist["spp_num"] = hist["spp"].map(to_float_or_none)
-        hist = hist[hist["spp_num"].notna()].copy()
-        if "isCancel" in hist.columns:
-            hist = hist[~is_cancelled_series(hist["isCancel"])].copy()
-        subj_col = first_existing_col(hist, ["subject", "Предмет", "subjectName", "Название предмета"])
-        if subj_col:
-            hist["subject_norm"] = hist[subj_col].map(normalize_text)
-            subject_spp = hist.groupby("subject_norm", as_index=False).agg(
-                avg_spp_subject=("spp_num", "mean"),
-                orders_subject=("spp_num", "size"),
-            )
-            calc = calc.merge(subject_spp, on="subject_norm", how="left")
-        else:
-            calc["avg_spp_subject"] = None
-            calc["orders_subject"] = 0
-
-        global_spp = hist["spp_num"].mean() if not hist.empty else None
-        missing = calc["avg_spp"].isna()
-        use_subject = missing & calc["avg_spp_subject"].notna()
-        calc.loc[use_subject, "avg_spp"] = calc.loc[use_subject, "avg_spp_subject"]
-        calc.loc[use_subject, "spp_source"] = "subject_history"
-
-        missing = calc["avg_spp"].isna()
-        if global_spp is not None and not math.isnan(float(global_spp)):
-            calc.loc[missing, "avg_spp"] = float(global_spp)
-            calc.loc[missing, "spp_source"] = "global_history"
+        """Оставлено для совместимости, но не используется: цены нельзя считать по чужому subject/global SPP."""
         return calc
 
     def build_calculation(self, today_orders: pd.DataFrame, previous_day_orders: pd.DataFrame, goods_df: pd.DataFrame, rrc_df: pd.DataFrame, ref_df: pd.DataFrame, orders_history: pd.DataFrame) -> pd.DataFrame:
@@ -1152,29 +1034,26 @@ class WBPriceCorrector:
         # Если subject из goods API есть, а subject_map не дал, используем API.
         if "subject_api" in calc.columns:
             empty_subject = calc["subject"].isna() | (calc["subject"].astype(str).str.strip() == "")
-            api_subject_present = calc["subject_api"].notna() & (calc["subject_api"].astype(str).str.strip() != "")
-            fill_from_api = empty_subject & api_subject_present
-            calc.loc[fill_from_api, "subject"] = calc.loc[fill_from_api, "subject_api"]
-            if "subject_source" in calc.columns:
-                calc.loc[fill_from_api, "subject_source"] = "prices_api"
+            calc.loc[empty_subject, "subject"] = calc.loc[empty_subject, "subject_api"]
             calc["subject_norm"] = calc["subject"].map(normalize_text)
 
-        # Если subject всё равно неизвестен, не блокируем товар автоматически:
-        # помады/блески дополнительно отсекаются по названию из РРЦ.
-        calc["excluded_by_rrc_name"] = calc["rrc_name"].map(excluded_by_rrc_name) if "rrc_name" in calc.columns else False
-        calc["excluded_rrc_keyword"] = calc["rrc_name"].map(excluded_rrc_keyword) if "rrc_name" in calc.columns else ""
-
         # SPP.
-        # Не используем общий fallback на историю/subject/global: если нет свежего SPP,
-        # товар не меняем. Исключение только для 23:00/05:00 — средний SPP за предыдущий день.
-        spp = self.build_spp_table(today_orders, previous_day_orders)
+        spp = self.build_spp_table(today_orders, previous_day_orders, orders_history)
         calc = calc.merge(spp, on="nmID", how="left")
 
+        # Исключения по названию РРЦ: защищает Помады/Блески, если subject пустой или неверный.
+        excl = calc["rrc_name"].apply(contains_excluded_rrc_name) if "rrc_name" in calc.columns else []
+        if len(excl):
+            calc["excluded_by_rrc_name"] = [x[0] for x in excl]
+            calc["excluded_rrc_keyword"] = [x[1] for x in excl]
+        else:
+            calc["excluded_by_rrc_name"] = False
+            calc["excluded_rrc_keyword"] = ""
+
         # Расчёт цен.
-        target_factor = self.active_target_factor
-        calc["pricing_period"] = self.active_pricing_period
-        calc["target_factor"] = target_factor
-        calc["target_finishedPrice"] = calc["rrc"].apply(lambda x: int(round(float(x) * target_factor)) if pd.notna(x) else None)
+        calc["pricing_period"] = self.cfg.pricing_period
+        calc["target_factor"] = float(self.cfg.target_factor)
+        calc["target_finishedPrice"] = calc["rrc"].apply(lambda x: int(round(float(x) * self.cfg.target_factor)) if pd.notna(x) else None)
         calc["new_discount"] = int(self.cfg.seller_discount)
         calc["target_priceWithDisc"] = calc.apply(self._calc_target_price_with_disc, axis=1)
         calc["new_price"] = calc.apply(self._calc_new_price, axis=1)
@@ -1195,9 +1074,8 @@ class WBPriceCorrector:
             "subject", "subject_source", "rrc", "pricing_period", "target_factor", "target_finishedPrice", "avg_spp", "spp_source",
             "target_priceWithDisc", "new_price", "new_discount", "current_wb_price", "current_wb_discount",
             "current_wb_discounted_price", "old_priceWithDisc_calc", "delta_price", "delta_price_pct",
-            "orders_3h", "orders_prev_day", "spp_previous_day_fallback_allowed", "spp_reference_date",
-            "name_api", "rrc_name", "excluded_by_rrc_name",
-            "excluded_rrc_keyword", "currencyIsoCode4217",
+            "orders_3h", "orders_today", "orders_prev_day", "orders_history", "spp_reference_date",
+            "name_api", "rrc_name", "excluded_by_rrc_name", "excluded_rrc_keyword", "currencyIsoCode4217",
         ]
         existing = [c for c in columns_order if c in calc.columns]
         rest = [c for c in calc.columns if c not in existing]
@@ -1257,28 +1135,19 @@ class WBPriceCorrector:
             if rrc is None or rrc <= 0:
                 decision = "skip"
                 reason_parts.append("нет РРЦ")
-            excluded_by_name = bool(r.get("excluded_by_rrc_name")) or excluded_by_rrc_name(r.get("rrc_name")) or excluded_by_rrc_name(r.get("name_api"))
-            excluded_keyword = str(r.get("excluded_rrc_keyword") or excluded_rrc_keyword(r.get("rrc_name")) or excluded_rrc_keyword(r.get("name_api")) or "")
-
-            if subject_norm in EXCLUDED_SUBJECTS:
+            if bool(r.get("excluded_by_rrc_name")):
                 decision = "skip"
-                reason_parts.append("исключённый subject: Помады/Блески")
-            elif excluded_by_name:
-                decision = "skip"
-                if excluded_keyword:
-                    reason_parts.append(f"исключено по названию РРЦ/товара: {excluded_keyword}")
-                else:
-                    reason_parts.append("исключено по названию РРЦ/товара: Помады/Блески")
-            elif not subject_norm:
-                # WB price API часто не отдаёт subject. Если РРЦ есть и название не похоже
-                # на помаду/блеск, товар можно корректировать: иначе весь прайс-лист будет пропущен.
-                if rrc is None or rrc <= 0:
+                kw = r.get("excluded_rrc_keyword") or ""
+                reason_parts.append(f"исключено по названию РРЦ: Помады/Блески ({kw})")
+            if not subject_norm:
+                if not self.cfg.allow_unknown_subject:
                     decision = "skip"
                     reason_parts.append("неизвестный subject")
-                elif not self.cfg.allow_unknown_subject:
-                    reason_parts.append("subject неизвестен, разрешено по РРЦ: не Помады/Блески")
                 else:
-                    reason_parts.append("subject неизвестен, но разрешён параметром")
+                    reason_parts.append("subject неизвестен, но есть РРЦ; разрешено")
+            elif subject_norm in EXCLUDED_SUBJECTS:
+                decision = "skip"
+                reason_parts.append("исключённый subject: Помады/Блески")
             if spp is None or spp < 0 or spp >= 95:
                 decision = "skip"
                 reason_parts.append("нет корректного SPP")
@@ -1307,9 +1176,7 @@ class WBPriceCorrector:
                     reason_parts.append(f"изменение price {delta_pct}% больше лимита {self.cfg.max_price_change_pct}%")
 
             if decision == "send":
-                factor = to_float_or_none(r.get("target_factor")) or self.active_target_factor
-                period = str(r.get("pricing_period") or self.active_pricing_period)
-                reason_parts.append(f"РРЦ*{factor:.2f}, режим={period}, discount={self.cfg.seller_discount}%, SPP={spp:.2f}%")
+                reason_parts.append(f"РРЦ*{float(self.cfg.target_factor):.2f}, режим={self.cfg.pricing_period}, discount={self.cfg.seller_discount}%, SPP={spp:.2f}%")
 
             decisions.append(decision)
             reasons.append("; ".join(reason_parts))
@@ -1358,22 +1225,26 @@ class WBPriceCorrector:
             self.s3.write_excel(hist_key, hist_combined, sheet_name="История")
 
     def run(self, apply: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if self.cfg.target_factor is None:
+            factor, period = determine_pricing_mode(now_msk())
+            self.cfg.target_factor = factor
+            self.cfg.pricing_period = period
+        else:
+            self.cfg.target_factor = float(self.cfg.target_factor)
+            self.cfg.pricing_period = self.cfg.pricing_period or "manual"
+
         log(
             f"Старт корректировки цен: store={self.cfg.store}, apply={apply}, "
-            f"target_factor={self.active_target_factor:.2f}, режим={self.active_pricing_period}, "
-            f"prev_day_spp_fallback_allowed={self.prev_day_spp_fallback_allowed}, "
-            f"время МСК={self.run_datetime_msk.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"target_factor={float(self.cfg.target_factor):.2f}, режим={self.cfg.pricing_period}"
         )
 
         today_orders = self.fetch_today_orders()
         log(f"Заказы сегодня: строк={len(today_orders)}")
         self.save_today_orders_snapshot(today_orders)
 
-        previous_day_orders = self.load_previous_day_orders_snapshot()
-        if self.prev_day_spp_fallback_allowed:
-            log("SPP fallback: переходный запуск 23:00/05:00 — при отсутствии 3h SPP разрешён средний SPP за предыдущий день")
-        else:
-            log("SPP fallback: обычный запуск — если нет SPP за последние 3 часа, товар не меняем")
+        # Предыдущий день нужен как обязательный SKU-level fallback, особенно в 05:00 при возврате РРЦ*0.9.
+        previous_day_orders = self.load_previous_day_orders()
+        log(f"Заказы предыдущего дня для fallback SPP: строк={len(previous_day_orders)}")
 
         rrc_df = self.load_rrc()
         ref_df = self.load_article_reference()
@@ -1415,7 +1286,7 @@ def build_s3_from_env() -> S3Storage:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WB price corrector: day РРЦ*0.9, night 23:00-04:59 МСК РРЦ*0.8")
+    parser = argparse.ArgumentParser(description="WB price corrector: target finishedPrice = РРЦ * 0.8 ночью / РРЦ * 0.9 днем")
     sub = parser.add_subparsers(dest="command")
 
     run_parser = sub.add_parser("run", help="Сделать расчёт и при --apply отправить цены в WB")
@@ -1423,18 +1294,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     mode = run_parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="Отправить изменения цен в WB")
     mode.add_argument("--dry-run", action="store_true", help="Только расчёт без отправки")
-    run_parser.add_argument("--target-factor", type=float, default=None, help="Фиксированный коэффициент к РРЦ. Если не задан, работает график: 23:00-04:59 МСК = 0.8, остальное время = 0.9")
-    run_parser.add_argument("--day-target-factor", type=float, default=DEFAULT_DAY_TARGET_FACTOR, help="Дневной коэффициент к РРЦ, по умолчанию 0.9")
-    run_parser.add_argument("--night-target-factor", type=float, default=DEFAULT_NIGHT_TARGET_FACTOR, help="Ночной коэффициент к РРЦ, по умолчанию 0.8")
-    run_parser.add_argument("--night-start-hour", type=int, default=DEFAULT_NIGHT_START_HOUR, help="Час начала ночного режима по Москве, по умолчанию 23")
-    run_parser.add_argument("--night-end-hour", type=int, default=DEFAULT_NIGHT_END_HOUR, help="Час окончания ночного режима по Москве, по умолчанию 5; в 05:00 уже дневной коэффициент")
+    run_parser.add_argument("--target-factor", type=float, default=None, help="Целевой коэффициент к РРЦ. Если не указан: 23:00-04:59 МСК = 0.8, иначе 0.9")
     run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца, %, по умолчанию 26")
     run_parser.add_argument("--price-tolerance-rub", type=int, default=DEFAULT_PRICE_TOLERANCE_RUB, help="Не отправлять, если отличие price <= N рублей")
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
     run_parser.add_argument("--fallback-days", type=int, default=DEFAULT_FALLBACK_DAYS, help="Сколько последних дней заказов читать для fallback SPP")
-    run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
+    run_parser.add_argument("--allow-unknown-subject", action="store_true", default=True, help="Разрешить менять товары без известного subject (по умолчанию включено; помады/блески режутся по subject и названию РРЦ)")
     run_parser.add_argument("--update-weekly-orders", action="store_true", help="Опционально обновлять сегодняшний день в обычном недельном файле заказов")
-    run_parser.add_argument("--disable-prev-day-fallback-on-switch", action="store_true", help="Отключить fallback SPP на предыдущий день в переходные часы 23:00/05:00")
 
     # Удобство: если запустили без команды — ведём как run --dry-run.
     args = parser.parse_args(argv)
@@ -1444,17 +1310,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.apply = False
         args.dry_run = True
         args.target_factor = None
-        args.day_target_factor = DEFAULT_DAY_TARGET_FACTOR
-        args.night_target_factor = DEFAULT_NIGHT_TARGET_FACTOR
-        args.night_start_hour = DEFAULT_NIGHT_START_HOUR
-        args.night_end_hour = DEFAULT_NIGHT_END_HOUR
         args.seller_discount = DEFAULT_SELLER_DISCOUNT
         args.price_tolerance_rub = DEFAULT_PRICE_TOLERANCE_RUB
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
         args.fallback_days = DEFAULT_FALLBACK_DAYS
-        args.allow_unknown_subject = False
+        args.allow_unknown_subject = True
         args.update_weekly_orders = False
-        args.disable_prev_day_fallback_on_switch = False
     return args
 
 
@@ -1467,17 +1328,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg = PriceCorrectorConfig(
         store=args.store,
         target_factor=args.target_factor,
-        day_target_factor=args.day_target_factor,
-        night_target_factor=args.night_target_factor,
-        night_start_hour=args.night_start_hour,
-        night_end_hour=args.night_end_hour,
         seller_discount=args.seller_discount,
         price_tolerance_rub=args.price_tolerance_rub,
         max_price_change_pct=args.max_price_change_pct,
         fallback_days=args.fallback_days,
         allow_unknown_subject=args.allow_unknown_subject,
         update_weekly_orders=args.update_weekly_orders,
-        prev_day_fallback_on_switch=not args.disable_prev_day_fallback_on_switch,
     )
     corrector = WBPriceCorrector(s3=s3, wb_key=os.environ["WB_PROMO_KEY_TOPFACE"], cfg=cfg)
     apply_changes = bool(args.apply)
