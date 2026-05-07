@@ -10,7 +10,7 @@
 - забирает заказы за сегодняшний и предыдущий день через statistics-api;
 - SPP считает самостоятельно по строкам заказов: (1 - finishedPrice / priceWithDisc) * 100;
 - базовый SPP берёт как spp_raw_max, округлённый вверх;
-- к найденному SPP добавляет поправку +1.5 п.п. по умолчанию;
+- к найденному SPP добавляет поправку -1.5 п.п. по умолчанию;
 - для оттенков одной группы, например 501/5 и 501/19, сначала пытается использовать общий SPP группы;
 - group fallback применяется только если средний SPP между оттенками отличается не больше чем на 3 п.п.;
 - если по товару/группе меньше 10 значений SPP, период не используется.
@@ -79,6 +79,7 @@ DEFAULT_PRICE_TOLERANCE_RUB = 1
 DEFAULT_MAX_PRICE_CHANGE_PCT = 80.0  # 0 = отключить ограничение
 DEFAULT_FALLBACK_DAYS = 21
 DEFAULT_MIN_SPP_SAMPLE_ORDERS = 10
+DEFAULT_SMALL_SPP_SPREAD_POINTS = float(os.environ.get("WB_SMALL_SPP_SPREAD_POINTS", "3") or 3)
 DEFAULT_PRICE_SOURCE = "orders-spp"  # боевой режим: считаем по заказам, сайт WB не используем
 DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # Экстренная защита от занижения: если фактическая WB-скидка/SPP из заказов
@@ -576,6 +577,7 @@ class PriceCorrectorConfig:
     max_price_change_pct: float = DEFAULT_MAX_PRICE_CHANGE_PCT
     fallback_days: int = DEFAULT_FALLBACK_DAYS
     min_spp_sample_orders: int = DEFAULT_MIN_SPP_SAMPLE_ORDERS
+    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     price_source: str = DEFAULT_PRICE_SOURCE
     public_dest: str = DEFAULT_PUBLIC_DEST
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
@@ -1226,10 +1228,10 @@ class WBPriceCorrector:
         sku_prev = self._agg_spp(prev, "spp_previous_day")
         sku_hist = self._agg_spp(hist_prev_period, "spp_history")
 
-        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
-        group_today = self._agg_spp_group(byt, "group_today", min_n)
-        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
-        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n, self.cfg.small_spp_spread_points)
+        group_today = self._agg_spp_group(byt, "group_today", min_n, self.cfg.small_spp_spread_points)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n, self.cfg.small_spp_spread_points)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n, self.cfg.small_spp_spread_points)
 
         nm_group = (
             all_rows[["nmID", "spp_shade_group"]]
@@ -1341,7 +1343,7 @@ class WBPriceCorrector:
         return g
 
     @staticmethod
-    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, small_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
         if df.empty or "spp_shade_group" not in df.columns:
             return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
@@ -1363,8 +1365,8 @@ class WBPriceCorrector:
             mean_min = float(elig["shade_mean"].min())
             mean_max = float(elig["shade_mean"].max())
             mean_spread = mean_max - mean_min
-            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
-            if mean_spread > 3.0:
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше заданного порога.
+            if mean_spread > float(small_spread_points):
                 continue
             rows.append({
                 "spp_shade_group": group,
@@ -1824,6 +1826,7 @@ class WBPriceCorrector:
             f"price_source={self.cfg.price_source}, site_dest={self.cfg.public_dest}, "
             f"safe_wb_discount_floor={self.cfg.safe_wb_discount_floor_pct:g}, "
             f"spp_adjustment_pct={self.cfg.spp_adjustment_pct:g}, "
+            f"small_spp_spread_points={self.cfg.small_spp_spread_points:g}, "
             f"use_safe_floor_for_missing={self.cfg.use_safe_floor_for_missing}, "
             f"время МСК={self.run_datetime_msk.strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -1889,11 +1892,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--night-target-factor", type=float, default=DEFAULT_NIGHT_TARGET_FACTOR, help="Ночной коэффициент к РРЦ, по умолчанию 0.8")
     run_parser.add_argument("--night-start-hour", type=int, default=DEFAULT_NIGHT_START_HOUR, help="Час начала ночного режима по Москве, по умолчанию 23")
     run_parser.add_argument("--night-end-hour", type=int, default=DEFAULT_NIGHT_END_HOUR, help="Час окончания ночного режима по Москве, по умолчанию 5; в 05:00 уже дневной коэффициент")
-    run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца, %, по умолчанию 26")
+    run_parser.add_argument("--seller-discount", type=int, default=DEFAULT_SELLER_DISCOUNT, help="Скидка продавца в процентах, по умолчанию 26")
     run_parser.add_argument("--price-tolerance-rub", type=int, default=DEFAULT_PRICE_TOLERANCE_RUB, help="Не отправлять, если отличие price <= N рублей")
     run_parser.add_argument("--max-price-change-pct", type=float, default=DEFAULT_MAX_PRICE_CHANGE_PCT, help="Макс. изменение price за запуск, 0 = отключить")
     run_parser.add_argument("--fallback-days", type=int, default=DEFAULT_FALLBACK_DAYS, help="Сколько последних дней заказов читать для fallback SPP")
     run_parser.add_argument("--min-spp-sample-orders", type=int, default=DEFAULT_MIN_SPP_SAMPLE_ORDERS, help="Минимум заказов для использования SPP из периода")
+    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Максимальный разбег среднего SPP между оттенками для склейки группы, п.п.; по умолчанию 3")
     run_parser.add_argument("--price-source", choices=["hybrid", "site", "orders-spp"], default=DEFAULT_PRICE_SOURCE, help="Источник расчёта: hybrid=сначала цена сайта, потом SPP; site=только цена сайта; orders-spp=только SPP из заказов")
     run_parser.add_argument("--public-dest", default=DEFAULT_PUBLIC_DEST, help="dest для публичной цены WB, по умолчанию WB_PUBLIC_DEST или -1257786")
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
@@ -1924,6 +1928,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.max_price_change_pct = DEFAULT_MAX_PRICE_CHANGE_PCT
         args.fallback_days = DEFAULT_FALLBACK_DAYS
         args.min_spp_sample_orders = DEFAULT_MIN_SPP_SAMPLE_ORDERS
+        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.price_source = DEFAULT_PRICE_SOURCE
         args.public_dest = DEFAULT_PUBLIC_DEST
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
@@ -1967,6 +1972,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_price_change_pct=args.max_price_change_pct,
         fallback_days=args.fallback_days,
         min_spp_sample_orders=args.min_spp_sample_orders,
+        small_spp_spread_points=args.small_spp_spread_points,
         price_source=args.price_source,
         public_dest=args.public_dest,
         site_price_tolerance_rub=args.site_price_tolerance_rub,
