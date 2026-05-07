@@ -86,6 +86,7 @@ DEFAULT_SITE_PRICE_TOLERANCE_RUB = 3
 # Рекомендованный аварийный режим: 45.
 DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT = float(os.environ.get("WB_SAFE_WB_DISCOUNT_FLOOR_PCT", "0") or 0)
 DEFAULT_SPP_ADJUSTMENT_PCT = float(os.environ.get("WB_SPP_ADJUSTMENT_PCT", "1.5") or 0)
+DEFAULT_SMALL_SPP_SPREAD_POINTS = 3.0
 DEFAULT_USE_SAFE_FLOOR_FOR_MISSING = (os.environ.get("WB_USE_SAFE_FLOOR_FOR_MISSING", "false").strip().lower() in {"1", "true", "yes", "y", "да"})
 DEFAULT_PUBLIC_DEST = os.environ.get("WB_PUBLIC_DEST", "-1257786")
 DEFAULT_PUBLIC_PRICE_CHUNK_SIZE = 80
@@ -581,6 +582,7 @@ class PriceCorrectorConfig:
     site_price_tolerance_rub: int = DEFAULT_SITE_PRICE_TOLERANCE_RUB
     safe_wb_discount_floor_pct: float = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
     spp_adjustment_pct: float = DEFAULT_SPP_ADJUSTMENT_PCT
+    small_spp_spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS
     use_safe_floor_for_missing: bool = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
     allow_unknown_subject: bool = False
     update_weekly_orders: bool = False
@@ -1226,10 +1228,11 @@ class WBPriceCorrector:
         sku_prev = self._agg_spp(prev, "spp_previous_day")
         sku_hist = self._agg_spp(hist_prev_period, "spp_history")
 
-        group_3h = self._agg_spp_group(by3, "group_3h", min_n)
-        group_today = self._agg_spp_group(byt, "group_today", min_n)
-        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n)
-        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n)
+        spread_points = float(self.cfg.small_spp_spread_points or 0)
+        group_3h = self._agg_spp_group(by3, "group_3h", min_n, spread_points)
+        group_today = self._agg_spp_group(byt, "group_today", min_n, spread_points)
+        group_prev = self._agg_spp_group(prev, "group_previous_day", min_n, spread_points)
+        group_hist = self._agg_spp_group(hist_prev_period, "group_history", min_n, spread_points)
 
         nm_group = (
             all_rows[["nmID", "spp_shade_group"]]
@@ -1338,7 +1341,7 @@ class WBPriceCorrector:
         return g
 
     @staticmethod
-    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int) -> pd.DataFrame:
+    def _agg_spp_group(df: pd.DataFrame, suffix: str, min_n: int, spread_points: float = DEFAULT_SMALL_SPP_SPREAD_POINTS) -> pd.DataFrame:
         if df.empty or "spp_shade_group" not in df.columns:
             return pd.DataFrame(columns=["spp_shade_group", f"avg_spp_{suffix}", f"orders_{suffix}"])
         tmp = df[df["spp_shade_group"].astype(str).str.strip() != ""].copy()
@@ -1360,8 +1363,8 @@ class WBPriceCorrector:
             mean_min = float(elig["shade_mean"].min())
             mean_max = float(elig["shade_mean"].max())
             mean_spread = mean_max - mean_min
-            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше чем на 3 п.п.
-            if mean_spread > 3.0:
+            # Склеиваем оттенки только если средний SPP по оттенкам расходится не больше лимита, по умолчанию 3 п.п.
+            if mean_spread > float(spread_points):
                 continue
             rows.append({
                 "spp_shade_group": group,
@@ -1896,6 +1899,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_parser.add_argument("--site-price-tolerance-rub", type=int, default=DEFAULT_SITE_PRICE_TOLERANCE_RUB, help="Допуск по фактической цене сайта до целевой, рублей")
     run_parser.add_argument("--safe-wb-discount-floor-pct", type=float, default=DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT, help="Консервативный floor WB-скидки/SPP для расчёта price. 0 = отключить")
     run_parser.add_argument("--spp-adjustment-pct", type=float, default=DEFAULT_SPP_ADJUSTMENT_PCT, help="Корректировка к рассчитанному SPP, п.п. По умолчанию +1.5")
+    run_parser.add_argument("--small-spp-spread-points", type=float, default=DEFAULT_SMALL_SPP_SPREAD_POINTS, help="Максимальный разбег среднего SPP между оттенками для склейки группы, п.п. По умолчанию 3")
     run_parser.add_argument("--use-safe-floor-for-missing", action="store_true", default=DEFAULT_USE_SAFE_FLOOR_FOR_MISSING, help="Если по товару нет достаточной выборки, использовать safe-wb-discount-floor-pct вместо пропуска")
     run_parser.add_argument("--allow-unknown-subject", action="store_true", help="Разрешить менять товары без известного subject")
     run_parser.add_argument("--update-weekly-orders", action="store_true", help="Опционально обновлять сегодняшний день в обычном недельном файле заказов")
@@ -1926,6 +1930,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         args.site_price_tolerance_rub = DEFAULT_SITE_PRICE_TOLERANCE_RUB
         args.safe_wb_discount_floor_pct = DEFAULT_SAFE_WB_DISCOUNT_FLOOR_PCT
         args.spp_adjustment_pct = DEFAULT_SPP_ADJUSTMENT_PCT
+        args.small_spp_spread_points = DEFAULT_SMALL_SPP_SPREAD_POINTS
         args.use_safe_floor_for_missing = DEFAULT_USE_SAFE_FLOOR_FOR_MISSING
         args.allow_unknown_subject = False
         args.update_weekly_orders = False
@@ -1969,6 +1974,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         site_price_tolerance_rub=args.site_price_tolerance_rub,
         safe_wb_discount_floor_pct=args.safe_wb_discount_floor_pct,
         spp_adjustment_pct=args.spp_adjustment_pct,
+        small_spp_spread_points=args.small_spp_spread_points,
         use_safe_floor_for_missing=args.use_safe_floor_for_missing,
         allow_unknown_subject=args.allow_unknown_subject,
         update_weekly_orders=args.update_weekly_orders,
