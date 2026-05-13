@@ -36,23 +36,6 @@ on:
           - "false"
           - "true"
 
-      apply_price:
-        description: "Разрешить изменение скидки продавца / цены"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      skip_price:
-        description: "Не строить контур цен в этом запуске"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-
   # При необходимости можно включить расписание.
   # schedule:
   #   - cron: "0 8 * * *"  # каждый день в 08:00 UTC
@@ -109,7 +92,7 @@ jobs:
           echo "=== Script head ==="
           head -40 assistant_wb_ads_manager.py
           echo "=== Script version marker ==="
-          grep -n "SCRIPT_VERSION\|strict-drr-keywords-price" assistant_wb_ads_manager.py || true
+          grep -n "SCRIPT_VERSION\|strict-drr-sheet-aware" assistant_wb_ads_manager.py || true
           echo "=== Old dayfirst bug check ==="
           grep -n "dayfirst=True" assistant_wb_ads_manager.py || true
           echo "=== Script SHA256 ==="
@@ -120,8 +103,8 @@ jobs:
             exit 1
           fi
 
-          if ! grep -q "strict-drr-keywords-price" assistant_wb_ads_manager.py; then
-            echo "ERROR: В assistant_wb_ads_manager.py нет маркера новой версии strict-drr-keywords-price"
+          if ! grep -q "strict-drr-sheet-aware" assistant_wb_ads_manager.py; then
+            echo "ERROR: В assistant_wb_ads_manager.py нет маркера новой версии strict-drr-sheet-aware"
             exit 1
           fi
 
@@ -143,14 +126,6 @@ jobs:
 
           if [ "${{ github.event.inputs.apply_start || 'false' }}" = "true" ]; then
             CMD="$CMD --apply-start"
-          fi
-
-          if [ "${{ github.event.inputs.apply_price || 'false' }}" = "true" ]; then
-            CMD="$CMD --apply-price"
-          fi
-
-          if [ "${{ github.event.inputs.skip_price || 'false' }}" = "true" ]; then
-            CMD="$CMD --skip-price"
           fi
 
           echo "Running: $CMD"
