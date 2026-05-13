@@ -2,55 +2,18 @@ name: TOPFACE WB Ads Manager
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "Режим запуска: run или preview"
-        required: true
-        default: "run"
-        type: choice
-        options:
-          - run
-          - preview
-      dry_run:
-        description: "Dry-run: рассчитать без отправки ставок в WB"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      apply_pause:
-        description: "Разрешить постановку кампаний на паузу"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      apply_start:
-        description: "Разрешить запуск кампаний обратно"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-
-  # При необходимости можно включить расписание.
-  # schedule:
-  #   - cron: "0 8 * * *"  # каждый день в 08:00 UTC
+  schedule:
+    - cron: "0 3 * * *"  # 06:00 МСК
 
 jobs:
-  run-topface-ads-manager:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     env:
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -64,9 +27,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy
+          pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
 
-      - name: Verify required secrets
+      - name: Verify secrets
         run: |
           python - <<'PY'
           import os
@@ -77,79 +40,36 @@ jobs:
               "YC_BUCKET_NAME",
               "WB_PROMO_KEY_TOPFACE",
           ]
+
           missing = [name for name in required if not os.getenv(name)]
           if missing:
               raise SystemExit("Missing secrets: " + ", ".join(missing))
+
           print("All required secrets are present.")
           PY
 
-      - name: Verify correct assistant_wb_ads_manager.py
+      - name: Verify script
         run: |
-          echo "=== Current directory ==="
+          echo "=== Script info ==="
           pwd
-          echo "=== Repository files ==="
-          ls -la
-          echo "=== Script head ==="
-          head -40 assistant_wb_ads_manager.py
-          echo "=== Script version marker ==="
-          grep -n "SCRIPT_VERSION\|strict-drr-sheet-aware" assistant_wb_ads_manager.py || true
-          echo "=== Old dayfirst bug check ==="
-          grep -n "dayfirst=True" assistant_wb_ads_manager.py || true
-          echo "=== Script SHA256 ==="
-          sha256sum assistant_wb_ads_manager.py
+          ls -lh ./assistant_wb_ads_manager.py
+          grep -n "SCRIPT_VERSION" ./assistant_wb_ads_manager.py || true
+          sha256sum ./assistant_wb_ads_manager.py
 
-          if grep -q "dayfirst=True" assistant_wb_ads_manager.py; then
-            echo "ERROR: В репозитории всё ещё старая версия assistant_wb_ads_manager.py с dayfirst=True"
+          if grep -q "dayfirst=True" ./assistant_wb_ads_manager.py; then
+            echo "ERROR: В корне репозитория старая версия assistant_wb_ads_manager.py"
             exit 1
           fi
 
-          if ! grep -q "strict-drr-sheet-aware" assistant_wb_ads_manager.py; then
-            echo "ERROR: В assistant_wb_ads_manager.py нет маркера новой версии strict-drr-sheet-aware"
+          if ! grep -q "SCRIPT_VERSION" ./assistant_wb_ads_manager.py; then
+            echo "ERROR: В assistant_wb_ads_manager.py нет SCRIPT_VERSION"
             exit 1
           fi
 
-      - name: Compile Python script
+      - name: Compile script
         run: |
-          python -m py_compile assistant_wb_ads_manager.py
+          python -m py_compile ./assistant_wb_ads_manager.py
 
       - name: Run TOPFACE WB Ads Manager
         run: |
-          CMD="python assistant_wb_ads_manager.py ${{ github.event.inputs.mode || 'run' }}"
-
-          if [ "${{ github.event.inputs.dry_run || 'false' }}" = "true" ]; then
-            CMD="$CMD --dry-run"
-          fi
-
-          if [ "${{ github.event.inputs.apply_pause || 'false' }}" = "true" ]; then
-            CMD="$CMD --apply-pause"
-          fi
-
-          if [ "${{ github.event.inputs.apply_start || 'false' }}" = "true" ]; then
-            CMD="$CMD --apply-start"
-          fi
-
-          echo "Running: $CMD"
-          eval "$CMD"
-
-      - name: Show local result files
-        if: always()
-        run: |
-          echo "=== Local XLSX/JSON files after run ==="
-          find . -maxdepth 3 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
-
-      - name: Upload local artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: topface-ads-manager-results
-          path: |
-            *.xlsx
-            *.json
-            **/Итог_последнего_запуска*.xlsx
-            **/Предпросмотр_последнего_запуска*.xlsx
-            **/Сводка_последнего_запуска*.json
-            **/Лог_API*.xlsx
-            **/История_ставок*.xlsx
-            **/История_пауз*.xlsx
-          if-no-files-found: warn
-          retention-days: 14
+          python ./assistant_wb_ads_manager.py run
