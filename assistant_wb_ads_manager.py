@@ -38,7 +38,6 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-sheet-aware-v3-2026-05-13"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -146,13 +145,13 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "nm_id": ["nmId", "nm_id", "Номенклатура WB", "Артикул WB", "Товар"],
     "supplier_article": ["Артикул продавца", "supplier_article", "supplierArticle", "Артикул"],
     "subject_norm": ["Предмет", "subject", "subject_norm", "Название предмета"],
-    "placement": ["Плейсмент", "placement", "Тип кампании", "Место размещения", "placement_norm"],
-    "current_bid_rub": ["Текущая ставка, ₽", "Текущая ставка", "Ставка", "Ставка в поиске (руб)", "Ставка в рекомендациях (руб)", "bid", "cpc", "cpm"],
+    "placement": ["Плейсмент", "placement", "Тип кампании", "Место размещения"],
+    "current_bid_rub": ["Текущая ставка, ₽", "Ставка", "bid", "cpc", "cpm"],
     "impressions": ["Показы", "views", "impressions"],
     "clicks": ["Клики", "clicks"],
     "orders": ["Заказы РК", "Заказы", "orders"],
     "spend": ["Расход", "Расходы", "Затраты", "Расход РК", "ad_spend"],
-    "revenue": ["Выручка РК", "Продажи РК", "Сумма заказов", "Сумма заказов, ₽", "Заказано на сумму", "Заказано на сумму, ₽", "ordersSumRub", "sum_price", "sumPrice", "sales", "revenue", "GMV"],
+    "revenue": ["Выручка РК", "Продажи РК", "sales", "revenue"],
     "gp_after_ads": ["ВП кампании", "Валовая прибыль после рекламы", "ВП после рекламы", "gross_profit"],
 }
 
@@ -292,32 +291,6 @@ def numeric_series(df: pd.DataFrame, aliases: Iterable[str], default: float = 0.
     return num.fillna(default).astype(float)
 
 
-def parse_date_series(values: pd.Series) -> pd.Series:
-    """Без warning разбирает даты из WB-отчётов: ISO, dd.mm.yyyy и Excel datetime."""
-    if not isinstance(values, pd.Series):
-        values = pd.Series(values)
-    raw = values.copy()
-    result = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
-    text = raw.astype(str).str.strip()
-
-    iso_mask = text.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)
-    if iso_mask.any():
-        result.loc[iso_mask] = pd.to_datetime(text.loc[iso_mask], format="%Y-%m-%d", errors="coerce")
-
-    dot_mask = result.isna() & text.str.fullmatch(r"\d{2}\.\d{2}\.\d{4}", na=False)
-    if dot_mask.any():
-        result.loc[dot_mask] = pd.to_datetime(text.loc[dot_mask], format="%d.%m.%Y", errors="coerce")
-
-    slash_mask = result.isna() & text.str.fullmatch(r"\d{2}/\d{2}/\d{4}", na=False)
-    if slash_mask.any():
-        result.loc[slash_mask] = pd.to_datetime(text.loc[slash_mask], format="%d/%m/%Y", errors="coerce")
-
-    remaining = result.isna() & raw.notna() & text.ne("") & text.ne("NaT") & text.ne("nan")
-    if remaining.any():
-        result.loc[remaining] = pd.to_datetime(raw.loc[remaining], errors="coerce")
-    return result.dt.date
-
-
 def _clean_id_value(value: Any) -> str:
     if value is None:
         return ""
@@ -373,7 +346,7 @@ def normalize_columns(df: pd.DataFrame, source_type: str) -> pd.DataFrame:
     result["_row_id"] = range(len(result))
 
     date_src = series_or_default(result, COLUMN_ALIASES["date"], default=pd.NaT)
-    result["date"] = parse_date_series(date_src)
+    result["date"] = pd.to_datetime(date_src, errors="coerce", dayfirst=True).dt.date
 
     result["campaign_id"] = series_or_default(result, COLUMN_ALIASES["campaign_id"], default="").map(_clean_id_value)
     result["campaign_name"] = _text_series(result, COLUMN_ALIASES["campaign_name"], default="")
@@ -402,20 +375,8 @@ def normalize_columns(df: pd.DataFrame, source_type: str) -> pd.DataFrame:
 # Загрузка Excel-данных
 # =============================
 
-def read_excel_bytes_as_sheets(payload: bytes) -> Dict[str, pd.DataFrame]:
-    xls = pd.ExcelFile(io.BytesIO(payload))
-    return {sheet_name: pd.read_excel(io.BytesIO(payload), sheet_name=sheet_name) for sheet_name in xls.sheet_names}
-
-
-def first_sheet_by_name(sheets: Dict[str, pd.DataFrame], wanted_name: str) -> pd.DataFrame:
-    wanted_norm = _norm_col_name(wanted_name)
-    for name, df in sheets.items():
-        if _norm_col_name(name) == wanted_norm:
-            return df.copy()
-    return pd.DataFrame()
-
-
-def read_excel_sheets_as_frame(sheets: Dict[str, pd.DataFrame], source_name: str) -> pd.DataFrame:
+def read_excel_bytes_as_frame(payload: bytes, source_name: str) -> pd.DataFrame:
+    sheets = pd.read_excel(io.BytesIO(payload), sheet_name=None)
     frames: List[pd.DataFrame] = []
     for sheet_name, sheet_df in sheets.items():
         if sheet_df is None or sheet_df.empty:
@@ -429,174 +390,13 @@ def read_excel_sheets_as_frame(sheets: Dict[str, pd.DataFrame], source_name: str
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
-def read_excel_bytes_as_frame(payload: bytes, source_name: str) -> pd.DataFrame:
-    sheets = read_excel_bytes_as_sheets(payload)
-    return read_excel_sheets_as_frame(sheets, source_name)
-
-
-def derive_campaign_placement_and_bid(campaigns_norm: pd.DataFrame, campaigns_raw: pd.DataFrame) -> pd.DataFrame:
-    result = campaigns_norm.copy()
-    search_bid = numeric_series(campaigns_raw, [
-        "Ставка в поиске (руб)", "Ставка поиск, руб", "Ставка поиск", "bid_search_rub", "search_bid",
-        "Ставка в поиске", "Ставка в поиске ₽",
-    ], default=0.0)
-    reco_bid = numeric_series(campaigns_raw, [
-        "Ставка в рекомендациях (руб)", "Ставка рекомендации, руб", "Ставка рекомендации", "bid_reco_rub",
-        "reco_bid", "recommendation_bid", "Ставка в рекомендациях", "Ставка в рекомендациях ₽",
-    ], default=0.0)
-    direct_bid = numeric_series(campaigns_raw, COLUMN_ALIASES["current_bid_rub"], default=0.0)
-
-    placements: List[str] = []
-    bids: List[float] = []
-    for idx in result.index:
-        placement_raw = result.at[idx, "placement"] if "placement" in result.columns else ""
-        placement = normalize_placement_value(placement_raw)
-        s_bid = float(search_bid.loc[idx] if idx in search_bid.index else 0.0)
-        r_bid = float(reco_bid.loc[idx] if idx in reco_bid.index else 0.0)
-        d_bid = float(direct_bid.loc[idx] if idx in direct_bid.index else 0.0)
-
-        if not placement:
-            if s_bid > 0 and r_bid > 0:
-                placement = "combined"
-            elif s_bid > 0:
-                placement = "search"
-            elif r_bid > 0:
-                placement = "recommendations"
-            else:
-                placement = "search"
-        if placement == "recommendation":
-            placement = "recommendations"
-
-        if placement == "recommendations" and r_bid > 0:
-            bid = r_bid
-        elif placement in {"search", "combined"} and s_bid > 0:
-            bid = s_bid
-        elif d_bid > 0:
-            bid = d_bid
-        elif s_bid > 0:
-            bid = s_bid
-        else:
-            bid = r_bid
-
-        placements.append(placement)
-        bids.append(float(bid or 0.0))
-    result["placement"] = placements
-    result["current_bid_rub"] = bids
-    return result
-
-
-def normalize_ads_analysis_sheets(sheets: Dict[str, pd.DataFrame], source_name: str) -> pd.DataFrame:
-    """Специально читает Анализ рекламы.xlsx: метрики из Статистика_Ежедневно, ставки/status из Список_кампаний."""
-    daily_raw = first_sheet_by_name(sheets, "Статистика_Ежедневно")
-    campaigns_raw = first_sheet_by_name(sheets, "Список_кампаний")
-
-    if daily_raw.empty:
-        combined = read_excel_sheets_as_frame(sheets, source_name)
-        return normalize_columns(combined, source_type="ads_generic")
-
-    daily = normalize_columns(daily_raw, source_type="ads_daily")
-    daily["source_file"] = source_name
-    daily["source_sheet"] = "Статистика_Ежедневно"
-
-    if "revenue" in daily.columns and float(pd.to_numeric(daily["revenue"], errors="coerce").fillna(0).sum()) == 0:
-        sum_orders_col = find_col(daily_raw, ["Сумма заказов", "Сумма заказов, ₽", "Заказано на сумму", "Заказано на сумму, ₽"])
-        if sum_orders_col:
-            daily["revenue"] = numeric_series(daily_raw, [sum_orders_col], default=0.0)
-
-    if campaigns_raw.empty:
-        if daily["campaign_status"].astype(str).str.strip().eq("").all():
-            daily["campaign_status"] = "Активна"
-        if daily["placement"].astype(str).str.strip().eq("").all():
-            daily["placement"] = "search"
-        return daily
-
-    campaigns = normalize_columns(campaigns_raw, source_type="ads_campaigns")
-    campaigns = derive_campaign_placement_and_bid(campaigns, campaigns_raw)
-    campaigns["source_file"] = source_name
-    campaigns["source_sheet"] = "Список_кампаний"
-
-    keep_cols = [
-        "campaign_id", "nm_id", "placement", "campaign_status", "campaign_name",
-        "current_bid_rub", "supplier_article", "subject_norm",
-    ]
-    for col in keep_cols:
-        if col not in campaigns.columns:
-            campaigns[col] = ""
-
-    campaigns_dim = campaigns[keep_cols].copy()
-    campaigns_dim = campaigns_dim[
-        campaigns_dim["campaign_id"].map(_clean_id_value).ne("")
-        & campaigns_dim["nm_id"].map(_clean_id_value).ne("")
-    ].copy()
-    if not campaigns_dim.empty:
-        campaigns_dim["campaign_id"] = campaigns_dim["campaign_id"].map(_clean_id_value)
-        campaigns_dim["nm_id"] = campaigns_dim["nm_id"].map(_clean_id_value)
-        campaigns_dim["placement"] = campaigns_dim["placement"].map(normalize_placement_value).replace({"recommendation": "recommendations"})
-        campaigns_dim["_status_rank"] = campaigns_dim["campaign_status"].map(lambda x: 1 if is_active_campaign(x) else 0)
-        campaigns_dim = campaigns_dim.sort_values(["campaign_id", "nm_id", "_status_rank"], ascending=[True, True, False])
-        campaigns_dim = campaigns_dim.drop_duplicates(["campaign_id", "nm_id", "placement"], keep="first")
-        campaigns_dim = campaigns_dim.drop(columns=["_status_rank"], errors="ignore")
-
-    daily["campaign_id"] = daily["campaign_id"].map(_clean_id_value)
-    daily["nm_id"] = daily["nm_id"].map(_clean_id_value)
-
-    if campaigns_dim.empty:
-        if daily["campaign_status"].astype(str).str.strip().eq("").all():
-            daily["campaign_status"] = "Активна"
-        if daily["placement"].astype(str).str.strip().eq("").all():
-            daily["placement"] = "search"
-        return daily
-
-    metric_cols = ["date", "campaign_id", "nm_id", "impressions", "clicks", "orders", "spend", "revenue", "gp_after_ads", "_row_id", "source_file", "source_sheet"]
-    for col in ["supplier_article", "subject_norm", "campaign_name", "campaign_status", "placement", "current_bid_rub"]:
-        if col not in daily.columns:
-            daily[col] = "" if col != "current_bid_rub" else 0.0
-    metric_cols.extend(["supplier_article", "subject_norm", "campaign_name", "campaign_status", "placement", "current_bid_rub"])
-    metric_cols = [c for c in metric_cols if c in daily.columns]
-
-    merged = daily[metric_cols].merge(
-        campaigns_dim,
-        on=["campaign_id", "nm_id"],
-        how="left",
-        suffixes=("", "_campaign"),
-    )
-
-    for col in ["placement", "campaign_status", "campaign_name", "supplier_article", "subject_norm"]:
-        camp_col = f"{col}_campaign"
-        if camp_col in merged.columns:
-            base = merged[col].fillna("").astype(str) if col in merged.columns else pd.Series([""] * len(merged), index=merged.index)
-            camp = merged[camp_col].fillna("").astype(str)
-            merged[col] = base.where(base.str.strip().ne(""), camp)
-    if "current_bid_rub_campaign" in merged.columns:
-        base_bid = pd.to_numeric(merged.get("current_bid_rub", 0), errors="coerce").fillna(0.0)
-        camp_bid = pd.to_numeric(merged["current_bid_rub_campaign"], errors="coerce").fillna(0.0)
-        merged["current_bid_rub"] = base_bid.where(base_bid > 0, camp_bid)
-
-    drop_cols = [c for c in merged.columns if c.endswith("_campaign")]
-    merged = merged.drop(columns=drop_cols, errors="ignore")
-    merged["placement"] = merged["placement"].map(normalize_placement_value).replace({"recommendation": "recommendations"})
-    return merged
-
-
 def load_ads_report(s3_client, config: Config) -> pd.DataFrame:
     if s3_key_exists(s3_client, config.yc_bucket_name, ADS_MAIN_KEY):
         payload = read_s3_bytes(s3_client, config.yc_bucket_name, ADS_MAIN_KEY)
-        sheets = read_excel_bytes_as_sheets(payload)
-        raw = normalize_ads_analysis_sheets(sheets, ADS_MAIN_KEY)
+        raw = read_excel_bytes_as_frame(payload, ADS_MAIN_KEY)
         if raw.empty:
             raise RuntimeError(f"Основной рекламный отчёт пустой: {ADS_MAIN_KEY}")
-        print(
-            "Диагностика загрузки рекламы: "
-            f"листы={list(sheets.keys())}; "
-            f"строк после нормализации={len(raw)}; "
-            f"валидных campaign_id={raw['campaign_id'].map(_clean_id_value).ne('').sum() if 'campaign_id' in raw.columns else 0}; "
-            f"валидных nm_id={raw['nm_id'].map(_clean_id_value).ne('').sum() if 'nm_id' in raw.columns else 0}; "
-            f"валидных placement={raw['placement'].astype(str).str.strip().ne('').sum() if 'placement' in raw.columns else 0}; "
-            f"валидных ставок={(pd.to_numeric(raw['current_bid_rub'], errors='coerce').fillna(0) > 0).sum() if 'current_bid_rub' in raw.columns else 0}; "
-            f"активных={raw['campaign_status'].map(is_active_campaign).sum() if 'campaign_status' in raw.columns else 0}",
-            flush=True,
-        )
-        return raw
+        return normalize_columns(raw, source_type="ads_main")
 
     weekly_keys = [
         key for key in list_s3_keys(s3_client, config.yc_bucket_name, ADS_WEEKLY_PREFIX)
@@ -606,8 +406,7 @@ def load_ads_report(s3_client, config: Config) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     for key in weekly_keys:
         payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
-        sheets = read_excel_bytes_as_sheets(payload)
-        raw = normalize_ads_analysis_sheets(sheets, key)
+        raw = read_excel_bytes_as_frame(payload, key)
         if not raw.empty:
             frames.append(raw)
     if not frames:
@@ -615,9 +414,7 @@ def load_ads_report(s3_client, config: Config) -> pd.DataFrame:
             "Не найден основной рекламный отчёт и нет непустых fallback-файлов: "
             f"{ADS_MAIN_KEY}; {ADS_WEEKLY_PREFIX}"
         )
-    result = pd.concat(frames, ignore_index=True, sort=False)
-    print(f"Диагностика fallback-рекламы: файлов={len(frames)}, строк={len(result)}", flush=True)
-    return result
+    return normalize_columns(pd.concat(frames, ignore_index=True, sort=False), source_type="ads_weekly_fallback")
 
 
 def load_excel_table_from_s3(s3_client, config: Config, key: str, columns: List[str]) -> pd.DataFrame:
@@ -1787,7 +1584,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ctx = build_run_context(args)
     s3_client = make_s3_client(config)
 
-    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}")
+    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: режим={ctx.mode}, dry_run={ctx.dry_run}")
     print(f"Окна: база {ctx.base_start}..{ctx.base_end}; текущее {ctx.current_start}..{ctx.current_end}; mature_end={ctx.mature_end}")
 
     ads_df = load_ads_report(s3_client, config)
@@ -1802,14 +1599,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     postcheck_results = latest_postcheck_results(bid_history)
 
     metrics_df = aggregate_campaign_metrics(ads_df, ctx)
-    print(f"Диагностика агрегации: строк метрик={len(metrics_df)}", flush=True)
-    if not metrics_df.empty:
-        print("Диагностика метрик по статусам: " + json.dumps(metrics_df.get("campaign_status", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-        print("Диагностика метрик по предметам: " + json.dumps(metrics_df.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
     decisions = build_decisions(metrics_df, pending_events, postcheck_results)
-    if not decisions.empty:
-        print("Диагностика решений action: " + json.dumps(decisions["action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
-        print("Диагностика решений reason_code: " + json.dumps(decisions["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
     pause_candidates = build_pause_candidates(decisions, bid_history)
 
     successful_changes, bid_api_log = apply_bid_changes(decisions, config, ctx)
