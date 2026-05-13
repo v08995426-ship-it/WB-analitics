@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v7-hotfix-minbid-2026-05-13"
+SCRIPT_VERSION = "strict-drr-v8-priceapi-autorun-2026-05-13"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -97,6 +97,8 @@ WB_PRICE_UPLOAD_ENDPOINT = "/api/v2/upload/task"
 DEFAULT_SELLER_DISCOUNT_PCT = 26
 DEFAULT_PRICE_RAISE_STEP_PP = 1
 DEFAULT_MIN_SELLER_DISCOUNT_PCT = int(os.environ.get("WB_PRICE_MIN_SELLER_DISCOUNT_PCT", "25") or 25)
+PRICE_TEST_SUBJECTS = {"помады", "блески", "косметические карандаши"}
+MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "10") or 10)
 
 
 WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
@@ -1248,38 +1250,78 @@ def evaluate_price_postchecks(price_history: pd.DataFrame, ads_df: pd.DataFrame,
 
 
 def build_price_decisions(metrics_df: pd.DataFrame, funnel_current: pd.DataFrame, goods_prices: pd.DataFrame, price_history: pd.DataFrame, config: Config, ctx: RunContext) -> pd.DataFrame:
+    """Формирует решения по тестовому повышению цены через скидку продавца.
+
+    Правила:
+    - работаем только с Помадами, Блесками и Косметическими карандашами;
+    - текущую скидку продавца берём только из WB Discounts & Prices API;
+    - если скидка из API не получена, цену не меняем;
+    - повышение цены = снижение фактической скидки продавца на 1 п.п.;
+    - ниже DEFAULT_MIN_SELLER_DISCOUNT_PCT не опускаемся;
+    - без данных воронки ценовой тест не запускаем, потому что нельзя отделить падение трафика от падения конверсии;
+    - не больше MAX_PRICE_TEST_ITEMS_PER_RUN новых price-test за один запуск;
+    - если есть незавершённый price post-check, товар не трогаем.
+    """
     if metrics_df is None or metrics_df.empty:
         return pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
+
     base = metrics_df[["nm_id", "supplier_article", "subject_norm", "orders", "impressions", "clicks", "ctr_pct"]].copy()
+    base["subject_norm"] = base["subject_norm"].map(lambda x: normalize_subject_value(x).lower())
+    base = base[base["subject_norm"].isin(PRICE_TEST_SUBJECTS)].copy()
+    if base.empty:
+        return pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
+
     base = base.groupby(["nm_id", "supplier_article", "subject_norm"], dropna=False).agg(
-        orders=("orders", "sum"), impressions=("impressions", "sum"), clicks=("clicks", "sum"), ctr_pct=("ctr_pct", "mean")
+        orders=("orders", "sum"),
+        impressions=("impressions", "sum"),
+        clicks=("clicks", "sum"),
+        ctr_pct=("ctr_pct", "mean"),
     ).reset_index()
-    if funnel_current is not None and not funnel_current.empty:
+
+    has_funnel = funnel_current is not None and not funnel_current.empty
+    if has_funnel:
         base = base.merge(funnel_current, on="nm_id", how="left")
+
     for col in ["card_views", "add_to_cart", "funnel_orders", "add_to_cart_conv", "cart_to_order_conv"]:
         if col not in base.columns:
             base[col] = 0.0
         base[col] = pd.to_numeric(base[col], errors="coerce").fillna(0.0)
+
     if goods_prices is not None and not goods_prices.empty:
-        base = base.merge(goods_prices[["nm_id", "current_discount", "current_wb_price"]], on="nm_id", how="left")
+        gp = goods_prices[["nm_id", "current_discount", "current_wb_price"]].copy()
+        gp["current_discount"] = pd.to_numeric(gp["current_discount"], errors="coerce")
+        gp["current_wb_price"] = pd.to_numeric(gp["current_wb_price"], errors="coerce")
+        base = base.merge(gp, on="nm_id", how="left")
     else:
-        base["current_discount"] = float(DEFAULT_SELLER_DISCOUNT_PCT)
-        base["current_wb_price"] = 0.0
+        base["current_discount"] = float("nan")
+        base["current_wb_price"] = float("nan")
+
     pending = _price_pending_events(price_history)
     rows: List[Dict[str, Any]] = []
-    for _, row in base.iterrows():
+    candidate_indices: List[int] = []
+
+    # Сначала строим все строки и помечаем потенциальные новые тесты.
+    for idx, row in base.iterrows():
         nm_id = _clean_id_value(row.get("nm_id", ""))
-        current_discount = float(pd.to_numeric(pd.Series([row.get("current_discount", DEFAULT_SELLER_DISCOUNT_PCT)]), errors="coerce").fillna(DEFAULT_SELLER_DISCOUNT_PCT).iloc[0])
+        subject_norm = normalize_subject_value(row.get("subject_norm", "")).lower()
+        current_discount_raw = pd.to_numeric(pd.Series([row.get("current_discount")]), errors="coerce").iloc[0]
+        current_discount = float(current_discount_raw) if not pd.isna(current_discount_raw) else float("nan")
         action = "Без изменений"
         reason_code = "PRICE_MONITOR_ONLY"
         new_discount: Optional[float] = None
         prev_event_id = ""
         post_status = ""
         pending_event = pending.get(nm_id)
-        if pending_event:
+
+        if subject_norm not in PRICE_TEST_SUBJECTS:
+            reason_code = "PRICE_NOT_TARGET_SUBJECT"
+        elif not has_funnel:
+            reason_code = "NO_FUNNEL_FOR_PRICE_TEST"
+        elif pd.isna(current_discount) or current_discount <= 0:
+            reason_code = "NO_CURRENT_DISCOUNT_FROM_WB_API"
+        elif pending_event:
             prev_event_id = _clean_text_value(pending_event.get("price_event_id", ""))
             post_status = _clean_text_value(pending_event.get("postcheck_status", "pending")) or "pending"
-            action = "Без изменений"
             reason_code = "PRICE_WAIT_D2_POSTCHECK"
         else:
             latest_bad = None
@@ -1292,7 +1334,7 @@ def build_price_decisions(metrics_df: pd.DataFrame, funnel_current: pd.DataFrame
                     if _clean_text_value(last.get("final_verdict", "")) == "PRICE_RAISE_BAD_CONVERSION_DROP":
                         latest_bad = last
             if latest_bad is not None:
-                old_discount = float(pd.to_numeric(pd.Series([latest_bad.get("old_discount", DEFAULT_SELLER_DISCOUNT_PCT)]), errors="coerce").fillna(DEFAULT_SELLER_DISCOUNT_PCT).iloc[0])
+                old_discount = float(pd.to_numeric(pd.Series([latest_bad.get("old_discount", current_discount)]), errors="coerce").fillna(current_discount).iloc[0])
                 if current_discount < old_discount:
                     action = "Вернуть скидку"
                     new_discount = old_discount
@@ -1300,28 +1342,58 @@ def build_price_decisions(metrics_df: pd.DataFrame, funnel_current: pd.DataFrame
                 else:
                     reason_code = "PRICE_ALREADY_REVERTED_AFTER_BAD"
             elif current_discount <= DEFAULT_MIN_SELLER_DISCOUNT_PCT:
-                action = "Без изменений"
                 reason_code = "PRICE_MIN_DISCOUNT_REACHED"
+            elif float(row.get("orders", 0) or 0) <= 0:
+                reason_code = "PRICE_NO_ORDERS_FOR_TEST"
             else:
                 action = "Повысить цену"
                 new_discount = max(DEFAULT_MIN_SELLER_DISCOUNT_PCT, current_discount - DEFAULT_PRICE_RAISE_STEP_PP)
                 reason_code = "PRICE_RAISE_1PP_TEST"
+
         reason_text = (
-            f"скидка={current_discount:.0f}%; новая скидка={new_discount if new_discount is not None else 'н/д'}; "
-            f"заказы={float(row.get('orders',0) or 0):.0f}; показы={float(row.get('impressions',0) or 0):.0f}; "
+            f"скидка_WB_API={current_discount if not pd.isna(current_discount) else 'н/д'}%; "
+            f"скидка по умолчанию={DEFAULT_SELLER_DISCOUNT_PCT}%; новая скидка={new_discount if new_discount is not None else 'н/д'}; "
+            f"предмет={subject_norm}; заказы={float(row.get('orders',0) or 0):.0f}; показы={float(row.get('impressions',0) or 0):.0f}; "
             f"клики={float(row.get('clicks',0) or 0):.0f}; CTR={float(row.get('ctr_pct',0) or 0):.2f}%; "
             f"просмотры карточки={float(row.get('card_views',0) or 0):.0f}; add_to_cart_conv={float(row.get('add_to_cart_conv',0) or 0):.2f}%; "
             f"cart_to_order_conv={float(row.get('cart_to_order_conv',0) or 0):.2f}%"
         )
         rows.append({
-            "nm_id": nm_id, "supplier_article": row.get("supplier_article", ""), "subject_norm": row.get("subject_norm", ""),
-            "current_discount": current_discount, "new_discount": new_discount, "price_action": action,
-            "reason_code": reason_code, "reason_text": reason_text,
-            "orders": row.get("orders", 0), "impressions": row.get("impressions", 0), "clicks": row.get("clicks", 0), "ctr_pct": row.get("ctr_pct", 0),
-            "card_views": row.get("card_views", 0), "add_to_cart": row.get("add_to_cart", 0), "funnel_orders": row.get("funnel_orders", 0),
-            "add_to_cart_conv": row.get("add_to_cart_conv", 0), "cart_to_order_conv": row.get("cart_to_order_conv", 0),
-            "previous_price_event_id": prev_event_id, "price_postcheck_status": post_status,
+            "nm_id": nm_id,
+            "supplier_article": row.get("supplier_article", ""),
+            "subject_norm": subject_norm,
+            "current_discount": current_discount,
+            "new_discount": new_discount,
+            "price_action": action,
+            "reason_code": reason_code,
+            "reason_text": reason_text,
+            "orders": row.get("orders", 0),
+            "impressions": row.get("impressions", 0),
+            "clicks": row.get("clicks", 0),
+            "ctr_pct": row.get("ctr_pct", 0),
+            "card_views": row.get("card_views", 0),
+            "add_to_cart": row.get("add_to_cart", 0),
+            "funnel_orders": row.get("funnel_orders", 0),
+            "add_to_cart_conv": row.get("add_to_cart_conv", 0),
+            "cart_to_order_conv": row.get("cart_to_order_conv", 0),
+            "previous_price_event_id": prev_event_id,
+            "price_postcheck_status": post_status,
         })
+        if action == "Повысить цену" and reason_code == "PRICE_RAISE_1PP_TEST":
+            candidate_indices.append(len(rows) - 1)
+
+    # Ограничиваем новые ценовые тесты за запуск, чтобы не менять 85 товаров одним пакетом.
+    if len(candidate_indices) > MAX_PRICE_TEST_ITEMS_PER_RUN:
+        # Оставляем товары с наибольшим числом заказов, остальным ставим ожидание лимита.
+        ranked = sorted(candidate_indices, key=lambda i: float(rows[i].get("orders", 0) or 0), reverse=True)
+        allowed = set(ranked[:MAX_PRICE_TEST_ITEMS_PER_RUN])
+        for i in candidate_indices:
+            if i not in allowed:
+                rows[i]["price_action"] = "Без изменений"
+                rows[i]["new_discount"] = None
+                rows[i]["reason_code"] = "PRICE_TEST_LIMIT_PER_RUN"
+                rows[i]["reason_text"] += f"; лимит новых price-test за запуск={MAX_PRICE_TEST_ITEMS_PER_RUN}"
+
     return pd.DataFrame(rows, columns=PRICE_DECISION_COLUMNS)
 
 
@@ -1349,10 +1421,8 @@ def apply_price_changes(price_decisions: pd.DataFrame, goods_prices: pd.DataFram
         return pd.DataFrame(), pd.DataFrame()
     api_logs: List[Dict[str, Any]] = []
     if ctx.mode == "preview" or ctx.dry_run or not apply_price:
-        for r in sent_rows:
-            r["api_status"] = "dry_run_or_not_applied"
-            r["api_response"] = "Для отправки цен нужен флаг --apply-price"
-        return pd.DataFrame(sent_rows), pd.DataFrame(api_logs)
+        api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_PRICE_UPLOAD_ENDPOINT, {"rows": len(payload_rows)}, "not_sent", "Цены не отправлялись: preview/dry-run или apply_price=False"))
+        return pd.DataFrame(), pd.DataFrame(api_logs)
     url = WB_PRICES_BASE_URL + WB_PRICE_UPLOAD_ENDPOINT
     for start in range(0, len(payload_rows), 1000):
         batch = payload_rows[start:start+1000]
@@ -2422,11 +2492,12 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
             continue
 
         if new_bid_f < min_bid:
-            result.at[idx, "new_bid_rub"] = round(min_bid, 2)
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "new_bid_rub"] = None
             rc = _clean_text_value(result.at[idx, "reason_code"])
-            if "WB_MIN_BID_ADJUSTED" not in rc:
-                result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_ADJUSTED").strip("_")
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Снизить", round(min_bid, 2), f"расчётная ставка {new_bid_f:.2f} ₽ ниже минимально допустимой WB {min_bid:.2f} ₽; отправляем минимум WB")
+            result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_NOT_ALLOWED").strip("_")
+            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"расчётная ставка {new_bid_f:.2f} ₽ ниже минимально допустимой WB {min_bid:.2f} ₽; не отправляем заведомо невалидную ставку")
+            result.at[idx, "pause_decision"] = ""
 
     for col in DECISION_COLUMNS:
         if col not in result.columns:
@@ -2810,8 +2881,13 @@ def apply_start_actions(start_candidates: pd.DataFrame, config: Config, ctx: Run
         result["api_status"] = "dry_run_no_call"
         return result, pd.DataFrame(api_logs)
     if not ctx.apply_start:
-        result["api_status"] = "not_applied_without_flag"
-        return result, pd.DataFrame(api_logs)
+        rollback_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).eq("ROLLBACK_WRONG_SUBJECT_PAUSE")
+        if not rollback_mask.any():
+            result["api_status"] = "not_applied_without_flag"
+            return result, pd.DataFrame(api_logs)
+        # Технический rollback ошибочных пауз прошлой версии запускаем автоматически в обычном run.
+        result.loc[~rollback_mask, "api_status"] = "not_applied_without_flag"
+        result = result.loc[rollback_mask].copy()
 
     url_base = config.wb_base_url.rstrip("/") + WB_START_ENDPOINT
     status_by_campaign: Dict[str, Tuple[str, str]] = {}
@@ -3331,7 +3407,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not price_decisions.empty:
             print("Диагностика цен action: " + json.dumps(price_decisions["price_action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
             print("Диагностика цен reason_code: " + json.dumps(price_decisions["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-        applied_price_changes, price_api_log = apply_price_changes(price_decisions, goods_prices, config, ctx, apply_price=bool(getattr(args, "apply_price", False)))
+        apply_price_now = (ctx.mode == "run" and not ctx.dry_run) or bool(getattr(args, "apply_price", False))
+        applied_price_changes, price_api_log = apply_price_changes(price_decisions, goods_prices, config, ctx, apply_price=apply_price_now)
         price_history = record_price_events(applied_price_changes, price_history, ctx)
 
     pause_candidates = build_pause_candidates(decisions, bid_history)
