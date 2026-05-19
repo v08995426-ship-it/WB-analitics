@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WB TOPFACE report from scratch: «Валовая Прибыль - НДС».
+WB TOPFACE report from scratch: «Валовая прибыль».
 
 Creates exactly 3 output workbooks and overwrites them on every run:
 1) Отчёты/Объединенный отчет/TOPFACE/Объединенный_отчет_TOPFACE.xlsx
 2) Отчёты/Объединенный отчет/TOPFACE/Технические_расчеты_TOPFACE.xlsx
 3) Отчёты/Объединенный отчет/TOPFACE/Пример_расчета_901_TOPFACE.xlsx
 
-Stage 1 only. Stage 2 is reserved by module stubs and diagnostics schema.
+Stage 1 + Stage 2: gross profit potential, localization, and plan deviation conclusions.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ import calendar
 import io
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -113,7 +114,8 @@ ALIASES: Dict[str, Sequence[str]] = {
     "other_costs": ["Прочие расходы, руб/ед", "Прочие расходы"],
     "cost": ["Себестоимость, руб", "Себестоимость", "Себестоимость, руб/ед"],
     "week": ["Неделя", "week", "week_code"],
-    "plan": ["План", "ВП-НДС", "Валовая Прибыль - НДС", "Валовая прибыль - НДС"],
+    "plan": ["План", "Валовая прибыль"],
+    "stock": ["Остаток", "Остатки", "stock", "quantity", "qty", "Доступно", "Доступный остаток", "Количество", "Всего", "остаток, шт", "Остаток, шт"],
 }
 
 
@@ -415,6 +417,7 @@ class DataPack:
     abc_weekly: pd.DataFrame
     abc_monthly: pd.DataFrame
     plan: pd.DataFrame
+    stock: pd.DataFrame
     diagnostics: Diagnostics
     latest_day: pd.Timestamp
 
@@ -588,10 +591,6 @@ class LoaderLayer:
                     "source_file": key,
                 })
                 out["product"] = out["supplier_article"].map(product_code)
-                # VAT for ABC periods is intentionally NOT calculated from ABC gross_revenue.
-                # It is recalculated later from Orders.finishedPrice for the same period/entity.
-                out["vat"] = np.nan
-                out["gp_minus_nds"] = np.nan
                 if is_month_file(start, end) and start.year == current_year and start <= latest_day:
                     monthly_frames.append(out)
                 elif start.year == current_year or end.year == current_year:
@@ -620,9 +619,8 @@ class LoaderLayer:
             chosen_col = None
             target_month = MONTH_RU[latest_day.month]
             patterns = [
-                f"вп ндс {target_month} {latest_day.year}",
-                f"валовая прибыль ндс {target_month} {latest_day.year}",
                 f"план {target_month} {latest_day.year}",
+                f"валовая прибыль {target_month} {latest_day.year}",
             ]
             for col in raw_cols:
                 k = norm_key(col).replace("-", " ")
@@ -632,7 +630,7 @@ class LoaderLayer:
             if chosen_col is None:
                 for col in raw_cols:
                     k = norm_key(col)
-                    if str(latest_day.year) in k and norm_key(target_month) in k and ("ндс" in k or "план" in k):
+                    if str(latest_day.year) in k and norm_key(target_month) in k and ("план" in k or "валовая прибыль" in k):
                         chosen_col = col
                         break
             if chosen_col is None and "plan" in raw.columns and not raw["plan"].isna().all():
@@ -654,6 +652,103 @@ class LoaderLayer:
             self.diagnostics.add("ERROR", "plan", f"Не прочитан план: {key}", exc)
             return pd.DataFrame()
 
+
+    def load_stock(self) -> pd.DataFrame:
+        """Load stock snapshots from weekly/current stock files.
+
+        The loader supports two common layouts:
+        1) flat rows: date / supplier_article or nm_id / warehouse / stock;
+        2) wide daily columns: supplier_article or nm_id / warehouse / 01.04.2026 / 02.04.2026 / ...
+
+        If a file has no explicit date, the end date parsed from the filename is used as snapshot day.
+        """
+        stock_prefixes = [
+            ("Остатки", self.store, "Недельные"),
+            ("Остатки", self.store),
+            ("Остатки",),
+            ("Остатки и товары в пути", self.store, "Недельные"),
+            ("Остатки и товары в пути", self.store),
+            ("Остатки и товары в пути",),
+        ]
+        files: List[str] = []
+        for parts in stock_prefixes:
+            files.extend(self.list_xlsx(*parts))
+        # Deduplicate while preserving order.
+        seen = set()
+        files = [x for x in files if not (x in seen or seen.add(x))]
+        frames: List[pd.DataFrame] = []
+        date_col_pattern = re.compile(r"^\d{1,2}[.\-/]\d{1,2}([.\-/]\d{2,4})?$")
+        for key in files:
+            try:
+                raw = read_excel_table(self.storage.read_bytes(key), preferred_sheet=None, header_rows=(0, 1, 2, 3))
+                raw_cols = list(raw.columns)
+                parsed_start, parsed_end = parse_abc_period(Path(key).name)
+                # Also support names like Остатки_2026-W15.xlsx.
+                if parsed_end is None:
+                    wk = re.search(r"(\d{4})-W(\d{2})", Path(key).name)
+                    if wk:
+                        parsed_start = pd.Timestamp(date.fromisocalendar(int(wk.group(1)), int(wk.group(2)), 1))
+                        parsed_end = pd.Timestamp(date.fromisocalendar(int(wk.group(1)), int(wk.group(2)), 7))
+                fallback_day = parsed_end if parsed_end is not None else pd.NaT
+
+                base_cols = [c for c in ["day", "nm_id", "supplier_article", "subject", "warehouse", "stock"] if c in raw.columns]
+                has_flat_stock = "stock" in raw.columns and not raw["stock"].isna().all()
+                if has_flat_stock:
+                    out = pd.DataFrame({
+                        "day": date_series(raw["day"]) if "day" in raw.columns else pd.Series([fallback_day] * len(raw)),
+                        "nm_id": num_series(raw["nm_id"]) if "nm_id" in raw.columns else pd.Series([np.nan] * len(raw)),
+                        "supplier_article": raw["supplier_article"].map(clean_article) if "supplier_article" in raw.columns else pd.Series([""] * len(raw)),
+                        "subject": raw["subject"].map(normalize_text) if "subject" in raw.columns else pd.Series([""] * len(raw)),
+                        "warehouse": raw["warehouse"].map(normalize_text) if "warehouse" in raw.columns else pd.Series([""] * len(raw)),
+                        "stock_qty": num_series(raw["stock"]).fillna(0),
+                        "source_file": key,
+                    })
+                    out["day"] = out["day"].fillna(fallback_day)
+                    frames.append(out)
+                    continue
+
+                # Wide layout: date-like columns contain stock values.
+                date_cols = []
+                for c in raw_cols:
+                    c_text = normalize_text(c)
+                    if date_col_pattern.match(c_text):
+                        date_cols.append(c)
+                        continue
+                    parsed = pd.to_datetime(c_text, dayfirst=True, errors="coerce")
+                    if pd.notna(parsed) and 2000 <= parsed.year <= 2100:
+                        date_cols.append(c)
+                if date_cols:
+                    id_cols = [c for c in raw_cols if c not in date_cols]
+                    melted = raw.melt(id_vars=id_cols, value_vars=date_cols, var_name="stock_day_raw", value_name="stock")
+                    melted = add_alias_columns(melted)
+                    out = pd.DataFrame({
+                        "day": pd.to_datetime(melted["stock_day_raw"], dayfirst=True, errors="coerce").dt.normalize(),
+                        "nm_id": num_series(melted["nm_id"]) if "nm_id" in melted.columns else pd.Series([np.nan] * len(melted)),
+                        "supplier_article": melted["supplier_article"].map(clean_article) if "supplier_article" in melted.columns else pd.Series([""] * len(melted)),
+                        "subject": melted["subject"].map(normalize_text) if "subject" in melted.columns else pd.Series([""] * len(melted)),
+                        "warehouse": melted["warehouse"].map(normalize_text) if "warehouse" in melted.columns else pd.Series([""] * len(melted)),
+                        "stock_qty": num_series(melted["stock"]).fillna(0),
+                        "source_file": key,
+                    })
+                    out["day"] = out["day"].fillna(fallback_day)
+                    frames.append(out)
+                else:
+                    self.diagnostics.add("WARN", "stock", f"Файл остатков не распознан: {key}", f"columns={raw_cols}")
+            except Exception as exc:
+                self.diagnostics.add("ERROR", "stock", f"Не прочитан файл остатков: {key}", exc)
+        result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["day", "nm_id", "supplier_article", "subject", "warehouse", "stock_qty", "source_file"])
+        if not result.empty:
+            result["day"] = pd.to_datetime(result["day"], errors="coerce").dt.normalize()
+            result["nm_id"] = num_series(result["nm_id"])
+            result["supplier_article"] = result["supplier_article"].map(clean_article)
+            result["subject"] = result["subject"].map(normalize_text)
+            result["warehouse"] = result["warehouse"].map(normalize_text)
+            result["stock_qty"] = num_series(result["stock_qty"]).fillna(0)
+            result = result[result["day"].notna()].copy()
+            result["product"] = result["supplier_article"].map(product_code)
+        self._log_frame("stock", result, "day")
+        return result
+
     def load_all(self) -> DataPack:
         orders = self.load_orders()
         funnel = self.load_funnel()
@@ -674,6 +769,7 @@ class LoaderLayer:
             if pd.notna(mx):
                 latest_day = max(latest_day, pd.Timestamp(mx).normalize())
         plan = self.load_plan(latest_day)
+        stock = self.load_stock()
 
         return DataPack(
             orders=orders,
@@ -684,6 +780,7 @@ class LoaderLayer:
             abc_weekly=abc_weekly,
             abc_monthly=abc_monthly,
             plan=plan,
+            stock=stock,
             diagnostics=self.diagnostics,
             latest_day=latest_day,
         )
@@ -720,6 +817,7 @@ class DictionaryLayer:
             self._base_fields(self.pack.economics, "economics"),
             self._base_fields(self.pack.abc_weekly, "abc_weekly"),
             self._base_fields(self.pack.abc_monthly, "abc_monthly"),
+            self._base_fields(self.pack.stock, "stock"),
         ]
         master = pd.concat(frames, ignore_index=True)
         master = master[master["subject"].isin(TARGET_SUBJECTS)].copy()
@@ -894,7 +992,7 @@ class Stage1Layer:
             self.diag.add("WARN", "orders", "Нет заказов за текущую неделю")
             return pd.DataFrame()
         orders["week_code"] = orders["day"].map(week_code)
-        # Prices must be weighted by quantity. VAT base is Orders.finishedPrice, not ABC revenue.
+        # Prices are weighted by order quantity.
         orders["finished_price_order_sum"] = orders["orders"].fillna(0) * orders["finished_price"].fillna(0)
         orders["price_with_disc_order_sum"] = orders["orders"].fillna(0) * orders["price_with_disc"].fillna(0)
         orders["spp_order_sum"] = orders["orders"].fillna(0) * orders["spp"].fillna(0)
@@ -929,8 +1027,6 @@ class Stage1Layer:
         enriched["storage_total"] = enriched["buyout_qty"] * enriched["storage"]
         enriched["other_costs_total"] = enriched["buyout_qty"] * enriched["other_costs"]
         enriched["cost_total"] = enriched["buyout_qty"] * enriched["cost"]
-        enriched["vat"] = enriched["finished_price_order_sum"] * enriched["buyout_pct_90"] * 7.0 / 107.0
-        enriched["vat_base_finished_price"] = enriched["finished_price_order_sum"] * enriched["buyout_pct_90"]
         enriched["gross_profit"] = (
             enriched["revenue"]
             - enriched["commission_wb"]
@@ -942,61 +1038,9 @@ class Stage1Layer:
             - enriched["cost_total"]
             - enriched["ad_spend"]
         )
-        enriched["gp_minus_nds"] = enriched["gross_profit"] - enriched["vat"]
         enriched["day_label"] = enriched["day"].dt.strftime("%d.%m")
         enriched["weekday_label"] = enriched["day"].apply(lambda x: f"{WEEKDAY_RU[int(pd.Timestamp(x).weekday())]} {pd.Timestamp(x).strftime('%d.%m')}")
         return enriched
-
-    def orders_finished_price_vat_by_period(self, period_col: str) -> pd.DataFrame:
-        """Calculate VAT base strictly from Orders.finishedPrice for weekly/monthly ABC blocks.
-
-        VAT formula:
-            sum(orders * buyout_pct_90 * finishedPrice) * 7 / 107
-
-        period_col must be either "week_code" or "month_key".
-        """
-        orders = DictionaryLayer.enrich_by_nm(self.pack.orders, self.dictionary, self.diag, "orders_vat_finished_price")
-        orders = DictionaryLayer.filter_target(orders)
-        if orders.empty:
-            return pd.DataFrame(columns=[period_col, "subject", "product", "supplier_article", "nm_id", "vat_base_finished_price", "vat"])
-        if period_col == "week_code":
-            orders["week_code"] = orders["day"].map(week_code)
-        elif period_col == "month_key":
-            orders["month_key"] = orders["day"].dt.to_period("M").astype(str)
-        else:
-            raise ValueError("period_col must be 'week_code' or 'month_key'")
-
-        orders = orders.merge(self.buyout_90()[["nm_id", "buyout_pct_90"]], on="nm_id", how="left")
-        orders["buyout_pct_90"] = orders["buyout_pct_90"].fillna(1.0).clip(lower=0, upper=1)
-        orders["orders_qty"] = num_series(orders["orders"]).fillna(0)
-        orders["finished_price_line_sum"] = orders["orders_qty"] * num_series(orders["finished_price"]).fillna(0)
-        orders["buyout_qty"] = orders["orders_qty"] * orders["buyout_pct_90"]
-        orders["vat_base_finished_price"] = orders["finished_price_line_sum"] * orders["buyout_pct_90"]
-        orders["vat"] = orders["vat_base_finished_price"] * 7.0 / 107.0
-        return orders.groupby([period_col, "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
-            orders_qty_for_vat=("orders_qty", "sum"),
-            buyout_qty_for_vat=("buyout_qty", "sum"),
-            vat_base_finished_price=("vat_base_finished_price", "sum"),
-            vat_from_finished_price=("vat", "sum"),
-        )
-
-    def apply_finished_price_vat_to_abc(self, abc: pd.DataFrame, period_col: str, source_name: str) -> pd.DataFrame:
-        """Overwrite ABC VAT with VAT calculated from Orders.finishedPrice."""
-        if abc.empty:
-            return abc.copy()
-        out = abc.copy()
-        vat = self.orders_finished_price_vat_by_period(period_col)
-        keys = [period_col, "subject", "product", "supplier_article", "nm_id"]
-        out = out.merge(vat, on=keys, how="left")
-        out["vat_old_from_abc_gross_revenue"] = num_series(out.get("gross_revenue", pd.Series(dtype=float))).fillna(0) * 7.0 / 107.0
-        out["vat"] = num_series(out["vat_from_finished_price"]).fillna(0.0)
-        out["gp_minus_nds"] = num_series(out["gross_profit"]).fillna(0.0) - out["vat"]
-        out["vat_source"] = "orders.finishedPrice * buyout_pct_90 * 7/107"
-        missing = int(out["vat_from_finished_price"].isna().sum())
-        if missing:
-            self.diag.add("WARN", source_name, "НДС по части ABC-строк не найден в заказах и поставлен 0", f"rows={missing}; period_col={period_col}")
-        self.diag.add("INFO", source_name, "НДС пересчитан от finishedPrice из заказов", f"rows={len(out)}; vat_sum={out['vat'].sum():.2f}; period_col={period_col}")
-        return out
 
     def weekly_abc_current_month(self) -> pd.DataFrame:
         df = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "abc_weekly")
@@ -1004,7 +1048,6 @@ class Stage1Layer:
         if df.empty:
             return df
         df = df[(df["period_end"] >= self.month_start) & (df["period_start"] <= self.latest_day)].copy()
-        df = self.apply_finished_price_vat_to_abc(df, "week_code", "abc_weekly")
         return df
 
     def monthly_abc_current_year(self) -> pd.DataFrame:
@@ -1027,8 +1070,6 @@ class Stage1Layer:
                     gross_profit=("gross_profit", "sum"),
                     gross_revenue=("gross_revenue", "sum"),
                     orders=("orders", "sum"),
-                    vat=("vat", "sum"),
-                    gp_minus_nds=("gp_minus_nds", "sum"),
                 )
                 synth["source_file"] = "SYNTH_FROM_WEEKLY_ABC_CURRENT_MONTH"
                 frames.append(synth)
@@ -1037,12 +1078,38 @@ class Stage1Layer:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
         out = out[out["month_key"].astype(str).str.startswith(str(self.current_year))].copy()
-        out = self.apply_finished_price_vat_to_abc(out, "month_key", "abc_monthly")
         return out
 
     def plan_used(self) -> pd.DataFrame:
-        plan = DictionaryLayer.enrich_by_nm(self.pack.plan, self.dictionary, self.diag, "plan") if not self.pack.plan.empty else self.pack.plan.copy()
-        plan = DictionaryLayer.filter_target(plan)
+        """Plan for the current month = previous month gross profit * 1.1.
+
+        This replaces План.xlsx for the new gross-profit report.
+        Source priority: monthly ABC for the previous month; if absent, weekly ABC rows whose period starts in the previous month.
+        """
+        prev_month_end = self.month_start - pd.Timedelta(days=1)
+        prev_key = prev_month_end.to_period("M").strftime("%Y-%m")
+        source = pd.DataFrame()
+        monthly = DictionaryLayer.enrich_by_nm(self.pack.abc_monthly, self.dictionary, self.diag, "plan_prev_month_abc_monthly")
+        monthly = DictionaryLayer.filter_target(monthly)
+        if not monthly.empty:
+            source = monthly[monthly["month_key"].astype(str) == prev_key].copy()
+            source["plan_source"] = "abc_monthly_previous_month"
+        if source.empty:
+            weekly = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "plan_prev_month_abc_weekly")
+            weekly = DictionaryLayer.filter_target(weekly)
+            if not weekly.empty:
+                weekly["period_mid"] = pd.to_datetime(weekly["period_start"]) + (pd.to_datetime(weekly["period_end"]) - pd.to_datetime(weekly["period_start"])) / 2
+                source = weekly[weekly["period_mid"].dt.to_period("M").astype(str) == prev_key].copy()
+                source["plan_source"] = "abc_weekly_previous_month"
+        if source.empty:
+            self.diag.add("WARN", "plan", "Нет ABC предыдущего месяца для плана", f"prev_month={prev_key}")
+            return pd.DataFrame(columns=["subject", "product", "supplier_article", "nm_id", "prev_month_gross_profit", "plan_month", "plan_source"])
+        plan = source.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            prev_month_gross_profit=("gross_profit", "sum"),
+            plan_source=("plan_source", "first"),
+        )
+        plan["plan_month"] = plan["prev_month_gross_profit"] * 1.10
+        self.diag.add("INFO", "plan", "План рассчитан от предыдущего месяца ×1.1", f"prev_month={prev_key}; rows={len(plan)}; plan_sum={plan['plan_month'].sum():.2f}")
         return plan
 
     def make_fact_table(self, source: pd.DataFrame, label_col: str, value_col: str, labels: List[str]) -> pd.DataFrame:
@@ -1101,7 +1168,7 @@ class Stage1Layer:
     def build_outputs(self) -> Dict[str, pd.DataFrame]:
         daily = self.daily_formula()
         day_labels = [f"{WEEKDAY_RU[i]} {d.strftime('%d.%m')}" for i, d in enumerate(self.week_days)]
-        daily_block = self.make_fact_table(daily, "weekday_label", "gp_minus_nds", day_labels) if not daily.empty else pd.DataFrame()
+        daily_block = self.make_fact_table(daily, "weekday_label", "gross_profit", day_labels) if not daily.empty else pd.DataFrame()
         # Future weekdays must be visually empty in main block.
         if not daily_block.empty:
             for d, lab in zip(self.week_days, day_labels):
@@ -1110,11 +1177,11 @@ class Stage1Layer:
 
         weekly = self.weekly_abc_current_month()
         week_labels = sorted(weekly["week_label"].dropna().astype(str).unique(), key=lambda x: x) if not weekly.empty else []
-        weekly_block = self.make_fact_table(weekly, "week_label", "gp_minus_nds", week_labels) if not weekly.empty else pd.DataFrame()
+        weekly_block = self.make_fact_table(weekly, "week_label", "gross_profit", week_labels) if not weekly.empty else pd.DataFrame()
 
         monthly = self.monthly_abc_current_year()
         month_labels = [f"{self.current_year:04d}-{m:02d}" for m in range(1, self.current_month + 1)]
-        monthly_block = self.make_fact_table(monthly, "month_key", "gp_minus_nds", month_labels) if not monthly.empty else pd.DataFrame()
+        monthly_block = self.make_fact_table(monthly, "month_key", "gross_profit", month_labels) if not monthly.empty else pd.DataFrame()
 
         return {
             "main_daily": daily_block,
@@ -1128,6 +1195,7 @@ class Stage1Layer:
             "abc_weekly_used": weekly,
             "abc_monthly_used": monthly,
             "plan_used": self.plan_used(),
+            "stock_used": DictionaryLayer.filter_target(DictionaryLayer.enrich_by_nm(self.pack.stock, self.dictionary, self.diag, "stock_used")) if not self.pack.stock.empty else pd.DataFrame(),
             "daily_formula": daily,
             "diagnostics": self.diag.frame(),
             "example_daily": daily[daily["supplier_article"].isin(EXAMPLE_ARTICLES)].copy() if not daily.empty else pd.DataFrame(),
@@ -1154,9 +1222,7 @@ class Stage1Layer:
                     other_costs_total=("other_costs_total", "sum"),
                     cost_total=("cost_total", "sum"),
                     ad_spend=("ad_spend", "sum"),
-                    vat=("vat", "sum"),
                     gross_profit=("gross_profit", "sum"),
-                    gp_minus_nds=("gp_minus_nds", "sum"),
                 )
                 calc["source"] = "stage1_formula_current_week"
                 frames.append(calc)
@@ -1166,8 +1232,6 @@ class Stage1Layer:
                 wcalc = w.groupby(["supplier_article", "subject", "product", "week_code"], as_index=False).agg(
                     orders_qty=("orders", "sum"),
                     gross_profit=("gross_profit", "sum"),
-                    vat=("vat", "sum"),
-                    gp_minus_nds=("gp_minus_nds", "sum"),
                 )
                 wcalc["source"] = "abc_weekly"
                 frames.append(wcalc)
@@ -1175,14 +1239,315 @@ class Stage1Layer:
 
 
 # =============================================================================
-# STAGE 2 PLACEHOLDER
+# STAGE 2: GP POTENTIAL, LOCALIZATION, CONCLUSIONS
 # =============================================================================
 
-class Stage2Layer:
-    """Reserved architecture for future causal analysis: traffic, conversion, price/SPP, RRP, stock coverage."""
+MIN_STOCK_DAYS = 2.0
+PLAN_GROWTH_FACTOR = 1.10
 
-    def __init__(self, *_: Any, **__: Any):
-        pass
+CENTRAL_POOL = [
+    "коледино", "электросталь", "белая дача", "вешки", "вёшки",
+    "рязань", "тюшев", "тула", "алексин", "владимир", "котовск", "воронеж",
+]
+SOUTH_POOL = ["краснодар", "невинномысск", "волгоград", "ростов", "аксай"]
+VOLGA_POOL = ["казань", "пенза", "сарапул", "новосемейкино", "самара"]
+NW_POOL = ["шушары", "санкт", "спб", "уткина", "заводь"]
+URAL_POOL = ["екатеринбург", "челябинск", "перм"]
+SIBERIA_POOL = ["новосибирск", "красноярск", "кемеров"]
+
+
+def warehouse_pool_name(warehouse: Any) -> str:
+    w = norm_key(warehouse)
+    for name, pool in [
+        ("ЦФО", CENTRAL_POOL),
+        ("Юг", SOUTH_POOL),
+        ("Поволжье", VOLGA_POOL),
+        ("Северо-Запад", NW_POOL),
+        ("Урал", URAL_POOL),
+        ("Сибирь", SIBERIA_POOL),
+    ]:
+        if any(token in w for token in pool):
+            return name
+    return f"СКЛАД:{normalize_text(warehouse)}"
+
+
+class Stage2Layer:
+    def __init__(self, pack: DataPack, dictionary: pd.DataFrame, stage1: Stage1Layer):
+        self.pack = pack
+        self.dictionary = dictionary
+        self.stage1 = stage1
+        self.diag = pack.diagnostics
+        self.latest_day = pack.latest_day
+        self.current_year = int(self.latest_day.year)
+        self.current_month = int(self.latest_day.month)
+        self.month_start = pd.Timestamp(date(self.current_year, self.current_month, 1))
+        self.days_in_month = calendar.monthrange(self.current_year, self.current_month)[1]
+        self.days_elapsed = max(1, min(int(self.latest_day.day), self.days_in_month))
+        self.current_month_key = self.latest_day.to_period("M").strftime("%Y-%m")
+        self.lookback_start = self.latest_day - pd.Timedelta(days=89)
+
+    def weekly_abc_90d(self) -> pd.DataFrame:
+        weekly = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "stage2_abc_weekly_90d")
+        weekly = DictionaryLayer.filter_target(weekly)
+        if weekly.empty:
+            return weekly
+        weekly = weekly[(weekly["period_end"] >= self.lookback_start) & (weekly["period_start"] <= self.latest_day)].copy()
+        weekly["days_in_period"] = (pd.to_datetime(weekly["period_end"]) - pd.to_datetime(weekly["period_start"])).dt.days + 1
+        weekly["days_in_period"] = weekly["days_in_period"].clip(lower=1).fillna(7)
+        # Aggregate duplicate article rows inside one ABC period before calculating article potential.
+        grouped = weekly.groupby(["subject", "product", "supplier_article", "nm_id", "week_code", "week_label", "period_start", "period_end"], dropna=False, as_index=False).agg(
+            gross_profit=("gross_profit", "sum"),
+            orders=("orders", "sum"),
+            days_in_period=("days_in_period", "max"),
+        )
+        grouped["weekly_gp_per_day"] = grouped["gross_profit"] / grouped["days_in_period"].replace(0, np.nan)
+        grouped["weekly_gp_per_day"] = grouped["weekly_gp_per_day"].fillna(0)
+        return grouped
+
+    def current_month_fact_from_weekly(self) -> pd.DataFrame:
+        weekly = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "stage2_current_month_weekly")
+        weekly = DictionaryLayer.filter_target(weekly)
+        if weekly.empty:
+            return weekly
+        weekly["period_mid"] = pd.to_datetime(weekly["period_start"]) + (pd.to_datetime(weekly["period_end"]) - pd.to_datetime(weekly["period_start"])) / 2
+        weekly = weekly[weekly["period_mid"].dt.to_period("M").astype(str) == self.current_month_key].copy()
+        return weekly.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            current_month_gross_profit=("gross_profit", "sum"),
+            current_month_orders=("orders", "sum"),
+        )
+
+    def gp_potential_90d(self) -> pd.DataFrame:
+        weekly = self.weekly_abc_90d()
+        plan = self.stage1.plan_used()
+        current = self.current_month_fact_from_weekly()
+        if weekly.empty:
+            base_cols = ["subject", "product", "supplier_article", "nm_id"]
+            if not plan.empty:
+                base = plan[base_cols].drop_duplicates().copy()
+            else:
+                base = self.dictionary[base_cols].drop_duplicates().copy() if not self.dictionary.empty else pd.DataFrame(columns=base_cols)
+            base["weeks_in_analysis"] = 0
+            base["gp_90d"] = 0.0
+            base["avg_gp_per_day"] = 0.0
+            base["target_gp_per_day"] = 0.0
+            base["best_week_gp_per_day"] = 0.0
+        else:
+            rows = []
+            for keys, g in weekly.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+                vals = pd.to_numeric(g["weekly_gp_per_day"], errors="coerce").fillna(0)
+                avg = float(vals.mean()) if len(vals) else 0.0
+                above = vals[vals > avg]
+                target = float(above.mean()) if len(above) else avg
+                rows.append({
+                    "subject": keys[0],
+                    "product": keys[1],
+                    "supplier_article": keys[2],
+                    "nm_id": keys[3],
+                    "weeks_in_analysis": int(g["week_code"].nunique()),
+                    "gp_90d": float(g["gross_profit"].sum()),
+                    "avg_gp_per_day": avg,
+                    "target_gp_per_day": target,
+                    "best_week_gp_per_day": float(vals.max()) if len(vals) else 0.0,
+                })
+            base = pd.DataFrame(rows)
+        if not plan.empty:
+            base = base.merge(plan[["subject", "product", "supplier_article", "nm_id", "prev_month_gross_profit", "plan_month"]], on=["subject", "product", "supplier_article", "nm_id"], how="outer")
+        else:
+            base["prev_month_gross_profit"] = 0.0
+            base["plan_month"] = 0.0
+        if not current.empty:
+            base = base.merge(current, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        else:
+            base["current_month_gross_profit"] = 0.0
+            base["current_month_orders"] = 0.0
+        for c in ["weeks_in_analysis", "gp_90d", "avg_gp_per_day", "target_gp_per_day", "best_week_gp_per_day", "prev_month_gross_profit", "plan_month", "current_month_gross_profit", "current_month_orders"]:
+            if c not in base.columns:
+                base[c] = 0.0
+            base[c] = pd.to_numeric(base[c], errors="coerce").fillna(0)
+        # If there is no previous-month base but there is current fact, neutralize division by zero and treat current fact as plan.
+        no_plan_has_fact = (base["plan_month"] <= 0) & (base["current_month_gross_profit"] > 0)
+        base.loc[no_plan_has_fact, "plan_month"] = base.loc[no_plan_has_fact, "current_month_gross_profit"]
+        base["plan_to_date"] = base["plan_month"] / self.days_in_month * self.days_elapsed
+        base["plan_completion_pct"] = np.where(base["plan_month"] > 0, base["current_month_gross_profit"] / base["plan_month"] * 100, np.nan)
+        base["plan_to_date_completion_pct"] = np.where(base["plan_to_date"] > 0, base["current_month_gross_profit"] / base["plan_to_date"] * 100, np.nan)
+        base["current_gp_per_day"] = base["current_month_gross_profit"] / self.days_elapsed
+        base["potential_status"] = np.select(
+            [
+                base["weeks_in_analysis"] <= 0,
+                base["current_gp_per_day"] < base["avg_gp_per_day"],
+                base["current_gp_per_day"] >= base["target_gp_per_day"],
+                base["current_gp_per_day"] >= base["target_gp_per_day"] * 0.90,
+            ],
+            [
+                "Нет истории ABC",
+                "Ниже минимальной планки",
+                "Выше целевого уровня",
+                "Идёт к целевому уровню",
+            ],
+            default="В пределах минимальной планки",
+        )
+        base["metric_note"] = "Средняя ВП/день = минимум; целевая ВП/день = среднее недель выше среднего"
+        return base.sort_values(["subject", "product", "supplier_article"]).reset_index(drop=True)
+
+    def stock_enriched(self) -> pd.DataFrame:
+        stock = self.pack.stock.copy()
+        if stock.empty:
+            return stock
+        stock = DictionaryLayer.enrich_by_nm(stock, self.dictionary, self.diag, "stage2_stock")
+        stock = DictionaryLayer.filter_target(stock)
+        if stock.empty:
+            return stock
+        stock["warehouse_pool"] = stock["warehouse"].map(warehouse_pool_name)
+        stock = stock.groupby(["day", "subject", "product", "supplier_article", "nm_id", "warehouse", "warehouse_pool"], dropna=False, as_index=False).agg(stock_qty=("stock_qty", "sum"))
+        return stock
+
+    def warehouse_weights(self) -> pd.DataFrame:
+        orders = DictionaryLayer.enrich_by_nm(self.pack.orders, self.dictionary, self.diag, "stage2_orders_warehouse_weights")
+        orders = DictionaryLayer.filter_target(orders)
+        if orders.empty:
+            return pd.DataFrame()
+        orders = orders[(orders["day"] >= self.lookback_start) & (orders["day"] <= self.latest_day)].copy()
+        orders["warehouse"] = orders["warehouse"].map(normalize_text)
+        orders = orders[orders["warehouse"].ne("")].copy()
+        if orders.empty:
+            return pd.DataFrame()
+        wh = orders.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(orders_90=("orders", "sum"))
+        wh["article_orders_90"] = wh.groupby(["supplier_article", "nm_id"], dropna=False)["orders_90"].transform("sum")
+        wh["warehouse_weight"] = np.where(wh["article_orders_90"] > 0, wh["orders_90"] / wh["article_orders_90"], 0)
+        wh["avg_daily_orders_warehouse"] = wh["orders_90"] / 90.0
+        wh = wh.sort_values(["supplier_article", "nm_id", "warehouse_weight"], ascending=[True, True, False])
+        wh["cum_weight"] = wh.groupby(["supplier_article", "nm_id"], dropna=False)["warehouse_weight"].cumsum()
+        wh["prev_cum_weight"] = wh.groupby(["supplier_article", "nm_id"], dropna=False)["cum_weight"].shift(1).fillna(0)
+        # Keep warehouses required to cover approximately 97%; include the first warehouse that crosses the threshold.
+        wh["is_key_warehouse"] = (wh["prev_cum_weight"] < 0.97) | (wh["warehouse_weight"] >= 0.03)
+        wh = wh[wh["is_key_warehouse"]].copy()
+        wh["warehouse_pool"] = wh["warehouse"].map(warehouse_pool_name)
+        wh["needed_stock_qty"] = wh["avg_daily_orders_warehouse"] * MIN_STOCK_DAYS
+        return wh
+
+    def localization_detail(self) -> pd.DataFrame:
+        stock = self.stock_enriched()
+        weights = self.warehouse_weights()
+        if stock.empty or weights.empty:
+            self.diag.add("WARN", "localization", "Недостаточно данных для локализации", f"stock_rows={len(stock)}; weights_rows={len(weights)}")
+            return pd.DataFrame()
+        stock_days = stock["day"].dropna().sort_values().unique()
+        # Grid: every stock day x every key warehouse, so missing stock rows become zero.
+        grid = weights.assign(_key=1).merge(pd.DataFrame({"day": stock_days, "_key": 1}), on="_key", how="outer").drop(columns="_key")
+        detail = grid.merge(stock[["day", "supplier_article", "nm_id", "warehouse", "stock_qty"]], on=["day", "supplier_article", "nm_id", "warehouse"], how="left")
+        detail["stock_qty"] = detail["stock_qty"].fillna(0)
+        pool_stock = stock.groupby(["day", "supplier_article", "nm_id", "warehouse_pool"], dropna=False, as_index=False).agg(pool_stock_qty=("stock_qty", "sum"))
+        detail = detail.merge(pool_stock, on=["day", "supplier_article", "nm_id", "warehouse_pool"], how="left")
+        detail["pool_stock_qty"] = detail["pool_stock_qty"].fillna(0)
+        detail["replacement_stock_qty"] = (detail["pool_stock_qty"] - detail["stock_qty"]).clip(lower=0)
+        detail["direct_available"] = detail["stock_qty"] >= detail["needed_stock_qty"]
+        detail["replacement_available"] = (~detail["direct_available"]) & (detail["replacement_stock_qty"] >= detail["needed_stock_qty"])
+        detail["available_with_replacement"] = detail["direct_available"] | detail["replacement_available"]
+        detail["direct_coverage_contribution_pct"] = np.where(detail["direct_available"], detail["warehouse_weight"] * 100, 0)
+        detail["replacement_coverage_contribution_pct"] = np.where(detail["available_with_replacement"], detail["warehouse_weight"] * 100, 0)
+        detail["localization_status"] = np.select(
+            [detail["direct_available"], detail["replacement_available"]],
+            ["Покрыт напрямую", "Покрыт заменой"],
+            default="Не покрыт",
+        )
+        return detail.sort_values(["day", "supplier_article", "warehouse_weight"], ascending=[True, True, False]).reset_index(drop=True)
+
+    def localization_summary(self, detail: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        if detail is None:
+            detail = self.localization_detail()
+        if detail.empty:
+            return pd.DataFrame()
+        summary = detail.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            direct_localization_pct=("direct_coverage_contribution_pct", "sum"),
+            localization_with_replacements_pct=("replacement_coverage_contribution_pct", "sum"),
+            stock_qty_total=("stock_qty", "sum"),
+            key_warehouses=("warehouse", "nunique"),
+            uncovered_warehouses=("localization_status", lambda s: int((s == "Не покрыт").sum())),
+        )
+        latest_by_article = summary.sort_values("day").groupby(["supplier_article", "nm_id"], dropna=False).tail(1).copy()
+        avg_period = summary.groupby(["supplier_article", "nm_id"], dropna=False).agg(
+            avg_direct_localization_pct=("direct_localization_pct", "mean"),
+            avg_localization_with_replacements_pct=("localization_with_replacements_pct", "mean"),
+        ).reset_index()
+        latest_by_article = latest_by_article.merge(avg_period, on=["supplier_article", "nm_id"], how="left")
+        latest_by_article["localization_status"] = pd.cut(
+            latest_by_article["localization_with_replacements_pct"],
+            bins=[-1, 30, 60, 85, 1000],
+            labels=["Критично", "Плохая локализация", "Риск", "Норма"],
+        ).astype(str)
+        return latest_by_article.sort_values(["subject", "product", "supplier_article"]).reset_index(drop=True)
+
+    def conclusions(self, potential: Optional[pd.DataFrame] = None, loc_summary: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        if potential is None:
+            potential = self.gp_potential_90d()
+        if loc_summary is None:
+            loc_summary = self.localization_summary()
+        out = potential.copy()
+        if not loc_summary.empty:
+            out = out.merge(
+                loc_summary[["supplier_article", "nm_id", "direct_localization_pct", "localization_with_replacements_pct", "stock_qty_total", "uncovered_warehouses", "localization_status"]],
+                on=["supplier_article", "nm_id"],
+                how="left",
+            )
+        for c in ["direct_localization_pct", "localization_with_replacements_pct", "stock_qty_total", "uncovered_warehouses"]:
+            if c not in out.columns:
+                out[c] = np.nan
+        if "localization_status" not in out.columns:
+            out["localization_status"] = "Нет данных"
+        out["plan_tempo_status"] = np.select(
+            [out["plan_to_date_completion_pct"] < 90, out["plan_to_date_completion_pct"] > 110],
+            ["Отстаём от плана", "Опережаем план"],
+            default="Идём по плану",
+        )
+        reasons = []
+        recommendations = []
+        for _, r in out.iterrows():
+            tempo = r.get("plan_tempo_status", "")
+            loc = r.get("localization_with_replacements_pct", np.nan)
+            direct_loc = r.get("direct_localization_pct", np.nan)
+            pot_status = r.get("potential_status", "")
+            if tempo == "Отстаём от плана":
+                if pd.notna(loc) and loc < 85:
+                    reason = f"Отставание связано с локализацией/остатками: покрытие с заменами {loc:.1f}%, прямое {direct_loc if pd.notna(direct_loc) else 0:.1f}%."
+                    rec = "Восстановить остатки на ключевых складах и складах-заменителях; сначала закрыть склады с максимальным весом заказов."
+                elif "Ниже минимальной" in str(pot_status):
+                    reason = "Локализация не выглядит главным ограничителем; текущая ВП/день ниже минимальной 90-дневной планки."
+                    rec = "Проверить цену, рекламу, спрос и карточку; вернуть товар хотя бы к средней ВП/день за 90 дней."
+                else:
+                    reason = "Темп ниже плана, но по потенциалу товар не провален; план мог вырасти быстрее фактического темпа."
+                    rec = "Сравнить условия лучших недель: ассортимент, цена, рекламная поддержка и наличие."
+            elif tempo == "Опережаем план":
+                reason = "Факт на дату выше плана; товар опережает плановый темп."
+                rec = "Удерживать условия роста: не допускать просадки остатков, контролировать рекламу и маржинальность."
+            else:
+                reason = "Факт близок к плановому темпу."
+                rec = "Поддерживать текущие условия и следить, чтобы ВП/день не упала ниже минимальной планки."
+            reasons.append(reason)
+            recommendations.append(rec)
+        out["reason"] = reasons
+        out["recommendation"] = recommendations
+        cols_first = [
+            "subject", "product", "supplier_article", "nm_id", "plan_tempo_status",
+            "plan_to_date_completion_pct", "plan_completion_pct", "current_month_gross_profit", "plan_month",
+            "avg_gp_per_day", "target_gp_per_day", "current_gp_per_day", "potential_status",
+            "direct_localization_pct", "localization_with_replacements_pct", "localization_status", "reason", "recommendation",
+        ]
+        rest = [c for c in out.columns if c not in cols_first]
+        return out[cols_first + rest].sort_values(["subject", "product", "supplier_article"]).reset_index(drop=True)
+
+    def build_outputs(self) -> Dict[str, pd.DataFrame]:
+        potential_weekly = self.weekly_abc_90d()
+        potential = self.gp_potential_90d()
+        loc_detail = self.localization_detail()
+        loc_summary = self.localization_summary(loc_detail)
+        conclusions = self.conclusions(potential, loc_summary)
+        return {
+            "stage2_gp_potential_weekly_90d": potential_weekly,
+            "stage2_gp_potential_90d": potential,
+            "stage2_localization_detail": loc_detail,
+            "stage2_localization_summary": loc_summary,
+            "stage2_conclusions": conclusions,
+        }
 
 
 # =============================================================================
@@ -1299,7 +1664,7 @@ def export_all(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> Tuple[Path,
     ws = wb.active
     ws.title = "Сводка"
     row = 1
-    row = write_main_block(ws, row, "Валовая Прибыль - НДС", outputs.get("main_daily", pd.DataFrame()))
+    row = write_main_block(ws, row, "Валовая прибыль", outputs.get("main_daily", pd.DataFrame()))
     row = write_main_block(ws, row, "Текущий месяц по неделям", outputs.get("main_weekly", pd.DataFrame()))
     row = write_main_block(ws, row, "Месяцы текущего года", outputs.get("main_monthly", pd.DataFrame()))
     ws.freeze_panes = "B3"
@@ -1317,7 +1682,13 @@ def export_all(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> Tuple[Path,
         "abc_weekly_used",
         "abc_monthly_used",
         "plan_used",
+        "stock_used",
         "daily_formula",
+        "stage2_gp_potential_weekly_90d",
+        "stage2_gp_potential_90d",
+        "stage2_localization_summary",
+        "stage2_localization_detail",
+        "stage2_conclusions",
         "diagnostics",
     ]:
         write_dataframe_sheet(tech_wb, sheet, outputs.get(sheet, pd.DataFrame()))
@@ -1337,12 +1708,12 @@ def export_all(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> Tuple[Path,
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TOPFACE WB report: Валовая Прибыль - НДС")
+    parser = argparse.ArgumentParser(description="TOPFACE WB report: Валовая прибыль")
     parser.add_argument("--root", default=".", help="Local reports root when S3 env vars are not set")
     parser.add_argument("--reports-root", default="Отчёты", help="Base reports folder/key")
     parser.add_argument("--store", default="TOPFACE", help="Store/brand folder")
     parser.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE", help="Output folder/key")
-    parser.add_argument("--local-tmp", default="/tmp/wb_topface_gp_nds", help="Local temporary folder for generated workbooks")
+    parser.add_argument("--local-tmp", default="/tmp/wb_topface_gp", help="Local temporary folder for generated workbooks")
     return parser.parse_args()
 
 
@@ -1356,6 +1727,9 @@ def main() -> int:
     dictionary = DictionaryLayer(pack).build()
     stage1 = Stage1Layer(pack, dictionary)
     outputs = stage1.build_outputs()
+    stage2 = Stage2Layer(pack, dictionary, stage1)
+    outputs.update(stage2.build_outputs())
+    outputs["diagnostics"] = pack.diagnostics.frame()
 
     local_report, local_tech, local_example = export_all(outputs, Path(args.local_tmp))
 
@@ -1367,6 +1741,15 @@ def main() -> int:
     storage.write_bytes(out_tech, local_tech.read_bytes())
     storage.write_bytes(out_example, local_example.read_bytes())
 
+    # GitHub Actions upload-artifact searches the runner filesystem, not S3.
+    # Therefore always keep local copies under --root/--out-subdir as well.
+    local_out_dir = Path(args.root) / args.out_subdir
+    local_out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(local_report, local_out_dir / MAIN_REPORT_NAME)
+    shutil.copy2(local_tech, local_out_dir / TECH_REPORT_NAME)
+    shutil.copy2(local_example, local_out_dir / EXAMPLE_REPORT_NAME)
+
+    log(f"Saved local copies: {local_out_dir}")
     log(f"Saved: {out_report}")
     log(f"Saved: {out_tech}")
     log(f"Saved: {out_example}")
