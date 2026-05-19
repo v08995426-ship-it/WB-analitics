@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+WB TOPFACE report from scratch: «Валовая Прибыль - НДС».
+
+Creates exactly 3 output workbooks and overwrites them on every run:
+1) Отчёты/Объединенный отчет/TOPFACE/Объединенный_отчет_TOPFACE.xlsx
+2) Отчёты/Объединенный отчет/TOPFACE/Технические_расчеты_TOPFACE.xlsx
+3) Отчёты/Объединенный отчет/TOPFACE/Пример_расчета_901_TOPFACE.xlsx
+
+Stage 1 only. Stage 2 is reserved by module stubs and diagnostics schema.
+"""
 
 from __future__ import annotations
 
 import argparse
 import calendar
 import io
-import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import boto3
 import numpy as np
@@ -21,38 +30,103 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-TARGET_SUBJECTS = [
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+TARGET_SUBJECTS: List[str] = [
     "Кисти косметические",
     "Помады",
     "Блески",
     "Косметические карандаши",
 ]
 
-EXCLUDE_ARTICLES = {
-    "CZ420", "CZ420БРОВИ", "CZ420ГЛАЗА", "DE49", "DE49ГЛАЗА", "PT901", "CZ420", "CZ420ГЛАЗА"
+EXCLUDE_ARTICLES_UPPER = {
+    "CZ420",
+    "CZ420БРОВИ",
+    "CZ420ГЛАЗА",
+    "DE49",
+    "DE49ГЛАЗА",
+    "PT901",
 }
 
-TARGET_EXAMPLE_ARTICLES = ["901/5", "901/8", "901/14", "901/18"]
+EXAMPLE_ARTICLES = ["901/5", "901/8", "901/14", "901/18"]
 
-THIN = Side(style="thin", color="D9D9D9")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-FILL_HEADER = PatternFill("solid", fgColor="DDEBF7")
-FILL_SECTION = PatternFill("solid", fgColor="E2F0D9")
-FILL_TOTAL = PatternFill("solid", fgColor="FFF2CC")
-FILL_CATEGORY = PatternFill("solid", fgColor="EAF4FF")
-FILL_PRODUCT = PatternFill("solid", fgColor="F7FBFF")
+MAIN_REPORT_NAME = "Объединенный_отчет_TOPFACE.xlsx"
+TECH_REPORT_NAME = "Технические_расчеты_TOPFACE.xlsx"
+EXAMPLE_REPORT_NAME = "Пример_расчета_901_TOPFACE.xlsx"
+
+HEADER_FILL = PatternFill("solid", fgColor="17365D")
+HEADER_FONT = Font(color="FFFFFF", bold=True)
+TITLE_FILL = PatternFill("solid", fgColor="1F4E79")
+TOTAL_FILL = PatternFill("solid", fgColor="D9EAF7")
+ARTICLE_FILL = PatternFill("solid", fgColor="FFFFFF")
+PLAN_FILL = PatternFill("solid", fgColor="EAF2F8")
+CATEGORY_FILLS = {
+    "Кисти косметические": PatternFill("solid", fgColor="9DC3E6"),
+    "Помады": PatternFill("solid", fgColor="B4C7E7"),
+    "Блески": PatternFill("solid", fgColor="C6E0F5"),
+    "Косметические карандаши": PatternFill("solid", fgColor="DDEBF7"),
+}
+PRODUCT_FILL = PatternFill("solid", fgColor="EAF4FF")
+THIN_SIDE = Side(style="thin", color="D9D9D9")
+BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTH_RU = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
+
+ALIASES: Dict[str, Sequence[str]] = {
+    "day": ["Дата", "Дата заказа", "date", "dt", "День"],
+    "nm_id": ["Артикул WB", "Артикул ВБ", "nmID", "nmId", "nm_id", "Номенклатура WB", "Номенклатура"],
+    "supplier_article": ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "Артикул WB продавца"],
+    "subject": ["Предмет", "subject", "Название предмета", "Категория", "category"],
+    "brand": ["Бренд", "brand"],
+    "title": ["Название", "Название товара", "Товар", "Наименование"],
+    "orders": ["Заказы", "orders", "ordersCount", "Кол-во заказов", "Количество заказов"],
+    "buyouts_count": ["buyoutsCount", "Выкупы", "Кол-во выкупов", "Количество выкупов"],
+    "finished_price": ["finishedPrice", "Цена с учетом всех скидок, кроме суммы по WB Кошельку", "Ср. цена продажи"],
+    "price_with_disc": ["priceWithDisc", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
+    "spp": ["СПП, %", "SPP", "Скидка WB, %", "spp"],
+    "warehouse": ["Склад", "warehouseName", "warehouse"],
+    "spend": ["Расход", "spend", "Продвижение", "Затраты", "Расходы"],
+    "gross_profit": ["Валовая прибыль", "Валовая прибыль, руб", "Валовая прибыль, руб/ед"],
+    "gross_revenue": ["Валовая выручка", "Выручка", "Валовая выручка, руб"],
+    "commission_pct": ["Комиссия WB, %", "Комиссия ВБ, %", "Комиссия, %"],
+    "acquiring_pct": ["Эквайринг, %", "Эквайринг WB, %"],
+    "logistics_direct": ["Логистика прямая, руб/ед", "Логистика прямая"],
+    "logistics_return": ["Логистика обратная, руб/ед", "Логистика обратная"],
+    "storage": ["Хранение, руб/ед", "Хранение"],
+    "other_costs": ["Прочие расходы, руб/ед", "Прочие расходы"],
+    "cost": ["Себестоимость, руб", "Себестоимость", "Себестоимость, руб/ед"],
+    "week": ["Неделя", "week", "week_code"],
+    "plan": ["План", "ВП-НДС", "Валовая Прибыль - НДС", "Валовая прибыль - НДС"],
+}
 
 
-# -------------------------
-# Helpers
-# -------------------------
+# =============================================================================
+# BASIC HELPERS
+# =============================================================================
 
 def log(message: str) -> None:
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
 def normalize_text(value: Any) -> str:
-    if value is None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
     text = str(value).replace("\xa0", " ").strip()
     return re.sub(r"\s+", " ", text)
@@ -60,1153 +134,1179 @@ def normalize_text(value: Any) -> str:
 
 def norm_key(value: Any) -> str:
     text = normalize_text(value).lower().replace("ё", "е")
-    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"[^a-zа-я0-9%]+", " ", text, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", text).strip()
 
 
 def clean_article(value: Any) -> str:
     text = normalize_text(value)
-    if not text or text.lower() in {"nan", "none"}:
+    if text.lower() in {"", "nan", "none", "null"}:
         return ""
     return text
 
 
-def upper_article(value: Any) -> str:
-    return clean_article(value).upper()
+def article_upper(value: Any) -> str:
+    return clean_article(value).upper().replace(" ", "")
 
 
-def clean_code_from_article(value: Any) -> str:
-    text = upper_article(value)
-    if not text or text in EXCLUDE_ARTICLES:
+def product_code(article: Any) -> str:
+    text = article_upper(article)
+    if not text or text in EXCLUDE_ARTICLES_UPPER:
         return ""
-    # PT901 / PT901.F25 / 901_/16 / 901/5 -> 901
+    text = text.replace("_", "/")
     m = re.match(r"^PT(\d+)", text)
     if m:
         return m.group(1)
     m = re.match(r"^(\d+)", text)
     if m:
         return m.group(1)
-    return ""
+    m = re.match(r"^([A-ZА-Я]+\d+)", text)
+    if m:
+        return m.group(1)
+    return text.split("/")[0].split(".")[0]
 
 
-def to_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+def to_number(value: Any) -> float:
+    if value is None:
+        return np.nan
+    if isinstance(value, str):
+        value = value.replace("\xa0", " ").replace(" ", "").replace("₽", "").replace("%", "").replace(",", ".")
+    return pd.to_numeric(value, errors="coerce")
 
 
-def to_dt(series: pd.Series) -> pd.Series:
+def num_series(series: pd.Series) -> pd.Series:
+    return series.map(to_number)
+
+
+def date_series(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce").dt.normalize()
 
 
-def safe_div(a: Any, b: Any) -> float:
-    try:
-        a = float(a)
-        b = float(b)
-    except Exception:
-        return np.nan
-    if pd.isna(a) or pd.isna(b) or b == 0:
-        return np.nan
-    return a / b
+def safe_ratio(a: Any, b: Any, default: float = np.nan) -> float:
+    a_num = to_number(a)
+    b_num = to_number(b)
+    if pd.isna(a_num) or pd.isna(b_num) or b_num == 0:
+        return default
+    return float(a_num / b_num)
 
 
-def safe_weighted_average(values: pd.Series, weights: pd.Series) -> float:
-    v = pd.to_numeric(values, errors="coerce")
-    w = pd.to_numeric(weights, errors="coerce").fillna(0)
-    mask = v.notna() & w.notna()
-    if not mask.any():
-        return np.nan
-    v = v[mask]
-    w = w[mask]
-    if w.sum() == 0:
-        return np.nan
-    return float(np.average(v, weights=w))
-
-
-def week_code_from_date(dt_value: Any) -> Optional[str]:
-    if pd.isna(dt_value):
-        return None
-    ts = pd.Timestamp(dt_value)
-    iso = ts.isocalendar()
+def week_code(ts: Any) -> str:
+    if pd.isna(ts):
+        return ""
+    d = pd.Timestamp(ts)
+    iso = d.isocalendar()
     return f"{int(iso.year)}-W{int(iso.week):02d}"
 
 
-def week_bounds_from_code(week_code: str) -> Tuple[Optional[date], Optional[date]]:
-    m = re.match(r"^(\d{4})-W(\d{2})$", str(week_code))
-    if not m:
-        return None, None
-    y = int(m.group(1))
-    w = int(m.group(2))
-    return date.fromisocalendar(y, w, 1), date.fromisocalendar(y, w, 7)
-
-
-def parse_week_code_from_name(name: str) -> Optional[str]:
-    m = re.search(r"(\d{4})-W(\d{2})", name)
+def week_start_from_code(code: str) -> Optional[pd.Timestamp]:
+    m = re.search(r"(\d{4})-W(\d{2})", str(code))
     if not m:
         return None
-    return f"{m.group(1)}-W{m.group(2)}"
+    return pd.Timestamp(date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1))
 
 
-def parse_abc_period_from_name(name: str) -> Tuple[Optional[date], Optional[date]]:
-    m = re.search(r"__(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})__", name)
+def parse_abc_period(filename: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    # Supports both wb_abc_report_goods__01.05.2026-07.05.2026__x.xlsx and single underscore variants.
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})", filename)
     if not m:
         return None, None
-    return (
-        date(int(m.group(3)), int(m.group(2)), int(m.group(1))),
-        date(int(m.group(6)), int(m.group(5)), int(m.group(4))),
-    )
+    start = pd.Timestamp(date(int(m.group(3)), int(m.group(2)), int(m.group(1))))
+    end = pd.Timestamp(date(int(m.group(6)), int(m.group(5)), int(m.group(4))))
+    return start, end
 
 
-def russian_month_name(month_num: int) -> str:
-    names = {
-        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
-        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
-        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
-    }
-    return names[month_num]
+def is_month_file(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    if pd.isna(start) or pd.isna(end):
+        return False
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    return start.day == 1 and end.day == last_day and start.month == end.month and start.year == end.year
 
 
-# -------------------------
-# Storage
-# -------------------------
-class BaseStorage:
+def month_key(ts: Any) -> str:
+    d = pd.Timestamp(ts)
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def money_format() -> str:
+    return '# ##0 ₽;[Red]-# ##0 ₽;0 ₽'
+
+
+# =============================================================================
+# STORAGE
+# =============================================================================
+
+class Storage:
     def list_files(self, prefix: str) -> List[str]:
         raise NotImplementedError
 
-    def read_bytes(self, path: str) -> bytes:
+    def read_bytes(self, key: str) -> bytes:
         raise NotImplementedError
 
-    def write_bytes(self, path: str, data: bytes) -> None:
+    def write_bytes(self, key: str, data: bytes) -> None:
         raise NotImplementedError
 
-    def exists(self, path: str) -> bool:
+    def exists(self, key: str) -> bool:
         raise NotImplementedError
 
 
-class LocalStorage(BaseStorage):
+class LocalStorage(Storage):
     def __init__(self, root: str):
         self.root = Path(root)
 
-    def _abs(self, rel_path: str) -> Path:
-        return self.root / rel_path
+    def _full(self, key: str) -> Path:
+        return self.root / key
 
     def list_files(self, prefix: str) -> List[str]:
-        prefix = prefix.replace("\\", "/").rstrip("/")
-        start = self._abs(prefix)
-        base = start if start.exists() else start.parent
+        prefix = prefix.replace("\\", "/").strip("/")
+        start = self._full(prefix)
+        base = start if start.is_dir() else start.parent
         if not base.exists():
             return []
-        out = []
-        for p in base.rglob("*"):
-            if p.is_file():
-                rel = str(p.relative_to(self.root)).replace("\\", "/")
+        out: List[str] = []
+        for path in base.rglob("*"):
+            if path.is_file():
+                rel = str(path.relative_to(self.root)).replace("\\", "/")
                 if rel.startswith(prefix):
                     out.append(rel)
         return sorted(out)
 
-    def read_bytes(self, path: str) -> bytes:
-        return self._abs(path).read_bytes()
+    def read_bytes(self, key: str) -> bytes:
+        return self._full(key).read_bytes()
 
-    def write_bytes(self, path: str, data: bytes) -> None:
-        abs_path = self._abs(path)
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
-        abs_path.write_bytes(data)
+    def write_bytes(self, key: str, data: bytes) -> None:
+        path = self._full(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
 
-    def exists(self, path: str) -> bool:
-        return self._abs(path).exists()
+    def exists(self, key: str) -> bool:
+        return self._full(key).exists()
 
 
-class S3Storage(BaseStorage):
-    def __init__(self, bucket: str, access_key: str, secret_key: str):
+class S3Storage(Storage):
+    def __init__(self, bucket: str, access_key: str, secret_key: str, endpoint_url: str):
         self.bucket = bucket
-        self.s3 = boto3.client(
+        self.client = boto3.client(
             "s3",
-            endpoint_url="https://storage.yandexcloud.net",
+            endpoint_url=endpoint_url,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
         )
 
     def list_files(self, prefix: str) -> List[str]:
-        files = []
-        token = None
+        out: List[str] = []
+        token: Optional[str] = None
         while True:
-            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
+            kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
             if token:
                 kwargs["ContinuationToken"] = token
-            resp = self.s3.list_objects_v2(**kwargs)
+            resp = self.client.list_objects_v2(**kwargs)
             for item in resp.get("Contents", []):
-                key = item["Key"]
-                if not key.endswith("/"):
-                    files.append(key)
+                key = item.get("Key", "")
+                if key and not key.endswith("/"):
+                    out.append(key)
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
-        return sorted(files)
+        return sorted(out)
 
-    def read_bytes(self, path: str) -> bytes:
-        return self.s3.get_object(Bucket=self.bucket, Key=path)["Body"].read()
+    def read_bytes(self, key: str) -> bytes:
+        return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
 
-    def write_bytes(self, path: str, data: bytes) -> None:
-        self.s3.put_object(Bucket=self.bucket, Key=path, Body=data)
+    def write_bytes(self, key: str, data: bytes) -> None:
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
 
-    def exists(self, path: str) -> bool:
+    def exists(self, key: str) -> bool:
         try:
-            self.s3.head_object(Bucket=self.bucket, Key=path)
+            self.client.head_object(Bucket=self.bucket, Key=key)
             return True
         except Exception:
             return False
 
 
-def make_storage(root: str) -> BaseStorage:
+def make_storage(root: str) -> Storage:
     bucket = os.getenv("YC_BUCKET_NAME", "").strip()
     access_key = os.getenv("YC_ACCESS_KEY_ID", "").strip()
     secret_key = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+    endpoint = os.getenv("YC_ENDPOINT_URL", "https://storage.yandexcloud.net").strip()
     if bucket and access_key and secret_key:
-        log("Using Yandex Object Storage (S3)")
-        return S3Storage(bucket, access_key, secret_key)
-    log("Using local filesystem")
+        log(f"Storage: Yandex Object Storage bucket={bucket}")
+        return S3Storage(bucket, access_key, secret_key, endpoint)
+    log(f"Storage: local root={Path(root).resolve()}")
     return LocalStorage(root)
 
 
-# -------------------------
-# Read helpers
-# -------------------------
-ALIASES = {
-    "day": ["Дата", "Дата заказа", "date", "dt"],
-    "nm_id": ["Артикул WB", "Артикул ВБ", "nmID", "nmId"],
-    "supplier_article": ["Артикул продавца", "supplierArticle", "Артикул WB продавца"],
-    "subject": ["Предмет", "subject", "Название предмета", "category"],
-    "brand": ["Бренд", "brand"],
-    "title": ["Название", "Название товара", "Товар"],
-    "orders": ["Заказы", "orders", "ordersCount", "Кол-во продаж"],
-    "buyouts_count": ["buyoutsCount"],
-    "finished_price": ["finishedPrice", "Ср. цена продажи", "Цена с учетом всех скидок, кроме суммы по WB Кошельку"],
-    "price_with_disc": ["priceWithDisc", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
-    "spp": ["СПП, %", "SPP", "Скидка WB, %", "spp"],
-    "gross_profit": ["Валовая прибыль", "Валовая прибыль, руб/ед"],
-    "gross_revenue": ["Валовая выручка"],
-    "spend": ["Расход", "spend", "Продвижение"],
-}
+# =============================================================================
+# EXCEL READ NORMALIZATION
+# =============================================================================
 
-
-def rename_using_aliases(df: pd.DataFrame) -> pd.DataFrame:
+def add_alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    cols = {norm_key(c): c for c in out.columns}
-    for target, aliases in ALIASES.items():
+    col_by_key = {norm_key(c): c for c in out.columns}
+    for target, variants in ALIASES.items():
         if target in out.columns:
             continue
         found = None
-        for a in aliases:
-            k = norm_key(a)
-            if k in cols:
-                found = cols[k]
+        for v in variants:
+            if norm_key(v) in col_by_key:
+                found = col_by_key[norm_key(v)]
                 break
-        if found is not None:
-            out[target] = out[found]
-        else:
-            out[target] = np.nan
+        out[target] = out[found] if found is not None else np.nan
     return out
 
 
-def read_excel_best(data: bytes, preferred_sheet: Optional[str] = None, header_candidates: Iterable[int] = (0, 1, 2)) -> pd.DataFrame:
-    bio = io.BytesIO(data)
-    xl = pd.ExcelFile(bio)
-    if preferred_sheet and preferred_sheet in xl.sheet_names:
-        sheet = preferred_sheet
-    else:
-        sheet = xl.sheet_names[0]
-    best = None
+def read_excel_table(data: bytes, preferred_sheet: Optional[str] = None, header_rows: Iterable[int] = (0, 1, 2, 3)) -> pd.DataFrame:
+    book = pd.ExcelFile(io.BytesIO(data))
+    sheet = preferred_sheet if preferred_sheet in book.sheet_names else book.sheet_names[0]
+    best: Optional[pd.DataFrame] = None
     best_score = -1
-    for header in header_candidates:
+    for header in header_rows:
         try:
-            df = xl.parse(sheet_name=sheet, header=header, dtype=object)
+            df = book.parse(sheet_name=sheet, header=header, dtype=object)
         except Exception:
             continue
-        df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-        score = len(df.columns)
+        df = df.dropna(how="all").dropna(axis=1, how="all")
+        df.columns = [normalize_text(c) or f"col_{i}" for i, c in enumerate(df.columns)]
+        alias_df = add_alias_columns(df)
+        score = 0
+        for required in ("day", "nm_id", "supplier_article", "subject", "orders", "spend", "gross_profit"):
+            if required in alias_df.columns and not alias_df[required].isna().all():
+                score += 1
+        score += min(len(df.columns), 30) / 100
         if score > best_score:
-            best = df
+            best = alias_df
             best_score = score
     if best is None:
-        raise ValueError(f"Не удалось прочитать {sheet}")
-    best.columns = [normalize_text(c) or f"col_{i}" for i, c in enumerate(best.columns)]
+        raise ValueError(f"Не удалось прочитать лист {sheet}")
     return best
 
 
-# -------------------------
-# Data loading
-# -------------------------
+def only_xlsx(files: Iterable[str]) -> List[str]:
+    return [f for f in files if f.lower().endswith((".xlsx", ".xlsm")) and "/~$" not in f and not Path(f).name.startswith("~$")]
+
+
+# =============================================================================
+# DATA MODEL
+# =============================================================================
+
 @dataclass
-class LoadedData:
+class Diagnostics:
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+
+    def add(self, level: str, source: str, message: str, details: Any = "") -> None:
+        self.rows.append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": level,
+            "source": source,
+            "message": message,
+            "details": normalize_text(details),
+        })
+
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows, columns=["timestamp", "level", "source", "message", "details"])
+
+
+@dataclass
+class DataPack:
     orders: pd.DataFrame
     funnel: pd.DataFrame
-    ads_daily: pd.DataFrame
+    ads_raw: pd.DataFrame
+    ads_used: pd.DataFrame
     economics: pd.DataFrame
     abc_weekly: pd.DataFrame
     abc_monthly: pd.DataFrame
     plan: pd.DataFrame
-    latest_date: pd.Timestamp
+    diagnostics: Diagnostics
+    latest_day: pd.Timestamp
 
 
-class Stage1Loader:
-    def __init__(self, storage: BaseStorage, reports_root: str = "Отчёты", store: str = "TOPFACE"):
+# =============================================================================
+# LOADER LAYER
+# =============================================================================
+
+class LoaderLayer:
+    def __init__(self, storage: Storage, reports_root: str, store: str, diagnostics: Diagnostics):
         self.storage = storage
-        self.reports_root = reports_root.rstrip("/")
+        self.reports_root = reports_root.strip("/")
         self.store = store
+        self.diagnostics = diagnostics
 
-    def _prefix(self, *parts: str) -> str:
+    def path(self, *parts: str) -> str:
         return "/".join([self.reports_root, *parts]).replace("//", "/")
 
-    def _list_xlsx(self, prefix: str) -> List[str]:
-        return [f for f in self.storage.list_files(prefix) if f.lower().endswith(".xlsx") and "/~$" not in f]
+    def list_xlsx(self, *parts: str) -> List[str]:
+        return only_xlsx(self.storage.list_files(self.path(*parts)))
+
+    def _log_frame(self, name: str, df: pd.DataFrame, date_col: Optional[str] = None) -> None:
+        if date_col and date_col in df.columns and not df.empty:
+            mn = pd.to_datetime(df[date_col], errors="coerce").min()
+            mx = pd.to_datetime(df[date_col], errors="coerce").max()
+            log(f"{name}: rows={len(df):,}, dates={mn.date() if pd.notna(mn) else '-'}..{mx.date() if pd.notna(mx) else '-'}")
+        else:
+            log(f"{name}: rows={len(df):,}")
 
     def load_orders(self) -> pd.DataFrame:
-        log("Loading orders")
-        files = self._list_xlsx(self._prefix("Заказы", self.store, "Недельные"))
-        frames = []
-        for path in files:
+        files = self.list_xlsx("Заказы", self.store, "Недельные")
+        frames: List[pd.DataFrame] = []
+        for key in files:
             try:
-                df = rename_using_aliases(read_excel_best(self.storage.read_bytes(path), preferred_sheet="Заказы", header_candidates=(0,)))
-                df["day"] = to_dt(df["day"])
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["subject"] = df["subject"].map(normalize_text)
-                df["finished_price"] = to_numeric(df["finished_price"])
-                df["price_with_disc"] = to_numeric(df["price_with_disc"])
-                df["spp"] = to_numeric(df["spp"])
-                if "orders" in df.columns and not to_numeric(df["orders"]).isna().all():
-                    df["orders"] = to_numeric(df["orders"]).fillna(0)
-                else:
-                    df["orders"] = 1.0
-                if "warehouseName" in df.columns:
-                    df["warehouse"] = df["warehouseName"].map(normalize_text)
-                elif "warehouse" not in df.columns:
-                    df["warehouse"] = ""
-                frames.append(df[["day", "nm_id", "supplier_article", "subject", "finished_price", "price_with_disc", "spp", "orders", "warehouse"]])
-            except Exception as e:
-                log(f"WARN: orders read error {path}: {e}")
-        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["day"])
-        out = out[out["day"].notna()].copy()
-        return out
+                df = read_excel_table(self.storage.read_bytes(key), preferred_sheet="Заказы", header_rows=(0, 1, 2))
+                out = pd.DataFrame({
+                    "day": date_series(df["day"]),
+                    "nm_id": num_series(df["nm_id"]),
+                    "supplier_article": df["supplier_article"].map(clean_article),
+                    "subject": df["subject"].map(normalize_text),
+                    "finished_price": num_series(df["finished_price"]),
+                    "price_with_disc": num_series(df["price_with_disc"]),
+                    "spp": num_series(df["spp"]),
+                    "orders": num_series(df["orders"]),
+                    "warehouse": df["warehouse"].map(normalize_text),
+                    "source_file": key,
+                })
+                if out["orders"].isna().all():
+                    out["orders"] = 1.0
+                out["orders"] = out["orders"].fillna(1.0)
+                frames.append(out)
+            except Exception as exc:
+                self.diagnostics.add("ERROR", "orders", f"Не прочитан файл заказов: {key}", exc)
+        result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not result.empty:
+            result = result[result["day"].notna()].copy()
+        self._log_frame("orders", result, "day")
+        return result
 
     def load_funnel(self) -> pd.DataFrame:
-        log("Loading funnel")
         candidates = [
-            self._prefix("Воронка продаж", self.store, "Воронка продаж.xlsx"),
-            self._prefix("Воронка продаж", "Воронка продаж.xlsx"),
+            self.path("Воронка продаж", self.store, "Воронка продаж.xlsx"),
+            self.path("Воронка продаж", "Воронка продаж.xlsx"),
         ]
-        path = None
-        for c in candidates:
-            if self.storage.exists(c):
-                path = c
-                break
-        if path is None:
-            return pd.DataFrame(columns=["day"])
-        df = rename_using_aliases(read_excel_best(self.storage.read_bytes(path), header_candidates=(0,)))
-        df["day"] = to_dt(df["day"])
-        df["nm_id"] = to_numeric(df["nm_id"])
-        df["orders"] = to_numeric(df["orders"])
-        df["buyouts_count"] = to_numeric(df["buyouts_count"])
-        return df[["day", "nm_id", "orders", "buyouts_count"]]
+        key = next((x for x in candidates if self.storage.exists(x)), None)
+        if not key:
+            self.diagnostics.add("ERROR", "funnel", "Файл воронки продаж не найден")
+            return pd.DataFrame()
+        try:
+            df = read_excel_table(self.storage.read_bytes(key), preferred_sheet=None, header_rows=(0, 1, 2))
+            out = pd.DataFrame({
+                "day": date_series(df["day"]),
+                "nm_id": num_series(df["nm_id"]),
+                "orders": num_series(df["orders"]),
+                "buyouts_count": num_series(df["buyouts_count"]),
+                "source_file": key,
+            })
+            out = out[out["day"].notna()].copy()
+            self._log_frame("funnel", out, "day")
+            return out
+        except Exception as exc:
+            self.diagnostics.add("ERROR", "funnel", f"Не прочитан файл воронки: {key}", exc)
+            return pd.DataFrame()
 
-    def load_ads_daily(self) -> pd.DataFrame:
-        log("Loading ads")
-        files = self._list_xlsx(self._prefix("Реклама", self.store, "Недельные"))
-        frames = []
-        for path in files:
+    def load_ads(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        files = self.list_xlsx("Реклама", self.store, "Недельные")
+        frames: List[pd.DataFrame] = []
+        for key in files:
             try:
-                df = rename_using_aliases(read_excel_best(self.storage.read_bytes(path), preferred_sheet="Статистика_Ежедневно", header_candidates=(0,)))
-                df["day"] = to_dt(df["day"])
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["subject"] = df["subject"].map(normalize_text)
-                df["spend"] = to_numeric(df["spend"])
-                frames.append(df[["day", "nm_id", "supplier_article", "subject", "spend"]])
-            except Exception as e:
-                log(f"WARN: ads read error {path}: {e}")
-        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["day"])
-        out = out[out["day"].notna()].copy()
-        return out
+                df = read_excel_table(self.storage.read_bytes(key), preferred_sheet="Статистика_Ежедневно", header_rows=(0, 1, 2))
+                out = pd.DataFrame({
+                    "day": date_series(df["day"]),
+                    "nm_id": num_series(df["nm_id"]),
+                    "spend": num_series(df["spend"]).fillna(0),
+                    "source_file": key,
+                })
+                out = out[out["day"].notna() & out["nm_id"].notna()].copy()
+                frames.append(out)
+            except Exception as exc:
+                self.diagnostics.add("ERROR", "ads", f"Не прочитан файл рекламы: {key}", exc)
+        raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["day", "nm_id", "spend", "source_file"])
+        if raw.empty:
+            used = pd.DataFrame(columns=["day", "nm_id", "spend"])
+        else:
+            # Critical rule: aggregate only by day + nmId before dictionary enrichment.
+            used = raw.groupby(["day", "nm_id"], dropna=False, as_index=False).agg(spend=("spend", "sum"))
+        self._log_frame("ads_raw", raw, "day")
+        self._log_frame("ads_used_day_nm", used, "day")
+        log(f"ads_used_day_nm: total_spend={used['spend'].sum():,.2f}" if not used.empty else "ads_used_day_nm: total_spend=0")
+        return raw, used
 
     def load_economics(self) -> pd.DataFrame:
-        log("Loading economics")
-        path = None
-        for c in [
-            self._prefix("Финансовые показатели", self.store, "Экономика.xlsx"),
-            self._prefix("Финансовые показатели", self.store, "Недельные", "Экономика.xlsx"),
-        ]:
-            if self.storage.exists(c):
-                path = c
-                break
-        if path is None:
-            return pd.DataFrame(columns=["week_code"])
-        df = pd.read_excel(io.BytesIO(self.storage.read_bytes(path)), sheet_name="Юнит экономика")
-        df.columns = [normalize_text(c) for c in df.columns]
-        df = rename_using_aliases(df)
-        df["supplier_article"] = df["supplier_article"].map(clean_article)
-        df["nm_id"] = to_numeric(df["nm_id"])
-        df["subject"] = df["subject"].map(normalize_text)
-        if "title" not in df.columns:
-            df["title"] = ""
-        df["title"] = df["title"].map(normalize_text)
-        if "code" not in df.columns:
-            df["code"] = df["supplier_article"].map(clean_code_from_article)
-        else:
-            df["code"] = df["code"].where(df["code"].astype(str).str.strip() != "", df["supplier_article"].map(clean_code_from_article))
-        for c in [
-            "Процент выкупа", "Комиссия WB, %", "Эквайринг, %", "Логистика прямая, руб/ед",
-            "Логистика обратная, руб/ед", "Хранение, руб/ед", "Прочие расходы, руб/ед", "Себестоимость, руб",
-            "НДС, руб/ед", "Валовая прибыль, руб/ед"
-        ]:
-            if c not in df.columns:
-                df[c] = np.nan
-            df[c] = to_numeric(df[c])
-        df["week_code"] = df.get("Неделя", pd.Series([None] * len(df))).astype(str).str.strip()
-        return df[[
-            "week_code", "supplier_article", "nm_id", "subject", "code", "title", "Процент выкупа", "Комиссия WB, %", "Эквайринг, %",
-            "Логистика прямая, руб/ед", "Логистика обратная, руб/ед", "Хранение, руб/ед",
-            "Прочие расходы, руб/ед", "Себестоимость, руб", "НДС, руб/ед", "Валовая прибыль, руб/ед"
-        ]]
+        candidates = [
+            self.path("Финансовые показатели", self.store, "Экономика.xlsx"),
+            self.path("Финансовые показатели", self.store, "Недельные", "Экономика.xlsx"),
+        ]
+        key = next((x for x in candidates if self.storage.exists(x)), None)
+        if not key:
+            self.diagnostics.add("ERROR", "economics", "Файл Экономика.xlsx не найден")
+            return pd.DataFrame()
+        try:
+            df = read_excel_table(self.storage.read_bytes(key), preferred_sheet="Юнит экономика", header_rows=(0, 1, 2, 3))
+            out = pd.DataFrame({
+                "week_code": df["week"].map(normalize_text),
+                "nm_id": num_series(df["nm_id"]),
+                "supplier_article": df["supplier_article"].map(clean_article),
+                "subject": df["subject"].map(normalize_text),
+                "brand": df["brand"].map(normalize_text),
+                "title": df["title"].map(normalize_text),
+                "commission_pct": num_series(df["commission_pct"]),
+                "acquiring_pct": num_series(df["acquiring_pct"]),
+                "logistics_direct": num_series(df["logistics_direct"]),
+                "logistics_return": num_series(df["logistics_return"]),
+                "storage": num_series(df["storage"]),
+                "other_costs": num_series(df["other_costs"]),
+                "cost": num_series(df["cost"]),
+                "source_file": key,
+            })
+            out["product"] = out["supplier_article"].map(product_code)
+            self._log_frame("economics", out)
+            return out
+        except Exception as exc:
+            self.diagnostics.add("ERROR", "economics", f"Не прочитан файл экономики: {key}", exc)
+            return pd.DataFrame()
 
-    def load_abc(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        log("Loading ABC")
-        files = self._list_xlsx(self._prefix("ABC"))
-        weekly_frames = []
-        monthly_frames = []
-        for path in files:
-            name = Path(path).name
-            if "wb_abc_report_goods__" not in name:
+    def load_abc(self, current_year: int, latest_day: pd.Timestamp) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        files = self.list_xlsx("ABC")
+        weekly_frames: List[pd.DataFrame] = []
+        monthly_frames: List[pd.DataFrame] = []
+        for key in files:
+            name = Path(key).name
+            if "abc" not in name.lower():
+                continue
+            start, end = parse_abc_period(name)
+            if start is None or end is None:
                 continue
             try:
-                df = rename_using_aliases(read_excel_best(self.storage.read_bytes(path), header_candidates=(0,)))
-                df["supplier_article"] = df["supplier_article"].map(clean_article)
-                df["nm_id"] = to_numeric(df["nm_id"])
-                df["subject"] = df["subject"].map(normalize_text)
-                df["gross_profit"] = to_numeric(df["gross_profit"])
-                df["gross_revenue"] = to_numeric(df["gross_revenue"])
-                df["orders"] = to_numeric(df["orders"])
-                start, end = parse_abc_period_from_name(name)
-                if not start or not end:
-                    continue
-                df["period_start"] = pd.Timestamp(start)
-                df["period_end"] = pd.Timestamp(end)
-                df["code"] = df["supplier_article"].map(clean_code_from_article)
-                df["vat"] = df["gross_revenue"] * 7.0 / 107.0
-                df["gp_minus_nds"] = df["gross_profit"] - df["vat"]
-                month_end = (pd.Timestamp(start).to_period("M").end_time.normalize()).date()
-                if start.day == 1 and end == month_end:
-                    df["month_key"] = f"{start.year:04d}-{start.month:02d}"
-                    monthly_frames.append(df[["month_key", "supplier_article", "nm_id", "subject", "code", "gross_profit", "gross_revenue", "vat", "gp_minus_nds", "orders"]])
-                else:
-                    df["week_code"] = week_code_from_date(start)
-                    df["week_label"] = pd.Timestamp(start).strftime("%d.%m")
-                    weekly_frames.append(df[["week_code", "week_label", "period_start", "period_end", "supplier_article", "nm_id", "subject", "code", "gross_profit", "gross_revenue", "vat", "gp_minus_nds", "orders"]])
-            except Exception as e:
-                log(f"WARN: abc read error {path}: {e}")
+                df = read_excel_table(self.storage.read_bytes(key), preferred_sheet=None, header_rows=(0, 1, 2))
+                out = pd.DataFrame({
+                    "period_start": start,
+                    "period_end": end,
+                    "week_code": week_code(start),
+                    "week_label": f"{start.strftime('%d.%m')}-{end.strftime('%d.%m')}",
+                    "month_key": month_key(start),
+                    "nm_id": num_series(df["nm_id"]),
+                    "supplier_article": df["supplier_article"].map(clean_article),
+                    "subject": df["subject"].map(normalize_text),
+                    "gross_profit": num_series(df["gross_profit"]).fillna(0),
+                    "gross_revenue": num_series(df["gross_revenue"]).fillna(0),
+                    "orders": num_series(df["orders"]).fillna(0),
+                    "source_file": key,
+                })
+                out["product"] = out["supplier_article"].map(product_code)
+                out["vat"] = out["gross_revenue"] * 7.0 / 107.0
+                out["gp_minus_nds"] = out["gross_profit"] - out["vat"]
+                if is_month_file(start, end) and start.year == current_year and start <= latest_day:
+                    monthly_frames.append(out)
+                elif start.year == current_year or end.year == current_year:
+                    weekly_frames.append(out)
+            except Exception as exc:
+                self.diagnostics.add("ERROR", "abc", f"Не прочитан ABC: {key}", exc)
         weekly = pd.concat(weekly_frames, ignore_index=True) if weekly_frames else pd.DataFrame()
         monthly = pd.concat(monthly_frames, ignore_index=True) if monthly_frames else pd.DataFrame()
+        self._log_frame("abc_weekly", weekly, "period_start")
+        self._log_frame("abc_monthly_current_year", monthly, "period_start")
+        if not weekly.empty:
+            log("abc_weekly periods: " + ", ".join(sorted(weekly["week_label"].dropna().astype(str).unique())))
+        if not monthly.empty:
+            log("abc_monthly periods: " + ", ".join(sorted(monthly["month_key"].dropna().astype(str).unique())))
         return weekly, monthly
 
-    def load_plan(self, current_month: pd.Timestamp) -> pd.DataFrame:
-        log("Loading plan")
-        path = self._prefix("Объединенный отчет", self.store, "План.xlsx")
-        if not self.storage.exists(path):
-            alt = "План.xlsx"
-            if not self.storage.exists(alt):
-                return pd.DataFrame(columns=["supplier_article", "subject", "plan_gp_minus_nds_month"])
-            path = alt
-        df = pd.read_excel(io.BytesIO(self.storage.read_bytes(path)), sheet_name="Итог_все_категории", header=2)
-        df.columns = [normalize_text(c) for c in df.columns]
-        df = df.rename(columns={normalize_text("Артикул продавца"): "supplier_article", normalize_text("Категория"): "subject"})
-        target_col = f"ВП-НДС {russian_month_name(current_month.month)} {current_month.year}"
-        col_map = {norm_key(c): c for c in df.columns}
-        chosen = col_map.get(norm_key(target_col))
-        if chosen is None:
-            for c in df.columns:
-                if norm_key(target_col) in norm_key(c):
-                    chosen = c
+    def load_plan(self, latest_day: pd.Timestamp) -> pd.DataFrame:
+        key = self.path("Объединенный отчет", self.store, "План.xlsx")
+        if not self.storage.exists(key):
+            self.diagnostics.add("WARN", "plan", f"План не найден: {key}")
+            return pd.DataFrame()
+        try:
+            # Plan files often have a title above table, try several headers.
+            raw = read_excel_table(self.storage.read_bytes(key), preferred_sheet="Итог_все_категории", header_rows=(0, 1, 2, 3, 4))
+            raw_cols = list(raw.columns)
+            chosen_col = None
+            target_month = MONTH_RU[latest_day.month]
+            patterns = [
+                f"вп ндс {target_month} {latest_day.year}",
+                f"валовая прибыль ндс {target_month} {latest_day.year}",
+                f"план {target_month} {latest_day.year}",
+            ]
+            for col in raw_cols:
+                k = norm_key(col).replace("-", " ")
+                if any(p in k for p in patterns):
+                    chosen_col = col
                     break
-        if chosen is None:
-            return pd.DataFrame(columns=["supplier_article", "subject", "plan_gp_minus_nds_month"])
-        out = df[["supplier_article", "subject", chosen]].copy()
-        out["supplier_article"] = out["supplier_article"].map(clean_article)
-        out["subject"] = out["subject"].map(normalize_text)
-        out["plan_gp_minus_nds_month"] = to_numeric(out[chosen])
-        return out[["supplier_article", "subject", "plan_gp_minus_nds_month"]]
+            if chosen_col is None:
+                for col in raw_cols:
+                    k = norm_key(col)
+                    if str(latest_day.year) in k and norm_key(target_month) in k and ("ндс" in k or "план" in k):
+                        chosen_col = col
+                        break
+            if chosen_col is None and "plan" in raw.columns and not raw["plan"].isna().all():
+                chosen_col = "plan"
+            if chosen_col is None:
+                self.diagnostics.add("WARN", "plan", "Не найдена колонка плана на текущий месяц", f"columns={raw_cols}")
+                return pd.DataFrame()
+            out = pd.DataFrame({
+                "supplier_article": raw["supplier_article"].map(clean_article),
+                "subject": raw["subject"].map(normalize_text),
+                "plan_month": num_series(raw[chosen_col]),
+                "source_file": key,
+                "source_column": chosen_col,
+            })
+            out["product"] = out["supplier_article"].map(product_code)
+            self._log_frame("plan", out)
+            return out
+        except Exception as exc:
+            self.diagnostics.add("ERROR", "plan", f"Не прочитан план: {key}", exc)
+            return pd.DataFrame()
 
-    def load_all(self) -> LoadedData:
+    def load_all(self) -> DataPack:
         orders = self.load_orders()
         funnel = self.load_funnel()
-        ads_daily = self.load_ads_daily()
+        ads_raw, ads_used = self.load_ads()
         economics = self.load_economics()
-        abc_weekly, abc_monthly = self.load_abc()
-        latest_candidates = []
-        for df, col in [(orders, "day"), (funnel, "day"), (ads_daily, "day")]:
-            if not df.empty:
-                latest_candidates.append(pd.to_datetime(df[col]).max())
+
+        candidates: List[pd.Timestamp] = []
+        for df, col in ((orders, "day"), (funnel, "day"), (ads_used, "day")):
+            if not df.empty and col in df.columns:
+                mx = pd.to_datetime(df[col], errors="coerce").max()
+                if pd.notna(mx):
+                    candidates.append(pd.Timestamp(mx).normalize())
+        latest_day = max(candidates) if candidates else pd.Timestamp(datetime.today().date())
+
+        abc_weekly, abc_monthly = self.load_abc(latest_day.year, latest_day)
         if not abc_weekly.empty:
-            latest_candidates.append(pd.to_datetime(abc_weekly["period_end"]).max())
-        latest_date = max([x for x in latest_candidates if pd.notna(x)], default=pd.Timestamp(datetime.today().date()))
-        plan = self.load_plan(pd.Timestamp(latest_date))
-        return LoadedData(
+            mx = pd.to_datetime(abc_weekly["period_end"], errors="coerce").max()
+            if pd.notna(mx):
+                latest_day = max(latest_day, pd.Timestamp(mx).normalize())
+        plan = self.load_plan(latest_day)
+
+        return DataPack(
             orders=orders,
             funnel=funnel,
-            ads_daily=ads_daily,
+            ads_raw=ads_raw,
+            ads_used=ads_used,
             economics=economics,
             abc_weekly=abc_weekly,
             abc_monthly=abc_monthly,
             plan=plan,
-            latest_date=pd.Timestamp(latest_date).normalize(),
+            diagnostics=self.diagnostics,
+            latest_day=latest_day,
         )
 
 
-# -------------------------
-# Stage 1 builder
-# -------------------------
-class Stage1Builder:
-    def __init__(self, data: LoadedData):
-        self.data = data
-        self.latest_day = pd.Timestamp(data.latest_date).normalize()
-        self.current_week_start = self.latest_day - pd.Timedelta(days=self.latest_day.weekday())
-        self.current_week_days = [self.current_week_start + pd.Timedelta(days=i) for i in range((self.latest_day - self.current_week_start).days + 1)]
-        self.current_month_key = self.latest_day.to_period("M").strftime("%Y-%m")
-        self.current_month_start = self.latest_day.replace(day=1)
-        self.days_in_month = calendar.monthrange(self.latest_day.year, self.latest_day.month)[1]
-        self.subject_order = TARGET_SUBJECTS.copy()
-        self.master = self.build_master()
-        self.buyout90 = self.build_buyout90()
-        self.econ_latest = self.build_econ_latest()
+# =============================================================================
+# DICTIONARY LAYER
+# =============================================================================
 
-    def _filter_subjects(self, df: pd.DataFrame) -> pd.DataFrame:
+class DictionaryLayer:
+    def __init__(self, pack: DataPack):
+        self.pack = pack
+
+    @staticmethod
+    def _base_fields(df: pd.DataFrame, source: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=["subject", "product", "supplier_article", "nm_id", "brand", "title", "source"])
+        x = df.copy()
+        for col in ["subject", "product", "supplier_article", "nm_id", "brand", "title"]:
+            if col not in x.columns:
+                x[col] = "" if col != "nm_id" else np.nan
+        x["subject"] = x["subject"].map(normalize_text)
+        x["supplier_article"] = x["supplier_article"].map(clean_article)
+        x["nm_id"] = num_series(x["nm_id"])
+        x["product"] = x["supplier_article"].map(product_code).where(x["product"].map(normalize_text).eq(""), x["product"].map(normalize_text))
+        x["brand"] = x["brand"].map(normalize_text)
+        x["title"] = x["title"].map(normalize_text)
+        x["source"] = source
+        return x[["subject", "product", "supplier_article", "nm_id", "brand", "title", "source"]]
+
+    def build(self) -> pd.DataFrame:
+        frames = [
+            self._base_fields(self.pack.orders, "orders"),
+            self._base_fields(self.pack.economics, "economics"),
+            self._base_fields(self.pack.abc_weekly, "abc_weekly"),
+            self._base_fields(self.pack.abc_monthly, "abc_monthly"),
+        ]
+        master = pd.concat(frames, ignore_index=True)
+        master = master[master["subject"].isin(TARGET_SUBJECTS)].copy()
+        master = master[master["supplier_article"].ne("") & master["product"].ne("")].copy()
+        master = master[~master["supplier_article"].map(article_upper).isin(EXCLUDE_ARTICLES_UPPER)].copy()
+        master["quality"] = (
+            master["subject"].ne("").astype(int) * 10
+            + master["supplier_article"].ne("").astype(int) * 10
+            + master["nm_id"].notna().astype(int) * 5
+            + master["title"].ne("").astype(int)
+        )
+        master = master.sort_values(["quality", "source"], ascending=[False, True])
+        by_article = master.drop_duplicates(["supplier_article", "nm_id"], keep="first")
+        by_article = by_article[["subject", "product", "supplier_article", "nm_id", "brand", "title", "source"]].copy()
+        log(f"dictionary: rows={len(by_article):,}, nm_ids={by_article['nm_id'].nunique(dropna=True):,}, articles={by_article['supplier_article'].nunique():,}")
+        return by_article
+
+    @staticmethod
+    def enrich_by_nm(df: pd.DataFrame, dictionary: pd.DataFrame, diagnostics: Diagnostics, source: str) -> pd.DataFrame:
         if df.empty:
             return df.copy()
         out = df.copy()
-        if "subject" in out.columns:
-            out["subject"] = out["subject"].map(normalize_text)
-            out = out[out["subject"].isin(TARGET_SUBJECTS)].copy()
-        if "supplier_article" in out.columns:
-            out["supplier_article"] = out["supplier_article"].map(clean_article)
-            out = out[~out["supplier_article"].map(upper_article).isin(EXCLUDE_ARTICLES)].copy()
-        if "code" not in out.columns:
-            out["code"] = out["supplier_article"].map(clean_code_from_article)
-        out = out[out["code"] != ""].copy()
+        dict_nm = dictionary.dropna(subset=["nm_id"]).sort_values("source").drop_duplicates("nm_id")
+        add_cols = ["subject", "product", "supplier_article", "brand", "title"]
+        for col in add_cols:
+            if col not in out.columns:
+                out[col] = ""
+        before_unmapped = int(out["nm_id"].notna().sum()) if "nm_id" in out.columns else 0
+        out = out.merge(dict_nm[["nm_id", *add_cols]], on="nm_id", how="left", suffixes=("", "_dict"))
+        for col in add_cols:
+            out[col] = out[col].where(out[col].map(normalize_text).ne(""), out[f"{col}_dict"])
+        out = out.drop(columns=[c for c in out.columns if c.endswith("_dict")])
+        out["subject"] = out["subject"].map(normalize_text)
+        out["supplier_article"] = out["supplier_article"].map(clean_article)
+        out["product"] = out["product"].map(normalize_text).where(out["product"].map(normalize_text).ne(""), out["supplier_article"].map(product_code))
+        unmapped = int(out.loc[out["nm_id"].notna() & out["supplier_article"].map(clean_article).eq(""), "nm_id"].nunique())
+        if unmapped:
+            diagnostics.add("WARN", source, "Есть nmId без сопоставления в master-словаре", f"unmapped_nm_ids={unmapped}; total_nm_rows={before_unmapped}")
         return out
 
-    def build_master(self) -> pd.DataFrame:
-        frames = []
-        for df in [self.data.orders, self.data.economics, self.data.abc_weekly, self.data.abc_monthly]:
-            if df.empty:
-                continue
-            x = df.copy()
-            for c in ["supplier_article", "nm_id", "subject", "brand", "title"]:
-                if c not in x.columns:
-                    x[c] = np.nan
-            x = x[["supplier_article", "nm_id", "subject", "brand", "title"]].copy()
-            frames.append(x)
-        if not frames:
-            return pd.DataFrame(columns=["supplier_article", "nm_id", "subject", "brand", "title", "code"])
-        m = pd.concat(frames, ignore_index=True)
-        m["supplier_article"] = m["supplier_article"].map(clean_article)
-        m["nm_id"] = to_numeric(m["nm_id"])
-        m["subject"] = m["subject"].map(normalize_text)
-        m["brand"] = m["brand"].map(normalize_text)
-        m["title"] = m["title"].map(normalize_text)
-        m["code"] = m["supplier_article"].map(clean_code_from_article)
-        m = self._filter_subjects(m)
-        m["quality"] = m["supplier_article"].ne("").astype(int) * 4 + m["subject"].ne("").astype(int) * 2 + m["title"].ne("").astype(int)
-        m = m.sort_values(["quality"], ascending=False).drop_duplicates(subset=["supplier_article", "nm_id"])
-        return m[["supplier_article", "nm_id", "subject", "brand", "title", "code"]]
+    @staticmethod
+    def filter_target(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df.copy()
+        out = df.copy()
+        for col in ["subject", "supplier_article", "product"]:
+            if col not in out.columns:
+                out[col] = ""
+        out["subject"] = out["subject"].map(normalize_text)
+        out["supplier_article"] = out["supplier_article"].map(clean_article)
+        out["product"] = out["product"].map(normalize_text).where(out["product"].map(normalize_text).ne(""), out["supplier_article"].map(product_code))
+        out = out[out["subject"].isin(TARGET_SUBJECTS)].copy()
+        out = out[out["supplier_article"].ne("") & out["product"].ne("")].copy()
+        out = out[~out["supplier_article"].map(article_upper).isin(EXCLUDE_ARTICLES_UPPER)].copy()
+        return out
 
-    def build_buyout90(self) -> pd.DataFrame:
-        if self.data.funnel.empty:
-            return pd.DataFrame(columns=["nm_id", "buyout_pct_90"])
-        f = self.data.funnel.copy()
+
+# =============================================================================
+# STAGE 1 CALCULATION LAYER
+# =============================================================================
+
+class Stage1Layer:
+    def __init__(self, pack: DataPack, dictionary: pd.DataFrame):
+        self.pack = pack
+        self.dictionary = dictionary
+        self.diag = pack.diagnostics
+        self.latest_day = pack.latest_day
+        self.current_year = int(self.latest_day.year)
+        self.current_month = int(self.latest_day.month)
+        self.month_start = pd.Timestamp(date(self.current_year, self.current_month, 1))
+        self.days_in_month = calendar.monthrange(self.current_year, self.current_month)[1]
+        self.week_start = self.latest_day - pd.Timedelta(days=int(self.latest_day.weekday()))
+        self.week_days = [self.week_start + pd.Timedelta(days=i) for i in range(7)]
+
+    def buyout_90(self) -> pd.DataFrame:
+        if self.pack.funnel.empty:
+            self.diag.add("WARN", "funnel", "Воронка пустая, buyout_pct_90 будет заменён на 1")
+            return pd.DataFrame(columns=["nm_id", "orders_90", "buyouts_90", "buyout_pct_90"])
+        f = self.pack.funnel.copy()
         f = f[(f["day"] >= self.latest_day - pd.Timedelta(days=89)) & (f["day"] <= self.latest_day)].copy()
-        g = f.groupby("nm_id", dropna=False).agg(orders_90=("orders", "sum"), buyouts_90=("buyouts_count", "sum")).reset_index()
-        g["buyout_pct_90"] = g.apply(lambda r: safe_div(r["buyouts_90"], r["orders_90"]), axis=1)
-        return g[["nm_id", "buyout_pct_90"]]
-
-    def build_econ_latest(self) -> pd.DataFrame:
-        if self.data.economics.empty:
-            return pd.DataFrame(columns=["supplier_article", "nm_id"])
-        econ = self._filter_subjects(self.data.economics)
-        # last available week per article
-        econ["week_ord"] = econ["week_code"].astype(str)
-        econ = econ.sort_values(["supplier_article", "week_ord"], ascending=[True, False])
-        econ = econ.drop_duplicates(subset=["supplier_article", "nm_id"], keep="first")
-        return econ.drop(columns=["week_ord"])
-
-    def build_current_week_daily_article(self) -> pd.DataFrame:
-        orders = self._filter_subjects(self.data.orders)
-        if orders.empty:
-            return pd.DataFrame()
-        orders = orders[(orders["day"] >= self.current_week_start) & (orders["day"] <= self.latest_day)].copy()
-        if orders.empty:
-            return pd.DataFrame()
-
-        orders = orders.merge(self.master, on=["supplier_article", "nm_id"], how="left", suffixes=("", "_m"))
-        for c in ["subject", "brand", "title", "code"]:
-            if f"{c}_m" in orders.columns:
-                orders[c] = orders[c].where(orders[c].notna() & (orders[c] != ""), orders[f"{c}_m"])
-        orders = orders.drop(columns=[c for c in orders.columns if c.endswith("_m")])
-        orders = self._filter_subjects(orders)
-
-        daily = orders.groupby(["day", "supplier_article", "nm_id", "subject", "code", "title"], dropna=False).agg(
-            orders_day=("orders", "sum"),
-            finished_price_day=("finished_price", "mean"),
-            price_with_disc_day=("price_with_disc", "mean"),
-            spp_day=("spp", "mean"),
-        ).reset_index()
-
-        daily = daily.merge(self.buyout90, on="nm_id", how="left")
-        daily = daily.merge(
-            self.econ_latest[[
-                "supplier_article", "nm_id", "subject", "code", "title", "Процент выкупа", "Комиссия WB, %", "Эквайринг, %",
-                "Логистика прямая, руб/ед", "Логистика обратная, руб/ед", "Хранение, руб/ед",
-                "Прочие расходы, руб/ед", "Себестоимость, руб", "НДС, руб/ед", "Валовая прибыль, руб/ед"
-            ]],
-            on=["supplier_article", "nm_id"], how="left", suffixes=("", "_e")
+        g = f.groupby("nm_id", dropna=False, as_index=False).agg(
+            orders_90=("orders", "sum"),
+            buyouts_90=("buyouts_count", "sum"),
         )
-        for c in ["subject", "code", "title"]:
-            if f"{c}_e" in daily.columns:
-                daily[c] = daily[c].where(daily[c].notna() & (daily[c] != ""), daily[f"{c}_e"])
-        daily = daily.drop(columns=[c for c in daily.columns if c.endswith("_e")])
+        g["buyout_pct_90"] = g.apply(lambda r: safe_ratio(r["buyouts_90"], r["orders_90"], np.nan), axis=1)
+        g["buyout_pct_90"] = g["buyout_pct_90"].clip(lower=0, upper=1)
+        return g
 
-        # ad spend by day/article
-        ads = self._filter_subjects(self.data.ads_daily)
+    def economics_for_rows(self, rows: pd.DataFrame) -> pd.DataFrame:
+        if rows.empty:
+            return rows.copy()
+        econ = DictionaryLayer.filter_target(self.pack.economics)
+        if econ.empty:
+            self.diag.add("ERROR", "economics", "Нет экономики по целевым категориям")
+            out = rows.copy()
+            for c in ["commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]:
+                out[c] = 0.0
+            out["economics_match_type"] = "missing_all"
+            return out
+
+        econ = econ.copy()
+        econ["week_start"] = econ["week_code"].map(week_start_from_code)
+        econ["week_start"] = pd.to_datetime(econ["week_start"], errors="coerce")
+        econ = econ.sort_values(["supplier_article", "week_start"], ascending=[True, False])
+
+        exact_keys = ["supplier_article", "week_code"]
+        exact = econ.drop_duplicates(exact_keys, keep="first")
+        out = rows.merge(
+            exact[[*exact_keys, "commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]],
+            on=exact_keys,
+            how="left",
+        )
+        out["economics_match_type"] = np.where(out["commission_pct"].notna() & (out["commission_pct"] != 0), "article_week", "")
+
+        latest_article = econ.drop_duplicates(["supplier_article"], keep="first")
+        out = out.merge(
+            latest_article[["supplier_article", "commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]],
+            on="supplier_article",
+            how="left",
+            suffixes=("", "_article_latest"),
+        )
+        cost_cols = ["commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]
+        need_article = out["commission_pct"].isna() | (out["commission_pct"] == 0)
+        for c in cost_cols:
+            out[c] = out[c].where(~need_article | out[c].notna() & (out[c] != 0), out[f"{c}_article_latest"])
+        out["economics_match_type"] = out["economics_match_type"].where(~need_article, "article_latest")
+        out = out.drop(columns=[c for c in out.columns if c.endswith("_article_latest")])
+
+        # Commission fallback: same subject in same week, then latest non-zero by subject.
+        subject_week = econ[econ["commission_pct"].notna() & (econ["commission_pct"] != 0)]
+        subject_week = subject_week.groupby(["subject", "week_code"], as_index=False)["commission_pct"].median().rename(columns={"commission_pct": "commission_subject_week"})
+        out = out.merge(subject_week, on=["subject", "week_code"], how="left")
+        need_comm = out["commission_pct"].isna() | (out["commission_pct"] == 0)
+        out["commission_pct"] = out["commission_pct"].where(~need_comm, out["commission_subject_week"])
+        out["economics_match_type"] = out["economics_match_type"].where(~need_comm, "commission_subject_week")
+
+        subject_latest = econ[econ["commission_pct"].notna() & (econ["commission_pct"] != 0)]
+        subject_latest = subject_latest.sort_values("week_start", ascending=False).drop_duplicates("subject")
+        subject_latest = subject_latest[["subject", "commission_pct"]].rename(columns={"commission_pct": "commission_subject_latest"})
+        out = out.merge(subject_latest, on="subject", how="left")
+        need_comm2 = out["commission_pct"].isna() | (out["commission_pct"] == 0)
+        out["commission_pct"] = out["commission_pct"].where(~need_comm2, out["commission_subject_latest"])
+        out["economics_match_type"] = out["economics_match_type"].where(~need_comm2, "commission_subject_latest")
+        out = out.drop(columns=["commission_subject_week", "commission_subject_latest"], errors="ignore")
+
+        for c in cost_cols:
+            out[c] = num_series(out[c]).fillna(0.0)
+        direct_share = float((out["economics_match_type"] == "article_week").mean()) if len(out) else 0.0
+        fallback_share = 1.0 - direct_share
+        self.diag.add("INFO", "economics", "Доля прямого совпадения и fallback", f"direct={direct_share:.1%}; fallback={fallback_share:.1%}")
+        return out
+
+    def ads_by_article_day(self) -> pd.DataFrame:
+        ads = self.pack.ads_used.copy()
+        if ads.empty:
+            return pd.DataFrame(columns=["day", "nm_id", "spend", "subject", "product", "supplier_article"])
+        ads = DictionaryLayer.enrich_by_nm(ads, self.dictionary, self.diag, "ads")
+        ads = DictionaryLayer.filter_target(ads)
+        total_before = self.pack.ads_used["spend"].sum() if not self.pack.ads_used.empty else 0.0
+        total_after = ads["spend"].sum() if not ads.empty else 0.0
+        self.diag.add("INFO", "ads", "Расход рекламы после сопоставления с целевыми категориями", f"before={total_before:.2f}; after={total_after:.2f}")
+        return ads
+
+    def daily_formula(self) -> pd.DataFrame:
+        orders = DictionaryLayer.enrich_by_nm(self.pack.orders, self.dictionary, self.diag, "orders")
+        orders = DictionaryLayer.filter_target(orders)
+        if orders.empty:
+            self.diag.add("ERROR", "orders", "После фильтра целевых категорий нет заказов")
+            return pd.DataFrame()
+        orders = orders[(orders["day"] >= self.week_start) & (orders["day"] <= self.latest_day)].copy()
+        if orders.empty:
+            self.diag.add("WARN", "orders", "Нет заказов за текущую неделю")
+            return pd.DataFrame()
+        orders["week_code"] = orders["day"].map(week_code)
+        grouped = orders.groupby(["day", "week_code", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders_qty=("orders", "sum"),
+            finished_price=("finished_price", "mean"),
+            price_with_disc=("price_with_disc", "mean"),
+            spp=("spp", "mean"),
+        )
+        grouped = grouped.merge(self.buyout_90(), on="nm_id", how="left")
+        grouped["buyout_pct_90"] = grouped["buyout_pct_90"].fillna(1.0).clip(lower=0, upper=1)
+
+        ads = self.ads_by_article_day()
         if not ads.empty:
-            ads = ads[(ads["day"] >= self.current_week_start) & (ads["day"] <= self.latest_day)].copy()
-            ads = ads.merge(self.master[["supplier_article", "nm_id", "subject", "code"]], on=["supplier_article", "nm_id"], how="left", suffixes=("", "_m"))
-            if "subject_m" in ads.columns:
-                ads["subject"] = ads["subject"].where(ads["subject"].notna() & (ads["subject"] != ""), ads["subject_m"])
-                ads["code"] = ads["code"].where(ads["code"].notna() & (ads["code"] != ""), ads["supplier_article"].map(clean_code_from_article))
-            ads = ads.drop(columns=[c for c in ads.columns if c.endswith("_m")])
-            ads = self._filter_subjects(ads)
-            ads_g = ads.groupby(["day", "supplier_article", "nm_id"], dropna=False).agg(ad_spend_day=("spend", "sum")).reset_index()
-            daily = daily.merge(ads_g, on=["day", "supplier_article", "nm_id"], how="left")
+            ads = ads[(ads["day"] >= self.week_start) & (ads["day"] <= self.latest_day)].copy()
+            ads_article = ads.groupby(["day", "nm_id", "supplier_article"], dropna=False, as_index=False).agg(ad_spend=("spend", "sum"))
+            grouped = grouped.merge(ads_article, on=["day", "nm_id", "supplier_article"], how="left")
         else:
-            daily["ad_spend_day"] = 0.0
-        daily["ad_spend_day"] = daily["ad_spend_day"].fillna(0.0)
+            grouped["ad_spend"] = 0.0
+        grouped["ad_spend"] = grouped["ad_spend"].fillna(0.0)
 
-        daily["buyout_factor"] = daily["buyout_pct_90"].fillna(to_numeric(daily["Процент выкупа"]) / 100.0).fillna(1.0)
-        daily["buyout_qty"] = daily["orders_day"] * daily["buyout_factor"]
-        daily["revenue_pwd"] = daily["buyout_qty"] * daily["price_with_disc_day"].fillna(0)
-        daily["commission_rub"] = daily["revenue_pwd"] * to_numeric(daily["Комиссия WB, %"]).fillna(0) / 100.0
-        daily["acquiring_rub"] = daily["revenue_pwd"] * to_numeric(daily["Эквайринг, %"]).fillna(0) / 100.0
-        daily["logistics_direct_rub"] = daily["buyout_qty"] * to_numeric(daily["Логистика прямая, руб/ед"]).fillna(0)
-        daily["logistics_return_rub"] = daily["buyout_qty"] * to_numeric(daily["Логистика обратная, руб/ед"]).fillna(0)
-        daily["storage_rub"] = daily["buyout_qty"] * to_numeric(daily["Хранение, руб/ед"]).fillna(0)
-        daily["other_rub"] = daily["buyout_qty"] * to_numeric(daily["Прочие расходы, руб/ед"]).fillna(0)
-        daily["cost_rub"] = daily["buyout_qty"] * to_numeric(daily["Себестоимость, руб"]).fillna(0)
-        daily["vat_rub"] = daily["buyout_qty"] * daily["finished_price_day"].fillna(0) * 7.0 / 107.0
-        daily["gross_profit_rub"] = (
-            daily["revenue_pwd"] - daily["commission_rub"] - daily["acquiring_rub"]
-            - daily["logistics_direct_rub"] - daily["logistics_return_rub"] - daily["storage_rub"]
-            - daily["other_rub"] - daily["cost_rub"] - daily["ad_spend_day"]
+        enriched = self.economics_for_rows(grouped)
+        enriched["buyout_qty"] = enriched["orders_qty"] * enriched["buyout_pct_90"]
+        enriched["revenue"] = enriched["buyout_qty"] * enriched["price_with_disc"].fillna(0)
+        enriched["commission_wb"] = enriched["revenue"] * enriched["commission_pct"] / 100.0
+        enriched["acquiring"] = enriched["revenue"] * enriched["acquiring_pct"] / 100.0
+        enriched["logistics_direct_total"] = enriched["buyout_qty"] * enriched["logistics_direct"]
+        enriched["logistics_return_total"] = enriched["buyout_qty"] * enriched["logistics_return"]
+        enriched["storage_total"] = enriched["buyout_qty"] * enriched["storage"]
+        enriched["other_costs_total"] = enriched["buyout_qty"] * enriched["other_costs"]
+        enriched["cost_total"] = enriched["buyout_qty"] * enriched["cost"]
+        enriched["vat"] = enriched["buyout_qty"] * enriched["finished_price"].fillna(0) * 7.0 / 107.0
+        enriched["gross_profit"] = (
+            enriched["revenue"]
+            - enriched["commission_wb"]
+            - enriched["acquiring"]
+            - enriched["logistics_direct_total"]
+            - enriched["logistics_return_total"]
+            - enriched["storage_total"]
+            - enriched["other_costs_total"]
+            - enriched["cost_total"]
+            - enriched["ad_spend"]
         )
-        daily["gp_minus_nds_rub"] = daily["gross_profit_rub"] - daily["vat_rub"]
-        daily["day_label"] = pd.to_datetime(daily["day"]).dt.strftime("%d.%m")
-        return daily
+        enriched["gp_minus_nds"] = enriched["gross_profit"] - enriched["vat"]
+        enriched["day_label"] = enriched["day"].dt.strftime("%d.%m")
+        enriched["weekday_label"] = enriched["day"].apply(lambda x: f"{WEEKDAY_RU[int(pd.Timestamp(x).weekday())]} {pd.Timestamp(x).strftime('%d.%m')}")
+        return enriched
 
-    def build_current_month_weekly_fact(self) -> pd.DataFrame:
-        abc = self._filter_subjects(self.data.abc_weekly)
-        if abc.empty:
-            return pd.DataFrame()
-        abc = abc[(abc["period_end"] >= self.current_month_start) & (abc["period_start"] <= self.latest_day)].copy()
-        return abc
+    def weekly_abc_current_month(self) -> pd.DataFrame:
+        df = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "abc_weekly")
+        df = DictionaryLayer.filter_target(df)
+        if df.empty:
+            return df
+        df = df[(df["period_end"] >= self.month_start) & (df["period_start"] <= self.latest_day)].copy()
+        return df
 
-    def build_last3months_fact(self) -> pd.DataFrame:
-        abc_month = self._filter_subjects(self.data.abc_monthly)
-        abc_week = self._filter_subjects(self.data.abc_weekly)
-        periods = [self.latest_day.to_period("M") - 2, self.latest_day.to_period("M") - 1, self.latest_day.to_period("M")]
-        month_keys = [p.strftime("%Y-%m") for p in periods]
+    def monthly_abc_current_year(self) -> pd.DataFrame:
+        monthly = DictionaryLayer.enrich_by_nm(self.pack.abc_monthly, self.dictionary, self.diag, "abc_monthly")
+        monthly = DictionaryLayer.filter_target(monthly)
         frames = []
-        if not abc_month.empty:
-            frames.append(abc_month[abc_month["month_key"].isin(month_keys)].copy())
-        # if current month not in monthly ABC, synthesize from weekly ABC
-        if self.current_month_key not in set(abc_month.get("month_key", pd.Series(dtype=str)).astype(str)):
-            if not abc_week.empty:
-                wk = abc_week.copy()
-                wk["month_key"] = pd.to_datetime(wk["period_start"]).dt.to_period("M").astype(str)
-                wk = wk[wk["month_key"] == self.current_month_key].copy()
-                if not wk.empty:
-                    curm = wk.groupby(["month_key", "supplier_article", "nm_id", "subject", "code"], dropna=False).agg(
-                        gross_profit=("gross_profit", "sum"),
-                        gross_revenue=("gross_revenue", "sum"),
-                        vat=("vat", "sum"),
-                        gp_minus_nds=("gp_minus_nds", "sum"),
-                        orders=("orders", "sum"),
-                    ).reset_index()
-                    frames = [f[f["month_key"] != self.current_month_key] for f in frames]
-                    frames.append(curm)
+        if not monthly.empty:
+            monthly = monthly[pd.to_datetime(monthly["period_start"]).dt.year == self.current_year].copy()
+            monthly = monthly[pd.to_datetime(monthly["period_start"]) <= self.latest_day].copy()
+            frames.append(monthly)
+        # For current month only: if no full monthly ABC, build from weekly ABC of current month.
+        current_key = f"{self.current_year:04d}-{self.current_month:02d}"
+        has_current_month = False if monthly.empty else current_key in set(monthly["month_key"].astype(str))
+        if not has_current_month:
+            weekly = self.weekly_abc_current_month()
+            if not weekly.empty:
+                synth = weekly.groupby(["month_key", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+                    period_start=("period_start", "min"),
+                    period_end=("period_end", "max"),
+                    gross_profit=("gross_profit", "sum"),
+                    gross_revenue=("gross_revenue", "sum"),
+                    orders=("orders", "sum"),
+                    vat=("vat", "sum"),
+                    gp_minus_nds=("gp_minus_nds", "sum"),
+                )
+                synth["source_file"] = "SYNTH_FROM_WEEKLY_ABC_CURRENT_MONTH"
+                frames.append(synth)
+                self.diag.add("INFO", "abc_monthly", "Текущий месяц собран из недельных ABC", current_key)
         if not frames:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
-        return out[out["month_key"].isin(month_keys)].copy()
-
-    def build_plan_month(self) -> pd.DataFrame:
-        plan = self._filter_subjects(self.data.plan)
-        if plan.empty:
-            return pd.DataFrame(columns=["supplier_article", "subject", "code", "plan_gp_minus_nds_month"])
-        plan["code"] = plan["supplier_article"].map(clean_code_from_article)
-        return plan[["supplier_article", "subject", "code", "plan_gp_minus_nds_month"]]
-
-    def build_month_fact_by_entity(self, monthly: pd.DataFrame, keys: List[str]) -> Dict[Tuple[Any, ...], float]:
-        if monthly.empty:
-            return {}
-        cur = monthly[monthly["month_key"] == self.current_month_key].copy()
-        if cur.empty:
-            return {}
-        return cur.groupby(keys, dropna=False)["gp_minus_nds"].sum().to_dict()
-
-    def aggregate_hierarchy(self, base: pd.DataFrame, value_col: str, label_col: str, labels: List[str], plan_mode: str) -> pd.DataFrame:
-        rows: List[Dict[str, Any]] = []
-        if base.empty:
-            return pd.DataFrame(columns=["Наименование"] + labels + ["План"])
-
-        plan = self.build_plan_month()
-        monthly_fact = self.build_last3months_fact()
-        article_fact_map = self.build_month_fact_by_entity(monthly_fact, ["supplier_article"])
-        product_fact_map = self.build_month_fact_by_entity(monthly_fact, ["subject", "code"])
-        category_fact_map = self.build_month_fact_by_entity(monthly_fact, ["subject"])
-        article_plan_map = plan.set_index("supplier_article")["plan_gp_minus_nds_month"].to_dict() if not plan.empty else {}
-        product_plan_map = plan.groupby(["subject", "code"], dropna=False)["plan_gp_minus_nds_month"].sum().to_dict() if not plan.empty else {}
-        category_plan_map = plan.groupby(["subject"], dropna=False)["plan_gp_minus_nds_month"].sum().to_dict() if not plan.empty else {}
-
-        def block_plan(level: str, subject: Optional[str], code: Optional[str], article: Optional[str], fact_values: List[float]) -> float:
-            if plan_mode == "daily":
-                if level == "article":
-                    p = article_plan_map.get(article, np.nan)
-                    if pd.isna(p):
-                        return float(np.nanmean(fact_values)) if fact_values else 0.0
-                    return float(p) / self.days_in_month
-                if level == "product":
-                    p = product_plan_map.get((subject, code), np.nan)
-                    if pd.isna(p):
-                        return float(np.nanmean(fact_values)) if fact_values else 0.0
-                    return float(p) / self.days_in_month
-                p = category_plan_map.get(subject, np.nan)
-                if pd.isna(p):
-                    return float(np.nanmean(fact_values)) if fact_values else 0.0
-                return float(p) / self.days_in_month
-            # month plan for weekly/monthly blocks
-            if level == "article":
-                p = article_plan_map.get(article, np.nan)
-                if pd.isna(p):
-                    return float(article_fact_map.get((article,), 0.0))
-                return float(p)
-            if level == "product":
-                p = product_plan_map.get((subject, code), np.nan)
-                if pd.isna(p):
-                    return float(product_fact_map.get((subject, code), 0.0))
-                return float(p)
-            p = category_plan_map.get((subject,), np.nan)
-            if pd.isna(p):
-                return float(category_fact_map.get((subject,), 0.0))
-            return float(p)
-
-        for subject in self.subject_order:
-            sg = base[base["subject"] == subject].copy()
-            if sg.empty:
-                continue
-            fact_values = [float(sg.loc[sg[label_col] == lbl, value_col].sum()) for lbl in labels]
-            row = {"Наименование": subject, "_level": "category"}
-            for lbl, val in zip(labels, fact_values):
-                row[lbl] = val
-            row["План"] = block_plan("category", subject, None, None, fact_values)
-            rows.append(row)
-
-            prod_order = sg.groupby("code", dropna=False)[value_col].sum().sort_values(ascending=False).index.tolist()
-            for code in prod_order:
-                pg = sg[sg["code"] == code].copy()
-                fact_values = [float(pg.loc[pg[label_col] == lbl, value_col].sum()) for lbl in labels]
-                prow = {"Наименование": str(code), "_level": "product", "_subject": subject}
-                for lbl, val in zip(labels, fact_values):
-                    prow[lbl] = val
-                prow["План"] = block_plan("product", subject, code, None, fact_values)
-                rows.append(prow)
-
-                art_order = pg.groupby("supplier_article", dropna=False)[value_col].sum().sort_values(ascending=False).index.tolist()
-                for art in art_order:
-                    ag = pg[pg["supplier_article"] == art].copy()
-                    fact_values = [float(ag.loc[ag[label_col] == lbl, value_col].sum()) for lbl in labels]
-                    arow = {"Наименование": art, "_level": "article", "_subject": subject, "_code": code}
-                    for lbl, val in zip(labels, fact_values):
-                        arow[lbl] = val
-                    arow["План"] = block_plan("article", subject, code, art, fact_values)
-                    rows.append(arow)
-
-            total = {"Наименование": f"Итого {subject}", "_level": "subject_total"}
-            for lbl in labels:
-                total[lbl] = float(sg.loc[sg[label_col] == lbl, value_col].sum())
-            total["План"] = block_plan("category", subject, None, None, [total[lbl] for lbl in labels])
-            rows.append(total)
-
-        grand = {"Наименование": "Итого по всем 4 категориям", "_level": "grand_total"}
-        for lbl in labels:
-            grand[lbl] = float(base.loc[base[label_col] == lbl, value_col].sum())
-        if plan_mode == "daily":
-            grand["План"] = float(sum(v for v in category_plan_map.values() if pd.notna(v))) / self.days_in_month if category_plan_map else float(np.nanmean([grand[lbl] for lbl in labels]))
-        else:
-            grand["План"] = float(sum(v for v in category_plan_map.values() if pd.notna(v))) if category_plan_map else float(sum(category_fact_map.values()))
-        rows.append(grand)
-        out = pd.DataFrame(rows)
+        out = out[out["month_key"].astype(str).str.startswith(str(self.current_year))].copy()
         return out
 
-    def build_main_blocks(self) -> Dict[str, pd.DataFrame]:
-        daily = self.build_current_week_daily_article()
-        daily = self._filter_subjects(daily)
-        day_labels = [d.strftime("%d.%m") for d in self.current_week_days]
-        block_daily_main = self.aggregate_hierarchy(daily, "gp_minus_nds_rub", "day_label", day_labels, plan_mode="daily") if not daily.empty else pd.DataFrame()
-        block_daily_gp = self.aggregate_hierarchy(daily, "gross_profit_rub", "day_label", day_labels, plan_mode="daily") if not daily.empty else pd.DataFrame()
-        block_daily_vat = self.aggregate_hierarchy(daily, "vat_rub", "day_label", day_labels, plan_mode="daily") if not daily.empty else pd.DataFrame()
+    def plan_used(self) -> pd.DataFrame:
+        plan = DictionaryLayer.enrich_by_nm(self.pack.plan, self.dictionary, self.diag, "plan") if not self.pack.plan.empty else self.pack.plan.copy()
+        plan = DictionaryLayer.filter_target(plan)
+        return plan
 
-        weekly = self.build_current_month_weekly_fact()
-        weekly = self._filter_subjects(weekly)
-        week_labels = sorted(weekly["week_label"].dropna().unique().tolist()) if not weekly.empty else []
-        block_weekly_main = self.aggregate_hierarchy(weekly, "gp_minus_nds", "week_label", week_labels, plan_mode="month") if not weekly.empty else pd.DataFrame()
-        block_weekly_gp = self.aggregate_hierarchy(weekly, "gross_profit", "week_label", week_labels, plan_mode="month") if not weekly.empty else pd.DataFrame()
-        block_weekly_vat = self.aggregate_hierarchy(weekly, "vat", "week_label", week_labels, plan_mode="month") if not weekly.empty else pd.DataFrame()
+    def make_fact_table(self, source: pd.DataFrame, label_col: str, value_col: str, labels: List[str]) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        if source.empty:
+            return pd.DataFrame(columns=["name", "level", "subject", "product", *labels, "План"])
 
-        monthly = self.build_last3months_fact()
-        monthly = self._filter_subjects(monthly)
-        month_keys = [(self.latest_day.to_period("M") - 2).strftime("%Y-%m"), (self.latest_day.to_period("M") - 1).strftime("%Y-%m"), self.current_month_key]
-        block_monthly_main = self.aggregate_hierarchy(monthly, "gp_minus_nds", "month_key", month_keys, plan_mode="month") if not monthly.empty else pd.DataFrame()
-        block_monthly_gp = self.aggregate_hierarchy(monthly, "gross_profit", "month_key", month_keys, plan_mode="month") if not monthly.empty else pd.DataFrame()
-        block_monthly_vat = self.aggregate_hierarchy(monthly, "vat", "month_key", month_keys, plan_mode="month") if not monthly.empty else pd.DataFrame()
+        plan = self.plan_used()
+        article_plan = plan.groupby("supplier_article", dropna=False)["plan_month"].sum().to_dict() if not plan.empty else {}
+        product_plan = plan.groupby(["subject", "product"], dropna=False)["plan_month"].sum().to_dict() if not plan.empty else {}
+        subject_plan = plan.groupby("subject", dropna=False)["plan_month"].sum().to_dict() if not plan.empty else {}
 
-        return {
-            "daily_main": block_daily_main,
-            "daily_gp": block_daily_gp,
-            "daily_vat": block_daily_vat,
-            "weekly_main": block_weekly_main,
-            "weekly_gp": block_weekly_gp,
-            "weekly_vat": block_weekly_vat,
-            "monthly_main": block_monthly_main,
-            "monthly_gp": block_monthly_gp,
-            "monthly_vat": block_monthly_vat,
-            "tech_daily": daily,
-            "tech_weekly": weekly,
-            "tech_monthly": monthly,
-            "tech_buyout90": self.buyout90,
-            "tech_econ_latest": self.econ_latest,
-            "tech_plan": self.build_plan_month(),
-            "tech_master": self.master,
-        }
+        def plan_value(level: str, subject: str, product: str = "", article: str = "", facts: Optional[List[float]] = None, daily: bool = False) -> float:
+            facts = facts or []
+            if level == "article":
+                val = article_plan.get(article, np.nan)
+            elif level == "product":
+                val = product_plan.get((subject, product), np.nan)
+            else:
+                val = subject_plan.get(subject, np.nan)
+            if pd.isna(val):
+                return float(sum(facts)) if facts else 0.0
+            if daily:
+                return float(val) / self.days_in_month
+            return float(val)
 
-    def build_example_weekly(self, articles: List[str]) -> pd.DataFrame:
-        # Detailed weekly forecast vs ABC for selected articles
-        orders = self._filter_subjects(self.data.orders)
-        if orders.empty:
-            return pd.DataFrame()
-        ads = self._filter_subjects(self.data.ads_daily)
-        abc = self._filter_subjects(self.data.abc_weekly)
-        econ = self._filter_subjects(self.data.economics)
-        funnel = self.data.funnel.copy()
-
-        orders = orders[orders["supplier_article"].isin(articles)].copy()
-        if orders.empty:
-            return pd.DataFrame()
-        orders["week_code"] = orders["day"].map(week_code_from_date)
-        # recent 4 weeks by orders
-        recent_weeks = sorted(orders["week_code"].dropna().unique().tolist())[-4:]
-        rows = []
-        for art in articles:
-            oa = orders[orders["supplier_article"] == art].copy()
-            if oa.empty:
+        is_daily = label_col == "weekday_label"
+        for subject in TARGET_SUBJECTS:
+            s = source[source["subject"] == subject].copy()
+            if s.empty:
                 continue
-            nm_id = oa["nm_id"].dropna().iloc[0] if oa["nm_id"].notna().any() else np.nan
-            subject = oa["subject"].dropna().iloc[0] if oa["subject"].notna().any() else ""
-            for wk in recent_weeks:
-                ws, we = week_bounds_from_code(wk)
-                ws = pd.Timestamp(ws) if ws else pd.NaT
-                we = pd.Timestamp(we) if we else pd.NaT
-                w_orders = oa[oa["week_code"] == wk].copy()
-                if w_orders.empty:
-                    continue
-                orders_week = w_orders["orders"].sum()
-                fsub = funnel.copy()
-                if not pd.isna(nm_id):
-                    fsub = fsub[fsub["nm_id"] == nm_id].copy()
-                if not fsub.empty and pd.notna(we):
-                    fsub = fsub[(fsub["day"] >= we - pd.Timedelta(days=89)) & (fsub["day"] <= we)].copy()
-                    buyout_pct_90 = safe_div(fsub["buyouts_count"].sum(), fsub["orders"].sum())
-                else:
-                    buyout_pct_90 = np.nan
-                e = econ[(econ["supplier_article"] == art) & (econ["week_code"] == wk)].copy()
-                if e.empty:
-                    e = econ[econ["supplier_article"] == art].copy().sort_values("week_code", ascending=False).head(1)
-                if e.empty:
-                    continue
-                e = e.iloc[0]
-                pwd = w_orders["price_with_disc"].mean()
-                fp = w_orders["finished_price"].mean()
-                buyout_factor = buyout_pct_90 if pd.notna(buyout_pct_90) else safe_div(e.get("Процент выкупа", np.nan), 100)
-                if pd.isna(buyout_factor):
-                    buyout_factor = 1.0
-                buyout_qty = orders_week * buyout_factor
-                revenue_pwd = buyout_qty * pwd
-                commission = revenue_pwd * float(e.get("Комиссия WB, %", 0) or 0) / 100.0
-                acquiring = revenue_pwd * float(e.get("Эквайринг, %", 0) or 0) / 100.0
-                logistics_direct = buyout_qty * float(e.get("Логистика прямая, руб/ед", 0) or 0)
-                logistics_return = buyout_qty * float(e.get("Логистика обратная, руб/ед", 0) or 0)
-                storage = buyout_qty * float(e.get("Хранение, руб/ед", 0) or 0)
-                other = buyout_qty * float(e.get("Прочие расходы, руб/ед", 0) or 0)
-                cost = buyout_qty * float(e.get("Себестоимость, руб", 0) or 0)
-                if not ads.empty:
-                    adw = ads[(ads["supplier_article"] == art) & (ads["day"] >= ws) & (ads["day"] <= we)]
-                    ad_spend = adw["spend"].sum()
-                else:
-                    ad_spend = 0.0
-                vat = buyout_qty * fp * 7.0 / 107.0
-                gp_forecast = revenue_pwd - commission - acquiring - logistics_direct - logistics_return - storage - other - cost - ad_spend
-                gp_minus_nds_forecast = gp_forecast - vat
-                abcw = abc[(abc["supplier_article"] == art) & (abc["week_code"] == wk)]
-                abc_gp = abcw["gross_profit"].sum() if not abcw.empty else np.nan
-                abc_vat = abcw["vat"].sum() if not abcw.empty else np.nan
-                abc_gp_minus_nds = abcw["gp_minus_nds"].sum() if not abcw.empty else np.nan
-                rows.append({
-                    "Артикул": art,
-                    "Категория": subject,
-                    "Неделя": wk,
-                    "Заказы, шт": orders_week,
-                    "% выкупа 90д": buyout_factor,
-                    "Выкупленные продажи, шт": buyout_qty,
-                    "Средний priceWithDisc": pwd,
-                    "Средний finishedPrice": fp,
-                    "Выручка по priceWithDisc, ₽": revenue_pwd,
-                    "Комиссия WB, ₽": commission,
-                    "Эквайринг, ₽": acquiring,
-                    "Логистика прямая, ₽": logistics_direct,
-                    "Логистика обратная, ₽": logistics_return,
-                    "Хранение, ₽": storage,
-                    "Прочие расходы, ₽": other,
-                    "Себестоимость, ₽": cost,
-                    "Реклама, ₽": ad_spend,
-                    "НДС, ₽": vat,
-                    "Валовая прибыль прогноз, ₽": gp_forecast,
-                    "Валовая прибыль - НДС прогноз, ₽": gp_minus_nds_forecast,
-                    "ABC Валовая прибыль, ₽": abc_gp,
-                    "ABC НДС, ₽": abc_vat,
-                    "ABC Валовая прибыль - НДС, ₽": abc_gp_minus_nds,
-                    "Отклонение прогноза к ABC ВП-НДС, ₽": gp_minus_nds_forecast - abc_gp_minus_nds if pd.notna(abc_gp_minus_nds) else np.nan,
-                })
+            values = [float(s.loc[s[label_col] == lab, value_col].sum()) for lab in labels]
+            rows.append({"name": subject, "level": "category", "subject": subject, "product": "", **dict(zip(labels, values)), "План": plan_value("category", subject, facts=values, daily=is_daily)})
+
+            products = s.groupby("product", dropna=False)[value_col].sum().sort_values(ascending=False).index.tolist()
+            for prod in products:
+                p = s[s["product"] == prod].copy()
+                values = [float(p.loc[p[label_col] == lab, value_col].sum()) for lab in labels]
+                rows.append({"name": prod, "level": "product", "subject": subject, "product": prod, **dict(zip(labels, values)), "План": plan_value("product", subject, prod, facts=values, daily=is_daily)})
+
+                articles = p.groupby("supplier_article", dropna=False)[value_col].sum().sort_values(ascending=False).index.tolist()
+                for art in articles:
+                    a = p[p["supplier_article"] == art].copy()
+                    values = [float(a.loc[a[label_col] == lab, value_col].sum()) for lab in labels]
+                    rows.append({"name": art, "level": "article", "subject": subject, "product": prod, **dict(zip(labels, values)), "План": plan_value("article", subject, prod, art, values, daily=is_daily)})
+
+        total_values = [float(source.loc[source[label_col] == lab, value_col].sum()) for lab in labels]
+        total_plan = sum(v for v in subject_plan.values() if pd.notna(v))
+        if is_daily:
+            total_plan = total_plan / self.days_in_month if total_plan else sum(total_values)
+        elif not total_plan:
+            total_plan = sum(total_values)
+        rows.append({"name": "Итого по всем 4 категориям", "level": "grand_total", "subject": "", "product": "", **dict(zip(labels, total_values)), "План": float(total_plan)})
         return pd.DataFrame(rows)
 
+    def build_outputs(self) -> Dict[str, pd.DataFrame]:
+        daily = self.daily_formula()
+        day_labels = [f"{WEEKDAY_RU[i]} {d.strftime('%d.%m')}" for i, d in enumerate(self.week_days)]
+        daily_block = self.make_fact_table(daily, "weekday_label", "gp_minus_nds", day_labels) if not daily.empty else pd.DataFrame()
+        # Future weekdays must be visually empty in main block.
+        if not daily_block.empty:
+            for d, lab in zip(self.week_days, day_labels):
+                if d > self.latest_day:
+                    daily_block[lab] = np.nan
 
-# -------------------------
-# Export helpers
-# -------------------------
+        weekly = self.weekly_abc_current_month()
+        week_labels = sorted(weekly["week_label"].dropna().astype(str).unique(), key=lambda x: x) if not weekly.empty else []
+        weekly_block = self.make_fact_table(weekly, "week_label", "gp_minus_nds", week_labels) if not weekly.empty else pd.DataFrame()
 
-def fmt_money(cell) -> None:
-    cell.number_format = '# ##0 "₽"'
+        monthly = self.monthly_abc_current_year()
+        month_labels = [f"{self.current_year:04d}-{m:02d}" for m in range(1, self.current_month + 1)]
+        monthly_block = self.make_fact_table(monthly, "month_key", "gp_minus_nds", month_labels) if not monthly.empty else pd.DataFrame()
 
+        return {
+            "main_daily": daily_block,
+            "main_weekly": weekly_block,
+            "main_monthly": monthly_block,
+            "dictionary": self.dictionary,
+            "orders_used": DictionaryLayer.filter_target(DictionaryLayer.enrich_by_nm(self.pack.orders, self.dictionary, self.diag, "orders_used")),
+            "funnel_used": self.buyout_90(),
+            "ads_used": self.ads_by_article_day(),
+            "economics_used": DictionaryLayer.filter_target(self.pack.economics),
+            "abc_weekly_used": weekly,
+            "abc_monthly_used": monthly,
+            "plan_used": self.plan_used(),
+            "daily_formula": daily,
+            "diagnostics": self.diag.frame(),
+            "example_daily": daily[daily["supplier_article"].isin(EXAMPLE_ARTICLES)].copy() if not daily.empty else pd.DataFrame(),
+            "example_weekly": self.example_weekly(EXAMPLE_ARTICLES),
+        }
 
-def fmt_pct(cell) -> None:
-    cell.number_format = '0.00%'
-
-
-def fmt_num(cell) -> None:
-    cell.number_format = '# ##0.00'
-
-
-def set_header(cell, fill=FILL_HEADER):
-    cell.fill = fill
-    cell.font = Font(bold=True)
-    cell.border = BORDER
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-
-def style_title(ws, row: int, start_col: int, end_col: int, title: str):
-    ws.merge_cells(start_row=row, start_column=start_col, end_row=row, end_column=end_col)
-    c = ws.cell(row, start_col, title)
-    c.fill = FILL_SECTION
-    c.font = Font(bold=True, size=12)
-    c.alignment = Alignment(horizontal="center", vertical="center")
-
-
-def autofit(ws):
-    widths: Dict[int, int] = {}
-    for row in ws.iter_rows():
-        for c in row:
-            if c.value is None:
-                continue
-            widths[c.column] = max(widths.get(c.column, 0), len(str(c.value)) + 2)
-    for col_idx, width in widths.items():
-        if col_idx == 1:
-            ws.column_dimensions[get_column_letter(col_idx)].width = 28
-        else:
-            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width, 12), 18)
-
-
-def write_hierarchy_block(ws, start_row: int, title: str, df: pd.DataFrame) -> int:
-    if df.empty:
-        ws.cell(start_row, 1, title).font = Font(bold=True)
-        ws.cell(start_row + 1, 1, "Нет данных")
-        return start_row + 3
-
-    cols = [c for c in df.columns if not c.startswith("_")]
-    style_title(ws, start_row, 1, len(cols), title)
-    hdr = start_row + 1
-    for j, col in enumerate(cols, start=1):
-        set_header(ws.cell(hdr, j, col if col != "Наименование" else ""))
-
-    row = hdr + 1
-    cat_start = None
-    prod_start = None
-    prod_row = None
-    cat_row = None
-
-    for _, r in df.iterrows():
-        level = r.get("_level", "")
-        if level == "category":
-            if prod_start and prod_row and row - 1 >= prod_start:
-                ws.row_dimensions.group(prod_start, row - 1, outline_level=2, hidden=True)
-                prod_start = None
-                prod_row = None
-            if cat_start and cat_row and row - 1 >= cat_start:
-                ws.row_dimensions.group(cat_start, row - 1, outline_level=1, hidden=True)
-                cat_start = None
-            cat_row = row
-            cat_start = row + 1
-        elif level == "product":
-            if prod_start and prod_row and row - 1 >= prod_start:
-                ws.row_dimensions.group(prod_start, row - 1, outline_level=2, hidden=True)
-            prod_row = row
-            prod_start = row + 1
-
-        for j, col in enumerate(cols, start=1):
-            cell = ws.cell(row, j, r[col])
-            cell.border = BORDER
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            if j >= 2 and isinstance(r[col], (int, float, np.integer, np.floating)) and not pd.isna(r[col]):
-                fmt_money(cell)
-
-        if level == "category":
-            for j in range(1, len(cols) + 1):
-                ws.cell(row, j).font = Font(bold=True)
-                ws.cell(row, j).fill = FILL_CATEGORY
-        elif level == "product":
-            for j in range(1, len(cols) + 1):
-                ws.cell(row, j).font = Font(bold=True, italic=True)
-                ws.cell(row, j).fill = FILL_PRODUCT
-            ws.row_dimensions[row].outlineLevel = 1
-        elif level == "article":
-            ws.row_dimensions[row].outlineLevel = 2
-        elif level in {"subject_total", "grand_total"}:
-            for j in range(1, len(cols) + 1):
-                ws.cell(row, j).font = Font(bold=True)
-                ws.cell(row, j).fill = FILL_TOTAL
-
-        row += 1
-
-    if prod_start and prod_row and row - 1 >= prod_start:
-        ws.row_dimensions.group(prod_start, row - 1, outline_level=2, hidden=True)
-    if cat_start and cat_row and row - 1 >= cat_start:
-        ws.row_dimensions.group(cat_start, row - 1, outline_level=1, hidden=True)
-
-    ws.sheet_properties.outlinePr.summaryBelow = False
-    return row + 2
+    def example_weekly(self, articles: List[str]) -> pd.DataFrame:
+        weekly = self.weekly_abc_current_month()
+        daily = self.daily_formula()
+        frames: List[pd.DataFrame] = []
+        if not daily.empty:
+            d = daily[daily["supplier_article"].isin(articles)].copy()
+            if not d.empty:
+                d["week_label"] = d["week_code"]
+                calc = d.groupby(["supplier_article", "subject", "product", "week_code"], as_index=False).agg(
+                    orders_qty=("orders_qty", "sum"),
+                    buyout_qty=("buyout_qty", "sum"),
+                    revenue=("revenue", "sum"),
+                    commission_wb=("commission_wb", "sum"),
+                    acquiring=("acquiring", "sum"),
+                    logistics_direct_total=("logistics_direct_total", "sum"),
+                    logistics_return_total=("logistics_return_total", "sum"),
+                    storage_total=("storage_total", "sum"),
+                    other_costs_total=("other_costs_total", "sum"),
+                    cost_total=("cost_total", "sum"),
+                    ad_spend=("ad_spend", "sum"),
+                    vat=("vat", "sum"),
+                    gross_profit=("gross_profit", "sum"),
+                    gp_minus_nds=("gp_minus_nds", "sum"),
+                )
+                calc["source"] = "stage1_formula_current_week"
+                frames.append(calc)
+        if not weekly.empty:
+            w = weekly[weekly["supplier_article"].isin(articles)].copy()
+            if not w.empty:
+                wcalc = w.groupby(["supplier_article", "subject", "product", "week_code"], as_index=False).agg(
+                    orders_qty=("orders", "sum"),
+                    gross_profit=("gross_profit", "sum"),
+                    vat=("vat", "sum"),
+                    gp_minus_nds=("gp_minus_nds", "sum"),
+                )
+                wcalc["source"] = "abc_weekly"
+                frames.append(wcalc)
+        return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 
-def write_dataframe_sheet(wb: Workbook, sheet_name: str, df: pd.DataFrame):
-    ws = wb.create_sheet(sheet_name[:31])
+# =============================================================================
+# STAGE 2 PLACEHOLDER
+# =============================================================================
+
+class Stage2Layer:
+    """Reserved architecture for future causal analysis: traffic, conversion, price/SPP, RRP, stock coverage."""
+
+    def __init__(self, *_: Any, **__: Any):
+        pass
+
+
+# =============================================================================
+# EXPORT LAYER
+# =============================================================================
+
+def write_dataframe_sheet(wb: Workbook, title: str, df: pd.DataFrame) -> None:
+    ws = wb.create_sheet(title[:31])
     if df is None or df.empty:
         ws.cell(1, 1, "Нет данных")
         return
-    for j, col in enumerate(df.columns, start=1):
-        set_header(ws.cell(1, j, col))
-    for i, row_vals in enumerate(df.itertuples(index=False), start=2):
-        for j, val in enumerate(row_vals, start=1):
-            c = ws.cell(i, j, val)
-            c.border = BORDER
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            if isinstance(val, (int, float, np.integer, np.floating)) and not pd.isna(val):
-                # heuristic formatting
-                col_name = df.columns[j-1].lower()
-                if "%" in df.columns[j-1] or "процент" in df.columns[j-1].lower():
-                    fmt_pct(c)
-                elif "цена" in col_name or "руб" in col_name or "прибыль" in col_name or "ндс" in col_name or "выручка" in col_name or "расход" in col_name or "себестоимость" in col_name:
-                    fmt_money(c)
-                else:
-                    fmt_num(c)
-    autofit(ws)
+    safe = df.copy()
+    for col in safe.columns:
+        if pd.api.types.is_datetime64_any_dtype(safe[col]):
+            safe[col] = safe[col].dt.strftime("%Y-%m-%d")
+    ws.append(list(safe.columns))
+    for row in safe.itertuples(index=False, name=None):
+        ws.append(list(row))
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center")
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = BORDER
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = '# ##0.00'
     ws.freeze_panes = "A2"
+    autofit(ws)
 
 
-def export_main_and_tech(main: Dict[str, pd.DataFrame], out_report: str, out_tech: str, out_example: str):
+def autofit(ws) -> None:
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 8
+        for cell in ws[letter]:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, min(len(value), 60))
+        ws.column_dimensions[letter].width = max_len + 2
+
+
+def write_main_block(ws, start_row: int, title: str, df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        ws.cell(start_row, 1, title)
+        ws.cell(start_row + 1, 1, "Нет данных")
+        return start_row + 3
+    display_cols = ["name"] + [c for c in df.columns if c not in {"name", "level", "subject", "product"}]
+    max_col = len(display_cols)
+
+    ws.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=max_col)
+    title_cell = ws.cell(start_row, 1, title)
+    title_cell.fill = TITLE_FILL
+    title_cell.font = Font(color="FFFFFF", bold=True, size=14)
+    title_cell.alignment = Alignment(horizontal="center")
+
+    header_row = start_row + 1
+    headers = ["Категория" if c == "name" else c for c in display_cols]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(header_row, col_idx, header)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = BORDER
+
+    excel_row = header_row + 1
+    for record in df.to_dict("records"):
+        level = record.get("level", "")
+        subject = record.get("subject", "")
+        for col_idx, col in enumerate(display_cols, start=1):
+            cell = ws.cell(excel_row, col_idx, record.get(col, None))
+            cell.border = BORDER
+            cell.alignment = Alignment(vertical="center")
+            if col_idx > 1 and isinstance(cell.value, (int, float, np.number)) and not pd.isna(cell.value):
+                cell.number_format = money_format()
+            if col == "План":
+                cell.font = Font(bold=True)
+                cell.fill = PLAN_FILL
+        if level == "category":
+            for cell in ws[excel_row]:
+                cell.fill = CATEGORY_FILLS.get(subject, CATEGORY_FILLS[TARGET_SUBJECTS[0]])
+                cell.font = Font(bold=True)
+            ws.row_dimensions[excel_row].outlineLevel = 0
+            ws.row_dimensions[excel_row].hidden = False
+        elif level == "product":
+            for cell in ws[excel_row]:
+                cell.fill = PRODUCT_FILL
+                cell.font = Font(bold=True)
+            ws.row_dimensions[excel_row].outlineLevel = 1
+            ws.row_dimensions[excel_row].hidden = True
+        elif level == "article":
+            for cell in ws[excel_row]:
+                cell.fill = ARTICLE_FILL
+            ws.row_dimensions[excel_row].outlineLevel = 2
+            ws.row_dimensions[excel_row].hidden = True
+        elif level == "grand_total":
+            for cell in ws[excel_row]:
+                cell.fill = TOTAL_FILL
+                cell.font = Font(bold=True)
+            ws.row_dimensions[excel_row].outlineLevel = 0
+            ws.row_dimensions[excel_row].hidden = False
+        excel_row += 1
+
+    ws.sheet_properties.outlinePr.summaryBelow = False
+    return excel_row + 2
+
+
+def export_all(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> Tuple[Path, Path, Path]:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    report_path = local_dir / MAIN_REPORT_NAME
+    tech_path = local_dir / TECH_REPORT_NAME
+    example_path = local_dir / EXAMPLE_REPORT_NAME
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Сводка"
     row = 1
-    row = write_hierarchy_block(ws, row, "Текущая неделя — Валовая прибыль - НДС", main["daily_main"])
-    row = write_hierarchy_block(ws, row, "Текущая неделя — Валовая прибыль", main["daily_gp"])
-    row = write_hierarchy_block(ws, row, "Текущая неделя — НДС", main["daily_vat"])
-    row = write_hierarchy_block(ws, row, "Текущий месяц — Валовая прибыль - НДС по неделям", main["weekly_main"])
-    row = write_hierarchy_block(ws, row, "Последние 3 месяца — Валовая прибыль - НДС", main["monthly_main"])
+    row = write_main_block(ws, row, "Валовая Прибыль - НДС", outputs.get("main_daily", pd.DataFrame()))
+    row = write_main_block(ws, row, "Текущий месяц по неделям", outputs.get("main_weekly", pd.DataFrame()))
+    row = write_main_block(ws, row, "Месяцы текущего года", outputs.get("main_monthly", pd.DataFrame()))
     ws.freeze_panes = "B3"
     autofit(ws)
-    wb.save(out_report)
+    wb.save(report_path)
 
-    twb = Workbook()
-    twb.remove(twb.active)
-    for sheet_name in [
-        "tech_daily", "tech_weekly", "tech_monthly", "tech_buyout90", "tech_econ_latest", "tech_plan", "tech_master"
+    tech_wb = Workbook()
+    tech_wb.remove(tech_wb.active)
+    for sheet in [
+        "dictionary",
+        "orders_used",
+        "funnel_used",
+        "ads_used",
+        "economics_used",
+        "abc_weekly_used",
+        "abc_monthly_used",
+        "plan_used",
+        "daily_formula",
+        "diagnostics",
     ]:
-        write_dataframe_sheet(twb, sheet_name.replace("tech_", ""), main.get(sheet_name, pd.DataFrame()))
-    twb.save(out_tech)
+        write_dataframe_sheet(tech_wb, sheet, outputs.get(sheet, pd.DataFrame()))
+    tech_wb.save(tech_path)
 
-    ex = main.get("example_weekly", pd.DataFrame())
-    ewb = Workbook()
-    ewb.remove(ewb.active)
-    if ex is None or ex.empty:
-        ws = ewb.create_sheet("Пример")
-        ws.cell(1, 1, "Нет данных для примеров")
-    else:
-        for art in TARGET_EXAMPLE_ARTICLES:
-            x = ex[ex["Артикул"] == art].copy()
-            write_dataframe_sheet(ewb, art.replace("/", "_"), x)
-    ewb.save(out_example)
+    ex_wb = Workbook()
+    ex_wb.remove(ex_wb.active)
+    write_dataframe_sheet(ex_wb, "daily_901", outputs.get("example_daily", pd.DataFrame()))
+    write_dataframe_sheet(ex_wb, "weekly_901", outputs.get("example_weekly", pd.DataFrame()))
+    ex_wb.save(example_path)
+
+    return report_path, tech_path, example_path
 
 
-# -------------------------
-# CLI
-# -------------------------
+# =============================================================================
+# RUNNER
+# =============================================================================
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="WB Stage 1 gross profit report")
-    p.add_argument("--root", default=".")
-    p.add_argument("--reports-root", default="Отчёты")
-    p.add_argument("--store", default="TOPFACE")
-    p.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description="TOPFACE WB report: Валовая Прибыль - НДС")
+    parser.add_argument("--root", default=".", help="Local reports root when S3 env vars are not set")
+    parser.add_argument("--reports-root", default="Отчёты", help="Base reports folder/key")
+    parser.add_argument("--store", default="TOPFACE", help="Store/brand folder")
+    parser.add_argument("--out-subdir", default="Отчёты/Объединенный отчет/TOPFACE", help="Output folder/key")
+    parser.add_argument("--local-tmp", default="/tmp/wb_topface_gp_nds", help="Local temporary folder for generated workbooks")
+    return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    diagnostics = Diagnostics()
     storage = make_storage(args.root)
-    loader = Stage1Loader(storage, args.reports_root, args.store)
-    log("Loading data")
-    data = loader.load_all()
-    log("Building stage 1")
-    builder = Stage1Builder(data)
-    main_blocks = builder.build_main_blocks()
-    main_blocks["example_weekly"] = builder.build_example_weekly(TARGET_EXAMPLE_ARTICLES)
+    loader = LoaderLayer(storage, args.reports_root, args.store, diagnostics)
+    pack = loader.load_all()
 
-    stamp = datetime.now().strftime("%Y-%m-%d")
-    out_report = f"{args.out_subdir}/Объединенный_отчет_{args.store}_{stamp}.xlsx"
-    out_tech = f"{args.out_subdir}/Технические_расчеты_{args.store}_{stamp}.xlsx"
-    out_example = f"{args.out_subdir}/Пример_расчета_901_{args.store}_{stamp}.xlsx"
+    dictionary = DictionaryLayer(pack).build()
+    stage1 = Stage1Layer(pack, dictionary)
+    outputs = stage1.build_outputs()
 
-    local_report = Path("/tmp") / f"wb_stage1_report_{stamp}.xlsx"
-    local_tech = Path("/tmp") / f"wb_stage1_tech_{stamp}.xlsx"
-    local_example = Path("/tmp") / f"wb_stage1_example_{stamp}.xlsx"
-    export_main_and_tech(main_blocks, str(local_report), str(local_tech), str(local_example))
+    local_report, local_tech, local_example = export_all(outputs, Path(args.local_tmp))
+
+    out_report = f"{args.out_subdir.strip('/')}/{MAIN_REPORT_NAME}"
+    out_tech = f"{args.out_subdir.strip('/')}/{TECH_REPORT_NAME}"
+    out_example = f"{args.out_subdir.strip('/')}/{EXAMPLE_REPORT_NAME}"
 
     storage.write_bytes(out_report, local_report.read_bytes())
     storage.write_bytes(out_tech, local_tech.read_bytes())
     storage.write_bytes(out_example, local_example.read_bytes())
-    log(f"Saved report: {out_report}")
-    log(f"Saved technical workbook: {out_tech}")
-    log(f"Saved example workbook: {out_example}")
+
+    log(f"Saved: {out_report}")
+    log(f"Saved: {out_tech}")
+    log(f"Saved: {out_example}")
     return 0
 
 
