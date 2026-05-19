@@ -588,8 +588,10 @@ class LoaderLayer:
                     "source_file": key,
                 })
                 out["product"] = out["supplier_article"].map(product_code)
-                out["vat"] = out["gross_revenue"] * 7.0 / 107.0
-                out["gp_minus_nds"] = out["gross_profit"] - out["vat"]
+                # VAT for ABC periods is intentionally NOT calculated from ABC gross_revenue.
+                # It is recalculated later from Orders.finishedPrice for the same period/entity.
+                out["vat"] = np.nan
+                out["gp_minus_nds"] = np.nan
                 if is_month_file(start, end) and start.year == current_year and start <= latest_day:
                     monthly_frames.append(out)
                 elif start.year == current_year or end.year == current_year:
@@ -892,12 +894,19 @@ class Stage1Layer:
             self.diag.add("WARN", "orders", "Нет заказов за текущую неделю")
             return pd.DataFrame()
         orders["week_code"] = orders["day"].map(week_code)
+        # Prices must be weighted by quantity. VAT base is Orders.finishedPrice, not ABC revenue.
+        orders["finished_price_order_sum"] = orders["orders"].fillna(0) * orders["finished_price"].fillna(0)
+        orders["price_with_disc_order_sum"] = orders["orders"].fillna(0) * orders["price_with_disc"].fillna(0)
+        orders["spp_order_sum"] = orders["orders"].fillna(0) * orders["spp"].fillna(0)
         grouped = orders.groupby(["day", "week_code", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
             orders_qty=("orders", "sum"),
-            finished_price=("finished_price", "mean"),
-            price_with_disc=("price_with_disc", "mean"),
-            spp=("spp", "mean"),
+            finished_price_order_sum=("finished_price_order_sum", "sum"),
+            price_with_disc_order_sum=("price_with_disc_order_sum", "sum"),
+            spp_order_sum=("spp_order_sum", "sum"),
         )
+        grouped["finished_price"] = grouped.apply(lambda r: safe_ratio(r["finished_price_order_sum"], r["orders_qty"], 0.0), axis=1)
+        grouped["price_with_disc"] = grouped.apply(lambda r: safe_ratio(r["price_with_disc_order_sum"], r["orders_qty"], 0.0), axis=1)
+        grouped["spp"] = grouped.apply(lambda r: safe_ratio(r["spp_order_sum"], r["orders_qty"], np.nan), axis=1)
         grouped = grouped.merge(self.buyout_90(), on="nm_id", how="left")
         grouped["buyout_pct_90"] = grouped["buyout_pct_90"].fillna(1.0).clip(lower=0, upper=1)
 
@@ -912,7 +921,7 @@ class Stage1Layer:
 
         enriched = self.economics_for_rows(grouped)
         enriched["buyout_qty"] = enriched["orders_qty"] * enriched["buyout_pct_90"]
-        enriched["revenue"] = enriched["buyout_qty"] * enriched["price_with_disc"].fillna(0)
+        enriched["revenue"] = enriched["price_with_disc_order_sum"] * enriched["buyout_pct_90"]
         enriched["commission_wb"] = enriched["revenue"] * enriched["commission_pct"] / 100.0
         enriched["acquiring"] = enriched["revenue"] * enriched["acquiring_pct"] / 100.0
         enriched["logistics_direct_total"] = enriched["buyout_qty"] * enriched["logistics_direct"]
@@ -920,7 +929,8 @@ class Stage1Layer:
         enriched["storage_total"] = enriched["buyout_qty"] * enriched["storage"]
         enriched["other_costs_total"] = enriched["buyout_qty"] * enriched["other_costs"]
         enriched["cost_total"] = enriched["buyout_qty"] * enriched["cost"]
-        enriched["vat"] = enriched["buyout_qty"] * enriched["finished_price"].fillna(0) * 7.0 / 107.0
+        enriched["vat"] = enriched["finished_price_order_sum"] * enriched["buyout_pct_90"] * 7.0 / 107.0
+        enriched["vat_base_finished_price"] = enriched["finished_price_order_sum"] * enriched["buyout_pct_90"]
         enriched["gross_profit"] = (
             enriched["revenue"]
             - enriched["commission_wb"]
@@ -937,12 +947,64 @@ class Stage1Layer:
         enriched["weekday_label"] = enriched["day"].apply(lambda x: f"{WEEKDAY_RU[int(pd.Timestamp(x).weekday())]} {pd.Timestamp(x).strftime('%d.%m')}")
         return enriched
 
+    def orders_finished_price_vat_by_period(self, period_col: str) -> pd.DataFrame:
+        """Calculate VAT base strictly from Orders.finishedPrice for weekly/monthly ABC blocks.
+
+        VAT formula:
+            sum(orders * buyout_pct_90 * finishedPrice) * 7 / 107
+
+        period_col must be either "week_code" or "month_key".
+        """
+        orders = DictionaryLayer.enrich_by_nm(self.pack.orders, self.dictionary, self.diag, "orders_vat_finished_price")
+        orders = DictionaryLayer.filter_target(orders)
+        if orders.empty:
+            return pd.DataFrame(columns=[period_col, "subject", "product", "supplier_article", "nm_id", "vat_base_finished_price", "vat"])
+        if period_col == "week_code":
+            orders["week_code"] = orders["day"].map(week_code)
+        elif period_col == "month_key":
+            orders["month_key"] = orders["day"].dt.to_period("M").astype(str)
+        else:
+            raise ValueError("period_col must be 'week_code' or 'month_key'")
+
+        orders = orders.merge(self.buyout_90()[["nm_id", "buyout_pct_90"]], on="nm_id", how="left")
+        orders["buyout_pct_90"] = orders["buyout_pct_90"].fillna(1.0).clip(lower=0, upper=1)
+        orders["orders_qty"] = num_series(orders["orders"]).fillna(0)
+        orders["finished_price_line_sum"] = orders["orders_qty"] * num_series(orders["finished_price"]).fillna(0)
+        orders["buyout_qty"] = orders["orders_qty"] * orders["buyout_pct_90"]
+        orders["vat_base_finished_price"] = orders["finished_price_line_sum"] * orders["buyout_pct_90"]
+        orders["vat"] = orders["vat_base_finished_price"] * 7.0 / 107.0
+        return orders.groupby([period_col, "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders_qty_for_vat=("orders_qty", "sum"),
+            buyout_qty_for_vat=("buyout_qty", "sum"),
+            vat_base_finished_price=("vat_base_finished_price", "sum"),
+            vat_from_finished_price=("vat", "sum"),
+        )
+
+    def apply_finished_price_vat_to_abc(self, abc: pd.DataFrame, period_col: str, source_name: str) -> pd.DataFrame:
+        """Overwrite ABC VAT with VAT calculated from Orders.finishedPrice."""
+        if abc.empty:
+            return abc.copy()
+        out = abc.copy()
+        vat = self.orders_finished_price_vat_by_period(period_col)
+        keys = [period_col, "subject", "product", "supplier_article", "nm_id"]
+        out = out.merge(vat, on=keys, how="left")
+        out["vat_old_from_abc_gross_revenue"] = num_series(out.get("gross_revenue", pd.Series(dtype=float))).fillna(0) * 7.0 / 107.0
+        out["vat"] = num_series(out["vat_from_finished_price"]).fillna(0.0)
+        out["gp_minus_nds"] = num_series(out["gross_profit"]).fillna(0.0) - out["vat"]
+        out["vat_source"] = "orders.finishedPrice * buyout_pct_90 * 7/107"
+        missing = int(out["vat_from_finished_price"].isna().sum())
+        if missing:
+            self.diag.add("WARN", source_name, "НДС по части ABC-строк не найден в заказах и поставлен 0", f"rows={missing}; period_col={period_col}")
+        self.diag.add("INFO", source_name, "НДС пересчитан от finishedPrice из заказов", f"rows={len(out)}; vat_sum={out['vat'].sum():.2f}; period_col={period_col}")
+        return out
+
     def weekly_abc_current_month(self) -> pd.DataFrame:
         df = DictionaryLayer.enrich_by_nm(self.pack.abc_weekly, self.dictionary, self.diag, "abc_weekly")
         df = DictionaryLayer.filter_target(df)
         if df.empty:
             return df
         df = df[(df["period_end"] >= self.month_start) & (df["period_start"] <= self.latest_day)].copy()
+        df = self.apply_finished_price_vat_to_abc(df, "week_code", "abc_weekly")
         return df
 
     def monthly_abc_current_year(self) -> pd.DataFrame:
@@ -975,6 +1037,7 @@ class Stage1Layer:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
         out = out[out["month_key"].astype(str).str.startswith(str(self.current_year))].copy()
+        out = self.apply_finished_price_vat_to_abc(out, "month_key", "abc_monthly")
         return out
 
     def plan_used(self) -> pd.DataFrame:
