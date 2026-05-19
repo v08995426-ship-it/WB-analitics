@@ -231,6 +231,24 @@ WAREHOUSE_ALIASES: Dict[str, str] = {
     **{name: "Склад Шушары" for name in NORTHWEST_AGGREGATE_WAREHOUSES},
 }
 
+NORTHWEST_WAREHOUSE_NAME_MARKERS: Tuple[str, ...] = (
+    "шушар",
+    "уткин",
+    "санкт-петербург",
+    "санкт петербург",
+    "спб",
+    "калининград",
+    "архангельск",
+    "вологд",
+    "мурманск",
+    "псков",
+    "сыктывкар",
+    "череповец",
+)
+
+NORTHWEST_OKRUG_NAME = "Северо-Западный федеральный округ"
+NORTHWEST_TARGET_WAREHOUSE = "Склад Шушары"
+
 TEMPLATE_WAREHOUSE_ALIASES: Dict[str, str] = {
     "Коледино": "Коледино",
     "Тула": "Тула",
@@ -251,9 +269,10 @@ TEMPLATE_WAREHOUSE_ALIASES: Dict[str, str] = {
     "Котовск": "Котовск",
     "Воронеж": "Воронеж",
     "Москва": "Коледино",
-    "СПб Уткина Заводь": "Санкт-Петербург Уткина Заводь",
-    "СПБ Уткина Заводь": "Санкт-Петербург Уткина Заводь",
+    "СПб Уткина Заводь": "Склад Шушары",
+    "СПБ Уткина Заводь": "Склад Шушары",
     "Санкт-Петербург Уткина Заводь": "Склад Шушары",
+    "Санкт Петербург Уткина Заводь": "Склад Шушары",
     "СПб Шушары": "Склад Шушары",
     "СПБ Шушары": "Склад Шушары",
     "СЦ Шушары": "Склад Шушары",
@@ -493,7 +512,21 @@ def normalize_nmid(value: object) -> str:
 
 def normalize_warehouse(name: object) -> str:
     s = normalize_text(name)
-    return WAREHOUSE_ALIASES.get(s, s)
+    if not s:
+        return ""
+
+    direct = WAREHOUSE_ALIASES.get(s)
+    if direct:
+        return direct
+
+    # WB периодически переименовывает склады СЗФО. Для расчёта поставки
+    # все такие варианты канонизируем в один целевой склад — Склад Шушары.
+    lowered = s.lower().replace("ё", "е")
+    lowered = re.sub(r"\s+", " ", lowered)
+    if any(marker in lowered for marker in NORTHWEST_WAREHOUSE_NAME_MARKERS):
+        return NORTHWEST_TARGET_WAREHOUSE
+
+    return s
 
 
 def normalize_template_header(name: object) -> str:
@@ -787,6 +820,15 @@ def prepare_daily_orders(orders: pd.DataFrame) -> pd.DataFrame:
     df = orders.copy()
     df["region_group"] = df["regionName"].map(REGION_TO_GROUP)
 
+    # Для СЗФО не опираемся на название склада или точную область доставки:
+    # WB может менять складские названия, но округ в заказах остаётся стабильным.
+    # Все продажи СЗФО в базовом и эконом-режиме направляем на Склад Шушары.
+    northwest_mask = df["oblastOkrugName"].eq(NORTHWEST_OKRUG_NAME)
+    northwest_rows = int(northwest_mask.sum())
+    if northwest_rows:
+        df.loc[northwest_mask, "region_group"] = NORTHWEST_TARGET_WAREHOUSE
+        log(f"Продажи СЗФО направлены на {NORTHWEST_TARGET_WAREHOUSE}: {northwest_rows:,} строк заказов")
+
     unmapped = int(df["region_group"].isna().sum())
     if unmapped:
         log(f"⚠️ Регионов без привязки к группе обслуживания: {unmapped}. Они будут отброшены.")
@@ -862,6 +904,8 @@ def attach_presence_flags(grid: pd.DataFrame, per_wh: pd.DataFrame, per_district
     def region_target_district(region_group: str) -> str:
         if region_group == "MOSCOW_CLUSTER":
             return "Центральный федеральный округ"
+        if region_group == NORTHWEST_TARGET_WAREHOUSE:
+            return NORTHWEST_OKRUG_NAME
         return WAREHOUSE_TO_DISTRICT.get(region_group, "")
 
     grid["target_district"] = grid["region_group"].map(region_target_district)
@@ -1044,11 +1088,19 @@ def build_warehouse_shares(region_metrics: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_strategy(shares_df: pd.DataFrame, cfg: AppConfig) -> pd.DataFrame:
-    if cfg.strategy_mode != "economy":
-        return shares_df.copy()
-
     df = shares_df.copy()
-    mask = df["subject"].isin(cfg.economy_subjects) & df["warehouse"].isin(ECONOMY_REPLACEMENT_MAP)
+    if not df.empty and "warehouse" in df.columns:
+        df["warehouse"] = df["warehouse"].map(normalize_warehouse)
+
+    if cfg.strategy_mode != "economy":
+        return df
+
+    # Эконом-режим заменяет только заданные склады. СЗФО всегда остаётся на Шушарах.
+    mask = (
+        df["subject"].isin(cfg.economy_subjects)
+        & df["warehouse"].isin(ECONOMY_REPLACEMENT_MAP)
+        & df["warehouse"].ne(NORTHWEST_TARGET_WAREHOUSE)
+    )
     df.loc[mask, "warehouse"] = df.loc[mask, "warehouse"].map(ECONOMY_REPLACEMENT_MAP)
 
     df = (
@@ -1968,8 +2020,8 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         "Самара (Новосемейкино)": "Новосемейкино",
         "Рязань (Тюшевское)": "Рязань",
         "Екатеринбург - Перспективная 14": "Екатеринбург",
-        "Склад Шушары": "СПб Уткина Заводь",
-        "Санкт-Петербург Уткина Заводь": "СПб Уткина Заводь",
+        "Склад Шушары": "Склад Шушары",
+        "Санкт-Петербург Уткина Заводь": "Склад Шушары",
     }
 
     for i, wh in enumerate(ordered_warehouses, start=article_1c_col + 1):
