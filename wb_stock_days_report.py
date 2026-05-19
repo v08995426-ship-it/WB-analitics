@@ -30,6 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
+SCRIPT_VERSION = "2026-05-19_F_COLUMN_FIXED_MINIMAL"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -671,7 +672,19 @@ def find_inbound_columns_raw(df: pd.DataFrame) -> tuple[Optional[int], Optional[
 
 
 def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
-    keys = [k for k in storage.list_keys(INBOUND_PREFIX) if is_inbound_file_key(k)]
+    """Загрузка товаров в пути.
+
+    Рабочее правило под текущий шаблон:
+    - артикул берём из колонки CODES / Артикул 1С / Артикул;
+    - количество берём строго из физического столбца F (индекс 5), как в Excel-ВПР.
+
+    Это намеренно простая логика без поиска 'Заказ МП', потому что в новом шаблоне
+    колонка F называется 'Итого заказ Вайлберис + Озон' и pandas видит её как Unnamed: 5.
+    """
+    keys = [
+        k for k in storage.list_keys(INBOUND_PREFIX)
+        if is_inbound_file_key(k)
+    ]
     log(f"Найдено файлов 'В пути' в S3: {len(keys)}")
 
     frames: list[pd.DataFrame] = []
@@ -681,52 +694,57 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
         fname = os.path.basename(key)
         base_date = parse_inbound_base_date(fname)
         if base_date is None:
-            skipped.append(f"{fname}: не распознана дата в имени")
-            log(f"Файл 'В пути' пропущен: не смогли распознать дату в имени {fname}")
+            msg = f"{fname}: не распознана дата в имени"
+            skipped.append(msg)
+            log(f"Файл 'В пути' пропущен: {msg}")
             continue
 
         arrival_date = base_date + timedelta(days=14)
 
         try:
-            df = storage.read_excel(key, header=None)
+            df = storage.read_excel(key)
         except Exception as exc:
-            skipped.append(f"{fname}: ошибка чтения {exc}")
-            log(f"Файл 'В пути' пропущен: ошибка чтения {fname}: {exc}")
+            msg = f"{fname}: ошибка чтения {exc}"
+            skipped.append(msg)
+            log(f"Файл 'В пути' пропущен: {msg}")
             continue
 
         if df.empty:
             skipped.append(f"{fname}: пустой файл")
             continue
 
-        code_col, qty_col, data_start_row = find_inbound_columns_raw(df)
+        code_col = try_choose_column(df, ["CODES", "Артикул 1С", "Артикул"])
         if code_col is None:
-            skipped.append(f"{fname}: не найдена колонка CODES/Артикул")
-            log(f"Файл 'В пути' пропущен: не найдена колонка артикула в {fname}")
-            continue
-        if qty_col is None:
-            skipped.append(f"{fname}: не найдена колонка Заказ МП")
-            log(f"Файл 'В пути' пропущен: не найдена колонка 'Заказ МП' в {fname}")
+            msg = f"{fname}: не найдена колонка CODES/Артикул"
+            skipped.append(msg)
+            log(f"Файл 'В пути' пропущен: {msg}")
             continue
 
-        data = df.iloc[data_start_row:].copy()
-        if data.empty:
-            skipped.append(f"{fname}: нет строк после заголовка")
+        if len(df.columns) <= 5:
+            msg = f"{fname}: нет физического столбца F"
+            skipped.append(msg)
+            log(f"Файл 'В пути' пропущен: {msg}")
             continue
+
+        qty_col = df.columns[5]
+        log(
+            f"Файл 'В пути' читаем как ВПР: {fname}; "
+            f"ключ={code_col}; количество=столбец F / {qty_col}"
+        )
 
         temp = pd.DataFrame({
-            "Артикул 1С": data.iloc[:, code_col].map(normalize_text),
-            "qty_raw": data.iloc[:, qty_col],
+            "Артикул 1С": df[code_col].map(normalize_text),
+            "qty_raw": df[qty_col],
         })
-        temp["article_marker"] = temp["Артикул 1С"].map(normalize_inbound_marker)
         temp = temp[
-            (~temp["article_marker"].isin({"CODES", "АРТИКУЛ1С", "АРТИКУЛ", "КОД", "КОДЫ"}))
+            (~temp["Артикул 1С"].str.upper().isin({"CODES", "КОДЫ", "АРТИКУЛ", "АРТИКУЛ 1С"}))
             & (temp["Артикул 1С"] != "")
         ].copy()
 
         temp["Партия в пути, шт"] = temp["qty_raw"].map(round_int)
         temp = temp[temp["Партия в пути, шт"] > 0].copy()
         if temp.empty:
-            skipped.append(f"{fname}: нет положительных значений в Заказ МП")
+            skipped.append(f"{fname}: в столбце F нет положительных значений")
             continue
 
         temp = temp[["Артикул 1С", "Партия в пути, шт"]].copy()
@@ -736,8 +754,9 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
         frames.append(temp)
 
         log(
-            f"Файл 'В пути' загружен: {fname}; строк={len(temp)}; "
-            f"кол-во={int(temp['Партия в пути, шт'].sum())}; поступление={arrival_date.strftime('%Y-%m-%d')}"
+            f"Файл 'В пути' загружен: {fname}; SKU={temp['Артикул 1С'].nunique()}; "
+            f"строк={len(temp)}; кол-во={int(temp['Партия в пути, шт'].sum())}; "
+            f"поступление={arrival_date.strftime('%Y-%m-%d')}"
         )
 
     if not frames:
@@ -949,7 +968,7 @@ def build_report_dataframe(
         axis=1,
     )
 
-    df = df[df["Продажи 60 дней, шт"] >= 20].copy()
+    df = df[(df["Продажи 60 дней, шт"] >= 20) | (df["Товары в пути, шт"] > 0)].copy()
 
     for col in [
         "Среднесуточные продажи 7д",
@@ -1667,6 +1686,7 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
 
 
 def run() -> Path:
+    log(f"Версия скрипта: {SCRIPT_VERSION}")
     cfg = get_config()
     storage = S3Storage(cfg)
     stop_articles = parse_stop_articles(cfg.stop_articles_raw)
