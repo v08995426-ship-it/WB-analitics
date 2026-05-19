@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-19_F_COLUMN_AND_ALL_STOCKS_FIXED"
+SCRIPT_VERSION = "2026-05-19_F_COLUMN_ALL_STOCKS_CRITICAL_SALES_ONLY"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -1010,10 +1010,23 @@ def build_report_dataframe(
 
 
 def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    crit_mask = (
+    # 1-й лист — это рабочий список риска по ходовым SKU.
+    # Поэтому сюда не включаем товары с 0 продаж за 60 дней: они остаются на расчётном/мониторинговом листах,
+    # но не засоряют список товаров, которые реально приносили продажи и сейчас заканчиваются.
+    revenue_sku_mask = report_df["Продажи 60 дней, шт"] > 0
+    stock_risk_mask = (
         (report_df["Остаток WB, шт"] <= 0)
         | (report_df["WB + Липецк, дней"] < 14)
         | ((report_df["Товары в пути, шт"] > 0) & (report_df["Хватит до поступления"] == "Нет"))
+    )
+    critical_before_sales_filter = int(stock_risk_mask.sum())
+    critical_zero_sales_excluded = int((stock_risk_mask & ~revenue_sku_mask).sum())
+    crit_mask = stock_risk_mask & revenue_sku_mask
+    log(
+        "Фильтр 1-го листа: "
+        f"риск-строк={critical_before_sales_filter}; "
+        f"исключено с продажами 60д=0: {critical_zero_sales_excluded}; "
+        f"осталось={int(crit_mask.sum())}"
     )
     critical = report_df[crit_mask].copy()
     critical["Комментарий"] = critical.apply(
