@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-19_F_COLUMN_FIXED_MINIMAL"
+SCRIPT_VERSION = "2026-05-19_F_COLUMN_AND_ALL_STOCKS_FIXED"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -968,7 +968,29 @@ def build_report_dataframe(
         axis=1,
     )
 
-    df = df[(df["Продажи 60 дней, шт"] >= 20) | (df["Товары в пути, шт"] > 0)].copy()
+    # ВАЖНО: отчёт должен учитывать не только товары с продажами >= 20 за 60 дней,
+    # но и все SKU, которые реально есть на остатке WB / МП или уже находятся в пути.
+    # Иначе ассортимент с остатком, но низкими/нулевыми продажами, исчезает из отчёта.
+    before_filter_rows = len(df)
+    before_filter_stock_rows = int((df["Остаток WB, шт"] > 0).sum())
+    before_filter_mp_rows = int((df["Остатки МП (Липецк), шт"] > 0).sum())
+    before_filter_inbound_rows = int((df["Товары в пути, шт"] > 0).sum())
+
+    df = df[
+        (df["Продажи 60 дней, шт"] >= 20)
+        | (df["Остаток WB, шт"] > 0)
+        | (df["Остатки МП (Липецк), шт"] > 0)
+        | (df["Товары в пути, шт"] > 0)
+    ].copy()
+
+    log(
+        "Фильтр итогового отчёта: "
+        f"было строк={before_filter_rows}; "
+        f"с остатком WB>0={before_filter_stock_rows}; "
+        f"с остатком МП>0={before_filter_mp_rows}; "
+        f"с товарами в пути>0={before_filter_inbound_rows}; "
+        f"осталось строк={len(df)}"
+    )
 
     for col in [
         "Среднесуточные продажи 7д",
