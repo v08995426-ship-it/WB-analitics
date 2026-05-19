@@ -127,6 +127,27 @@ MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
 DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
 
 
+RU_MONTHS_GENITIVE: dict[int, str] = {
+    1: "января",
+    2: "февраля",
+    3: "марта",
+    4: "апреля",
+    5: "мая",
+    6: "июня",
+    7: "июля",
+    8: "августа",
+    9: "сентября",
+    10: "октября",
+    11: "ноября",
+    12: "декабря",
+}
+
+
+def format_ru_date_for_filename(value: date) -> str:
+    return f"{value.day} {RU_MONTHS_GENITIVE[value.month]}"
+
+
+
 @dataclass
 class Config:
     bucket: str
@@ -501,78 +522,211 @@ def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
     return metrics, keys
 
 
+def normalize_inbound_marker(value: object) -> str:
+    text = normalize_text(value).upper().replace("Ё", "Е")
+    return re.sub(r"[^0-9A-ZА-Я]+", "", text)
+
+
+def is_inbound_file_key(key: str) -> bool:
+    if not key.lower().endswith(".xlsx"):
+        return False
+    fname = os.path.basename(key).lower().replace("ё", "е")
+    spaced = re.sub(r"[\s_\-]+", " ", fname)
+    compact = re.sub(r"[\s_\-]+", "", fname)
+    return "в пути" in spaced or "впути" in compact
+
+
 def parse_inbound_base_date(filename: str) -> Optional[date]:
-    for pattern, dt_format in (
-        (r"(\d{2}-\d{2}-\d{4})", "%d-%m-%Y"),
-        (r"(\d{2}-\d{2}-\d{2})(?!\d)", "%d-%m-%y"),
-    ):
-        m = re.search(pattern, filename)
-        if m:
-            try:
-                return datetime.strptime(m.group(1), dt_format).date()
-            except ValueError:
-                continue
+    name = os.path.basename(filename).lower().replace("ё", "е")
+
+    numeric_patterns: tuple[tuple[str, str], ...] = (
+        (r"(?<!\d)(\d{2})[.\-_/](\d{2})[.\-_/](\d{4})(?!\d)", "dmy4"),
+        (r"(?<!\d)(\d{2})[.\-_/](\d{2})[.\-_/](\d{2})(?!\d)", "dmy2"),
+        (r"(?<!\d)(\d{4})[.\-_/](\d{2})[.\-_/](\d{2})(?!\d)", "ymd4"),
+        (r"(?<!\d)(\d{8})(?!\d)", "compact"),
+    )
+    for pattern, kind in numeric_patterns:
+        m = re.search(pattern, name)
+        if not m:
+            continue
+        try:
+            if kind == "dmy4":
+                return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            if kind == "dmy2":
+                year = int(m.group(3))
+                year += 2000 if year < 70 else 1900
+                return date(year, int(m.group(2)), int(m.group(1)))
+            if kind == "ymd4":
+                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            if kind == "compact":
+                raw = m.group(1)
+                # Основной ожидаемый вариант для выгрузок: YYYYMMDD.
+                try:
+                    return date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+                except ValueError:
+                    return date(int(raw[4:8]), int(raw[2:4]), int(raw[:2]))
+        except ValueError:
+            continue
+
+    month_map = {
+        "января": 1, "январь": 1,
+        "февраля": 2, "февраль": 2,
+        "марта": 3, "март": 3,
+        "апреля": 4, "апрель": 4,
+        "мая": 5, "май": 5,
+        "июня": 6, "июнь": 6,
+        "июля": 7, "июль": 7,
+        "августа": 8, "август": 8,
+        "сентября": 9, "сентябрь": 9,
+        "октября": 10, "октябрь": 10,
+        "ноября": 11, "ноябрь": 11,
+        "декабря": 12, "декабрь": 12,
+    }
+    m = re.search(
+        r"(?<!\d)(\d{1,2})\s*("
+        + "|".join(month_map.keys())
+        + r")(?:\s*(20\d{2}))?",
+        name,
+    )
+    if m:
+        year = int(m.group(3)) if m.group(3) else date.today().year
+        try:
+            return date(year, month_map[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+
     return None
 
 
-def detect_inbound_mp_column(df: pd.DataFrame) -> tuple[Optional[str], int]:
-    direct = try_choose_column(df, ["Заказ МП", "ЗаказМП"])
-    if direct is not None:
-        return direct, 0
+def find_inbound_columns_raw(df: pd.DataFrame) -> tuple[Optional[int], Optional[int], int]:
+    article_priority = {
+        "CODES": 0,
+        "АРТИКУЛ1С": 1,
+        "АРТИКУЛ": 2,
+        "КОД": 3,
+        "КОДЫ": 3,
+    }
+    qty_markers = (
+        "ЗАКАЗМП",
+        "ЗАКАЗНАМП",
+        "ЗАКАЗМАРКЕТПЛЕЙС",
+        "КОЛИЧЕСТВОМП",
+        "QTY",
+    )
 
-    target = "ЗАКАЗМП"
-    scan_rows = min(len(df), 5)
+    best_same_row: Optional[tuple[int, int, int, int]] = None  # score, row, article_col, qty_col
+    first_article: Optional[tuple[int, int, int]] = None  # score, row, col
+    first_qty: Optional[tuple[int, int]] = None  # row, col
+
+    scan_rows = min(len(df), 25)
     for row_idx in range(scan_rows):
-        for col in df.columns:
-            cell_value = normalize_text(df.iloc[row_idx][col]).upper().replace(" ", "")
-            if cell_value == target:
-                return str(col), row_idx + 1
-    return None, 0
+        row_article_hits: list[tuple[int, int]] = []
+        row_qty_hits: list[int] = []
+
+        for col_idx, value in enumerate(df.iloc[row_idx].tolist()):
+            marker = normalize_inbound_marker(value)
+            if not marker:
+                continue
+
+            article_score: Optional[int] = None
+            for candidate, score in article_priority.items():
+                if marker == candidate or marker.startswith(candidate):
+                    article_score = score
+                    break
+            if article_score is not None:
+                row_article_hits.append((article_score, col_idx))
+                if first_article is None or (article_score, row_idx) < (first_article[0], first_article[1]):
+                    first_article = (article_score, row_idx, col_idx)
+
+            if any(candidate in marker for candidate in qty_markers):
+                row_qty_hits.append(col_idx)
+                if first_qty is None:
+                    first_qty = (row_idx, col_idx)
+
+        if row_article_hits and row_qty_hits:
+            row_article_hits.sort(key=lambda x: (x[0], x[1]))
+            candidate = (row_article_hits[0][0], row_idx, row_article_hits[0][1], row_qty_hits[0])
+            if best_same_row is None or candidate < best_same_row:
+                best_same_row = candidate
+
+    if best_same_row is not None:
+        _, row_idx, article_col, qty_col = best_same_row
+        return article_col, qty_col, row_idx + 1
+
+    if first_article is not None and first_qty is not None:
+        _, article_row, article_col = first_article
+        qty_row, qty_col = first_qty
+        return article_col, qty_col, max(article_row, qty_row) + 1
+
+    article_col = first_article[2] if first_article is not None else None
+    qty_col = first_qty[1] if first_qty is not None else None
+    data_start_row = max(
+        [x for x in [
+            first_article[1] + 1 if first_article is not None else None,
+            first_qty[0] + 1 if first_qty is not None else None,
+        ] if x is not None],
+        default=0,
+    )
+    return article_col, qty_col, data_start_row
 
 
 def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
-    keys = [
-        k for k in storage.list_keys(INBOUND_PREFIX)
-        if k.lower().endswith(".xlsx") and "в пути" in os.path.basename(k).lower()
-    ]
+    keys = [k for k in storage.list_keys(INBOUND_PREFIX) if is_inbound_file_key(k)]
+    log(f"Найдено файлов 'В пути' в S3: {len(keys)}")
+
     frames: list[pd.DataFrame] = []
+    skipped: list[str] = []
 
     for key in keys:
         fname = os.path.basename(key)
         base_date = parse_inbound_base_date(fname)
         if base_date is None:
+            skipped.append(f"{fname}: не распознана дата в имени")
             log(f"Файл 'В пути' пропущен: не смогли распознать дату в имени {fname}")
             continue
 
         arrival_date = base_date + timedelta(days=14)
-        df = storage.read_excel(key)
-        if df.empty:
+
+        try:
+            df = storage.read_excel(key, header=None)
+        except Exception as exc:
+            skipped.append(f"{fname}: ошибка чтения {exc}")
+            log(f"Файл 'В пути' пропущен: ошибка чтения {fname}: {exc}")
             continue
 
-        code_col = try_choose_column(df, ["CODES", "Артикул 1С", "Артикул"])
+        if df.empty:
+            skipped.append(f"{fname}: пустой файл")
+            continue
+
+        code_col, qty_col, data_start_row = find_inbound_columns_raw(df)
         if code_col is None:
+            skipped.append(f"{fname}: не найдена колонка CODES/Артикул")
             log(f"Файл 'В пути' пропущен: не найдена колонка артикула в {fname}")
             continue
-
-        qty_col, data_start_row = detect_inbound_mp_column(df)
         if qty_col is None:
+            skipped.append(f"{fname}: не найдена колонка Заказ МП")
             log(f"Файл 'В пути' пропущен: не найдена колонка 'Заказ МП' в {fname}")
             continue
 
-        temp = pd.DataFrame({
-            "Артикул 1С": df[code_col].map(normalize_text),
-            "qty_raw": df[qty_col],
-        })
-        if data_start_row > 0:
-            temp = temp.iloc[data_start_row:].copy()
+        data = df.iloc[data_start_row:].copy()
+        if data.empty:
+            skipped.append(f"{fname}: нет строк после заголовка")
+            continue
 
+        temp = pd.DataFrame({
+            "Артикул 1С": data.iloc[:, code_col].map(normalize_text),
+            "qty_raw": data.iloc[:, qty_col],
+        })
+        temp["article_marker"] = temp["Артикул 1С"].map(normalize_inbound_marker)
         temp = temp[
-            (~temp["Артикул 1С"].str.upper().isin({"CODES", "КОДЫ"}))
+            (~temp["article_marker"].isin({"CODES", "АРТИКУЛ1С", "АРТИКУЛ", "КОД", "КОДЫ"}))
             & (temp["Артикул 1С"] != "")
         ].copy()
-        temp["Партия в пути, шт"] = pd.to_numeric(temp["qty_raw"], errors="coerce").fillna(0).map(round_int)
+
+        temp["Партия в пути, шт"] = temp["qty_raw"].map(round_int)
         temp = temp[temp["Партия в пути, шт"] > 0].copy()
         if temp.empty:
+            skipped.append(f"{fname}: нет положительных значений в Заказ МП")
             continue
 
         temp = temp[["Артикул 1С", "Партия в пути, шт"]].copy()
@@ -581,7 +735,14 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
         temp["Файл в пути"] = fname
         frames.append(temp)
 
+        log(
+            f"Файл 'В пути' загружен: {fname}; строк={len(temp)}; "
+            f"кол-во={int(temp['Партия в пути, шт'].sum())}; поступление={arrival_date.strftime('%Y-%m-%d')}"
+        )
+
     if not frames:
+        if skipped:
+            log("Товары в пути не попали в отчёт. Причины: " + " | ".join(skipped[:10]))
         return pd.DataFrame(
             columns=[
                 "Артикул 1С",
@@ -616,8 +777,12 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
         })
 
     nearest_df = pd.DataFrame(nearest_rows)
-    return total_qty.merge(nearest_df, on="Артикул 1С", how="left")
-
+    inbound_result = total_qty.merge(nearest_df, on="Артикул 1С", how="left")
+    log(
+        "Итого товары в пути загружены: "
+        f"SKU={len(inbound_result)}, партий={len(all_inbound)}, шт={int(inbound_result['Товары в пути, шт'].sum())}"
+    )
+    return inbound_result
 
 def load_current_month_zero_days(storage: S3Storage, zero_articles: set[str], avg7_map: dict[str, float], run_date: date) -> dict[str, int]:
     if not zero_articles:
@@ -939,7 +1104,7 @@ def send_document_to_telegram(cfg: Config, path: Path, caption: str) -> None:
 
 
 def send_to_telegram(cfg: Config, path: Path, critical_count: int, dead_count: int) -> None:
-    caption = f"📦 Отчёт по остаткам WB {STORE_NAME}\nКритично: {critical_count}\nDead_Stock: {dead_count}"
+    caption = f"📦 Отчёт Остатки и товары в пути {STORE_NAME}\nКритично: {critical_count}\nDead_Stock: {dead_count}"
     send_document_to_telegram(cfg, path, caption)
 
 
@@ -1475,8 +1640,9 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
     plan_df, unresolved_df, routes_df = build_transfer_plan(balance_df)
     template_plan_df = filter_plan_for_template(plan_df, cfg.run_date)
 
-    calc_path = Path(OUT_DIR) / f"Перераспределение_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
-    template_out_path = Path(OUT_DIR) / f"Шаблон_перераспределения_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
+    date_label = format_ru_date_for_filename(cfg.run_date)
+    calc_path = Path(OUT_DIR) / f"Расчёт перераспределения_{date_label}.xlsx"
+    template_out_path = Path(OUT_DIR) / f"Перераспределение_{date_label}.xlsx"
 
     save_redistribution_workbook(
         path=calc_path,
@@ -1534,7 +1700,8 @@ def run() -> Path:
     )
 
     critical, calc, dead, monitor = split_sheets(report_df)
-    report_path = Path(OUT_DIR) / f"Отчёт_дни_остатка_WB_{STORE_NAME}_{cfg.run_date.strftime('%Y%m%d')}.xlsx"
+    date_label = format_ru_date_for_filename(cfg.run_date)
+    report_path = Path(OUT_DIR) / f"Отчёт Остатки и товары в пути_{date_label}.xlsx"
     save_report(report_path, critical, calc, dead, monitor)
 
     log(f"Отчёт сохранён: {report_path}")
@@ -1555,16 +1722,12 @@ def run() -> Path:
     if should_send_redistribution(cfg):
         send_document_to_telegram(
             cfg,
-            redistribution_calc_path,
-            f"🚚 Перераспределение WB {STORE_NAME}\nРасчёт излишков/дефицита на {cfg.redistribution_target_days} дней",
-        )
-        send_document_to_telegram(
-            cfg,
             redistribution_template_path,
-            f"🚚 Шаблон перераспределения WB {STORE_NAME}\nЗаполнено автоматически по расчёту за {cfg.redistribution_days} дней",
+            f"🚚 Перераспределение WB {STORE_NAME}\nШаблон заполнен автоматически по расчёту за {cfg.redistribution_days} дней",
         )
+        log(f"Полный расчёт перераспределения в Telegram не отправляется: {redistribution_calc_path.name}")
     else:
-        log("Отправка файлов перераспределения в Telegram пропущена по расписанию")
+        log("Отправка шаблона перераспределения в Telegram пропущена по расписанию")
 
     return report_path
 
