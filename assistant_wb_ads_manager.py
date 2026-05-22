@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v11-postcheck-price-2026-05-22"
+SCRIPT_VERSION = "strict-drr-v14-funnel-verified-2026-05-22"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -100,7 +100,7 @@ DEFAULT_SELLER_DISCOUNT_PCT = 26
 DEFAULT_PRICE_RAISE_STEP_PP = 1
 DEFAULT_MIN_SELLER_DISCOUNT_PCT = int(os.environ.get("WB_PRICE_MIN_SELLER_DISCOUNT_PCT", "25") or 25)
 PRICE_TEST_SUBJECTS = {"помады", "блески", "косметические карандаши"}
-MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "10") or 10)
+MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "30") or 30)
 
 
 WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
@@ -117,8 +117,23 @@ MIN_BID_COLUMNS = [
     "api_status",
     "response_text",
 ]
+
+RENAME_CAMPAIGN_COLUMNS = [
+    "run_datetime",
+    "campaign_id",
+    "current_name",
+    "target_name",
+    "supplier_article",
+    "nm_ids",
+    "subjects",
+    "rename_action",
+    "reason_code",
+    "api_status",
+    "response_text",
+]
 WB_PAUSE_ENDPOINT = "/adv/v0/pause"
 WB_START_ENDPOINT = "/adv/v0/start"
+WB_RENAME_ENDPOINT = "/adv/v0/rename"
 
 BID_HISTORY_COLUMNS = [
     "event_id",
@@ -1064,21 +1079,43 @@ def load_price_history(s3_client, config: Config) -> pd.DataFrame:
 
 
 def normalize_funnel_report(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Нормализует файл воронки.
+
+    Важно: воронку НЕ фильтруем по subject_norm внутри этой функции.
+    В реальном файле воронки предмета может не быть или он может называться иначе.
+    Если здесь применить filter_managed_subject_rows(), строки с пустым subject_norm
+    полностью исчезают, и ценовой блок ошибочно уходит в режим funnel_missing=True.
+    Предмет подтягивается позже через nm_id из рекламных метрик / price API.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     result = pd.DataFrame(index=df.index)
-    result["date"] = parse_date_series(series_or_default(df, ["Дата", "date", "dt", "day"], default=pd.NaT))
-    result["nm_id"] = series_or_default(df, ["Артикул WB", "nmID", "nmId", "nm_id"], default="").map(_clean_id_value)
-    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "Артикул", "vendorCode"], default="")
+    result["date"] = parse_date_series(series_or_default(df, ["Дата", "date", "dt", "day", "День"], default=pd.NaT))
+    result["nm_id"] = series_or_default(df, ["Артикул WB", "Номенклатура WB", "nmID", "nmId", "nm_id", "nm", "НМ"], default="").map(_clean_id_value)
+    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode", "vendor_code"], default="")
     result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm"], default="").map(normalize_subject_value)
-    result["card_views"] = numeric_series(df, ["Переходы в карточку", "Просмотры карточки", "openCardCount", "open_card_count", "openCard"], default=0.0)
-    result["add_to_cart"] = numeric_series(df, ["Добавления в корзину", "addToCartCount", "add_to_cart_count"], default=0.0)
-    result["funnel_orders"] = numeric_series(df, ["Заказы", "ordersCount", "orders_count"], default=0.0)
+    result["card_views"] = numeric_series(df, [
+        "Переходы в карточку", "Переходы", "Просмотры карточки", "Просмотры карточек",
+        "Карточку посмотрели", "openCardCount", "open_card_count", "openCard", "open_card"
+    ], default=0.0)
+    result["add_to_cart"] = numeric_series(df, [
+        "Добавления в корзину", "Добавили в корзину", "Корзины", "В корзину",
+        "addToCartCount", "add_to_cart_count", "addToCart", "add_to_cart"
+    ], default=0.0)
+    result["funnel_orders"] = numeric_series(df, [
+        "Заказы", "Заказали", "Заказано", "ordersCount", "orders_count", "orders"
+    ], default=0.0)
     # Если конверсии есть в отчёте, используем их; иначе считаем ниже.
-    result["add_to_cart_conv"] = numeric_series(df, ["Конверсия в корзину", "Конверсия в корзину %", "addToCartConversion", "add_to_cart_conversion"], default=0.0)
-    result["cart_to_order_conv"] = numeric_series(df, ["Конверсия в заказ", "Конверсия корзина-заказ", "cartToOrderConversion", "cart_to_order_conversion"], default=0.0)
+    result["add_to_cart_conv"] = numeric_series(df, [
+        "Конверсия в корзину", "Конверсия в корзину %", "Конверсия корзины",
+        "addToCartConversion", "add_to_cart_conversion"
+    ], default=0.0)
+    result["cart_to_order_conv"] = numeric_series(df, [
+        "Конверсия в заказ", "Конверсия корзина-заказ", "Конверсия корзины в заказ",
+        "cartToOrderConversion", "cart_to_order_conversion"
+    ], default=0.0)
     result = result[result["nm_id"].map(_clean_id_value).ne("")].copy()
-    result = filter_managed_subject_rows(result)
     result["add_to_cart_conv"] = result.apply(lambda r: safe_ctr_pct(r.get("add_to_cart", 0), r.get("card_views", 0)) if float(r.get("add_to_cart_conv", 0) or 0) == 0 else float(r.get("add_to_cart_conv", 0) or 0), axis=1)
     result["cart_to_order_conv"] = result.apply(lambda r: safe_ctr_pct(r.get("funnel_orders", 0), r.get("add_to_cart", 0)) if float(r.get("cart_to_order_conv", 0) or 0) == 0 else float(r.get("cart_to_order_conv", 0) or 0), axis=1)
     return result
@@ -1086,16 +1123,39 @@ def normalize_funnel_report(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_funnel_report(s3_client, config: Config) -> pd.DataFrame:
     if not s3_key_exists(s3_client, config.yc_bucket_name, FUNNEL_KEY):
+        print(f"Диагностика воронки: файл не найден: {FUNNEL_KEY}", flush=True)
         return pd.DataFrame()
     try:
         payload = read_s3_bytes(s3_client, config.yc_bucket_name, FUNNEL_KEY)
         sheets = read_excel_bytes_as_sheets(payload)
         frames: List[pd.DataFrame] = []
+        diag_rows: List[Dict[str, Any]] = []
         for sheet_name, df in sheets.items():
+            raw_rows = 0 if df is None else len(df)
             norm = normalize_funnel_report(df)
+            diag_rows.append({
+                "sheet": sheet_name,
+                "raw_rows": raw_rows,
+                "normalized_rows": len(norm),
+                "rows_with_nm_id": int(norm["nm_id"].map(_clean_id_value).ne("").sum()) if not norm.empty and "nm_id" in norm.columns else 0,
+                "rows_with_date": int(norm["date"].notna().sum()) if not norm.empty and "date" in norm.columns else 0,
+                "card_views_sum": float(pd.to_numeric(norm.get("card_views", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
+                "add_to_cart_sum": float(pd.to_numeric(norm.get("add_to_cart", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
+                "orders_sum": float(pd.to_numeric(norm.get("funnel_orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
+            })
             if not norm.empty:
                 norm["source_sheet"] = sheet_name
                 frames.append(norm)
+        if diag_rows:
+            total_norm = sum(int(r["normalized_rows"]) for r in diag_rows)
+            total_views = sum(float(r["card_views_sum"]) for r in diag_rows)
+            total_cart = sum(float(r["add_to_cart_sum"]) for r in diag_rows)
+            total_orders = sum(float(r["orders_sum"]) for r in diag_rows)
+            print(
+                f"Диагностика воронки: файл найден; листов={len(diag_rows)}; строк после нормализации={total_norm}; "
+                f"переходы={total_views:.0f}; корзины={total_cart:.0f}; заказы={total_orders:.0f}",
+                flush=True,
+            )
         return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
     except Exception as exc:
         print(f"Предупреждение: не удалось прочитать воронку {FUNNEL_KEY}: {exc}", flush=True)
@@ -1301,7 +1361,7 @@ def build_price_decisions(metrics_df: pd.DataFrame, funnel_current: pd.DataFrame
     - повышение цены = снижение фактической скидки продавца на 1 п.п.;
     - ниже DEFAULT_MIN_SELLER_DISCOUNT_PCT не опускаемся;
     - если воронки нет, ценовой тест разрешён ограниченно: оцениваем по рекламе/заказам, а в отчётах ставим funnel_missing=True;
-    - не больше MAX_PRICE_TEST_ITEMS_PER_RUN новых price-test за один запуск;
+    - не больше MAX_PRICE_TEST_ITEMS_PER_RUN новых price-test за один запуск; по умолчанию 30, можно переопределить env WB_MAX_PRICE_TEST_ITEMS_PER_RUN;
     - если есть незавершённый price post-check, товар не трогаем.
     """
     if metrics_df is None or metrics_df.empty:
@@ -2843,6 +2903,220 @@ def record_bid_events(successful_changes: pd.DataFrame, bid_history: pd.DataFram
     return pd.concat([base[BID_HISTORY_COLUMNS], additions[BID_HISTORY_COLUMNS]], ignore_index=True)
 
 
+
+# =============================
+# Переименование рекламных кампаний
+# =============================
+
+def normalize_article_for_campaign_name(value: Any) -> str:
+    """
+    Приводит артикул продавца к короткому имени кампании.
+    Примеры: PT155.009K -> 155/9; PT156.001 -> 156/1; 155/001 -> 155/1.
+    Если артикул уже в нормальном формате или содержит буквенную часть, возвращаем аккуратно очищенный текст.
+    """
+    text = _clean_text_value(value).replace(" ", "").strip()
+    if not text:
+        return ""
+    upper = text.upper()
+
+    # PT155.009K / PT155.009 -> 155/9
+    m = re.fullmatch(r"PT(\d{2,5})[\._\-/](\d{1,4})([A-ZА-Я]*)", upper)
+    if m:
+        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
+        shade_raw = m.group(2)
+        shade = str(int(shade_raw)) if shade_raw.isdigit() else shade_raw
+        suffix = m.group(3) or ""
+        return f"{code}/{shade}{suffix}"
+
+    # 155.009K / 155_009 / 155-009 -> 155/9K
+    m = re.fullmatch(r"(\d{2,5})[\._\-/](\d{1,4})([A-ZА-Я]*)", upper)
+    if m:
+        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
+        shade_raw = m.group(2)
+        shade = str(int(shade_raw)) if shade_raw.isdigit() else shade_raw
+        suffix = m.group(3) or ""
+        return f"{code}/{shade}{suffix}"
+
+    # PT901.F26 -> 901/F26; если уже F26 — оставляем F26.
+    m = re.fullmatch(r"PT(\d{2,5})[\._\-/]([A-ZА-Я]+\d+)", upper)
+    if m:
+        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
+        return f"{code}/{m.group(2)}"
+
+    # Если уже есть слэш, убираем лидирующие нули у числового оттенка.
+    m = re.fullmatch(r"(\d{2,5})/(\d{1,4})([A-ZА-Я]*)", upper)
+    if m:
+        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
+        shade = str(int(m.group(2))) if m.group(2).isdigit() else m.group(2)
+        return f"{code}/{shade}{m.group(3) or ''}"
+
+    return text[:100]
+
+
+def _best_article_by_nm(metrics_df: pd.DataFrame, keyword_core_df: Optional[pd.DataFrame], goods_prices: Optional[pd.DataFrame]) -> Dict[str, str]:
+    """Собирает nm_id -> артикул из отчёта рекламы, поисковых запросов и WB price API."""
+    article_by_nm: Dict[str, str] = {}
+
+    def add_mapping(df: Optional[pd.DataFrame], nm_col: str, art_col: str) -> None:
+        if df is None or df.empty or nm_col not in df.columns or art_col not in df.columns:
+            return
+        local = df[[nm_col, art_col]].copy()
+        local[nm_col] = local[nm_col].map(_clean_id_value)
+        local[art_col] = local[art_col].map(_clean_text_value)
+        local = local[(local[nm_col] != "") & (local[art_col] != "")]
+        # Берём самое частое непустое значение по nm_id.
+        for nm_id, grp in local.groupby(nm_col, dropna=False):
+            if nm_id in article_by_nm and article_by_nm[nm_id]:
+                continue
+            vals = grp[art_col].astype(str).str.strip()
+            if vals.empty:
+                continue
+            article_by_nm[nm_id] = normalize_article_for_campaign_name(vals.value_counts().index[0])
+
+    add_mapping(metrics_df, "nm_id", "supplier_article")
+    add_mapping(keyword_core_df, "nm_id", "supplier_article")
+    add_mapping(goods_prices, "nm_id", "supplier_article_api")
+    return article_by_nm
+
+
+def build_campaign_rename_plan(
+    metrics_df: pd.DataFrame,
+    keyword_core_df: Optional[pd.DataFrame],
+    goods_prices: Optional[pd.DataFrame],
+    ctx: RunContext,
+) -> pd.DataFrame:
+    """
+    Строит план переименования РК обратно в короткий артикул продавца.
+    Безопасное правило: переименовываем только кампании, где однозначно найден один артикул.
+    Если в campaign_id несколько разных артикулов — не трогаем, чтобы не назвать сборную кампанию неверно.
+    """
+    if metrics_df is None or metrics_df.empty:
+        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
+    article_by_nm = _best_article_by_nm(metrics_df, keyword_core_df, goods_prices)
+    work = metrics_df.copy()
+    for col in ["campaign_id", "nm_id", "campaign_name", "supplier_article", "subject_norm"]:
+        if col not in work.columns:
+            work[col] = ""
+    work["campaign_id"] = work["campaign_id"].map(_clean_id_value)
+    work["nm_id"] = work["nm_id"].map(_clean_id_value)
+    work["current_name_clean"] = work["campaign_name"].map(_clean_text_value)
+    work["article_for_name"] = work.apply(
+        lambda r: normalize_article_for_campaign_name(r.get("supplier_article", "")) or article_by_nm.get(_clean_id_value(r.get("nm_id", "")), ""),
+        axis=1,
+    )
+    work = work[(work["campaign_id"] != "") & (work["article_for_name"] != "")].copy()
+    if work.empty:
+        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
+
+    rows: List[Dict[str, Any]] = []
+    for campaign_id, grp in work.groupby("campaign_id", dropna=False):
+        current_names = [_clean_text_value(x) for x in grp.get("current_name_clean", pd.Series(dtype=str)).tolist() if _clean_text_value(x)]
+        current_name = current_names[0] if current_names else ""
+        articles = sorted({normalize_article_for_campaign_name(x) for x in grp.get("article_for_name", pd.Series(dtype=str)).tolist() if normalize_article_for_campaign_name(x)})
+        nm_ids = sorted({_clean_id_value(x) for x in grp.get("nm_id", pd.Series(dtype=str)).tolist() if _clean_id_value(x)})
+        subjects = sorted({normalize_subject_value(x) for x in grp.get("subject_norm", pd.Series(dtype=str)).tolist() if normalize_subject_value(x)})
+
+        if len(articles) != 1:
+            rows.append({
+                "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                "campaign_id": campaign_id,
+                "current_name": current_name,
+                "target_name": "",
+                "supplier_article": "; ".join(articles[:10]),
+                "nm_ids": "; ".join(nm_ids[:20]),
+                "subjects": "; ".join(subjects[:10]),
+                "rename_action": "Без изменений",
+                "reason_code": "MULTIPLE_ARTICLES_IN_CAMPAIGN" if articles else "NO_SUPPLIER_ARTICLE",
+                "api_status": "not_sent",
+                "response_text": "Кампания содержит несколько артикулов или артикул не найден; автоматическое переименование небезопасно",
+            })
+            continue
+
+        target_name = articles[0]
+        if current_name == target_name:
+            action = "Без изменений"
+            reason_code = "ALREADY_NAMED_BY_ARTICLE"
+            api_status = "not_sent"
+            response_text = "Название уже равно артикулу продавца"
+        else:
+            action = "Переименовать"
+            reason_code = "RENAME_TO_SUPPLIER_ARTICLE"
+            api_status = ""
+            response_text = ""
+        rows.append({
+            "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+            "campaign_id": campaign_id,
+            "current_name": current_name,
+            "target_name": target_name,
+            "supplier_article": target_name,
+            "nm_ids": "; ".join(nm_ids[:20]),
+            "subjects": "; ".join(subjects[:10]),
+            "rename_action": action,
+            "reason_code": reason_code,
+            "api_status": api_status,
+            "response_text": response_text,
+        })
+    out = pd.DataFrame(rows)
+    for col in RENAME_CAMPAIGN_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    return out[RENAME_CAMPAIGN_COLUMNS]
+
+
+def apply_campaign_renames(rename_plan: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """POST /adv/v0/rename. В run переименовывает РК в артикул продавца; в preview/dry-run только показывает план."""
+    if rename_plan is None or rename_plan.empty:
+        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS), pd.DataFrame()
+    result = rename_plan.copy()
+    api_logs: List[Dict[str, Any]] = []
+    candidates = result[result["rename_action"].astype(str) == "Переименовать"].copy()
+    if candidates.empty:
+        return result, pd.DataFrame(api_logs)
+
+    url = config.wb_base_url.rstrip("/") + WB_RENAME_ENDPOINT
+    for idx, row in candidates.iterrows():
+        advert_id = to_int_id(row.get("campaign_id", ""))
+        target_name = _clean_text_value(row.get("target_name", ""))
+        if advert_id is None or not target_name:
+            result.loc[idx, "api_status"] = "payload_error"
+            result.loc[idx, "response_text"] = "Не удалось собрать payload для rename"
+            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, {}, "payload_error", "Не удалось собрать payload для rename", campaign_id=row.get("campaign_id", "")))
+            continue
+        payload = {"advertId": advert_id, "name": target_name}
+
+        if ctx.mode == "preview":
+            result.loc[idx, "api_status"] = "preview_no_call"
+            result.loc[idx, "response_text"] = "Предпросмотр без API-вызова"
+            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "preview_no_call", "Предпросмотр без API-вызова", campaign_id=row.get("campaign_id", "")))
+            continue
+        if ctx.dry_run:
+            result.loc[idx, "api_status"] = "dry_run_no_call"
+            result.loc[idx, "response_text"] = "run --dry-run без API-вызова"
+            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "dry_run_no_call", "run --dry-run без API-вызова", campaign_id=row.get("campaign_id", "")))
+            continue
+
+        try:
+            resp = requests.post(url, headers=wb_headers(config), json=payload, timeout=60)
+            status = str(resp.status_code)
+            result.loc[idx, "api_status"] = status
+            result.loc[idx, "response_text"] = str(resp.text)[:1000]
+            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, status, resp.text, campaign_id=row.get("campaign_id", "")))
+            if 200 <= resp.status_code < 300:
+                result.loc[idx, "reason_code"] = "RENAMED_TO_SUPPLIER_ARTICLE"
+            else:
+                result.loc[idx, "reason_code"] = "RENAME_API_ERROR"
+        except Exception as exc:
+            result.loc[idx, "api_status"] = "exception"
+            result.loc[idx, "response_text"] = repr(exc)[:1000]
+            result.loc[idx, "reason_code"] = "RENAME_API_EXCEPTION"
+            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "exception", repr(exc), campaign_id=row.get("campaign_id", "")))
+        time.sleep(0.2)
+
+    for col in RENAME_CAMPAIGN_COLUMNS:
+        if col not in result.columns:
+            result[col] = ""
+    return result[RENAME_CAMPAIGN_COLUMNS], pd.DataFrame(api_logs)
+
 # =============================
 # Паузы и запуск обратно
 # =============================
@@ -3490,6 +3764,7 @@ def write_outputs(
     applied_price_changes: Optional[pd.DataFrame] = None,
     bid_ramp_monitor: Optional[pd.DataFrame] = None,
     one_campaign_experiment: Optional[pd.DataFrame] = None,
+    rename_plan: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     summary = build_summary(ctx, decisions, successful_changes, pause_candidates, applied_pauses, start_candidates, applied_starts)
     summary["Ключевых фраз CORE_80"] = int(len(keyword_core_df[keyword_core_df["keyword_group"] == "CORE_80"])) if keyword_core_df is not None and not keyword_core_df.empty and "keyword_group" in keyword_core_df.columns else 0
@@ -3504,6 +3779,8 @@ def write_outputs(
     summary["Окно проверки паузы, дней"] = PAUSE_ANALYSIS_DAYS
     summary["Правило автопаузы"] = "минимальная ставка WB + ДРР > лимита за 21 день + показы >= 10000"
     summary["Кисти паузим"] = "нет"
+    summary["Кандидатов на переименование РК"] = int(rename_plan["rename_action"].astype(str).eq("Переименовать").sum()) if rename_plan is not None and not rename_plan.empty and "rename_action" in rename_plan.columns else 0
+    summary["Переименовано РК"] = int(rename_plan["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if rename_plan is not None and not rename_plan.empty and "api_status" in rename_plan.columns else 0
     summary_df = pd.DataFrame([{"Показатель": k, "Значение": v} for k, v in summary.items()])
 
     sheets = {
@@ -3525,6 +3802,7 @@ def write_outputs(
         "Фактически_изменённые_ставки": successful_changes if successful_changes is not None else pd.DataFrame(),
         "Кандидаты_на_запуск": start_candidates if start_candidates is not None else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS),
         "Минимальные_ставки_WB": min_bids_df if min_bids_df is not None else pd.DataFrame(columns=MIN_BID_COLUMNS),
+        "Переименование_РК": rename_plan if rename_plan is not None else pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS),
         "Лог_API": api_log if api_log is not None else pd.DataFrame(),
         "Сводка": summary_df,
     }
@@ -3647,6 +3925,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     price_decisions = pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
     applied_price_changes = pd.DataFrame()
     price_api_log = pd.DataFrame()
+    rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
+    rename_api_log = pd.DataFrame()
     goods_prices = pd.DataFrame()
     if not getattr(args, "skip_price", False):
         goods_prices, price_list_api_log = fetch_current_goods_prices(config, ctx)
@@ -3658,6 +3938,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         apply_price_now = (ctx.mode == "run" and not ctx.dry_run) or bool(getattr(args, "apply_price", False))
         applied_price_changes, price_api_log = apply_price_changes(price_decisions, goods_prices, config, ctx, apply_price=apply_price_now)
         price_history = record_price_events(applied_price_changes, price_history, ctx)
+
+    rename_plan = build_campaign_rename_plan(metrics_df, keyword_core_df, goods_prices, ctx)
+    if not rename_plan.empty:
+        print("Диагностика переименования РК action: " + json.dumps(rename_plan["rename_action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
+        print("Диагностика переименования РК reason_code: " + json.dumps(rename_plan["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
+    rename_plan, rename_api_log = apply_campaign_renames(rename_plan, config, ctx)
 
     pause_candidates = build_pause_candidates(decisions, bid_history)
 
@@ -3694,10 +3980,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         pause_history = pd.concat([pause_history, applied_starts[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
 
     all_api_log = pd.concat(
-        [df for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log] if df is not None and not df.empty],
+        [df for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log, rename_api_log] if df is not None and not df.empty],
         ignore_index=True,
         sort=False,
-    ) if any(df is not None and not df.empty for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log]) else pd.DataFrame()
+    ) if any(df is not None and not df.empty for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log, rename_api_log]) else pd.DataFrame()
     full_api_log = append_api_log_to_s3(s3_client, config, all_api_log)
 
     save_table_to_s3_excel(s3_client, config, BID_HISTORY_KEY, bid_history[BID_HISTORY_COLUMNS])
@@ -3727,6 +4013,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         applied_price_changes=applied_price_changes,
         bid_ramp_monitor=bid_ramp_monitor,
         one_campaign_experiment=one_campaign_experiment,
+        rename_plan=rename_plan,
     )
     print_summary(summary)
     return 0
