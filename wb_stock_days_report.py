@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT_FIX_REDISTRIBUTION_STYLE"
+SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT_FIX_HIGHLIGHT_ZERO_SALES"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -973,9 +973,14 @@ def build_report_dataframe(
 
     df["Хватит до поступления"] = df.apply(enough_to_arrival, axis=1)
     df["Out of stock, days"] = df["WB + Липецк + в пути, дней"].map(lambda x: round_int(max(60 - safe_float(x), 0)))
-    df["Хватит на 60 дней"] = df["WB + Липецк + в пути, дней"].map(
-        lambda x: "Да" if safe_float(x) >= 60 else f"Дефицит {round_int(60 - safe_float(x))} дн."
-    )
+    def cover_60_label(row: pd.Series) -> str:
+        # Если продаж за 60 дней не было, не считаем дефицит и не подсвечиваем строку.
+        if round_int(row.get("Продажи 60 дней, шт")) <= 0:
+            return ""
+        cover_days = safe_float(row.get("WB + Липецк + в пути, дней"))
+        return "Да" if cover_days >= 60 else f"Дефицит {round_int(60 - cover_days)} дн."
+
+    df["Хватит на 60 дней"] = df.apply(cover_60_label, axis=1)
 
     df["Дней без остатка WB в текущем месяце"] = df["Артикул WB"].map(zero_days_map).fillna(0).astype(int)
     df.loc[df["Остаток WB, шт"] > 0, "Дней без остатка WB в текущем месяце"] = 0
@@ -1156,18 +1161,27 @@ def highlight_rows(ws) -> None:
     enough_idx = headers.index("Хватит до поступления") + 1 if "Хватит до поступления" in headers else None
     comment_idx = headers.index("Комментарий") + 1 if "Комментарий" in headers else None
     deficit_idx = headers.index("Хватит на 60 дней") + 1 if "Хватит на 60 дней" in headers else None
+    sales60_idx = headers.index("Продажи 60 дней, шт") + 1 if "Продажи 60 дней, шт" in headers else None
     zero_idx = headers.index("Дней без остатка WB в текущем месяце") + 1 if "Дней без остатка WB в текущем месяце" in headers else None
 
     for r in range(2, ws.max_row + 1):
         row_is_strawberry = False
-        if enough_idx and str(ws.cell(r, enough_idx).value or "").strip() == "Нет":
-            row_is_strawberry = True
-        if comment_idx and str(ws.cell(r, comment_idx).value or "").strip() == "Не хватает до поставки":
-            row_is_strawberry = True
-        if wb_days_idx and safe_float(ws.cell(r, wb_days_idx).value) < 7:
-            row_is_strawberry = True
-        if ws.title == SHEET_MONITOR and deficit_idx and "Дефицит" in str(ws.cell(r, deficit_idx).value or ""):
-            row_is_strawberry = True
+        sales60 = safe_float(ws.cell(r, sales60_idx).value) if sales60_idx else 0.0
+
+        if ws.title == SHEET_CRITICAL:
+            # На первом листе красим всю строку только при WB < 7 дней.
+            row_is_strawberry = bool(wb_days_idx and safe_float(ws.cell(r, wb_days_idx).value) < 7)
+        elif ws.title == SHEET_MONITOR:
+            # В мониторинге красим дефицит только по товарам, у которых были продажи.
+            deficit_text = str(ws.cell(r, deficit_idx).value or "") if deficit_idx else ""
+            row_is_strawberry = bool(sales60 > 0 and "Дефицит" in deficit_text)
+        else:
+            if enough_idx and str(ws.cell(r, enough_idx).value or "").strip() == "Нет":
+                row_is_strawberry = True
+            if comment_idx and str(ws.cell(r, comment_idx).value or "").strip() == "Не хватает до поставки":
+                row_is_strawberry = True
+            if wb_days_idx and safe_float(ws.cell(r, wb_days_idx).value) < 7:
+                row_is_strawberry = True
 
         if row_is_strawberry:
             for c in range(1, ws.max_column + 1):
