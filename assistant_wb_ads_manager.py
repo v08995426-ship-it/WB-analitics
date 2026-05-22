@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v17-campaign-compare-7d-2026-05-22"
+SCRIPT_VERSION = "strict-drr-v18-economics-no-rename-2026-05-22"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -89,6 +89,7 @@ API_LOG_KEY = SERVICE_PREFIX + "Лог_API.xlsx"
 
 KEYWORDS_WEEKLY_PREFIX = "Отчёты/Поисковые запросы/TOPFACE/Недельные/"
 FUNNEL_KEY = "Отчёты/Воронка продаж/TOPFACE/Воронка продаж.xlsx"
+ECONOMICS_KEY = "Отчёты/Финансовые показатели/TOPFACE/Экономика.xlsx"
 PRICE_HISTORY_KEY = SERVICE_PREFIX + "История_изменений_цен.xlsx"
 ONE_CAMPAIGN_EXPERIMENT_HISTORY_KEY = SERVICE_PREFIX + "История_эксперимента_1РК.xlsx"
 
@@ -101,6 +102,8 @@ DEFAULT_PRICE_RAISE_STEP_PP = 1
 DEFAULT_MIN_SELLER_DISCOUNT_PCT = int(os.environ.get("WB_PRICE_MIN_SELLER_DISCOUNT_PCT", "25") or 25)
 PRICE_TEST_SUBJECTS = {"помады", "блески", "косметические карандаши"}
 MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "30") or 30)
+# Условная ВП после рекламы: вычитаем себестоимость, если она есть в Экономике.
+ECONOMICS_SUBTRACT_COGS = str(os.environ.get("WB_ECONOMICS_SUBTRACT_COGS", "1")).strip().lower() not in {"0", "false", "no", "нет"}
 
 
 WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
@@ -212,6 +215,8 @@ BID_RAMP_MONITOR_COLUMNS = [
 
 BID_CAMPAIGN_COMPARE_COLUMNS = [
     "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "campaign_status",
+    "economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct",
+    "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit",
     "comparison_status", "last_bid_change_date", "old_bid_rub", "new_bid_rub", "bid_change_reason_code",
     "before_period", "after_period", "before_days", "after_days",
     "current_action", "current_reason_code", "current_reason_text",
@@ -1193,6 +1198,272 @@ def load_funnel_report(s3_client, config: Config) -> pd.DataFrame:
         print(f"Предупреждение: не удалось прочитать воронку {FUNNEL_KEY}: {exc}", flush=True)
         return pd.DataFrame()
 
+
+
+
+# =============================
+# Экономика: условная ВП после рекламы для диагностики ставок
+# =============================
+
+def normalize_economics_report(df: pd.DataFrame, source_sheet: str = "") -> pd.DataFrame:
+    """Нормализует файл Экономика.xlsx.
+
+    Для управления ставками нужна не точная бухгалтерская прибыль, а устойчивые параметры юнит-экономики:
+    комиссия WB %, эквайринг %, НДС/ед, средняя логистика/ед, себестоимость/ед и средняя цена.
+    Если точного артикула нет, ниже используется fallback по товарной группе: 901/5 -> среднее по 901.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    result = pd.DataFrame(index=df.index)
+    result["source_sheet"] = source_sheet
+    result["week"] = _text_series(df, ["Неделя", "week"], default="")
+    result["nm_id"] = series_or_default(df, ["Артикул WB", "nmID", "nmId", "nm_id", "Номенклатура WB"], default="").map(_clean_id_value)
+    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode"], default="")
+    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm"], default="").map(normalize_subject_value)
+    result["sales_qty"] = numeric_series(df, ["Чистые продажи, шт", "Продажи, шт", "sales_qty", "quantity"], default=0.0)
+
+    gross_revenue = numeric_series(df, ["Валовая выручка", "Выручка", "revenue"], default=0.0)
+    avg_price = numeric_series(df, ["Средняя цена продажи", "avg_price", "Средняя цена"], default=0.0)
+    result["avg_price"] = avg_price
+    mask_price = (result["avg_price"] <= 0) & (result["sales_qty"] > 0) & (gross_revenue > 0)
+    result.loc[mask_price, "avg_price"] = gross_revenue.loc[mask_price] / result.loc[mask_price, "sales_qty"]
+
+    commission_pct = numeric_series(df, ["Комиссия WB, %", "Комиссия WB %", "commission_pct"], default=0.0)
+    commission_total = numeric_series(df, ["Комиссия WB", "commission"], default=0.0)
+    result["commission_pct"] = commission_pct
+    mask_comm = (result["commission_pct"] <= 0) & (gross_revenue > 0) & (commission_total > 0)
+    result.loc[mask_comm, "commission_pct"] = commission_total.loc[mask_comm] / gross_revenue.loc[mask_comm] * 100.0
+
+    acquiring_pct = numeric_series(df, ["Эквайринг, %", "Эквайринг %", "acquiring_pct"], default=0.0)
+    acquiring_total = numeric_series(df, ["Эквайринг", "acquiring"], default=0.0)
+    result["acquiring_pct"] = acquiring_pct
+    mask_acq = (result["acquiring_pct"] <= 0) & (gross_revenue > 0) & (acquiring_total > 0)
+    result.loc[mask_acq, "acquiring_pct"] = acquiring_total.loc[mask_acq] / gross_revenue.loc[mask_acq] * 100.0
+
+    vat_per_unit = numeric_series(df, ["НДС, руб/ед", "НДС руб/ед", "vat_per_unit"], default=0.0)
+    vat_total = numeric_series(df, ["НДС", "vat"], default=0.0)
+    result["vat_per_unit"] = vat_per_unit
+    mask_vat = (result["vat_per_unit"] <= 0) & (result["sales_qty"] > 0) & (vat_total > 0)
+    result.loc[mask_vat, "vat_per_unit"] = vat_total.loc[mask_vat] / result.loc[mask_vat, "sales_qty"]
+
+    logistics_direct_unit = numeric_series(df, ["Логистика прямая, руб/ед", "Логистика прямая руб/ед"], default=0.0)
+    logistics_return_unit = numeric_series(df, ["Логистика обратная, руб/ед", "Логистика обратная руб/ед"], default=0.0)
+    logistics_direct_total = numeric_series(df, ["Логистика прямая"], default=0.0)
+    logistics_return_total = numeric_series(df, ["Логистика обратная"], default=0.0)
+    result["logistics_per_unit"] = logistics_direct_unit + logistics_return_unit
+    mask_log = (result["logistics_per_unit"] <= 0) & (result["sales_qty"] > 0) & ((logistics_direct_total + logistics_return_total) > 0)
+    result.loc[mask_log, "logistics_per_unit"] = (logistics_direct_total.loc[mask_log] + logistics_return_total.loc[mask_log]) / result.loc[mask_log, "sales_qty"]
+
+    cogs_per_unit = numeric_series(df, ["Себестоимость, руб", "Себестоимость", "cogs_per_unit"], default=0.0)
+    cogs_total = numeric_series(df, ["Себестоимость всего", "cogs_total"], default=0.0)
+    result["cogs_per_unit"] = cogs_per_unit
+    mask_cogs = (result["cogs_per_unit"] <= 0) & (result["sales_qty"] > 0) & (cogs_total > 0)
+    result.loc[mask_cogs, "cogs_per_unit"] = cogs_total.loc[mask_cogs] / result.loc[mask_cogs, "sales_qty"]
+
+    result["product_group"] = result["supplier_article"].map(product_group_from_article)
+    result = result[(result["nm_id"].ne("") | result["supplier_article"].map(_clean_text_value).ne(""))].copy()
+    for col in ["avg_price", "commission_pct", "acquiring_pct", "vat_per_unit", "logistics_per_unit", "cogs_per_unit", "sales_qty"]:
+        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0.0)
+    return result
+
+
+def load_economics_report(s3_client, config: Config) -> pd.DataFrame:
+    if not s3_key_exists(s3_client, config.yc_bucket_name, ECONOMICS_KEY):
+        print(f"Диагностика экономики: файл не найден: {ECONOMICS_KEY}", flush=True)
+        return pd.DataFrame()
+    try:
+        payload = read_s3_bytes(s3_client, config.yc_bucket_name, ECONOMICS_KEY)
+        sheets = read_excel_bytes_as_sheets(payload)
+        frames: List[pd.DataFrame] = []
+        for sheet_name, df in sheets.items():
+            sh_norm = _norm_col_name(sheet_name)
+            if not ("юнит" in sh_norm or "общий факт" in sh_norm):
+                continue
+            norm = normalize_economics_report(df, source_sheet=str(sheet_name))
+            if not norm.empty:
+                frames.append(norm)
+        result = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+        if not result.empty:
+            print(
+                "Диагностика экономики: "
+                f"файл найден; листов использовано={len(frames)}; строк={len(result)}; "
+                f"nm_id={result['nm_id'].map(_clean_id_value).ne('').sum()}; "
+                f"групп={result['product_group'].map(_clean_text_value).ne('').sum()}",
+                flush=True,
+            )
+        else:
+            print("Диагностика экономики: файл найден, но нужные листы/строки не распознаны", flush=True)
+        return result
+    except Exception as exc:
+        print(f"Предупреждение: не удалось прочитать экономику {ECONOMICS_KEY}: {exc}", flush=True)
+        return pd.DataFrame()
+
+
+def _weighted_mean_numeric(df: pd.DataFrame, value_col: str, weight_col: str = "sales_qty") -> float:
+    if df is None or df.empty or value_col not in df.columns:
+        return 0.0
+    vals = pd.to_numeric(df[value_col], errors="coerce")
+    weights = pd.to_numeric(df.get(weight_col, pd.Series([1.0] * len(df), index=df.index)), errors="coerce").fillna(0.0)
+    mask = vals.notna() & (weights > 0)
+    if mask.any() and float(weights.loc[mask].sum()) > 0:
+        return float((vals.loc[mask] * weights.loc[mask]).sum() / weights.loc[mask].sum())
+    vals = vals.dropna()
+    return float(vals.mean()) if not vals.empty else 0.0
+
+
+def _economics_metric_from_group(g: pd.DataFrame, method: str) -> Dict[str, Any]:
+    if g is None or g.empty:
+        return {}
+    supplier_article = _clean_text_value(g["supplier_article"].dropna().astype(str).iloc[0]) if "supplier_article" in g.columns and not g["supplier_article"].dropna().empty else ""
+    product_group = _clean_text_value(g["product_group"].dropna().astype(str).iloc[0]) if "product_group" in g.columns and not g["product_group"].dropna().empty else product_group_from_article(supplier_article)
+    return {
+        "economics_match_method": method,
+        "supplier_article_from_economics": normalize_article_for_campaign_name(supplier_article) or supplier_article,
+        "economics_product_group": product_group,
+        "economics_avg_price": _weighted_mean_numeric(g, "avg_price"),
+        "economics_commission_pct": _weighted_mean_numeric(g, "commission_pct"),
+        "economics_acquiring_pct": _weighted_mean_numeric(g, "acquiring_pct"),
+        "economics_vat_per_unit": _weighted_mean_numeric(g, "vat_per_unit"),
+        "economics_logistics_per_unit": _weighted_mean_numeric(g, "logistics_per_unit"),
+        "economics_cogs_per_unit": _weighted_mean_numeric(g, "cogs_per_unit") if ECONOMICS_SUBTRACT_COGS else 0.0,
+    }
+
+
+def build_economics_lookup(economics_df: pd.DataFrame) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    lookup: Dict[str, Dict[str, Dict[str, Any]]] = {"nm": {}, "article": {}, "group": {}}
+    if economics_df is None or economics_df.empty:
+        return lookup
+    local = economics_df.copy()
+    # Обычно файл недельный. Берём последнюю неделю, чтобы не усреднять старые условия комиссии/логистики.
+    if "week" in local.columns and local["week"].map(_clean_text_value).ne("").any():
+        latest_week = sorted(local["week"].map(_clean_text_value).dropna().unique())[-1]
+        local = local[local["week"].map(_clean_text_value).eq(latest_week)].copy()
+    for nm_id, g in local[local["nm_id"].map(_clean_id_value).ne("")].groupby("nm_id", dropna=False):
+        lookup["nm"][_clean_id_value(nm_id)] = _economics_metric_from_group(g, "exact_nm_id")
+    tmp = local.copy()
+    tmp["article_norm"] = tmp["supplier_article"].map(normalize_article_for_campaign_name)
+    for art, g in tmp[tmp["article_norm"].map(_clean_text_value).ne("")].groupby("article_norm", dropna=False):
+        lookup["article"][_clean_text_value(art)] = _economics_metric_from_group(g, "exact_supplier_article")
+    for grp, g in local[local["product_group"].map(_clean_text_value).ne("")].groupby("product_group", dropna=False):
+        lookup["group"][_clean_text_value(grp)] = _economics_metric_from_group(g, "avg_product_group")
+    return lookup
+
+
+def lookup_economics_metrics(economics_lookup: Dict[str, Dict[str, Dict[str, Any]]], nm_id: Any, supplier_article: Any) -> Dict[str, Any]:
+    nm = _clean_id_value(nm_id)
+    art = normalize_article_for_campaign_name(supplier_article) or _clean_text_value(supplier_article)
+    grp = product_group_from_article(art or supplier_article)
+    if nm and nm in economics_lookup.get("nm", {}):
+        return economics_lookup["nm"][nm]
+    if art and art in economics_lookup.get("article", {}):
+        return economics_lookup["article"][art]
+    if grp and grp in economics_lookup.get("group", {}):
+        return economics_lookup["group"][grp]
+    return {}
+
+
+def estimate_gp_after_ads_from_economics(revenue: Any, orders: Any, ad_spend: Any, econ: Dict[str, Any]) -> float:
+    revenue_f = money_or_zero(revenue)
+    orders_f = money_or_zero(orders)
+    spend_f = money_or_zero(ad_spend)
+    if not econ or revenue_f <= 0:
+        return float("nan")
+    avg_price = float(econ.get("economics_avg_price", 0) or 0)
+    units = orders_f
+    if units <= 0 and avg_price > 0:
+        units = revenue_f / avg_price
+    commission = revenue_f * float(econ.get("economics_commission_pct", 0) or 0) / 100.0
+    acquiring = revenue_f * float(econ.get("economics_acquiring_pct", 0) or 0) / 100.0
+    vat = units * float(econ.get("economics_vat_per_unit", 0) or 0)
+    logistics = units * float(econ.get("economics_logistics_per_unit", 0) or 0)
+    cogs = units * float(econ.get("economics_cogs_per_unit", 0) or 0)
+    return float(revenue_f - commission - acquiring - vat - logistics - cogs - spend_f)
+
+
+def enrich_ads_with_estimated_gp(ads_df: pd.DataFrame, economics_df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет условную ВП после рекламы в рекламные дневные строки.
+
+    Формула: сумма заказов - комиссия WB% - эквайринг% - НДС/ед*заказы - логистика/ед*заказы
+    - себестоимость/ед*заказы - расход рекламы. Если точного SKU нет, берём среднее по группе артикула
+    (например, 901/5 -> среднее по всем 901).
+    """
+    if ads_df is None or ads_df.empty:
+        return ads_df if ads_df is not None else pd.DataFrame()
+    result = ads_df.copy()
+    for col in ["economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct", "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit"]:
+        if col not in result.columns:
+            result[col] = "" if col in {"economics_match_method", "economics_product_group"} else float("nan")
+    lookup = build_economics_lookup(economics_df)
+    if not any(lookup.values()):
+        print("Диагностика экономики: lookup пустой, ВП после рекламы не рассчитана", flush=True)
+        return result
+    matched = 0
+    gp_values: List[float] = []
+    for idx, row in result.iterrows():
+        econ = lookup_economics_metrics(lookup, row.get("nm_id", ""), row.get("supplier_article", ""))
+        gp = estimate_gp_after_ads_from_economics(row.get("revenue", 0), row.get("orders", 0), row.get("spend", 0), econ)
+        gp_values.append(gp)
+        if econ:
+            matched += 1
+            if not _clean_text_value(row.get("supplier_article", "")) and _clean_text_value(econ.get("supplier_article_from_economics", "")):
+                result.at[idx, "supplier_article"] = econ.get("supplier_article_from_economics", "")
+            for col in ["economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct", "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit"]:
+                result.at[idx, col] = econ.get(col, "")
+    result["estimated_gp_after_ads"] = gp_values
+    # Заполняем gp_after_ads условной экономикой, если в рекламном отчёте ВП нет или она пустая.
+    if "gp_after_ads" not in result.columns:
+        result["gp_after_ads"] = result["estimated_gp_after_ads"]
+    else:
+        existing = pd.to_numeric(result["gp_after_ads"], errors="coerce")
+        estimated = pd.to_numeric(result["estimated_gp_after_ads"], errors="coerce")
+        result["gp_after_ads"] = existing.where(existing.notna(), estimated)
+    print(
+        f"Диагностика экономики: ВП после рекламы рассчитана для {matched} из {len(result)} строк рекламы; "
+        f"себестоимость вычитаем={'да' if ECONOMICS_SUBTRACT_COGS else 'нет'}",
+        flush=True,
+    )
+    return result
+
+
+def enrich_supplier_articles_from_economics(df: pd.DataFrame, economics_df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or economics_df is None or economics_df.empty or "nm_id" not in df.columns:
+        return df if df is not None else pd.DataFrame()
+    lookup = build_economics_lookup(economics_df)
+    result = df.copy()
+    if "supplier_article" not in result.columns:
+        result["supplier_article"] = ""
+    for idx, row in result.iterrows():
+        if _clean_text_value(row.get("supplier_article", "")):
+            continue
+        econ = lookup_economics_metrics(lookup, row.get("nm_id", ""), "")
+        art = _clean_text_value(econ.get("supplier_article_from_economics", "")) if econ else ""
+        if art:
+            result.at[idx, "supplier_article"] = art
+    return result
+
+
+def _economics_info_for_key(ads_df: pd.DataFrame, key: Tuple[str, str, str]) -> Dict[str, Any]:
+    empty = {
+        "economics_match_method": "", "economics_product_group": "", "economics_avg_price": "",
+        "economics_commission_pct": "", "economics_acquiring_pct": "", "economics_vat_per_unit": "",
+        "economics_logistics_per_unit": "", "economics_cogs_per_unit": "",
+    }
+    if ads_df is None or ads_df.empty:
+        return empty
+    campaign_id, nm_id, placement = key
+    part = ads_df[
+        (ads_df["campaign_id"].astype(str).map(_clean_id_value).eq(campaign_id))
+        & (ads_df["nm_id"].astype(str).map(_clean_id_value).eq(nm_id))
+        & (ads_df["placement"].astype(str).map(normalize_placement_value).eq(placement))
+    ].copy()
+    if part.empty:
+        return empty
+    for col in empty:
+        if col in part.columns:
+            vals = [_clean_text_value(x) for x in part[col].tolist() if _clean_text_value(x)]
+            if vals:
+                empty[col] = vals[-1]
+    return empty
 
 def aggregate_funnel_metrics(funnel_df: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
     cols = ["nm_id", "card_views", "add_to_cart", "funnel_orders", "add_to_cart_conv", "cart_to_order_conv"]
@@ -4305,9 +4576,9 @@ def _bid_compare_conclusion(
     drr_delta = _safe_delta_pp(after_drr, before_drr)
     pos_delta = _safe_delta_pp(after_pos, before_pos)
     vis_delta = _safe_delta_pp(after_visibility, before_visibility)
-    gp_text = "ВП/день н/д"
+    gp_text = "условная ВП после рекламы/день н/д"
     if gp_delta != "":
-        gp_text = f"ВП после рекламы/день {'выросла' if float(gp_delta) >= 0 else 'упала'} на {float(gp_delta):.1f}%"
+        gp_text = f"условная ВП после рекламы/день {'выросла' if float(gp_delta) >= 0 else 'упала'} на {float(gp_delta):.1f}%"
     drr_text = f"ДРР {before_drr:.2f}%→{after_drr:.2f}%" if before_drr or after_drr else "ДРР н/д"
     pos_text = "позиция CORE80 н/д"
     if pos_delta != "":
@@ -4400,6 +4671,10 @@ def build_campaign_7d_comparison(
         after_card_views = _aggregate_funnel_card_views_window(funnel_df, nm_id, after_start, after_end)
         before_share = safe_ctr_pct(before_card_views, before_kw.get("query_freq", 0))
         after_share = safe_ctr_pct(after_card_views, after_kw.get("query_freq", 0))
+        econ_info = _economics_info_for_key(ads_df, key)
+
+        if after_days <= 0:
+            comparison_status = "WAIT_AFTER_DATA" if event else comparison_status
 
         event_id = _clean_text_value(event.get("event_id", "")) if event else ""
         eff = effects.get(event_id, {}) if event_id else {}
@@ -4425,6 +4700,14 @@ def build_campaign_7d_comparison(
             "subject_norm": decision.get("subject_norm", ""),
             "placement": decision.get("placement", ""),
             "campaign_status": decision.get("campaign_status", ""),
+            "economics_match_method": econ_info.get("economics_match_method", ""),
+            "economics_product_group": econ_info.get("economics_product_group", ""),
+            "economics_avg_price": econ_info.get("economics_avg_price", ""),
+            "economics_commission_pct": econ_info.get("economics_commission_pct", ""),
+            "economics_acquiring_pct": econ_info.get("economics_acquiring_pct", ""),
+            "economics_vat_per_unit": econ_info.get("economics_vat_per_unit", ""),
+            "economics_logistics_per_unit": econ_info.get("economics_logistics_per_unit", ""),
+            "economics_cogs_per_unit": econ_info.get("economics_cogs_per_unit", ""),
             "comparison_status": comparison_status,
             "last_bid_change_date": event_date_text,
             "old_bid_rub": old_bid,
@@ -4501,6 +4784,19 @@ def build_campaign_7d_comparison(
         if col not in out.columns:
             out[col] = ""
     if not out.empty:
+        after_cols = [c for c in out.columns if c.startswith("after_")] + [
+            "impressions_delta_pct", "clicks_delta_pct", "ctr_delta_pp", "orders_qty_delta_pct",
+            "orders_sum_delta_pct", "gp_after_ads_delta_pct", "ad_spend_delta_pct", "drr_delta_pp",
+            "core80_position_delta", "core80_visibility_delta_pp", "traffic_share_delta_pp",
+        ]
+        no_after = pd.to_numeric(out.get("after_days", pd.Series(dtype=float)), errors="coerce").fillna(0).le(0)
+        if no_after.any():
+            out.loc[no_after, after_cols] = ""
+            out.loc[no_after, "after_period"] = ""
+            out.loc[no_after, "diagnostic_conclusion"] = (
+                "WAIT_AFTER_DATA: после изменения ставки ещё нет зрелых данных для сравнения; "
+                "нули не используются как эффект изменения"
+            )
         out = out.sort_values(["subject_norm", "supplier_article", "campaign_id", "placement"], ascending=[True, True, True, True])
     return out[BID_CAMPAIGN_COMPARE_COLUMNS]
 
@@ -4550,8 +4846,9 @@ def write_outputs(
     summary["Окно проверки паузы, дней"] = PAUSE_ANALYSIS_DAYS
     summary["Правило автопаузы"] = "минимальная ставка WB + ДРР > лимита за 21 день + показы >= 10000"
     summary["Кисти паузим"] = "нет"
-    summary["Кандидатов на переименование РК"] = int(rename_plan["rename_action"].astype(str).eq("Переименовать").sum()) if rename_plan is not None and not rename_plan.empty and "rename_action" in rename_plan.columns else 0
-    summary["Переименовано РК"] = int(rename_plan["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if rename_plan is not None and not rename_plan.empty and "api_status" in rename_plan.columns else 0
+    summary["Кандидатов на переименование РК"] = 0
+    summary["Переименовано РК"] = 0
+    summary["Переименование РК"] = "отключено"
     summary["Строк сравнения РК 7д"] = int(len(bid_campaign_compare)) if bid_campaign_compare is not None else 0
     summary_df = pd.DataFrame([{"Показатель": k, "Значение": v} for k, v in summary.items()])
 
@@ -4642,6 +4939,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     funnel_df = load_funnel_report(s3_client, config)
     print(f"Воронка продаж загружена для price-check: {len(funnel_df):,} строк".replace(",", " "), flush=True)
 
+    economics_df = load_economics_report(s3_client, config)
+    ads_df = enrich_ads_with_estimated_gp(ads_df, economics_df)
+
     bid_history_raw = load_bid_history(s3_client, config)
     pause_history_raw = load_pause_history(s3_client, config)
     price_history_raw = load_price_history(s3_client, config)
@@ -4673,11 +4973,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     postcheck_results = latest_postcheck_results(bid_history)
 
     metrics_df = aggregate_campaign_metrics(ads_df, ctx)
+    metrics_df = enrich_supplier_articles_from_economics(metrics_df, economics_df)
     print(f"Диагностика агрегации: строк метрик={len(metrics_df)}", flush=True)
     if not metrics_df.empty:
         print("Диагностика метрик по статусам: " + json.dumps(metrics_df.get("campaign_status", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
         print("Диагностика метрик по предметам: " + json.dumps(metrics_df.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
     decisions = build_decisions(metrics_df, pending_events, postcheck_results, ctx)
+    decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
     min_bids_df, min_bid_api_log = fetch_wb_min_bids_for_decisions(decisions, config, ctx)
     decisions = enrich_decisions_with_min_bids(decisions, min_bids_df)
     if not min_bids_df.empty:
@@ -4712,12 +5014,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         applied_price_changes, price_api_log = apply_price_changes(price_decisions, goods_prices, config, ctx, apply_price=apply_price_now)
         price_history = record_price_events(applied_price_changes, price_history, ctx)
 
-    rename_plan = build_campaign_rename_plan(metrics_df, keyword_core_df, goods_prices, ctx)
-    if not rename_plan.empty:
-        print("Диагностика переименования РК action: " + json.dumps(rename_plan["rename_action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
-        print("Диагностика переименования РК reason_code: " + json.dumps(rename_plan["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-    rename_plan, rename_api_log = apply_campaign_renames(rename_plan, config, ctx)
-    decisions = enrich_supplier_articles_from_rename_plan(decisions, rename_plan)
+    # Переименование РК отключено: кампании уже вернули к артикулам, больше не отправляем /adv/v0/rename.
+    rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
+    rename_api_log = pd.DataFrame()
+    decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
 
     pause_candidates = build_pause_candidates(decisions, bid_history)
 
