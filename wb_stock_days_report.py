@@ -30,11 +30,12 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-19_F_COLUMN_ALL_STOCKS_CRITICAL_SALES_ONLY"
+SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
-SHEET_DEAD = "Dead_Stock"
+SHEET_DEAD_WB = "Dead_Stock_WB"
+SHEET_DEAD_ALL = "Dead_Stock_Все остатки+в пути"
 SHEET_MONITOR = "Мониторинг остатков"
 
 FONT_NAME = "Calibri"
@@ -45,6 +46,8 @@ FILL_LIGHT_GREEN = PatternFill("solid", fgColor="CCFFCC")
 FILL_BLACK = PatternFill("solid", fgColor="000000")
 FILL_ORANGE = PatternFill("solid", fgColor="FCE4D6")
 FILL_BLUE_ROW = PatternFill("solid", fgColor="DDEBF7")
+FILL_STRAWBERRY = PatternFill("solid", fgColor="FB2943")
+FILL_WHITE = PatternFill("solid", fgColor="FFFFFF")
 
 BORDER_THIN = Border(
     left=Side(style="thin", color="D9D9D9"),
@@ -847,6 +850,21 @@ def compute_coef_rrc(price: int, rrc: int) -> str:
     return f"{price / rrc:.2f}".replace(".", ",") + "_РРЦ"
 
 
+def assign_manager_by_article_1c(article: object, current_manager: object = "") -> str:
+    """Жёсткие правила закрепления SKU за менеджерами поверх ABC-отчёта."""
+    current = normalize_text(current_manager)
+    article_key = normalize_key(article).replace("Ё", "Е")
+    compact = re.sub(r"[^0-9A-ZА-Я]+", ".", article_key).strip(".")
+    match = re.match(r"^(?:PT)?(\d{3,4})(?:\.|$)", compact) or re.match(r"^(?:PT)?(\d{3,4})", article_key)
+    code = match.group(1) if match else ""
+
+    if code in {"104", "110", "810", "811", "619"}:
+        return "Игорь"
+    if code in {"901", "620", "922"}:
+        return "Влад"
+    return current
+
+
 def build_report_dataframe(
     wb_stocks: pd.DataFrame,
     sales: pd.DataFrame,
@@ -874,7 +892,7 @@ def build_report_dataframe(
     missing = df["Артикул 1С"].isna() | (df["Артикул 1С"].astype(str).str.strip() == "")
     df.loc[missing, "Артикул 1С"] = df.loc[missing, "Артикул WB продавца"]
     df["Артикул 1С"] = df["Артикул 1С"].map(normalize_text)
-    df = df[(df["Артикул 1С"] != "") & (~df["Артикул 1С"].str.startswith("PT104", na=False))].copy()
+    df = df[(df["Артикул 1С"] != "") & (~df["Артикул 1С"].map(normalize_key).str.startswith("CZ", na=False))].copy()
 
     df = df.merge(stocks_1c, on="Артикул 1С", how="left")
     df["Остатки МП (Липецк), шт"] = df["Остатки МП (Липецк), шт"].fillna(0).map(ceil_int)
@@ -897,7 +915,10 @@ def build_report_dataframe(
         df["Менеджер"] = ""
     df["Менеджер"] = df["Менеджер"].fillna("")
     df["Менеджер"] = df.apply(
-        lambda r: MANAGER_OVERRIDES_BY_ARTICLE_1C.get(normalize_text(r.get("Артикул 1С")), normalize_text(r.get("Менеджер"))),
+        lambda r: assign_manager_by_article_1c(
+            r.get("Артикул 1С"),
+            MANAGER_OVERRIDES_BY_ARTICLE_1C.get(normalize_text(r.get("Артикул 1С")), normalize_text(r.get("Менеджер"))),
+        ),
         axis=1,
     )
 
@@ -1009,10 +1030,8 @@ def build_report_dataframe(
     ).reset_index(drop=True)
 
 
-def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    # 1-й лист — это рабочий список риска по ходовым SKU.
-    # Поэтому сюда не включаем товары с 0 продаж за 60 дней: они остаются на расчётном/мониторинговом листах,
-    # но не засоряют список товаров, которые реально приносили продажи и сейчас заканчиваются.
+def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # 1-й лист — рабочий список риска по ходовым SKU.
     revenue_sku_mask = report_df["Продажи 60 дней, шт"] > 0
     stock_risk_mask = (
         (report_df["Остаток WB, шт"] <= 0)
@@ -1040,6 +1059,30 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
         "Комментарий", "Менеджер", "Delist",
     ]].copy()
 
+    # Мониторинг: убрали Out of stock и расчётные дни, которые раньше требовалось скрывать.
+    monitor = report_df[report_df["Delist"] != "Delist"].copy()
+    monitor = monitor[[
+        "Артикул 1С", "Продажи 60 дней, шт", "Хватит на 60 дней",
+        "Товары в пути, шт", "Ближайшее поступление, шт", "Хватит до поступления",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце", "Менеджер",
+    ]].copy()
+
+    # Dead_Stock_WB — только остатки на WB: Липецк и товары в пути не участвуют в расчёте.
+    dead_wb = report_df[report_df["WB хватит, дней"] > 120].copy()
+    dead_wb = dead_wb[[
+        "Артикул 1С", "Менеджер", "WB хватит, дней", "Остаток WB, шт",
+        "Продажи 60 дней, шт", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
+    ]].copy()
+
+    # Dead_Stock_Все остатки+в пути — текущая логика: WB + Липецк + товары в пути.
+    dead_all = report_df[report_df["WB + Липецк + в пути, дней"] > 120].copy()
+    dead_all = dead_all[[
+        "Артикул 1С", "Менеджер", "WB хватит, дней", "WB + Липецк, дней",
+        "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
+        "Продажи 60 дней, шт", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
+    ]].copy()
+
     calc = report_df[[
         "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Остаток WB, шт",
         "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
@@ -1051,22 +1094,7 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
         "Дней без остатка WB в текущем месяце", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
     ]].copy()
 
-    dead = report_df[report_df["WB + Липецк + в пути, дней"] > 120].copy()
-    dead = dead[[
-        "Артикул 1С", "Менеджер", "WB хватит, дней", "WB + Липецк, дней",
-        "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
-        "Продажи 60 дней, шт", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
-    ]].copy()
-
-    monitor = report_df[report_df["Delist"] != "Delist"].copy()
-    monitor = monitor[[
-        "Артикул 1С", "Продажи 60 дней, шт", "Out of stock, days", "Хватит на 60 дней",
-        "WB + Липецк, дней", "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
-        "Товары в пути, шт", "Ближайшее поступление, шт", "Хватит до поступления",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце", "Менеджер",
-    ]].copy()
-    return critical, calc, dead, monitor
+    return critical, monitor, dead_wb, dead_all, calc
 
 
 def auto_fit_columns(ws) -> None:
@@ -1076,68 +1104,127 @@ def auto_fit_columns(ws) -> None:
             text = "" if cell.value is None else str(cell.value)
             max_len = max((len(part) for part in text.split("\n")), default=0)
             widths[cell.column] = max(widths.get(cell.column, 0), max_len)
+
+    preferred_by_header = {
+        "Артикул 1С": 22,
+        "Менеджер": 16,
+        "Артикул WB": 18,
+        "Артикул WB продавца": 24,
+        "Продажи 60 дней, шт": 20,
+        "Продажи 7 дней, шт": 18,
+        "WB хватит, дней": 22,
+        "Out of stock, days": 18,
+        "WB + Липецк, дней": 22,
+        "После ближайшего поступления, дней": 30,
+        "WB + Липецк + в пути, дней": 27,
+        "Товары в пути, шт": 20,
+        "Ближайшее поступление, шт": 24,
+        "Дата поступления": 18,
+        "Дней до поступления": 20,
+        "Остаток WB, шт": 18,
+        "Остатки МП (Липецк), шт": 24,
+        "Дней без остатка WB в текущем месяце": 34,
+        "Хватит на 60 дней": 22,
+        "Хватит до поступления": 22,
+        "Расчётный спрос в день, шт": 24,
+        "Комментарий": 30,
+        "Цена покупателя": 18,
+        "Коэффициент": 18,
+        "Delist": 14,
+    }
+    headers = [c.value for c in ws[1]]
     for idx, width in widths.items():
-        ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 3, 16), 42)
+        header = headers[idx - 1] if idx - 1 < len(headers) else ""
+        preferred = preferred_by_header.get(header, 16)
+        if ws.title == SHEET_CRITICAL:
+            preferred = max(preferred, 20)
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(preferred, min(width + 4, 54)), 54)
 
 
-def style_sheet(ws, monitor: bool = False, dead_days_col: Optional[int] = None) -> None:
+def format_date_columns(ws) -> None:
+    headers = [c.value for c in ws[1]]
+    for idx, header in enumerate(headers, start=1):
+        if header == "Дата поступления":
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(r, idx)
+                cell.number_format = "yyyy-mm-dd"
+
+
+def highlight_rows(ws) -> None:
+    headers = [c.value for c in ws[1]]
+    wb_days_idx = headers.index("WB хватит, дней") + 1 if "WB хватит, дней" in headers else None
+    enough_idx = headers.index("Хватит до поступления") + 1 if "Хватит до поступления" in headers else None
+    comment_idx = headers.index("Комментарий") + 1 if "Комментарий" in headers else None
+    deficit_idx = headers.index("Хватит на 60 дней") + 1 if "Хватит на 60 дней" in headers else None
+    zero_idx = headers.index("Дней без остатка WB в текущем месяце") + 1 if "Дней без остатка WB в текущем месяце" in headers else None
+
+    for r in range(2, ws.max_row + 1):
+        row_is_strawberry = False
+        if enough_idx and str(ws.cell(r, enough_idx).value or "").strip() == "Нет":
+            row_is_strawberry = True
+        if comment_idx and str(ws.cell(r, comment_idx).value or "").strip() == "Не хватает до поставки":
+            row_is_strawberry = True
+        if wb_days_idx and safe_float(ws.cell(r, wb_days_idx).value) < 7:
+            row_is_strawberry = True
+        if ws.title == SHEET_MONITOR and deficit_idx and "Дефицит" in str(ws.cell(r, deficit_idx).value or ""):
+            row_is_strawberry = True
+
+        if row_is_strawberry:
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(r, c)
+                cell.fill = FILL_STRAWBERRY
+                cell.font = Font(name=FONT_NAME, size=FONT_SIZE, color="FFFFFF", bold=(c == 1))
+
+        if zero_idx and safe_float(ws.cell(r, zero_idx).value) > 0:
+            cell = ws.cell(r, zero_idx)
+            cell.fill = FILL_STRAWBERRY
+            cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
+
+
+def style_sheet(ws) -> None:
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = ALIGN_CENTER
             cell.border = BORDER_THIN
+            cell.fill = FILL_WHITE
             cell.font = Font(name=FONT_NAME, size=FONT_SIZE, color="000000")
+
     for cell in ws[1]:
         cell.fill = FILL_HEADER
         cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
-    for row in ws.iter_rows(min_row=2):
-        row[0].alignment = ALIGN_LEFT
+        cell.alignment = ALIGN_CENTER
+    ws.row_dimensions[1].height = 58
+
+    for r in range(2, ws.max_row + 1):
+        ws.row_dimensions[r].height = 24
+        ws.cell(r, 1).alignment = ALIGN_LEFT
+
     auto_fit_columns(ws)
+    format_date_columns(ws)
+    highlight_rows(ws)
     ws.auto_filter.ref = ws.dimensions
     ws.freeze_panes = "A2"
 
-    headers = [c.value for c in ws[1]]
 
-    if ws.title == SHEET_CRITICAL:
-        wb_days_idx = headers.index("WB хватит, дней") + 1 if "WB хватит, дней" in headers else None
-        comment_idx = headers.index("Комментарий") + 1 if "Комментарий" in headers else None
-        for r in range(2, ws.max_row + 1):
-            if wb_days_idx is not None and safe_float(ws.cell(r, wb_days_idx).value) == 0:
-                for c in range(1, ws.max_column + 1):
-                    ws.cell(r, c).fill = FILL_ORANGE
-            if comment_idx is not None and str(ws.cell(r, comment_idx).value or "").strip() == "Не хватает до поставки":
-                for c in range(1, ws.max_column + 1):
-                    ws.cell(r, c).fill = FILL_BLUE_ROW
-
-    if ws.title == SHEET_DEAD and dead_days_col is not None:
-        for r in range(2, ws.max_row + 1):
-            cell = ws.cell(r, dead_days_col)
-            if safe_float(cell.value) > 180:
-                cell.fill = FILL_BLACK
-                cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
-
-    if monitor and "Хватит на 60 дней" in headers:
-        idx = headers.index("Хватит на 60 дней") + 1
-        for r in range(2, ws.max_row + 1):
-            value = str(ws.cell(r, idx).value or "")
-            if value.startswith("Дефицит"):
-                for c in range(1, ws.max_column + 1):
-                    ws.cell(r, c).fill = FILL_ORANGE
-
-
-def save_report(report_path: Path, critical: pd.DataFrame, calc: pd.DataFrame, dead: pd.DataFrame, monitor: pd.DataFrame) -> None:
+def save_report(
+    report_path: Path,
+    critical: pd.DataFrame,
+    monitor: pd.DataFrame,
+    dead_wb: pd.DataFrame,
+    dead_all: pd.DataFrame,
+    calc: pd.DataFrame,
+) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
         critical.to_excel(writer, sheet_name=SHEET_CRITICAL, index=False)
-        calc.to_excel(writer, sheet_name=SHEET_CALC, index=False)
-        dead.to_excel(writer, sheet_name=SHEET_DEAD, index=False)
         monitor.to_excel(writer, sheet_name=SHEET_MONITOR, index=False)
+        dead_wb.to_excel(writer, sheet_name=SHEET_DEAD_WB, index=False)
+        dead_all.to_excel(writer, sheet_name=SHEET_DEAD_ALL, index=False)
+        calc.to_excel(writer, sheet_name=SHEET_CALC, index=False)
+
     wb = load_workbook(report_path)
-    style_sheet(wb[SHEET_CRITICAL])
-    style_sheet(wb[SHEET_CALC])
-    dead_headers = [c.value for c in wb[SHEET_DEAD][1]]
-    dead_days_col = dead_headers.index("WB + Липецк + в пути, дней") + 1 if "WB + Липецк + в пути, дней" in dead_headers else None
-    style_sheet(wb[SHEET_DEAD], dead_days_col=dead_days_col)
-    style_sheet(wb[SHEET_MONITOR], monitor=True)
+    for sheet_name in [SHEET_CRITICAL, SHEET_MONITOR, SHEET_DEAD_WB, SHEET_DEAD_ALL, SHEET_CALC]:
+        style_sheet(wb[sheet_name])
     wb.save(report_path)
 
 
@@ -1158,7 +1245,7 @@ def send_document_to_telegram(cfg: Config, path: Path, caption: str) -> None:
 
 
 def send_to_telegram(cfg: Config, path: Path, critical_count: int, dead_count: int) -> None:
-    caption = f"📦 Отчёт Остатки и товары в пути {STORE_NAME}\nКритично: {critical_count}\nDead_Stock: {dead_count}"
+    caption = f"📦 Отчёт Остатки и товары в пути {STORE_NAME}\nКритично: {critical_count}\nDead_Stock_Все остатки+в пути: {dead_count}"
     send_document_to_telegram(cfg, path, caption)
 
 
@@ -1754,10 +1841,10 @@ def run() -> Path:
         abc_df=abc_df,
     )
 
-    critical, calc, dead, monitor = split_sheets(report_df)
+    critical, monitor, dead_wb, dead_all, calc = split_sheets(report_df)
     date_label = format_ru_date_for_filename(cfg.run_date)
     report_path = Path(OUT_DIR) / f"Отчёт Остатки и товары в пути_{date_label}.xlsx"
-    save_report(report_path, critical, calc, dead, monitor)
+    save_report(report_path, critical, monitor, dead_wb, dead_all, calc)
 
     log(f"Отчёт сохранён: {report_path}")
     log(f"Источник остатков: {stock_source}")
@@ -1770,7 +1857,7 @@ def run() -> Path:
     )
 
     if should_send_report(cfg):
-        send_to_telegram(cfg, report_path, len(critical), len(dead))
+        send_to_telegram(cfg, report_path, len(critical), len(dead_all))
     else:
         log("Отправка отчёта по дням остатка в Telegram пропущена по расписанию")
 
