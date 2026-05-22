@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v18-economics-no-rename-2026-05-22"
+SCRIPT_VERSION = "strict-drr-v19-economics-zero-base-hotfix-2026-05-22"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -2005,12 +2005,32 @@ def safe_ctr_pct(clicks: float, impressions: float) -> float:
 
 
 def growth_pct_or_status(current: float, base: float) -> Tuple[Optional[float], str]:
-    current = float(current or 0)
-    base = float(base or 0)
-    if base == 0 and current > 0:
-        return None, "NEW_ACTIVITY"
-    if base == 0 and current == 0:
-        return None, "ZERO_BASE"
+    """Безопасный расчёт изменения к базе.
+
+    Для обычных неотрицательных метрик возвращает % роста.
+    Для ВП/GP база может быть 0 или отрицательной: в этих случаях процент
+    классической формулой current / base считать нельзя — иначе получаем
+    division by zero или вводящий в заблуждение знак. Поэтому возвращаем
+    None и статус, а в отчёте показываем причину.
+    """
+    current_num = pd.to_numeric(pd.Series([current]), errors="coerce").iloc[0]
+    base_num = pd.to_numeric(pd.Series([base]), errors="coerce").iloc[0]
+    current = 0.0 if pd.isna(current_num) else float(current_num)
+    base = 0.0 if pd.isna(base_num) else float(base_num)
+
+    if abs(base) < 1e-9:
+        if abs(current) < 1e-9:
+            return None, "ZERO_BASE"
+        if current > 0:
+            return None, "NEW_ACTIVITY"
+        return None, "NEGATIVE_CURRENT_ZERO_BASE"
+
+    # Для отрицательной базы процент роста ВП не интерпретируем как обычный growth %.
+    if base < 0:
+        if current >= 0:
+            return None, "FROM_NEGATIVE_TO_NONNEGATIVE"
+        return ((current - base) / abs(base)) * 100.0, "NEGATIVE_BASE"
+
     return (current / base - 1.0) * 100.0, "OK"
 
 
