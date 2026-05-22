@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v14-funnel-verified-2026-05-22"
+SCRIPT_VERSION = "strict-drr-v17-campaign-compare-7d-2026-05-22"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -199,10 +199,38 @@ PRICE_DECISION_COLUMNS = [
 ]
 
 BID_RAMP_MONITOR_COLUMNS = [
-    "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement",
-    "current_bid_rub", "new_bid_rub", "reason_code",
+    "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "campaign_status",
+    "ramp_candidate", "ramp_mode_status", "ramp_applied_in_current_run", "ramp_reason_group",
+    "current_bid_rub", "min_bid_rub", "new_bid_rub", "api_status",
+    "reason_code", "reason_text",
+    "wait_status", "wait_rule", "wait_until_date", "wait_days_left",
+    "last_bid_change_date", "last_bid_change_old_bid", "last_bid_change_new_bid", "last_bid_change_reason_code",
     "impressions", "avg_impressions_per_day", "spend", "avg_spend_per_day", "orders", "revenue",
+    "campaign_drr_pct", "drr_limit_pct", "last21_impressions", "last21_drr_pct",
     "target_impressions_per_day", "max_spend_per_day", "check_days", "monitor_status",
+]
+
+BID_CAMPAIGN_COMPARE_COLUMNS = [
+    "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "campaign_status",
+    "comparison_status", "last_bid_change_date", "old_bid_rub", "new_bid_rub", "bid_change_reason_code",
+    "before_period", "after_period", "before_days", "after_days",
+    "current_action", "current_reason_code", "current_reason_text",
+    "postcheck_status", "final_verdict", "target_bid_action", "target_bid_action_text", "recommended_next_bid_rub",
+    "before_impressions", "after_impressions", "before_impressions_per_day", "after_impressions_per_day", "impressions_delta_pct",
+    "before_clicks", "after_clicks", "before_clicks_per_day", "after_clicks_per_day", "clicks_delta_pct",
+    "before_ctr_pct", "after_ctr_pct", "ctr_delta_pp",
+    "before_orders_qty", "after_orders_qty", "before_orders_qty_per_day", "after_orders_qty_per_day", "orders_qty_delta_pct",
+    "before_orders_sum_rub", "after_orders_sum_rub", "before_orders_sum_rub_per_day", "after_orders_sum_rub_per_day", "orders_sum_delta_pct",
+    "before_gp_after_ads_rub", "after_gp_after_ads_rub", "before_gp_after_ads_rub_per_day", "after_gp_after_ads_rub_per_day", "gp_after_ads_delta_pct",
+    "before_ad_spend_rub", "after_ad_spend_rub", "before_ad_spend_rub_per_day", "after_ad_spend_rub_per_day", "ad_spend_delta_pct",
+    "before_drr_pct", "after_drr_pct", "drr_delta_pp",
+    "core80_queries_count",
+    "before_core80_avg_position", "after_core80_avg_position", "core80_position_delta",
+    "before_core80_visibility_pct", "after_core80_visibility_pct", "core80_visibility_delta_pp",
+    "before_core80_query_freq", "after_core80_query_freq",
+    "before_card_views", "after_card_views", "before_card_views_per_day", "after_card_views_per_day",
+    "before_traffic_share_pct", "after_traffic_share_pct", "traffic_share_delta_pp",
+    "diagnostic_conclusion",
 ]
 
 ONE_CAMPAIGN_EXPERIMENT_COLUMNS = [
@@ -284,6 +312,10 @@ DECISION_COLUMNS = [
     "wait_days_left",
     "wait_status",
     "pause_decision",
+    "ramp_candidate",
+    "ramp_status",
+    "ramp_applied_in_current_run",
+    "ramp_api_status",
 ]
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
@@ -1962,15 +1994,118 @@ def lt_metric_factor(after: float, before: float, factor: float) -> bool:
     return float(after) < float(before) * factor
 
 
+
+def bid_effect_empty_frame() -> pd.DataFrame:
+    return pd.DataFrame(columns=[
+        "event_id", "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "direction",
+        "event_date", "old_bid_rub", "new_bid_rub", "reason_code",
+        "before_window_days", "after_d1_days", "after_d3_days", "after_d7_days",
+        "before_spend", "after_d1_spend", "after_d3_spend", "after_d7_spend",
+        "before_spend_per_day", "after_d1_spend_per_day", "after_d3_spend_per_day", "after_d7_spend_per_day",
+        "before_revenue", "after_d1_revenue", "after_d3_revenue", "after_d7_revenue",
+        "before_revenue_per_day", "after_d1_revenue_per_day", "after_d3_revenue_per_day", "after_d7_revenue_per_day",
+        "before_orders", "after_d1_orders", "after_d3_orders", "after_d7_orders",
+        "before_orders_per_day", "after_d1_orders_per_day", "after_d3_orders_per_day", "after_d7_orders_per_day",
+        "before_impressions", "after_d1_impressions", "after_d3_impressions", "after_d7_impressions",
+        "before_impressions_per_day", "after_d1_impressions_per_day", "after_d3_impressions_per_day", "after_d7_impressions_per_day",
+        "before_clicks", "after_d1_clicks", "after_d3_clicks", "after_d7_clicks",
+        "before_clicks_per_day", "after_d1_clicks_per_day", "after_d3_clicks_per_day", "after_d7_clicks_per_day",
+        "before_ctr_pct", "after_d1_ctr_pct", "after_d3_ctr_pct", "after_d7_ctr_pct",
+        "before_drr_pct", "after_d1_drr_pct", "after_d3_drr_pct", "after_d7_drr_pct",
+        "before_gp", "after_d1_gp", "after_d3_gp", "after_d7_gp",
+        "before_gp_per_day", "after_d1_gp_per_day", "after_d3_gp_per_day", "after_d7_gp_per_day",
+        "d1_verdict", "d3_verdict", "d7_verdict", "final_verdict", "postcheck_status",
+        "target_bid_action", "target_bid_action_text", "recommended_next_bid_rub",
+        "traffic_delta_d1_pct", "traffic_delta_d3_pct", "orders_delta_d3_pct", "revenue_delta_d3_pct", "gp_delta_d3_pct",
+        # обратная совместимость со старым листом
+        "drr_before", "drr_after_d3", "impressions_after_d1", "clicks_after_d1", "orders_after_d3",
+        "revenue_after_d3", "spend_after_d3", "gp_after_d3",
+    ])
+
+
+def _event_num(row: pd.Series | Dict[str, Any], col: str, default: float = 0.0) -> float:
+    value = pd.to_numeric(pd.Series([row.get(col, default)]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return default
+    return float(value)
+
+
+def _per_day(metrics: Dict[str, float], days: float) -> Dict[str, float]:
+    d = max(float(days or 1.0), 1.0)
+    return {
+        "spend": float(metrics.get("spend", 0.0) or 0.0) / d,
+        "revenue": float(metrics.get("revenue", 0.0) or 0.0) / d,
+        "orders": float(metrics.get("orders", 0.0) or 0.0) / d,
+        "impressions": float(metrics.get("impressions", 0.0) or 0.0) / d,
+        "clicks": float(metrics.get("clicks", 0.0) or 0.0) / d,
+        "gp_after_ads": (float(metrics.get("gp_after_ads", 0.0)) / d) if not pd.isna(metrics.get("gp_after_ads", float("nan"))) else float("nan"),
+    }
+
+
+def _pct_delta(after: float, before: float) -> Optional[float]:
+    before = float(before or 0.0)
+    after = float(after or 0.0)
+    if before == 0:
+        return None
+    return (after / before - 1.0) * 100.0
+
+
+def _metric_ratio(after: float, before: float) -> float:
+    before = float(before or 0.0)
+    after = float(after or 0.0)
+    if before == 0:
+        return 1.0 if after >= 0 else 0.0
+    return after / before
+
+
+def _postcheck_target_action(
+    verdict: str,
+    direction: str,
+    is_ramp_event: bool,
+    current_new_bid: float,
+    step: float,
+) -> Tuple[str, str, Any]:
+    verdict = _clean_text_value(verdict)
+    direction = _clean_text_value(direction).lower()
+    if not verdict:
+        return "WAIT_POSTCHECK", "ждём созревания данных для оценки изменения ставки", ""
+    if verdict.startswith("WAIT") or verdict in {"RAMP_D3_MONITOR_WEEK"}:
+        return "WAIT_POSTCHECK", "ждём финальную оценку изменения ставки", ""
+    if verdict in {"RAISE_BAD", "RAMP_NEGATIVE_GP_D7", "RAMP_SPEND_OVER_LIMIT_D7"}:
+        next_bid = round(max(float(current_new_bid or 0.0) - float(step or 1.0), TECHNICAL_BID_FLOOR_RUB), 2)
+        return "REVERT_TO_PREVIOUS_BID", "эффект плохой: откатить ставку на предыдущий уровень", next_bid
+    if verdict == "LOWER_BAD":
+        next_bid = round(float(current_new_bid or 0.0) + float(step or 1.0), 2)
+        return "REVERT_TO_PREVIOUS_BID", "снижение ухудшило трафик/экономику: откатить ставку вверх", next_bid
+    if verdict in {"RAISE_GOOD"}:
+        return "HOLD_BID_LEVEL", "повышение сработало: оставить новый уровень, следующий шаг только по обычной логике ДРР/разгона", ""
+    if verdict in {"RAISE_D3_MIXED", "RAISE_NO_TRAFFIC_GROWTH"}:
+        return "HOLD_BID_LEVEL", "эффект неоднозначный: оставить ставку, не делать автоматический откат без ухудшения экономики", ""
+    if verdict in {"LOWER_GOOD"}:
+        return "HOLD_BID_LEVEL", "снижение сработало: оставить новый уровень; дальше снижать только если ДРР всё ещё выше лимита", ""
+    if verdict in {"LOWER_D3_MIXED"}:
+        return "HOLD_BID_LEVEL", "эффект снижения смешанный: оставить ставку до следующего окна", ""
+    if verdict == "RAMP_GOOD_D7":
+        return "STOP_RAMP_HOLD", "цель разгона достигнута: остановить разгон и оставить ставку", ""
+    if verdict == "RAMP_NEEDS_MORE_BID_D7":
+        next_bid = round(float(current_new_bid or 0.0) + float(step or 1.0), 2)
+        return "CONTINUE_RAMP", "цель 1000 показов/день не достигнута, расход в лимите: продолжить разгон следующим шагом", next_bid
+    return "HOLD_BID_LEVEL", f"вердикт {verdict}: оставить ставку до следующего окна", ""
+
+
 def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Оценивает эффект изменения ставки нормальным сравнением ДО/ПОСЛЕ.
+
+    Важно: значения ДО в истории — это 5-дневная база на момент изменения ставки.
+    Старый код сравнивал D+1 за один день с этой 5-дневной суммой и мог ошибочно ставить
+    RAISE_NO_TRAFFIC_GROWTH. Здесь все сравнения делаются в формате среднее/день:
+    - ДО: сумма за 5 дней / 5;
+    - D+1: один зрелый день;
+    - D+3: сумма за 3 дня / 3;
+    - D+7 для разгона: сумма за 7 дней / 7.
+    """
     if bid_history.empty:
-        return bid_history.copy(), pd.DataFrame(columns=[
-            "event_id", "campaign_id", "nm_id", "placement", "direction",
-            "event_date", "d1_verdict", "d3_verdict", "d7_verdict", "final_verdict",
-            "postcheck_status", "drr_before", "drr_after_d3",
-            "impressions_after_d1", "clicks_after_d1", "orders_after_d3",
-            "revenue_after_d3", "spend_after_d3", "gp_after_d3",
-        ])
+        return bid_history.copy(), bid_effect_empty_frame()
 
     updated = coerce_history_columns_object(bid_history.copy(), BID_HISTORY_COLUMNS)
     for col in BID_HISTORY_COLUMNS:
@@ -1980,6 +2115,8 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
             updated[col] = updated[col].astype("object")
 
     effects: List[Dict[str, Any]] = []
+    before_days = float(ANALYSIS_WINDOW_DAYS)
+
     for idx, row in updated.iterrows():
         event_date = pd.to_datetime(row.get("event_date"), errors="coerce")
         if pd.isna(event_date):
@@ -1988,7 +2125,9 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
         key = make_key(row)
         direction = _clean_text_value(row.get("direction", "")).lower()
         event_reason_code = _clean_text_value(row.get("reason_code", ""))
-        is_ramp_event = event_reason_code.startswith("RAMP_") or event_reason_code.startswith("LOW_BID_NO_SPEND_NO_ORDERS_RAMP")
+        is_ramp_event = is_ramp_event_reason(event_reason_code)
+        step, _ = bid_step_rub(row.get("placement", ""))
+        drr_limit = drr_limit_for_subject(row.get("subject_norm", ""))
 
         status = _clean_text_value(row.get("postcheck_status", "")) or "pending"
         final_verdict = _clean_text_value(row.get("final_verdict", ""))
@@ -1997,95 +2136,126 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
         d7_verdict = _clean_text_value(row.get("d7_verdict", ""))
 
         before = {
-            "spend": float(pd.to_numeric(pd.Series([row.get("spend_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "revenue": float(pd.to_numeric(pd.Series([row.get("revenue_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "orders": float(pd.to_numeric(pd.Series([row.get("orders_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "impressions": float(pd.to_numeric(pd.Series([row.get("impressions_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "clicks": float(pd.to_numeric(pd.Series([row.get("clicks_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "drr": float(pd.to_numeric(pd.Series([row.get("drr_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "gp": float(pd.to_numeric(pd.Series([row.get("gp_before", float("nan"))]), errors="coerce").iloc[0]),
+            "spend": _event_num(row, "spend_before", 0.0),
+            "revenue": _event_num(row, "revenue_before", 0.0),
+            "orders": _event_num(row, "orders_before", 0.0),
+            "impressions": _event_num(row, "impressions_before", 0.0),
+            "clicks": _event_num(row, "clicks_before", 0.0),
+            "gp_after_ads": _event_num(row, "gp_before", float("nan")),
         }
+        before_drr = _event_num(row, "drr_before", safe_drr_pct(before["spend"], before["revenue"]))
+        before_daily = _per_day(before, before_days)
+        before_ctr = safe_ctr_pct(before["clicks"], before["impressions"])
 
-        d1_after = {"impressions": 0.0, "clicks": 0.0}
-        d3_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "gp_after_ads": float("nan")}
+        d1_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
+        d3_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
+        d7_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
+        d1_daily = _per_day(d1_after, 1.0)
+        d3_daily = _per_day(d3_after, 3.0)
+        d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
+        drr_after_d1 = 0.0
         drr_after_d3 = 0.0
+        drr_after_d7 = 0.0
 
+        # D+1: только ранний сигнал по трафику, без финального отката обычного повышения.
         d1_day = event_day + timedelta(days=1)
         if ctx.mature_end >= d1_day and status not in {"resolved"}:
             d1_after = aggregate_after_event(ads_df, key, d1_day, d1_day)
+            d1_daily = _per_day(d1_after, 1.0)
+            drr_after_d1 = safe_drr_pct(d1_after["spend"], d1_after["revenue"])
+            d1_traffic_grew = (
+                grew_enough(d1_daily["impressions"], before_daily["impressions"], 1.05)
+                or grew_enough(d1_daily["clicks"], before_daily["clicks"], 1.05)
+            )
             if direction == "raise":
                 if is_ramp_event:
-                    if grew_enough(d1_after["impressions"], before["impressions"], 1.05) or grew_enough(d1_after["clicks"], before["clicks"], 1.05):
-                        d1_verdict = "RAMP_D1_TRAFFIC_GROWTH"
-                    else:
-                        d1_verdict = "RAMP_D1_WAIT_WEEK"
-                    status = "d1_done"
-                elif grew_enough(d1_after["impressions"], before["impressions"], 1.05) or grew_enough(d1_after["clicks"], before["clicks"], 1.05):
-                    d1_verdict = "RAISE_D1_OK"
+                    d1_verdict = "RAMP_D1_TRAFFIC_GROWTH" if d1_traffic_grew else "RAMP_D1_WAIT_WEEK"
                     status = "d1_done"
                 else:
-                    d1_verdict = "RAISE_NO_TRAFFIC_GROWTH"
-                    final_verdict = "RAISE_NO_TRAFFIC_GROWTH"
-                    status = "resolved"
+                    d1_verdict = "RAISE_D1_OK" if d1_traffic_grew else "RAISE_D1_NO_TRAFFIC_YET"
+                    status = "d1_done"
             elif direction == "lower":
-                if retained_enough(d1_after["impressions"], before["impressions"], 0.80) and retained_enough(d1_after["clicks"], before["clicks"], 0.80):
-                    d1_verdict = "LOWER_D1_OK"
-                else:
-                    d1_verdict = "LOWER_TRAFFIC_DROP_RISK"
+                traffic_retained = (
+                    retained_enough(d1_daily["impressions"], before_daily["impressions"], 0.80)
+                    and retained_enough(d1_daily["clicks"], before_daily["clicks"], 0.80)
+                )
+                d1_verdict = "LOWER_D1_OK" if traffic_retained else "LOWER_TRAFFIC_DROP_RISK"
                 status = "d1_done"
             updated.at[idx, "d1_verdict"] = d1_verdict
             updated.at[idx, "d1_check_date"] = str(ctx.mature_end)
 
+        # D+3: финальная оценка обычного повышения/снижения. Сравнение только среднее/день.
         d3_end = event_day + timedelta(days=3)
         if ctx.mature_end >= d3_end and status not in {"resolved"}:
             d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d3_end)
+            d3_daily = _per_day(d3_after, 3.0)
             drr_after_d3 = safe_drr_pct(d3_after["spend"], d3_after["revenue"])
+            d3_traffic_grew = (
+                grew_enough(d3_daily["impressions"], before_daily["impressions"], 1.05)
+                or grew_enough(d3_daily["clicks"], before_daily["clicks"], 1.05)
+            )
+            traffic_retained = (
+                retained_enough(d3_daily["impressions"], before_daily["impressions"], 0.80)
+                and retained_enough(d3_daily["clicks"], before_daily["clicks"], 0.80)
+            )
+            orders_retained = retained_enough(d3_daily["orders"], before_daily["orders"], 0.90)
+            revenue_retained = retained_enough(d3_daily["revenue"], before_daily["revenue"], 0.90)
+            gp_retained = ge_metric_factor(d3_daily["gp_after_ads"], before_daily["gp_after_ads"], 0.90)
+            gp_bad = lt_metric_factor(d3_daily["gp_after_ads"], before_daily["gp_after_ads"], 0.80)
+            drr_ok = drr_after_d3 <= drr_limit
+
             if direction == "raise":
                 if is_ramp_event:
                     d3_verdict = "RAMP_D3_MONITOR_WEEK"
                     final_verdict = ""
                     status = "d3_done"
-                elif drr_after_d3 > before["drr"] + 2.0:
+                elif (not drr_ok) and (not orders_retained or not revenue_retained or gp_bad):
                     d3_verdict = "RAISE_BAD"
                     final_verdict = "RAISE_BAD"
-                elif d3_after["spend"] > before["spend"] and d3_after["orders"] <= before["orders"] and ge_metric(before["gp"], d3_after["gp_after_ads"]):
-                    d3_verdict = "RAISE_BAD"
-                    final_verdict = "RAISE_BAD"
-                elif ge_metric(d3_after["orders"], before["orders"]) and ge_metric(d3_after["revenue"], before["revenue"]) and ge_metric(d3_after["gp_after_ads"], before["gp"]):
+                    status = "resolved"
+                elif d3_traffic_grew and drr_ok and orders_retained and revenue_retained and gp_retained:
                     d3_verdict = "RAISE_GOOD"
                     final_verdict = "RAISE_GOOD"
+                    status = "resolved"
+                elif (not d3_traffic_grew) and drr_ok and orders_retained and revenue_retained:
+                    d3_verdict = "RAISE_NO_TRAFFIC_GROWTH"
+                    final_verdict = "RAISE_NO_TRAFFIC_GROWTH"
+                    status = "resolved"
                 else:
                     d3_verdict = "RAISE_D3_MIXED"
                     final_verdict = "RAISE_D3_MIXED"
+                    status = "resolved"
             elif direction == "lower":
-                if drr_after_d3 < before["drr"] and ge_metric_factor(d3_after["gp_after_ads"], before["gp"], 0.95) and ge_metric_factor(d3_after["orders"], before["orders"], 0.90):
+                if drr_after_d3 < before_drr and orders_retained and gp_retained and traffic_retained:
                     d3_verdict = "LOWER_GOOD"
                     final_verdict = "LOWER_GOOD"
-                elif lt_metric_factor(d3_after["orders"], before["orders"], 0.90) and lt_metric_factor(d3_after["gp_after_ads"], before["gp"], 0.95) and drr_after_d3 >= before["drr"]:
+                elif (not traffic_retained or not orders_retained or gp_bad) and drr_after_d3 >= before_drr:
                     d3_verdict = "LOWER_BAD"
                     final_verdict = "LOWER_BAD"
                 else:
                     d3_verdict = "LOWER_D3_MIXED"
                     final_verdict = "LOWER_D3_MIXED"
-            if not is_ramp_event:
                 status = "resolved"
             updated.at[idx, "d3_verdict"] = d3_verdict
             updated.at[idx, "d3_check_date"] = str(ctx.mature_end)
 
+        # D+7: финальная оценка разгона.
         if is_ramp_event:
             d7_end = event_day + timedelta(days=RAMP_CHECK_DAYS)
             if ctx.mature_end >= d7_end and status not in {"resolved"}:
                 d7_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d7_end)
-                avg_imp_d7 = float(d7_after.get("impressions", 0.0) or 0.0) / float(RAMP_CHECK_DAYS)
-                avg_spend_d7 = float(d7_after.get("spend", 0.0) or 0.0) / float(RAMP_CHECK_DAYS)
-                gp_d7 = d7_after.get("gp_after_ads", float("nan"))
-                if not pd.isna(gp_d7) and float(gp_d7) < 0:
+                d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
+                drr_after_d7 = safe_drr_pct(d7_after["spend"], d7_after["revenue"])
+                avg_imp_d7 = d7_daily["impressions"]
+                avg_spend_d7 = d7_daily["spend"]
+                gp_d7_daily = d7_daily["gp_after_ads"]
+                if not pd.isna(gp_d7_daily) and float(gp_d7_daily) < 0:
                     d7_verdict = "RAMP_NEGATIVE_GP_D7"
                     final_verdict = "RAMP_NEGATIVE_GP_D7"
                 elif avg_spend_d7 > RAMP_MAX_SPEND_PER_DAY:
                     d7_verdict = "RAMP_SPEND_OVER_LIMIT_D7"
                     final_verdict = "RAMP_SPEND_OVER_LIMIT_D7"
-                elif avg_imp_d7 >= RAMP_TARGET_IMPRESSIONS_PER_DAY and (pd.isna(gp_d7) or float(gp_d7) >= 0):
+                elif avg_imp_d7 >= RAMP_TARGET_IMPRESSIONS_PER_DAY and (pd.isna(gp_d7_daily) or float(gp_d7_daily) >= 0):
                     d7_verdict = "RAMP_GOOD_D7"
                     final_verdict = "RAMP_GOOD_D7"
                 else:
@@ -2095,30 +2265,78 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
                 updated.at[idx, "d7_check_date"] = str(ctx.mature_end)
                 status = "resolved"
 
+        # Для отчёта считаем доступные after-окна независимо от текущего status, если данные уже зрелые.
+        if ctx.mature_end >= d1_day:
+            d1_after = aggregate_after_event(ads_df, key, d1_day, d1_day)
+            d1_daily = _per_day(d1_after, 1.0)
+            drr_after_d1 = safe_drr_pct(d1_after["spend"], d1_after["revenue"])
+        if ctx.mature_end >= d3_end:
+            d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d3_end)
+            d3_daily = _per_day(d3_after, 3.0)
+            drr_after_d3 = safe_drr_pct(d3_after["spend"], d3_after["revenue"])
+        if is_ramp_event:
+            d7_end = event_day + timedelta(days=RAMP_CHECK_DAYS)
+            if ctx.mature_end >= d7_end:
+                d7_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d7_end)
+                d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
+                drr_after_d7 = safe_drr_pct(d7_after["spend"], d7_after["revenue"])
+
         updated.at[idx, "postcheck_status"] = status
         updated.at[idx, "final_verdict"] = final_verdict
 
-        if not drr_after_d3 and ctx.mature_end >= event_day + timedelta(days=3):
-            d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), event_day + timedelta(days=3))
-            drr_after_d3 = safe_drr_pct(d3_after["spend"], d3_after["revenue"])
-        if ctx.mature_end >= d1_day:
-            d1_after = aggregate_after_event(ads_df, key, d1_day, d1_day)
-        if ctx.mature_end >= event_day + timedelta(days=3):
-            d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), event_day + timedelta(days=3))
+        target_action, target_text, recommended_next_bid = _postcheck_target_action(
+            final_verdict, direction, is_ramp_event, _event_num(row, "new_bid_rub", 0.0), step
+        )
+
+        after_d1_ctr = safe_ctr_pct(d1_after["clicks"], d1_after["impressions"])
+        after_d3_ctr = safe_ctr_pct(d3_after["clicks"], d3_after["impressions"])
+        after_d7_ctr = safe_ctr_pct(d7_after["clicks"], d7_after["impressions"])
 
         effects.append({
             "event_id": row.get("event_id", ""),
             "campaign_id": row.get("campaign_id", ""),
             "nm_id": row.get("nm_id", ""),
+            "supplier_article": row.get("supplier_article", ""),
+            "subject_norm": row.get("subject_norm", ""),
             "placement": row.get("placement", ""),
             "direction": direction,
             "event_date": row.get("event_date", ""),
+            "old_bid_rub": row.get("old_bid_rub", ""),
+            "new_bid_rub": row.get("new_bid_rub", ""),
+            "reason_code": event_reason_code,
+            "before_window_days": before_days,
+            "after_d1_days": 1 if ctx.mature_end >= d1_day else 0,
+            "after_d3_days": 3 if ctx.mature_end >= d3_end else 0,
+            "after_d7_days": RAMP_CHECK_DAYS if is_ramp_event and ctx.mature_end >= event_day + timedelta(days=RAMP_CHECK_DAYS) else 0,
+            "before_spend": before["spend"], "after_d1_spend": d1_after["spend"], "after_d3_spend": d3_after["spend"], "after_d7_spend": d7_after["spend"],
+            "before_spend_per_day": before_daily["spend"], "after_d1_spend_per_day": d1_daily["spend"], "after_d3_spend_per_day": d3_daily["spend"], "after_d7_spend_per_day": d7_daily["spend"],
+            "before_revenue": before["revenue"], "after_d1_revenue": d1_after["revenue"], "after_d3_revenue": d3_after["revenue"], "after_d7_revenue": d7_after["revenue"],
+            "before_revenue_per_day": before_daily["revenue"], "after_d1_revenue_per_day": d1_daily["revenue"], "after_d3_revenue_per_day": d3_daily["revenue"], "after_d7_revenue_per_day": d7_daily["revenue"],
+            "before_orders": before["orders"], "after_d1_orders": d1_after["orders"], "after_d3_orders": d3_after["orders"], "after_d7_orders": d7_after["orders"],
+            "before_orders_per_day": before_daily["orders"], "after_d1_orders_per_day": d1_daily["orders"], "after_d3_orders_per_day": d3_daily["orders"], "after_d7_orders_per_day": d7_daily["orders"],
+            "before_impressions": before["impressions"], "after_d1_impressions": d1_after["impressions"], "after_d3_impressions": d3_after["impressions"], "after_d7_impressions": d7_after["impressions"],
+            "before_impressions_per_day": before_daily["impressions"], "after_d1_impressions_per_day": d1_daily["impressions"], "after_d3_impressions_per_day": d3_daily["impressions"], "after_d7_impressions_per_day": d7_daily["impressions"],
+            "before_clicks": before["clicks"], "after_d1_clicks": d1_after["clicks"], "after_d3_clicks": d3_after["clicks"], "after_d7_clicks": d7_after["clicks"],
+            "before_clicks_per_day": before_daily["clicks"], "after_d1_clicks_per_day": d1_daily["clicks"], "after_d3_clicks_per_day": d3_daily["clicks"], "after_d7_clicks_per_day": d7_daily["clicks"],
+            "before_ctr_pct": before_ctr, "after_d1_ctr_pct": after_d1_ctr, "after_d3_ctr_pct": after_d3_ctr, "after_d7_ctr_pct": after_d7_ctr,
+            "before_drr_pct": before_drr, "after_d1_drr_pct": drr_after_d1, "after_d3_drr_pct": drr_after_d3, "after_d7_drr_pct": drr_after_d7,
+            "before_gp": before["gp_after_ads"], "after_d1_gp": d1_after["gp_after_ads"], "after_d3_gp": d3_after["gp_after_ads"], "after_d7_gp": d7_after["gp_after_ads"],
+            "before_gp_per_day": before_daily["gp_after_ads"], "after_d1_gp_per_day": d1_daily["gp_after_ads"], "after_d3_gp_per_day": d3_daily["gp_after_ads"], "after_d7_gp_per_day": d7_daily["gp_after_ads"],
             "d1_verdict": d1_verdict,
             "d3_verdict": d3_verdict,
             "d7_verdict": _clean_text_value(updated.at[idx, "d7_verdict"]) if "d7_verdict" in updated.columns else d7_verdict,
             "final_verdict": final_verdict,
             "postcheck_status": status,
-            "drr_before": before["drr"],
+            "target_bid_action": target_action,
+            "target_bid_action_text": target_text,
+            "recommended_next_bid_rub": recommended_next_bid,
+            "traffic_delta_d1_pct": _pct_delta(d1_daily["impressions"], before_daily["impressions"]),
+            "traffic_delta_d3_pct": _pct_delta(d3_daily["impressions"], before_daily["impressions"]),
+            "orders_delta_d3_pct": _pct_delta(d3_daily["orders"], before_daily["orders"]),
+            "revenue_delta_d3_pct": _pct_delta(d3_daily["revenue"], before_daily["revenue"]),
+            "gp_delta_d3_pct": _pct_delta(d3_daily["gp_after_ads"], before_daily["gp_after_ads"]),
+            # обратная совместимость
+            "drr_before": before_drr,
             "drr_after_d3": drr_after_d3,
             "impressions_after_d1": d1_after.get("impressions", 0.0),
             "clicks_after_d1": d1_after.get("clicks", 0.0),
@@ -2128,7 +2346,10 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
             "gp_after_d3": d3_after.get("gp_after_ads", float("nan")),
         })
 
-    return updated[BID_HISTORY_COLUMNS], pd.DataFrame(effects)
+    effect_df = pd.DataFrame(effects)
+    if effect_df.empty:
+        effect_df = bid_effect_empty_frame()
+    return updated[BID_HISTORY_COLUMNS], effect_df
 
 
 # =============================
@@ -2432,6 +2653,69 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
     }
 
 
+
+def business_min_bid_rub(placement: Any) -> float:
+    """Бизнес-минимум для отчёта и решений: поиск/CPC не ниже 4 ₽, полки/combined не ниже 80 ₽."""
+    placement_norm = normalize_placement_value(placement)
+    if placement_norm == "combined":
+        return 80.0
+    if placement_norm in {"search", "recommendations"}:
+        return 4.0
+    return 1.0
+
+
+def is_ramp_related_reason(reason_code: Any, wait_rule: Any = "", last_reason_code: Any = "") -> bool:
+    text = " ".join([
+        _clean_text_value(reason_code).upper(),
+        _clean_text_value(wait_rule).upper(),
+        _clean_text_value(last_reason_code).upper(),
+    ])
+    return "RAMP" in text or "РАЗГОН" in text or "LOW_BID_NO_SPEND_NO_ORDERS" in text or "WAIT_D7" in text
+
+
+def is_ramp_candidate_by_metrics(row: pd.Series | Dict[str, Any]) -> bool:
+    """Кампания подходит под режим разгона по текущим метрикам: мало показов и расход в лимите."""
+    if not is_active_campaign(row.get("campaign_status", "")):
+        return False
+    if not is_managed_subject(row.get("subject_norm", "")):
+        return False
+    avg_imp = money_or_zero(row.get("avg_impressions_per_day", 0))
+    avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
+    return avg_imp < RAMP_TARGET_IMPRESSIONS_PER_DAY and avg_spend <= RAMP_MAX_SPEND_PER_DAY
+
+
+def classify_ramp_status(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, bool]:
+    """Возвращает статус режима Разгон для отчёта: статус, группа причины, применён ли режим."""
+    reason_code = _clean_text_value(row.get("reason_code", ""))
+    wait_rule = _clean_text_value(row.get("wait_rule", ""))
+    wait_status = _clean_text_value(row.get("wait_status", ""))
+    last_reason = _clean_text_value(row.get("last_bid_change_reason_code", ""))
+    action = _clean_text_value(row.get("action", ""))
+    api_status = _clean_text_value(row.get("api_status", row.get("ramp_api_status", "")))
+    candidate = is_ramp_candidate_by_metrics(row)
+    related = is_ramp_related_reason(reason_code, wait_rule, last_reason)
+    reason_upper = reason_code.upper()
+    wait_upper = wait_rule.upper()
+    api_ok = api_status.isdigit() and 200 <= int(api_status) < 300
+
+    if api_ok and action == "Повысить" and related:
+        return "РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", "APPLIED_NOW", True
+    if ("WAIT_D7_RAMP" in reason_upper or "WAIT_D7_RAMP" in wait_upper or "RAMP" in last_reason.upper()) and wait_status == "WAIT_ACTIVE":
+        return "РАЗГОН_АКТИВЕН_ЖДЕМ_D7", "ACTIVE_WAIT_D7", True
+    if related and "WB_MIN_BID_NOT_ALLOWED" in reason_upper:
+        return "РАЗГОН_ПОДХОДИТ_НО_БЛОК_MIN_WB", "BLOCKED_BY_MIN_BID", False
+    if action == "Повысить" and related:
+        return "РАЗГОН_К_ОТПРАВКЕ", "TO_SEND", False
+    if candidate and wait_status == "WAIT_ACTIVE" and not related:
+        return "РАЗГОН_ПОДХОДИТ_НО_ЖДЕМ_ДРУГОЙ_POSTCHECK", "WAIT_OTHER_POSTCHECK", False
+    if candidate and reason_code in {"NOT_ACTIVE", "MISSING_KEY", "NOT_MANAGED_SUBJECT"}:
+        return "РАЗГОН_НЕ_МОЖЕТ_БЫТЬ_ПРИМЕНЕН", "TECHNICAL_BLOCK", False
+    if candidate:
+        return "РАЗГОН_ПОДХОДИТ_ПО_МЕТРИКАМ_НО_НЕ_ВКЛЮЧЕН", "CANDIDATE_BY_METRICS", False
+    if related:
+        return "РАЗГОН_КОНТРОЛЬ", "RELATED_CONTROL", False
+    return "", "", False
+
 def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, str, str], Dict[str, Any]], postcheck_results: Dict[Tuple[str, str, str], Dict[str, Any]], ctx: Optional[RunContext] = None) -> pd.DataFrame:
     if metrics_df.empty:
         return pd.DataFrame(columns=DECISION_COLUMNS)
@@ -2495,6 +2779,11 @@ def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, st
             "wait_status": wait_info.get("wait_status", ""),
             "pause_decision": decision.get("pause_decision", ""),
         }
+        ramp_status, ramp_reason_group, ramp_applied = classify_ramp_status(out)
+        out["ramp_candidate"] = bool(is_ramp_candidate_by_metrics(out))
+        out["ramp_status"] = ramp_status
+        out["ramp_applied_in_current_run"] = bool(ramp_applied and _clean_text_value(out.get("ramp_api_status", "")))
+        out["ramp_api_status"] = ""
         rows.append(out)
     result = pd.DataFrame(rows)
     for col in DECISION_COLUMNS:
@@ -2686,6 +2975,9 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
         min_bid = lookup.get(key)
         if min_bid is None:
             continue
+        # Используем эффективный минимум: максимум из WB API min и нашего бизнес-минимума.
+        # Для поиска/рекомендаций бизнес-минимум 4 ₽, для combined/полок 80 ₽.
+        min_bid = max(float(min_bid), business_min_bid_rub(row.get("placement", "")))
         result.at[idx, "min_bid_rub"] = round(min_bid, 2)
 
         current_bid = pd.to_numeric(row.get("current_bid_rub", None), errors="coerce")
@@ -2785,14 +3077,28 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
             continue
 
         if row.get("action") != "Снизить":
-            # Для повышения/разгона тоже нельзя отправлять ставку ниже минимума WB: WB отклонит запрос.
+            # Для повышения/разгона нельзя отправлять ставку ниже минимума WB: WB отклонит запрос.
+            # Но если это именно Разгон, корректно поднимаем ставку сразу до effective min_bid,
+            # иначе combined/полки с текущей ставкой 3-5 ₽ никогда не выйдут в рабочую минимальную ставку 80 ₽.
             if not pd.isna(new_bid) and float(new_bid) < float(min_bid) and row.get("action") == "Повысить":
-                result.at[idx, "action"] = "Без изменений"
-                result.at[idx, "new_bid_rub"] = None
                 rc = _clean_text_value(result.at[idx, "reason_code"])
-                result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_NOT_ALLOWED").strip("_")
-                result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"расчётная ставка {float(new_bid):.2f} ₽ ниже минимально допустимой WB {float(min_bid):.2f} ₽; не отправляем заведомо невалидную ставку")
-                result.at[idx, "pause_decision"] = ""
+                if is_ramp_related_reason(rc) or is_ramp_candidate_by_metrics(row):
+                    adjusted_bid = round(float(min_bid), 2)
+                    result.at[idx, "new_bid_rub"] = adjusted_bid
+                    result.at[idx, "reason_code"] = (rc + "__TO_EFFECTIVE_MIN_BID").strip("_")
+                    result.at[idx, "reason_text"] = build_reason_text(
+                        result.loc[idx],
+                        "Повысить",
+                        adjusted_bid,
+                        f"разгон: расчётная ставка {float(new_bid):.2f} ₽ ниже effective min_bid {float(min_bid):.2f} ₽; ставим сразу минимально допустимую ставку"
+                    )
+                    result.at[idx, "pause_decision"] = ""
+                else:
+                    result.at[idx, "action"] = "Без изменений"
+                    result.at[idx, "new_bid_rub"] = None
+                    result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_NOT_ALLOWED").strip("_")
+                    result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"расчётная ставка {float(new_bid):.2f} ₽ ниже минимально допустимой WB/effective min {float(min_bid):.2f} ₽; не отправляем заведомо невалидную ставку")
+                    result.at[idx, "pause_decision"] = ""
             continue
         if pd.isna(new_bid):
             continue
@@ -3482,36 +3788,130 @@ def append_api_log_to_s3(s3_client, config: Config, new_log: pd.DataFrame) -> pd
 # Разгон показов и эксперимент 1 РК на товарную группу
 # =============================
 
+
+def enrich_supplier_articles_from_rename_plan(df: pd.DataFrame, rename_plan: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Подтягивает короткий артикул продавца из плана переименования в основные листы отчёта."""
+    if df is None or df.empty or rename_plan is None or rename_plan.empty:
+        return df if df is not None else pd.DataFrame()
+    if "campaign_id" not in df.columns:
+        return df
+    result = df.copy()
+    if "supplier_article" not in result.columns:
+        result["supplier_article"] = ""
+    rp = rename_plan.copy()
+    if "campaign_id" not in rp.columns or "supplier_article" not in rp.columns:
+        return result
+    rp["campaign_id_clean"] = rp["campaign_id"].map(_clean_id_value)
+    article_map = {
+        _clean_id_value(r.get("campaign_id", "")): _clean_text_value(r.get("supplier_article", ""))
+        for _, r in rp.iterrows()
+        if _clean_id_value(r.get("campaign_id", "")) and _clean_text_value(r.get("supplier_article", ""))
+    }
+    for idx, row in result.iterrows():
+        cur = _clean_text_value(row.get("supplier_article", ""))
+        if cur:
+            continue
+        art = article_map.get(_clean_id_value(row.get("campaign_id", "")), "")
+        if art:
+            result.at[idx, "supplier_article"] = art
+    return result
+
+
+def enrich_decisions_with_bid_api_status(decisions: pd.DataFrame, successful_changes: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Фиксирует в Решениях, какие ставки реально ушли в WB, и обновляет ramp_status."""
+    if decisions is None or decisions.empty:
+        return decisions if decisions is not None else pd.DataFrame(columns=DECISION_COLUMNS)
+    result = decisions.copy()
+    if "ramp_api_status" not in result.columns:
+        result["ramp_api_status"] = ""
+    if "ramp_applied_in_current_run" not in result.columns:
+        result["ramp_applied_in_current_run"] = False
+    success_map: Dict[Tuple[str, str, str], str] = {}
+    if successful_changes is not None and not successful_changes.empty:
+        for _, r in successful_changes.iterrows():
+            success_map[make_key(r)] = _clean_text_value(r.get("api_status", ""))
+    for idx, row in result.iterrows():
+        key = make_key(row)
+        if key in success_map:
+            result.at[idx, "ramp_api_status"] = success_map[key]
+        tmp = result.loc[idx].to_dict()
+        if key in success_map:
+            tmp["api_status"] = success_map[key]
+        status, reason_group, applied = classify_ramp_status(tmp)
+        result.at[idx, "ramp_candidate"] = bool(is_ramp_candidate_by_metrics(tmp))
+        result.at[idx, "ramp_status"] = status
+        result.at[idx, "ramp_applied_in_current_run"] = bool(key in success_map and is_ramp_related_reason(tmp.get("reason_code", ""), tmp.get("wait_rule", ""), tmp.get("last_bid_change_reason_code", "")))
+    for col in DECISION_COLUMNS:
+        if col not in result.columns:
+            result[col] = ""
+    return result[DECISION_COLUMNS]
+
+
 def build_bid_ramp_monitor(decisions: pd.DataFrame) -> pd.DataFrame:
+    """Лист Разгон_показов: показывает не только отправленные изменения, но и весь статус режима Разгон.
+
+    В лист попадают:
+    - кампании, которые подходят под разгон по метрикам: <1000 показов/день и расход <=500 ₽/день;
+    - кампании, где режим Разгон уже активен и ждёт D+7;
+    - кампании, где Разгон был заблокирован/скорректирован минимумом ставки WB.
+    """
     if decisions is None or decisions.empty:
         return pd.DataFrame(columns=BID_RAMP_MONITOR_COLUMNS)
     rows: List[Dict[str, Any]] = []
     for _, row in decisions.iterrows():
         rc = _clean_text_value(row.get("reason_code", ""))
-        if not (rc.startswith("RAMP_TO_1000_IMPRESSIONS_PER_DAY") or rc.startswith("LOW_BID_NO_SPEND_NO_ORDERS_RAMP")):
+        related = is_ramp_related_reason(rc, row.get("wait_rule", ""), row.get("last_bid_change_reason_code", ""))
+        candidate = is_ramp_candidate_by_metrics(row)
+        if not related and not candidate:
             continue
+        status, reason_group, applied = classify_ramp_status(row)
         rows.append({
             "campaign_id": row.get("campaign_id", ""),
             "nm_id": row.get("nm_id", ""),
             "supplier_article": row.get("supplier_article", ""),
             "subject_norm": row.get("subject_norm", ""),
             "placement": row.get("placement", ""),
+            "campaign_status": row.get("campaign_status", ""),
+            "ramp_candidate": bool(candidate),
+            "ramp_mode_status": status,
+            "ramp_applied_in_current_run": bool(row.get("ramp_applied_in_current_run", False)),
+            "ramp_reason_group": reason_group,
             "current_bid_rub": row.get("current_bid_rub", 0),
+            "min_bid_rub": row.get("min_bid_rub", ""),
             "new_bid_rub": row.get("new_bid_rub", ""),
+            "api_status": row.get("ramp_api_status", ""),
             "reason_code": rc,
+            "reason_text": row.get("reason_text", ""),
+            "wait_status": row.get("wait_status", ""),
+            "wait_rule": row.get("wait_rule", ""),
+            "wait_until_date": row.get("wait_until_date", ""),
+            "wait_days_left": row.get("wait_days_left", ""),
+            "last_bid_change_date": row.get("last_bid_change_date", ""),
+            "last_bid_change_old_bid": row.get("last_bid_change_old_bid", ""),
+            "last_bid_change_new_bid": row.get("last_bid_change_new_bid", ""),
+            "last_bid_change_reason_code": row.get("last_bid_change_reason_code", ""),
             "impressions": row.get("impressions", 0),
             "avg_impressions_per_day": row.get("avg_impressions_per_day", 0),
             "spend": row.get("spend", 0),
             "avg_spend_per_day": row.get("avg_spend_per_day", 0),
             "orders": row.get("orders", 0),
             "revenue": row.get("revenue", 0),
+            "campaign_drr_pct": row.get("campaign_drr_pct", 0),
+            "drr_limit_pct": row.get("drr_limit_pct", 0),
+            "last21_impressions": row.get("last21_impressions", 0),
+            "last21_drr_pct": row.get("last21_drr_pct", 0),
             "target_impressions_per_day": RAMP_TARGET_IMPRESSIONS_PER_DAY,
             "max_spend_per_day": RAMP_MAX_SPEND_PER_DAY,
             "check_days": RAMP_CHECK_DAYS,
-            "monitor_status": "raise_bid_and_check_week",
+            "monitor_status": status or "not_ramp",
         })
-    return pd.DataFrame(rows, columns=BID_RAMP_MONITOR_COLUMNS)
-
+    out = pd.DataFrame(rows)
+    for col in BID_RAMP_MONITOR_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    if not out.empty:
+        out = out.sort_values(["ramp_reason_group", "subject_norm", "avg_impressions_per_day"], ascending=[True, True, True])
+    return out[BID_RAMP_MONITOR_COLUMNS]
 
 def keyword_core_stats_for_group(keyword_core_df: pd.DataFrame, subject_norm: str, product_group: str, supplier_articles: Iterable[Any]) -> Dict[str, Any]:
     if keyword_core_df is None or keyword_core_df.empty:
@@ -3741,6 +4141,370 @@ def build_summary(ctx: RunContext, decisions: pd.DataFrame, successful_changes: 
     }
 
 
+
+# =============================
+# Диагностика РК: нормальное сравнение 7 дней до/после изменения ставки
+# =============================
+
+def _date_window_label(start_date: Optional[date], end_date: Optional[date]) -> str:
+    if not start_date or not end_date or end_date < start_date:
+        return ""
+    return f"{start_date.isoformat()}..{end_date.isoformat()}"
+
+
+def _window_days_count(start_date: Optional[date], end_date: Optional[date]) -> int:
+    if not start_date or not end_date or end_date < start_date:
+        return 0
+    return int((end_date - start_date).days + 1)
+
+
+def _sum_window_campaign_metrics(ads_df: pd.DataFrame, key: Tuple[str, str, str], start_date: Optional[date], end_date: Optional[date]) -> Dict[str, float]:
+    if not start_date or not end_date or end_date < start_date:
+        return {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
+    return aggregate_after_event(ads_df, key, start_date, end_date)
+
+
+def _safe_per_day_value(value: Any, days: int) -> float:
+    if days <= 0:
+        return 0.0
+    val = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(val):
+        return float("nan")
+    return float(val) / float(days)
+
+
+def _safe_delta_pct(after: Any, before: Any) -> Any:
+    before_num = pd.to_numeric(pd.Series([before]), errors="coerce").iloc[0]
+    after_num = pd.to_numeric(pd.Series([after]), errors="coerce").iloc[0]
+    if pd.isna(before_num) or pd.isna(after_num) or float(before_num) == 0:
+        return ""
+    return (float(after_num) / float(before_num) - 1.0) * 100.0
+
+
+def _safe_delta_pp(after: Any, before: Any) -> Any:
+    before_num = pd.to_numeric(pd.Series([before]), errors="coerce").iloc[0]
+    after_num = pd.to_numeric(pd.Series([after]), errors="coerce").iloc[0]
+    if pd.isna(before_num) or pd.isna(after_num):
+        return ""
+    return float(after_num) - float(before_num)
+
+
+def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
+    vals = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce").fillna(0.0)
+    mask = vals.notna() & (w > 0)
+    if mask.any() and float(w.loc[mask].sum()) > 0:
+        return float((vals.loc[mask] * w.loc[mask]).sum() / w.loc[mask].sum())
+    vals = vals.dropna()
+    return float(vals.mean()) if not vals.empty else 0.0
+
+
+def _core80_queries_for_nm(keyword_core_df: pd.DataFrame, nm_id: str, supplier_article: str = "") -> set[str]:
+    if keyword_core_df is None or keyword_core_df.empty or "query_text_norm" not in keyword_core_df.columns:
+        return set()
+    core = keyword_core_df.copy()
+    if "keyword_group" in core.columns:
+        core = core[core["keyword_group"].astype(str).eq("CORE_80")].copy()
+    core = core[core["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy() if "nm_id" in core.columns else core.iloc[0:0].copy()
+    if supplier_article and "supplier_article" in core.columns:
+        art_core = core[core["supplier_article"].astype(str).map(_clean_text_value).eq(_clean_text_value(supplier_article))].copy()
+        if not art_core.empty:
+            core = art_core
+    return set(core["query_text_norm"].astype(str).str.strip().str.lower().tolist())
+
+
+def _aggregate_core80_keyword_window(keyword_df: pd.DataFrame, keyword_core_df: pd.DataFrame, nm_id: str, supplier_article: str, start_date: Optional[date], end_date: Optional[date]) -> Dict[str, float]:
+    empty = {"queries_count": 0.0, "avg_position": 0.0, "visibility_pct": 0.0, "query_freq": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0}
+    if keyword_df is None or keyword_df.empty or not start_date or not end_date or end_date < start_date:
+        return empty
+    queries = _core80_queries_for_nm(keyword_core_df, nm_id, supplier_article)
+    if not queries:
+        return empty
+    part = keyword_df.copy()
+    if "nm_id" in part.columns:
+        part = part[part["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy()
+    if supplier_article and "supplier_article" in part.columns:
+        art_part = part[part["supplier_article"].astype(str).map(_clean_text_value).eq(_clean_text_value(supplier_article))].copy()
+        if not art_part.empty:
+            part = art_part
+    if "query_text_norm" in part.columns:
+        part = part[part["query_text_norm"].astype(str).str.strip().str.lower().isin(queries)].copy()
+    if has_valid_dates(part):
+        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
+    if part.empty:
+        return {**empty, "queries_count": float(len(queries))}
+    query_freq = pd.to_numeric(part.get("query_freq", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    return {
+        "queries_count": float(len(queries)),
+        "avg_position": _weighted_average(part.get("median_position", pd.Series(dtype=float)), query_freq),
+        "visibility_pct": _weighted_average(part.get("visibility_pct", pd.Series(dtype=float)), query_freq),
+        "query_freq": float(query_freq.sum()),
+        "clicks_to_card": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+        "keyword_orders": float(pd.to_numeric(part.get("keyword_orders", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
+    }
+
+
+def _aggregate_funnel_card_views_window(funnel_df: pd.DataFrame, nm_id: str, start_date: Optional[date], end_date: Optional[date]) -> float:
+    if funnel_df is None or funnel_df.empty or not start_date or not end_date or end_date < start_date:
+        return 0.0
+    part = funnel_df.copy()
+    if "nm_id" not in part.columns:
+        return 0.0
+    part = part[part["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy()
+    if has_valid_dates(part):
+        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
+    if part.empty:
+        return 0.0
+    return float(pd.to_numeric(part.get("card_views", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
+
+
+def _latest_bid_event_by_key(bid_history: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    if bid_history is None or bid_history.empty:
+        return {}
+    local = bid_history.copy()
+    for col in BID_HISTORY_COLUMNS:
+        if col not in local.columns:
+            local[col] = ""
+    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce")
+    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
+    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], na_position="first")
+    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for _, row in local.iterrows():
+        key = make_key(row)
+        if all(key):
+            out[key] = row.to_dict()
+    return out
+
+
+def _effect_by_event_id(effect_df: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    if effect_df is None or effect_df.empty or "event_id" not in effect_df.columns:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, row in effect_df.iterrows():
+        eid = _clean_text_value(row.get("event_id", ""))
+        if eid:
+            out[eid] = row.to_dict()
+    return out
+
+
+def _bid_compare_conclusion(
+    action: str,
+    reason_code: str,
+    final_verdict: str,
+    target_action: str,
+    before_gp_day: Any,
+    after_gp_day: Any,
+    before_drr: float,
+    after_drr: float,
+    before_pos: float,
+    after_pos: float,
+    before_visibility: float,
+    after_visibility: float,
+) -> str:
+    gp_delta = _safe_delta_pct(after_gp_day, before_gp_day)
+    drr_delta = _safe_delta_pp(after_drr, before_drr)
+    pos_delta = _safe_delta_pp(after_pos, before_pos)
+    vis_delta = _safe_delta_pp(after_visibility, before_visibility)
+    gp_text = "ВП/день н/д"
+    if gp_delta != "":
+        gp_text = f"ВП после рекламы/день {'выросла' if float(gp_delta) >= 0 else 'упала'} на {float(gp_delta):.1f}%"
+    drr_text = f"ДРР {before_drr:.2f}%→{after_drr:.2f}%" if before_drr or after_drr else "ДРР н/д"
+    pos_text = "позиция CORE80 н/д"
+    if pos_delta != "":
+        pos_text = f"позиция CORE80 {before_pos:.1f}→{after_pos:.1f} ({float(pos_delta):+.1f}; меньше лучше)"
+    vis_text = "видимость CORE80 н/д"
+    if vis_delta != "":
+        vis_text = f"видимость {before_visibility:.1f}%→{after_visibility:.1f}% ({float(vis_delta):+.1f} п.п.)"
+    decision_text = f"Решение кода: {action or 'Без изменений'} / {reason_code or 'без reason_code'}"
+    if final_verdict:
+        decision_text += f"; post-check={final_verdict}"
+    if target_action:
+        decision_text += f"; целевое действие={target_action}"
+    return "; ".join([gp_text, drr_text, pos_text, vis_text, decision_text])
+
+
+def build_campaign_7d_comparison(
+    decisions: pd.DataFrame,
+    bid_history: pd.DataFrame,
+    ads_df: pd.DataFrame,
+    keyword_df: pd.DataFrame,
+    keyword_core_df: pd.DataFrame,
+    funnel_df: pd.DataFrame,
+    effect_df: Optional[pd.DataFrame],
+    ctx: RunContext,
+) -> pd.DataFrame:
+    """Строит диагностический лист: РК × nm × placement, сравнение 7 дней до/после последней ставки.
+
+    Если по строке есть последняя успешная правка ставки, окно ДО = 7 дней до event_date,
+    окно ПОСЛЕ = до 7 зрелых дней после event_date. Если истории правки нет, сравниваем
+    последние 7 зрелых дней с предыдущими 7 днями. Метрики CORE_80 берутся по продающим
+    запросам, которые формируют 80% заказов по SKU; доля трафика = переходы в карточку
+    из воронки / частотность CORE_80.
+    """
+    if decisions is None or decisions.empty:
+        return pd.DataFrame(columns=BID_CAMPAIGN_COMPARE_COLUMNS)
+    latest_events = _latest_bid_event_by_key(bid_history)
+    effects = _effect_by_event_id(effect_df)
+    rows: List[Dict[str, Any]] = []
+    current_after_end = ctx.mature_end
+    current_after_start = current_after_end - timedelta(days=6)
+    current_before_end = current_after_start - timedelta(days=1)
+    current_before_start = current_before_end - timedelta(days=6)
+
+    for _, decision in decisions.iterrows():
+        key = make_key(decision)
+        if not all(key):
+            continue
+        event = latest_events.get(key)
+        comparison_status = "NO_BID_CHANGE_HISTORY_COMPARE_LAST_7D"
+        old_bid = ""
+        new_bid = ""
+        change_reason = ""
+        event_date_text = ""
+        if event:
+            event_dt = pd.to_datetime(event.get("event_date", ""), errors="coerce")
+            if not pd.isna(event_dt):
+                event_day = event_dt.date()
+                before_start = event_day - timedelta(days=7)
+                before_end = event_day - timedelta(days=1)
+                after_start = event_day + timedelta(days=1)
+                after_end = min(ctx.mature_end, event_day + timedelta(days=7))
+                comparison_status = "BID_CHANGE_7D_BEFORE_AFTER"
+                event_date_text = event_day.isoformat()
+            else:
+                before_start, before_end = current_before_start, current_before_end
+                after_start, after_end = current_after_start, current_after_end
+            old_bid = event.get("old_bid_rub", "")
+            new_bid = event.get("new_bid_rub", "")
+            change_reason = _clean_text_value(event.get("reason_code", ""))
+        else:
+            before_start, before_end = current_before_start, current_before_end
+            after_start, after_end = current_after_start, current_after_end
+
+        before_days = _window_days_count(before_start, before_end)
+        after_days = _window_days_count(after_start, after_end)
+        before_metrics = _sum_window_campaign_metrics(ads_df, key, before_start, before_end)
+        after_metrics = _sum_window_campaign_metrics(ads_df, key, after_start, after_end)
+        before_daily = _per_day(before_metrics, before_days or 1)
+        after_daily = _per_day(after_metrics, after_days or 1)
+        before_ctr = safe_ctr_pct(before_metrics.get("clicks", 0), before_metrics.get("impressions", 0))
+        after_ctr = safe_ctr_pct(after_metrics.get("clicks", 0), after_metrics.get("impressions", 0))
+        before_drr = safe_drr_pct(before_metrics.get("spend", 0), before_metrics.get("revenue", 0))
+        after_drr = safe_drr_pct(after_metrics.get("spend", 0), after_metrics.get("revenue", 0))
+
+        nm_id = _clean_id_value(decision.get("nm_id", ""))
+        supplier_article = _clean_text_value(decision.get("supplier_article", ""))
+        before_kw = _aggregate_core80_keyword_window(keyword_df, keyword_core_df, nm_id, supplier_article, before_start, before_end)
+        after_kw = _aggregate_core80_keyword_window(keyword_df, keyword_core_df, nm_id, supplier_article, after_start, after_end)
+        before_card_views = _aggregate_funnel_card_views_window(funnel_df, nm_id, before_start, before_end)
+        after_card_views = _aggregate_funnel_card_views_window(funnel_df, nm_id, after_start, after_end)
+        before_share = safe_ctr_pct(before_card_views, before_kw.get("query_freq", 0))
+        after_share = safe_ctr_pct(after_card_views, after_kw.get("query_freq", 0))
+
+        event_id = _clean_text_value(event.get("event_id", "")) if event else ""
+        eff = effects.get(event_id, {}) if event_id else {}
+        final_verdict = _clean_text_value(eff.get("final_verdict", event.get("final_verdict", "") if event else ""))
+        target_action = _clean_text_value(eff.get("target_bid_action", ""))
+        target_text = _clean_text_value(eff.get("target_bid_action_text", ""))
+        recommended_next = eff.get("recommended_next_bid_rub", "") if eff else ""
+        action = _clean_text_value(decision.get("action", ""))
+        reason_code = _clean_text_value(decision.get("reason_code", ""))
+        reason_text = _clean_text_value(decision.get("reason_text", ""))
+        conclusion = _bid_compare_conclusion(
+            action, reason_code, final_verdict, target_action,
+            before_daily.get("gp_after_ads", float("nan")), after_daily.get("gp_after_ads", float("nan")),
+            before_drr, after_drr,
+            before_kw.get("avg_position", 0.0), after_kw.get("avg_position", 0.0),
+            before_kw.get("visibility_pct", 0.0), after_kw.get("visibility_pct", 0.0),
+        )
+
+        rows.append({
+            "campaign_id": decision.get("campaign_id", ""),
+            "nm_id": nm_id,
+            "supplier_article": supplier_article,
+            "subject_norm": decision.get("subject_norm", ""),
+            "placement": decision.get("placement", ""),
+            "campaign_status": decision.get("campaign_status", ""),
+            "comparison_status": comparison_status,
+            "last_bid_change_date": event_date_text,
+            "old_bid_rub": old_bid,
+            "new_bid_rub": new_bid,
+            "bid_change_reason_code": change_reason,
+            "before_period": _date_window_label(before_start, before_end),
+            "after_period": _date_window_label(after_start, after_end),
+            "before_days": before_days,
+            "after_days": after_days,
+            "current_action": action,
+            "current_reason_code": reason_code,
+            "current_reason_text": reason_text,
+            "postcheck_status": decision.get("postcheck_status", ""),
+            "final_verdict": final_verdict,
+            "target_bid_action": target_action,
+            "target_bid_action_text": target_text,
+            "recommended_next_bid_rub": recommended_next,
+            "before_impressions": before_metrics.get("impressions", 0),
+            "after_impressions": after_metrics.get("impressions", 0),
+            "before_impressions_per_day": before_daily.get("impressions", 0),
+            "after_impressions_per_day": after_daily.get("impressions", 0),
+            "impressions_delta_pct": _safe_delta_pct(after_daily.get("impressions", 0), before_daily.get("impressions", 0)),
+            "before_clicks": before_metrics.get("clicks", 0),
+            "after_clicks": after_metrics.get("clicks", 0),
+            "before_clicks_per_day": before_daily.get("clicks", 0),
+            "after_clicks_per_day": after_daily.get("clicks", 0),
+            "clicks_delta_pct": _safe_delta_pct(after_daily.get("clicks", 0), before_daily.get("clicks", 0)),
+            "before_ctr_pct": before_ctr,
+            "after_ctr_pct": after_ctr,
+            "ctr_delta_pp": _safe_delta_pp(after_ctr, before_ctr),
+            "before_orders_qty": before_metrics.get("orders", 0),
+            "after_orders_qty": after_metrics.get("orders", 0),
+            "before_orders_qty_per_day": before_daily.get("orders", 0),
+            "after_orders_qty_per_day": after_daily.get("orders", 0),
+            "orders_qty_delta_pct": _safe_delta_pct(after_daily.get("orders", 0), before_daily.get("orders", 0)),
+            "before_orders_sum_rub": before_metrics.get("revenue", 0),
+            "after_orders_sum_rub": after_metrics.get("revenue", 0),
+            "before_orders_sum_rub_per_day": before_daily.get("revenue", 0),
+            "after_orders_sum_rub_per_day": after_daily.get("revenue", 0),
+            "orders_sum_delta_pct": _safe_delta_pct(after_daily.get("revenue", 0), before_daily.get("revenue", 0)),
+            "before_gp_after_ads_rub": before_metrics.get("gp_after_ads", float("nan")),
+            "after_gp_after_ads_rub": after_metrics.get("gp_after_ads", float("nan")),
+            "before_gp_after_ads_rub_per_day": before_daily.get("gp_after_ads", float("nan")),
+            "after_gp_after_ads_rub_per_day": after_daily.get("gp_after_ads", float("nan")),
+            "gp_after_ads_delta_pct": _safe_delta_pct(after_daily.get("gp_after_ads", float("nan")), before_daily.get("gp_after_ads", float("nan"))),
+            "before_ad_spend_rub": before_metrics.get("spend", 0),
+            "after_ad_spend_rub": after_metrics.get("spend", 0),
+            "before_ad_spend_rub_per_day": before_daily.get("spend", 0),
+            "after_ad_spend_rub_per_day": after_daily.get("spend", 0),
+            "ad_spend_delta_pct": _safe_delta_pct(after_daily.get("spend", 0), before_daily.get("spend", 0)),
+            "before_drr_pct": before_drr,
+            "after_drr_pct": after_drr,
+            "drr_delta_pp": _safe_delta_pp(after_drr, before_drr),
+            "core80_queries_count": max(before_kw.get("queries_count", 0), after_kw.get("queries_count", 0)),
+            "before_core80_avg_position": before_kw.get("avg_position", 0),
+            "after_core80_avg_position": after_kw.get("avg_position", 0),
+            "core80_position_delta": _safe_delta_pp(after_kw.get("avg_position", 0), before_kw.get("avg_position", 0)),
+            "before_core80_visibility_pct": before_kw.get("visibility_pct", 0),
+            "after_core80_visibility_pct": after_kw.get("visibility_pct", 0),
+            "core80_visibility_delta_pp": _safe_delta_pp(after_kw.get("visibility_pct", 0), before_kw.get("visibility_pct", 0)),
+            "before_core80_query_freq": before_kw.get("query_freq", 0),
+            "after_core80_query_freq": after_kw.get("query_freq", 0),
+            "before_card_views": before_card_views,
+            "after_card_views": after_card_views,
+            "before_card_views_per_day": _safe_per_day_value(before_card_views, before_days),
+            "after_card_views_per_day": _safe_per_day_value(after_card_views, after_days),
+            "before_traffic_share_pct": before_share,
+            "after_traffic_share_pct": after_share,
+            "traffic_share_delta_pp": _safe_delta_pp(after_share, before_share),
+            "diagnostic_conclusion": conclusion,
+        })
+    out = pd.DataFrame(rows)
+    for col in BID_CAMPAIGN_COMPARE_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    if not out.empty:
+        out = out.sort_values(["subject_norm", "supplier_article", "campaign_id", "placement"], ascending=[True, True, True, True])
+    return out[BID_CAMPAIGN_COMPARE_COLUMNS]
+
+
 def write_outputs(
     s3_client,
     config: Config,
@@ -3765,6 +4529,7 @@ def write_outputs(
     bid_ramp_monitor: Optional[pd.DataFrame] = None,
     one_campaign_experiment: Optional[pd.DataFrame] = None,
     rename_plan: Optional[pd.DataFrame] = None,
+    bid_campaign_compare: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     summary = build_summary(ctx, decisions, successful_changes, pause_candidates, applied_pauses, start_candidates, applied_starts)
     summary["Ключевых фраз CORE_80"] = int(len(keyword_core_df[keyword_core_df["keyword_group"] == "CORE_80"])) if keyword_core_df is not None and not keyword_core_df.empty and "keyword_group" in keyword_core_df.columns else 0
@@ -3774,6 +4539,12 @@ def write_outputs(
     summary["Скидка продавца по умолчанию"] = DEFAULT_SELLER_DISCOUNT_PCT
     summary["Минимальная скидка продавца"] = DEFAULT_MIN_SELLER_DISCOUNT_PCT
     summary["Кандидатов на разгон показов"] = int(len(bid_ramp_monitor)) if bid_ramp_monitor is not None else 0
+    if bid_ramp_monitor is not None and not bid_ramp_monitor.empty and "ramp_mode_status" in bid_ramp_monitor.columns:
+        ramp_counts = bid_ramp_monitor["ramp_mode_status"].astype(str).value_counts().to_dict()
+        summary["Разгон: активен ждём D+7"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЖДЕМ_D7", 0))
+        summary["Разгон: применён сейчас"] = int(ramp_counts.get("РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", 0))
+        summary["Разгон: заблокирован min WB"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_БЛОК_MIN_WB", 0))
+        summary["Разгон: подходит по метрикам, но ждёт другой post-check"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_ЖДЕМ_ДРУГОЙ_POSTCHECK", 0))
     summary["Эксперимент 1РК групп"] = int(len(one_campaign_experiment)) if one_campaign_experiment is not None else 0
     summary["Порог паузы по показам"] = PAUSE_MIN_IMPRESSIONS
     summary["Окно проверки паузы, дней"] = PAUSE_ANALYSIS_DAYS
@@ -3781,6 +4552,7 @@ def write_outputs(
     summary["Кисти паузим"] = "нет"
     summary["Кандидатов на переименование РК"] = int(rename_plan["rename_action"].astype(str).eq("Переименовать").sum()) if rename_plan is not None and not rename_plan.empty and "rename_action" in rename_plan.columns else 0
     summary["Переименовано РК"] = int(rename_plan["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if rename_plan is not None and not rename_plan.empty and "api_status" in rename_plan.columns else 0
+    summary["Строк сравнения РК 7д"] = int(len(bid_campaign_compare)) if bid_campaign_compare is not None else 0
     summary_df = pd.DataFrame([{"Показатель": k, "Значение": v} for k, v in summary.items()])
 
     sheets = {
@@ -3788,6 +4560,7 @@ def write_outputs(
         "История_изменений_ставок": bid_history if bid_history is not None else pd.DataFrame(columns=BID_HISTORY_COLUMNS),
         "Эффект_изменения_ставки": effect_df if effect_df is not None else pd.DataFrame(),
         "Оценка_изменения_ставок": effect_df if effect_df is not None else pd.DataFrame(),
+        "Сравнение_РК_7дней": bid_campaign_compare if bid_campaign_compare is not None else pd.DataFrame(columns=BID_CAMPAIGN_COMPARE_COLUMNS),
         "Ключевые_фразы_80": keyword_core_df if keyword_core_df is not None else pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS),
         "Эффект_по_ключевым_фразам": keyword_effects_df if keyword_effects_df is not None else pd.DataFrame(columns=KEYWORD_EFFECT_COLUMNS),
         "Разгон_показов": bid_ramp_monitor if bid_ramp_monitor is not None else pd.DataFrame(columns=BID_RAMP_MONITOR_COLUMNS),
@@ -3915,7 +4688,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     bid_ramp_monitor = build_bid_ramp_monitor(decisions)
     if not bid_ramp_monitor.empty:
-        print(f"Диагностика разгона показов: кандидатов={len(bid_ramp_monitor)}", flush=True)
+        print(f"Диагностика разгона показов до API: строк статуса={len(bid_ramp_monitor)}", flush=True)
 
     one_campaign_experiment = build_one_campaign_experiment(metrics_df, keyword_core_df)
     if not one_campaign_experiment.empty:
@@ -3944,6 +4717,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Диагностика переименования РК action: " + json.dumps(rename_plan["rename_action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
         print("Диагностика переименования РК reason_code: " + json.dumps(rename_plan["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
     rename_plan, rename_api_log = apply_campaign_renames(rename_plan, config, ctx)
+    decisions = enrich_supplier_articles_from_rename_plan(decisions, rename_plan)
 
     pause_candidates = build_pause_candidates(decisions, bid_history)
 
@@ -3961,6 +4735,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     successful_changes, bid_api_log = apply_bid_changes(decisions, config, ctx)
     bid_history = record_bid_events(successful_changes, bid_history, ctx)
+    decisions = enrich_decisions_with_bid_api_status(decisions, successful_changes)
+    bid_campaign_compare = build_campaign_7d_comparison(
+        decisions=decisions,
+        bid_history=bid_history,
+        ads_df=ads_df,
+        keyword_df=keyword_df,
+        keyword_core_df=keyword_core_df,
+        funnel_df=funnel_df,
+        effect_df=effect_df,
+        ctx=ctx,
+    )
+    if not bid_campaign_compare.empty:
+        print(f"Диагностика сравнения РК 7д: строк={len(bid_campaign_compare)}", flush=True)
+    bid_ramp_monitor = build_bid_ramp_monitor(decisions)
+    if not bid_ramp_monitor.empty:
+        print("Диагностика разгона статус: " + json.dumps(bid_ramp_monitor["ramp_mode_status"].value_counts().to_dict(), ensure_ascii=False), flush=True)
 
     applied_pauses, pause_api_log = apply_pause_actions(pause_candidates, config, ctx)
     if not applied_pauses.empty:
@@ -4014,6 +4804,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bid_ramp_monitor=bid_ramp_monitor,
         one_campaign_experiment=one_campaign_experiment,
         rename_plan=rename_plan,
+        bid_campaign_compare=bid_campaign_compare,
     )
     print_summary(summary)
     return 0
