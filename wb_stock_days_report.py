@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT"
+SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT_FIX_REDISTRIBUTION_STYLE"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -1758,7 +1758,8 @@ def save_redistribution_workbook(
 
     wb = load_workbook(path)
     for sheet in wb.sheetnames:
-        style_sheet(wb[sheet], monitor=(sheet == "Баланс_21д"))
+        # Общий style_sheet теперь без параметра monitor: подсветка завязана на фактические колонки листа.
+        style_sheet(wb[sheet])
     wb.save(path)
     wb.close()
 
