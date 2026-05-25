@@ -2013,11 +2013,797 @@ def upload_to_storage(storage: Storage, local_paths: List[Path], root: str) -> N
             log(f"WARN: failed to save {rel}: {exc}")
 
 
+
+# ------------------------- factor money bridge + PDF + Telegram -------------------------
+FACTOR_REPORT_NAME = "Факторный_мост_ВП_TOPFACE.xlsx"
+PDF_REPORT_NAME = "Управленческий_отчет_TOPFACE.pdf"
+
+
+def _period_bounds_from_daily(daily: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    if daily is None or daily.empty or "day" not in daily.columns:
+        today = pd.Timestamp(datetime.today().date())
+        last_monday = today - pd.Timedelta(days=int(today.weekday()))
+        if today.weekday() == 6:
+            week_start, week_end = last_monday, today
+        else:
+            week_start, week_end = last_monday - pd.Timedelta(days=7), last_monday - pd.Timedelta(days=1)
+        return week_start, week_end, week_start - pd.Timedelta(days=7), week_start - pd.Timedelta(days=1)
+    mx = pd.to_datetime(daily["day"], errors="coerce").max()
+    if pd.isna(mx):
+        mx = pd.Timestamp(datetime.today().date())
+    mx = pd.Timestamp(mx).normalize()
+    last_monday = mx - pd.Timedelta(days=int(mx.weekday()))
+    if mx.weekday() == 6:
+        week_start, week_end = last_monday, mx
+    else:
+        week_start, week_end = last_monday - pd.Timedelta(days=7), last_monday - pd.Timedelta(days=1)
+    return week_start, week_end, week_start - pd.Timedelta(days=7), week_start - pd.Timedelta(days=1)
+
+
+def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=group_cols)
+    x = daily.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    x = x[(x["day"] >= start) & (x["day"] <= end)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=group_cols)
+    for c in group_cols:
+        if c not in x.columns:
+            x[c] = ""
+    sum_cols = [c for c in [
+        "orders", "order_sum", "open_cards", "add_to_cart", "buyouts_count", "cancels_count",
+        "manual_impressions", "manual_clicks", "manual_spend", "manual_orders", "manual_order_sum",
+        "unified_impressions", "unified_clicks", "unified_spend", "unified_orders", "unified_order_sum",
+        "unknown_impressions", "unknown_clicks", "unknown_spend", "unknown_orders", "unknown_order_sum",
+        "search_frequency", "search_transitions", "search_add_to_cart", "search_orders",
+        "ad_spend_model", "gross_profit_model", "buyout_qty_model", "revenue_model",
+        "commission_model", "acquiring_model", "logistics_direct_model", "logistics_return_model",
+        "storage_model", "other_costs_model", "cost_model"
+    ] if c in x.columns]
+    mean_cols = [c for c in ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "localization_with_replacements_pct"] if c in x.columns]
+    agg = {c: (c, "sum") for c in sum_cols}
+    for c in mean_cols:
+        agg[c] = (c, "mean")
+    g = x.groupby(group_cols, dropna=False, as_index=False).agg(**agg)
+    g["ad_spend_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"])
+    # Avoid double-count if ad_spend_model already includes manual+unified and channels exist.
+    channel_spend = sum((g[c] if c in g.columns else 0) for c in ["manual_spend", "unified_spend", "unknown_spend"])
+    if "ad_spend_model" in g.columns and float(pd.to_numeric(channel_spend, errors="coerce").fillna(0).sum()) > 0:
+        g["ad_spend_total"] = channel_spend
+    g["ad_clicks_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_clicks", "unified_clicks", "unknown_clicks"])
+    g["ad_impressions_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_impressions", "unified_impressions", "unknown_impressions"])
+    g["drr_pct"] = np.where(g.get("order_sum", 0) > 0, g["ad_spend_total"] / g["order_sum"] * 100, np.nan)
+    g["cpc"] = np.where(g["ad_clicks_total"] > 0, g["ad_spend_total"] / g["ad_clicks_total"], np.nan)
+    g["ctr_pct"] = np.where(g["ad_impressions_total"] > 0, g["ad_clicks_total"] / g["ad_impressions_total"] * 100, np.nan)
+    g["cart_conv_pct"] = np.where(g.get("open_cards", 0) > 0, g.get("add_to_cart", 0) / g.get("open_cards", 0) * 100, np.nan)
+    g["order_conv_pct"] = np.where(g.get("add_to_cart", 0) > 0, g.get("orders", 0) / g.get("add_to_cart", 0) * 100, np.nan)
+    g["card_to_order_pct"] = np.where(g.get("open_cards", 0) > 0, g.get("orders", 0) / g.get("open_cards", 0) * 100, np.nan)
+    g["search_traffic_capture_pct"] = np.where(g.get("search_frequency", 0) > 0, g.get("search_transitions", 0) / g.get("search_frequency", 0) * 100, np.nan)
+    g["avg_order_price"] = np.where(g.get("orders", 0) > 0, g.get("order_sum", 0) / g.get("orders", 0), np.nan)
+    return g
+
+
+def _abc_gp_for_period(builder: AnalyticsBuilder, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    abc = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
+    if abc is None or abc.empty:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact"])
+    x = abc.copy()
+    x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+    # Exact weekly file if available; otherwise overlap fallback.
+    exact = x[(x["period_start"] == start) & (x["period_end"] == end)].copy()
+    if exact.empty:
+        exact = x[(x["period_start"] <= end) & (x["period_end"] >= start)].copy()
+    if exact.empty:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact"])
+    for c in group_cols:
+        if c not in exact.columns:
+            exact[c] = ""
+    return exact.groupby(group_cols, dropna=False, as_index=False).agg(
+        gp_fact=("gross_profit", "sum"),
+        gross_revenue_fact=("gross_revenue", "sum"),
+        sales_qty_fact=("orders", "sum"),
+    )
+
+
+def _merge_cur_prev(cur: pd.DataFrame, prev: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+    cur = cur.copy() if cur is not None else pd.DataFrame(columns=keys)
+    prev = prev.copy() if prev is not None else pd.DataFrame(columns=keys)
+    return cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev")).fillna(0)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _factor_row(level: str, keys: Dict[str, Any], factor: str, was: Any, now: Any, change: Any, effect: float, zone: str, comment: str) -> Dict[str, Any]:
+    rec = {"level": level, **keys}
+    rec.update({
+        "factor": factor, "was": was, "now": now, "change": change,
+        "effect_gp_rub": float(effect) if pd.notna(effect) else 0.0,
+        "effect_type": "плюс" if effect > 0 else ("минус" if effect < 0 else "нейтрально"),
+        "zone": zone, "comment": comment,
+    })
+    return rec
+
+
+def _entity_factor_rows(level: str, g: pd.DataFrame, keys: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for _, r in g.iterrows():
+        keyvals = {k: r.get(k, "") for k in keys}
+        cur_sum = _safe_float(r.get("order_sum"))
+        prev_sum = _safe_float(r.get("order_sum_prev"))
+        cur_gp = _safe_float(r.get("gp_fact"), _safe_float(r.get("gross_profit_model")))
+        prev_gp = _safe_float(r.get("gp_fact_prev"), _safe_float(r.get("gross_profit_model_prev")))
+        cur_margin = cur_gp / cur_sum if cur_sum else 0.0
+        prev_margin = prev_gp / prev_sum if prev_sum else cur_margin
+        cur_orders = _safe_float(r.get("orders"))
+        avg_price = cur_sum / cur_orders if cur_orders else _safe_float(r.get("avg_order_price"), 0)
+        # 1) Volume/order sum effect.
+        volume_effect = (cur_sum - prev_sum) * prev_margin
+        rows.append(_factor_row(level, keyvals, "Объём / сумма заказов", prev_sum, cur_sum, cur_sum - prev_sum, volume_effect, "рынок + управление", "Сколько ВП изменилось из-за изменения суммы заказов при прежней маржинальности."))
+        # 2) Margin total effect.
+        margin_effect = cur_sum * (cur_margin - prev_margin)
+        rows.append(_factor_row(level, keyvals, "Маржинальность", prev_margin * 100, cur_margin * 100, (cur_margin - prev_margin) * 100, margin_effect, "экономика", "Изменение ВП из-за изменения маржинальности после расходов и ABC-факта."))
+        # 3) Advertising/Drr effect.
+        cur_drr = _safe_float(r.get("drr_pct"), np.nan)
+        prev_drr = _safe_float(r.get("drr_pct_prev"), np.nan)
+        if pd.notna(cur_drr) and pd.notna(prev_drr):
+            drr_effect = -cur_sum * ((cur_drr - prev_drr) / 100.0)
+            rows.append(_factor_row(level, keyvals, "ДРР / рекламная нагрузка", prev_drr, cur_drr, cur_drr - prev_drr, drr_effect, "управляемый", "Сколько ВП забрал или добавил сдвиг ДРР относительно прошлой недели."))
+        # 4) Price effect.
+        cur_price = _safe_float(r.get("avg_order_price"), _safe_float(r.get("finished_price")))
+        prev_price = _safe_float(r.get("avg_order_price_prev"), _safe_float(r.get("finished_price_prev")))
+        if cur_orders and prev_price:
+            price_effect = cur_orders * (cur_price - prev_price) * prev_margin
+            rows.append(_factor_row(level, keyvals, "Цена продажи", prev_price, cur_price, cur_price - prev_price, price_effect, "управляемый", "Эффект изменения продажной цены при текущем объёме заказов."))
+        # 5) WB buyer price / SPP.
+        cur_spp = _safe_float(r.get("spp"), _safe_float(r.get("spp_funnel")))
+        prev_spp = _safe_float(r.get("spp_prev"), _safe_float(r.get("spp_funnel_prev")))
+        if cur_spp or prev_spp:
+            # Higher SPP usually makes buyer price better; this is an explanatory external/partly external factor.
+            spp_effect = cur_sum * ((cur_spp - prev_spp) / 100.0) * 0.30 * prev_margin
+            rows.append(_factor_row(level, keyvals, "СПП / цена покупателя", prev_spp, cur_spp, cur_spp - prev_spp, spp_effect, "WB / внешний", "Оценка влияния изменения СПП на привлекательность цены и ВП."))
+        # 6) Unit expenses.
+        qty = _safe_float(r.get("buyout_qty_model"), _safe_float(r.get("sales_qty_fact"), cur_orders))
+        for title, col, zone in [
+            ("Комиссия WB/шт", "commission_model", "WB / экономика"),
+            ("Эквайринг/шт", "acquiring_model", "WB / экономика"),
+            ("Логистика/шт", "logistics_direct_model", "WB / логистика"),
+            ("Обратная логистика/шт", "logistics_return_model", "WB / логистика"),
+            ("Хранение/шт", "storage_model", "WB / логистика"),
+            ("Себестоимость/шт", "cost_model", "управляемый"),
+            ("Прочие расходы/шт", "other_costs_model", "экономика"),
+        ]:
+            cur_total = _safe_float(r.get(col))
+            prev_total = _safe_float(r.get(f"{col}_prev"))
+            cur_unit = cur_total / qty if qty else 0.0
+            prev_qty = _safe_float(r.get("buyout_qty_model_prev"), _safe_float(r.get("sales_qty_fact_prev"), _safe_float(r.get("orders_prev"))))
+            prev_unit = prev_total / prev_qty if prev_qty else 0.0
+            if cur_unit or prev_unit:
+                effect = -qty * (cur_unit - prev_unit)
+                rows.append(_factor_row(level, keyvals, title, prev_unit, cur_unit, cur_unit - prev_unit, effect, zone, "Эффект изменения расхода на единицу."))
+        # 7) Demand, traffic share and conversions.
+        demand_cur = _safe_float(r.get("search_frequency"))
+        demand_prev = _safe_float(r.get("search_frequency_prev"))
+        capture_cur = _safe_float(r.get("search_traffic_capture_pct")) / 100.0
+        capture_prev = _safe_float(r.get("search_traffic_capture_pct_prev")) / 100.0
+        cart_cur = _safe_float(r.get("cart_conv_pct")) / 100.0
+        cart_prev = _safe_float(r.get("cart_conv_pct_prev")) / 100.0
+        order_cur = _safe_float(r.get("order_conv_pct")) / 100.0
+        order_prev = _safe_float(r.get("order_conv_pct_prev")) / 100.0
+        if demand_cur or demand_prev:
+            demand_effect = (demand_cur - demand_prev) * capture_prev * cart_prev * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Спрос WB", demand_prev, demand_cur, demand_cur - demand_prev, demand_effect, "внешний", "Эффект изменения общего поискового спроса WB."))
+        if demand_cur and (capture_cur or capture_prev):
+            traffic_effect = demand_cur * (capture_cur - capture_prev) * cart_prev * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "% поискового трафика", capture_prev * 100, capture_cur * 100, (capture_cur - capture_prev) * 100, traffic_effect, "управляемый", "Эффект изменения доли спроса, которую забрала карточка."))
+        opens = _safe_float(r.get("open_cards"))
+        if opens and (cart_cur or cart_prev):
+            cart_effect = opens * (cart_cur - cart_prev) * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Конверсия в корзину", cart_prev * 100, cart_cur * 100, (cart_cur - cart_prev) * 100, cart_effect, "карточка", "Сколько ВП изменилось из-за входной конверсии карточки."))
+        if opens and (order_cur or order_prev):
+            order_effect = opens * cart_cur * (order_cur - order_prev) * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Корзина -> заказ", order_prev * 100, order_cur * 100, (order_cur - order_prev) * 100, order_effect, "карточка / цена / доставка", "Сколько ВП изменилось из-за дожима из корзины в заказ."))
+    return rows
+
+
+def compute_optimal_benchmarks(outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    x = daily.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    rows = []
+    group_cols = ["subject", "product", "supplier_article", "nm_id"]
+    for keys, part in x.groupby(group_cols, dropna=False):
+        p = part.sort_values("day").copy()
+        if p.empty:
+            continue
+        positive = p[p["order_sum"].fillna(0) > 0].copy()
+        if positive.empty:
+            positive = p.copy()
+        threshold = positive["order_sum"].quantile(0.80) if len(positive) >= 5 else positive["order_sum"].mean()
+        best = positive[positive["order_sum"] >= threshold].copy()
+        if best.empty:
+            best = positive.nlargest(min(3, len(positive)), "order_sum")
+        def ratio(num, den, mul=1.0):
+            den_sum = pd.to_numeric(best.get(den, 0), errors="coerce").sum()
+            if not den_sum:
+                return np.nan
+            return pd.to_numeric(best.get(num, 0), errors="coerce").sum() / den_sum * mul
+        ad_spend = best[[c for c in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"] if c in best.columns]].sum(axis=1)
+        clicks = best[[c for c in ["manual_clicks", "unified_clicks", "unknown_clicks"] if c in best.columns]].sum(axis=1)
+        impressions = best[[c for c in ["manual_impressions", "unified_impressions", "unknown_impressions"] if c in best.columns]].sum(axis=1)
+        order_sum = pd.to_numeric(best.get("order_sum", 0), errors="coerce").sum()
+        rec = dict(zip(group_cols, keys))
+        rec.update({
+            "best_days_count": len(best),
+            "optimal_order_sum_day": pd.to_numeric(best.get("order_sum", 0), errors="coerce").mean(),
+            "optimal_orders_day": pd.to_numeric(best.get("orders", 0), errors="coerce").mean(),
+            "optimal_drr_pct": ad_spend.sum() / order_sum * 100 if order_sum else np.nan,
+            "optimal_cpc": ad_spend.sum() / clicks.sum() if clicks.sum() else np.nan,
+            "optimal_ctr_pct": clicks.sum() / impressions.sum() * 100 if impressions.sum() else np.nan,
+            "optimal_cart_conv_pct": ratio("add_to_cart", "open_cards", 100),
+            "optimal_order_conv_pct": ratio("orders", "add_to_cart", 100),
+            "optimal_search_capture_pct": ratio("search_transitions", "search_frequency", 100),
+            "optimal_price_sale": ratio("order_sum", "orders", 1),
+            "optimal_spp": pd.to_numeric(best.get("spp", best.get("spp_funnel", np.nan)), errors="coerce").mean(),
+        })
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timestamp, week_end: pd.Timestamp, prev_start: pd.Timestamp, prev_end: pd.Timestamp) -> pd.DataFrame:
+    e = builder.enrich(builder.pack.entry_points, "entry_points")
+    if e is None or e.empty:
+        return pd.DataFrame()
+    e = e.copy()
+    e["day"] = pd.to_datetime(e["day"], errors="coerce").dt.normalize()
+    group_cols = ["subject", "product", "supplier_article", "nm_id", "entry_section", "entry_point"]
+    def agg(start, end):
+        x = e[(e["day"] >= start) & (e["day"] <= end)].copy()
+        if x.empty:
+            return pd.DataFrame(columns=group_cols)
+        g = x.groupby(group_cols, dropna=False, as_index=False).agg(
+            impressions=("impressions", "sum"), transitions=("transitions", "sum"),
+            add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
+        )
+        g["ctr_pct"] = np.where(g["impressions"] > 0, g["transitions"] / g["impressions"] * 100, np.nan)
+        g["cart_conv_pct"] = np.where(g["transitions"] > 0, g["add_to_cart"] / g["transitions"] * 100, np.nan)
+        g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
+        return g
+    cur = agg(week_start, week_end)
+    prev = agg(prev_start, prev_end)
+    out = _merge_cur_prev(cur, prev, group_cols)
+    # Join article margin and avg price from daily data for ₽ effect.
+    daily = outputs_global_for_bridge.get("article_day_fact", pd.DataFrame()) if "outputs_global_for_bridge" in globals() else pd.DataFrame()
+    if daily is not None and not daily.empty:
+        ag = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        gp_cur = _abc_gp_for_period(builder, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        ag = ag.merge(gp_cur, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        ag["gp_use"] = ag["gp_fact"].fillna(ag.get("gross_profit_model", 0))
+        ag["margin_use"] = np.where(ag["order_sum"] > 0, ag["gp_use"] / ag["order_sum"], 0)
+        ag["avg_price_use"] = np.where(ag["orders"] > 0, ag["order_sum"] / ag["orders"], 0)
+        out = out.merge(ag[["subject", "product", "supplier_article", "nm_id", "margin_use", "avg_price_use"]], on=["subject", "product", "supplier_article", "nm_id"], how="left")
+    else:
+        out["margin_use"] = 0.0
+        out["avg_price_use"] = 0.0
+    out["delta_transitions"] = out["transitions"] - out["transitions_prev"]
+    out["delta_orders"] = out["orders"] - out["orders_prev"]
+    out["delta_cart_conv_pp"] = out["cart_conv_pct"] - out["cart_conv_pct_prev"]
+    out["delta_order_conv_pp"] = out["order_conv_pct"] - out["order_conv_pct_prev"]
+    out["effect_gp_rub"] = out["delta_orders"] * out["avg_price_use"].fillna(0) * out["margin_use"].fillna(0)
+    totals = out.groupby(["subject", "product", "supplier_article", "nm_id"], as_index=False)["orders"].sum().rename(columns={"orders": "orders_total"})
+    out = out.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+    out["orders_share_pct"] = np.where(out["orders_total"] > 0, out["orders"] / out["orders_total"] * 100, np.nan)
+    return out.sort_values(["subject", "product", "supplier_article", "effect_gp_rub"], ascending=[True, True, True, False])
+
+
+def build_factor_outputs(builder: AnalyticsBuilder, outputs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    global outputs_global_for_bridge
+    outputs_global_for_bridge = outputs
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    optimal = compute_optimal_benchmarks(outputs)
+    factor_rows: List[Dict[str, Any]] = []
+    for level, keys in [
+        ("category", ["subject"]),
+        ("product", ["subject", "product"]),
+        ("article", ["subject", "product", "supplier_article", "nm_id"]),
+    ]:
+        cur = _agg_daily_for_bridge(daily, week_start, week_end, keys)
+        prev = _agg_daily_for_bridge(daily, prev_start, prev_end, keys)
+        cur_gp = _abc_gp_for_period(builder, week_start, week_end, keys)
+        prev_gp = _abc_gp_for_period(builder, prev_start, prev_end, keys).rename(columns={"gp_fact": "gp_fact_prev", "gross_revenue_fact": "gross_revenue_fact_prev", "sales_qty_fact": "sales_qty_fact_prev"})
+        g = _merge_cur_prev(cur, prev, keys)
+        if not cur_gp.empty:
+            g = g.merge(cur_gp, on=keys, how="left")
+        if not prev_gp.empty:
+            g = g.merge(prev_gp, on=keys, how="left")
+        for c in ["gp_fact", "gp_fact_prev", "gross_revenue_fact", "gross_revenue_fact_prev", "sales_qty_fact", "sales_qty_fact_prev"]:
+            if c not in g.columns:
+                g[c] = np.nan
+        factor_rows.extend(_entity_factor_rows(level, g, keys))
+    factor_bridge = pd.DataFrame(factor_rows)
+    if not factor_bridge.empty:
+        factor_bridge["abs_effect_gp_rub"] = factor_bridge["effect_gp_rub"].abs()
+        totals = factor_bridge.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False)["abs_effect_gp_rub"].sum().rename("total_abs_effect").reset_index()
+        factor_bridge = factor_bridge.merge(totals, on=["level", "subject", "product", "supplier_article", "nm_id"], how="left")
+        factor_bridge["effect_weight_pct"] = np.where(factor_bridge["total_abs_effect"] > 0, factor_bridge["abs_effect_gp_rub"] / factor_bridge["total_abs_effect"] * 100, 0)
+        factor_bridge = factor_bridge.sort_values(["level", "subject", "product", "supplier_article", "abs_effect_gp_rub"], ascending=[True, True, True, True, False])
+    entry_bridge = compute_entry_points_bridge(builder, week_start, week_end, prev_start, prev_end)
+    # Human-readable summary for PDF: top-4 money factors per entity.
+    summary_rows = []
+    if not factor_bridge.empty:
+        for keys, part in factor_bridge.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False):
+            lvl, subject, product, art, nm_id = keys
+            p = part[part["abs_effect_gp_rub"] > 50].sort_values("abs_effect_gp_rub", ascending=False).head(4)
+            if p.empty:
+                text = "Критичных денежных факторов не выделено: изменение ВП находится в рабочем диапазоне."
+            else:
+                phrases = []
+                for _, r in p.iterrows():
+                    val = float(r["effect_gp_rub"])
+                    sign = "добавил" if val > 0 else "забрал"
+                    phrases.append(f"{r['factor']}: {sign} около {abs(val):,.0f} ₽ ВП".replace(",", " "))
+                text = "; ".join(phrases) + "."
+            summary_rows.append({
+                "level": lvl, "subject": subject, "product": product, "supplier_article": art, "nm_id": nm_id,
+                "period": f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}",
+                "compare_period": f"{prev_start.strftime('%d.%m')}-{prev_end.strftime('%d.%m.%Y')}",
+                "summary_text": text,
+            })
+    factor_summary = pd.DataFrame(summary_rows)
+    return {
+        "optimal_benchmarks": optimal,
+        "factor_bridge": factor_bridge,
+        "entry_points_bridge": entry_bridge,
+        "factor_summary_for_pdf": factor_summary,
+    }
+
+
+def write_factor_report(path: Path, factor_outputs: Dict[str, pd.DataFrame]) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sheet_name, df in factor_outputs.items():
+        write_df_sheet(wb, sheet_name[:31], df if df is not None else pd.DataFrame())
+    wb.save(path)
+
+
+def _fmt_rub(x: Any, short: bool = False) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    if short and abs(val) >= 1000:
+        return f"{val/1000:.0f}к ₽".replace(".", ",")
+    return f"{val:,.0f} ₽".replace(",", " ")
+
+
+def _fmt_num_pdf(x: Any) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:,.0f}".replace(",", " ")
+
+
+def _fmt_pct_pdf(x: Any, digits: int = 1) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:.{digits}f}%".replace(".", ",")
+
+
+def _fmt_cpc_pdf(x: Any) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:.1f} ₽".replace(".", ",")
+
+
+def _delta_pct(cur: Any, prev: Any) -> Optional[float]:
+    try:
+        cur = float(cur); prev = float(prev)
+        if pd.isna(cur) or pd.isna(prev) or abs(prev) < 1e-9:
+            return None
+        return (cur / prev - 1) * 100
+    except Exception:
+        return None
+
+
+def _register_topface_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = [
+        (os.getenv("TOPFACE_FONT_REGULAR"), os.getenv("TOPFACE_FONT_BOLD"), os.getenv("TOPFACE_FONT_BLACK")),
+        ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Black.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ]
+    for reg, bold, black in candidates:
+        if reg and bold and black and Path(reg).exists() and Path(bold).exists() and Path(black).exists():
+            pdfmetrics.registerFont(TTFont("TFReg", reg))
+            pdfmetrics.registerFont(TTFont("TFBold", bold))
+            pdfmetrics.registerFont(TTFont("TFBlack", black))
+            return "TFReg", "TFBold", "TFBlack"
+    return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
+
+
+def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception as exc:
+        log(f"WARN: reportlab недоступен, PDF не создан: {exc}")
+        return None
+    F_REG, F_BOLD, F_BLACK = _register_topface_fonts()
+    W, H = 1600, 900
+    RED = HexColor("#c90022")
+    RED_DARK = HexColor("#a50019")
+    WHITE = colors.white
+    SOFT = HexColor("#fff4f5")
+    BLACK = HexColor("#111111")
+    GRAY = HexColor("#555555")
+    GREEN = HexColor("#087a38")
+    BAD = HexColor("#b00020")
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    # Current incomplete week: from Monday to latest available day in daily.
+    latest = pd.to_datetime(daily["day"], errors="coerce").max() if daily is not None and not daily.empty else week_end
+    cur_monday = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_week_end = cur_monday + pd.Timedelta(days=6)
+    c = canvas.Canvas(str(path), pagesize=(W, H))
+    bookmarks: Dict[str, str] = {}
+    page_num = 0
+
+    def bg(title: str, subtitle: str = "", section: str = ""):
+        nonlocal page_num
+        page_num += 1
+        c.setFillColor(RED); c.rect(0, 0, W, H, fill=1, stroke=0)
+        c.setFillColor(WHITE); c.setFont(F_REG, 34); c.drawString(70, 835, "topface")
+        c.setFont(F_BLACK, 46); c.drawString(70, 765, title)
+        if subtitle:
+            c.setFont(F_BOLD, 20); c.drawString(70, 725, subtitle)
+        if section:
+            c.setFont(F_BOLD, 14); c.drawRightString(W-75, 710, section)
+        c.setFont(F_BOLD, 13); c.drawRightString(W-75, 38, f"Страница {page_num}")
+
+    def button(x, y, w, label, target=None):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, 44, 14, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.setFont(F_BOLD, 13); c.drawCentredString(x+w/2, y+17, label)
+        if target and target in bookmarks:
+            c.linkRect("", bookmarks[target], (x, y, x+w, y+44), relative=0)
+
+    def top_nav(active=""):
+        labels = [("cur", "Текущая"), ("prev", "Прошлая"), ("month", "Месяц"), ("closed", "Закр. месяц"), ("summary", "Сводка")]
+        x = 880
+        for key, lab in labels:
+            button(x, 800, 128, lab, key)
+            x += 142
+
+    def card(x, y, w, h, value, label, sub1="", sub2="", metric="good"):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
+        c.setFillColor(BLACK); c.setFont(F_BLACK, 28); c.drawCentredString(x+w/2, y+h-42, str(value))
+        c.setFillColor(GRAY); c.setFont(F_REG, 14); c.drawCentredString(x+w/2, y+h-72, label)
+        if sub1:
+            color = GREEN if "↑" in sub1 else BAD if "↓" in sub1 else GRAY
+            c.setFillColor(color); c.setFont(F_BOLD, 11); c.drawCentredString(x+w/2, y+34, sub1)
+        if sub2:
+            color = GREEN if "↑" in sub2 else BAD if "↓" in sub2 else GRAY
+            c.setFillColor(color); c.setFont(F_BOLD, 11); c.drawCentredString(x+w/2, y+18, sub2)
+
+    def table_box(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=48, first_col_red=True):
+        if col_widths is None:
+            col_widths = [w/len(headers)]*len(headers)
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 16, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.roundRect(x, y+h-54, w, 54, 12, fill=1, stroke=0)
+        xx=x
+        c.setFillColor(WHITE); c.setFont(F_BOLD, font_size)
+        for i, head in enumerate(headers):
+            c.drawCentredString(xx+col_widths[i]/2, y+h-34, str(head))
+            xx += col_widths[i]
+        yy=y+h-54-row_h
+        for ridx, row in enumerate(rows):
+            c.setFillColor(WHITE if ridx%2==0 else SOFT); c.rect(x, yy, w, row_h, fill=1, stroke=0)
+            xx=x
+            for i, val in enumerate(row):
+                if i == 0 and first_col_red:
+                    c.setFillColor(SOFT); c.roundRect(xx+8, yy+6, col_widths[i]-16, row_h-12, 8, fill=1, stroke=0)
+                    c.setFillColor(RED_DARK); c.setFont(F_BOLD, font_size)
+                else:
+                    c.setFillColor(BLACK); c.setFont(F_BOLD, font_size)
+                # Manual multi-line support.
+                text = str(val)
+                lines = text.split("\n")
+                line_y = yy + row_h/2 + (len(lines)-1)*8
+                for line in lines:
+                    c.drawCentredString(xx+col_widths[i]/2, line_y, line[:44])
+                    line_y -= 16
+                xx += col_widths[i]
+            yy -= row_h
+
+    def delta_text(cur, prev, metric_lower_better=False):
+        d = _delta_pct(cur, prev)
+        if d is None:
+            return ""
+        arrow = "↑" if d > 0 else "↓" if d < 0 else "→"
+        # visual sign only; color is handled by arrow in card; compact.
+        return f"{arrow} {abs(d):.1f}%".replace(".", ",")
+
+    # Page 1 current week by days.
+    bookmarks["cur"] = "cur"; c.bookmarkPage("cur")
+    bg("Текущая неделя", f"{cur_monday.strftime('%d.%m')}-{cur_week_end.strftime('%d.%m.%Y')} / оперативно: дни и план", "Текущая неделя")
+    top_nav("cur")
+    cur_period = _agg_daily_for_bridge(daily, cur_monday, latest, ["subject"])
+    prev_same = _agg_daily_for_bridge(daily, cur_monday-pd.Timedelta(days=7), latest-pd.Timedelta(days=7), ["subject"])
+    cur_total = cur_period.sum(numeric_only=True)
+    prev_total = prev_same.sum(numeric_only=True) if not prev_same.empty else pd.Series(dtype=float)
+    card(70, 610, 260, 120, _fmt_rub(cur_total.get("order_sum", 0)), "Сумма заказов", delta_text(cur_total.get("order_sum",0), prev_total.get("order_sum",0)))
+    card(360, 610, 260, 120, _fmt_rub(cur_total.get("gross_profit_model", 0)), "ВП расч.", delta_text(cur_total.get("gross_profit_model",0), prev_total.get("gross_profit_model",0)))
+    card(650, 610, 260, 120, _fmt_pct_pdf(cur_total.get("ad_spend_total",0)/cur_total.get("order_sum",1)*100 if cur_total.get("order_sum",0) else 0), "ДРР", delta_text(cur_total.get("ad_spend_total",0)/cur_total.get("order_sum",1), prev_total.get("ad_spend_total",0)/prev_total.get("order_sum",1) if prev_total.get("order_sum",0) else None))
+    card(940, 610, 260, 120, _fmt_rub(cur_total.get("ad_spend_total", 0)), "Расход РК", delta_text(cur_total.get("ad_spend_total",0), prev_total.get("ad_spend_total",0)))
+    plan_day = max(0, float(cur_total.get("order_sum",0)) / max(1, (latest-cur_monday).days+1) * 1.1)
+    card(1230, 610, 260, 120, _fmt_rub(plan_day), "План/день", "по сумме")
+    # Day table.
+    headers = ["Категория", "Пн\n"+cur_monday.strftime("%d.%m"), "Вт\n"+(cur_monday+pd.Timedelta(days=1)).strftime("%d.%m"), "Ср\n"+(cur_monday+pd.Timedelta(days=2)).strftime("%d.%m"), "Чт\n"+(cur_monday+pd.Timedelta(days=3)).strftime("%d.%m"), "Пт\n"+(cur_monday+pd.Timedelta(days=4)).strftime("%d.%m"), "Сб\n"+(cur_monday+pd.Timedelta(days=5)).strftime("%d.%m"), "Вс\n"+(cur_monday+pd.Timedelta(days=6)).strftime("%d.%m"), "План/день"]
+    rows=[]
+    cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
+    cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
+    day_agg = _agg_daily_for_bridge(daily, cur_monday, cur_week_end, ["day", "subject"])
+    for cat in cats:
+        left = f"{cat_short.get(cat,cat)}\nСумма\nВП\nРасх. РК\nДРР"
+        vals=[left]
+        for i in range(7):
+            day = cur_monday + pd.Timedelta(days=i)
+            p = day_agg[(day_agg["day"] == day) & (day_agg["subject"] == cat)] if not day_agg.empty and "day" in day_agg.columns else pd.DataFrame()
+            if p.empty or day > latest:
+                vals.append("-\n-\n-\n-")
+            else:
+                rr=p.iloc[0]
+                vals.append(f"{_fmt_rub(rr.get('order_sum',0), True)}\n{_fmt_rub(rr.get('gross_profit_model',0), True)}\n{_fmt_rub(rr.get('ad_spend_total',0), True)}\n{_fmt_pct_pdf(rr.get('drr_pct',0))}")
+        vals.append(f"{_fmt_rub(plan_day/4, True)}\n-\n-\n-")
+        rows.append(vals)
+    table_box(70, 80, 1460, 470, headers, rows, col_widths=[190]+[145]*7+[255], font_size=12, row_h=92)
+    c.showPage()
+
+    # Page 2 current categories.
+    bookmarks["cur_cat"] = "cur_cat"; c.bookmarkPage("cur_cat")
+    bg("Текущая неделя: категории", f"{cur_monday.strftime('%d.%m')}-{latest.strftime('%d.%m.%Y')} / переход по категории", "Текущая неделя")
+    top_nav("cur")
+    cat_cur = _merge_cur_prev(cur_period, prev_same, ["subject"])
+    rows=[]
+    for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows():
+        rows.append([cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(r.get("gross_profit_model")), _fmt_pct_pdf(r.get("drr_pct")), _fmt_rub(r.get("ad_spend_total")), _fmt_cpc_pdf(r.get("cpc"))])
+    table_box(80, 300, 1360, 330, ["Категория", "Сумма", "Δ", "ВП расч.", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,210,120,210,160,220,160], font_size=14, row_h=66)
+    c.showPage()
+
+    # Page 3 previous week summary.
+    bookmarks["prev"] = "prev"; c.bookmarkPage("prev")
+    bg("Прошлая неделя", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / сравнение с {prev_start.strftime('%d.%m')}-{prev_end.strftime('%d.%m.%Y')}", "Прошлая неделя")
+    top_nav("prev")
+    cat = _agg_daily_for_bridge(daily, week_start, week_end, ["subject"])
+    cat_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject"])
+    cat_gp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+    cat_gp_prev = _abc_gp_for_period(builder_global_for_pdf, prev_start, prev_end, ["subject"]).rename(columns={"gp_fact":"gp_fact_prev"}) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+    cat_sum = _merge_cur_prev(cat, cat_prev, ["subject"])
+    if not cat_gp.empty: cat_sum = cat_sum.merge(cat_gp, on="subject", how="left")
+    if not cat_gp_prev.empty: cat_sum = cat_sum.merge(cat_gp_prev[["subject","gp_fact_prev"]], on="subject", how="left")
+    total = cat_sum.sum(numeric_only=True)
+    card(70, 610, 260, 120, _fmt_rub(total.get("order_sum",0)), "Сумма заказов", delta_text(total.get("order_sum",0), total.get("order_sum_prev",0)))
+    card(360, 610, 260, 120, _fmt_rub(total.get("gp_fact", total.get("gross_profit_model",0))), "ВП факт ABC", delta_text(total.get("gp_fact",0), total.get("gp_fact_prev",0)))
+    card(650, 610, 260, 120, _fmt_pct_pdf(total.get("ad_spend_total",0)/total.get("order_sum",1)*100 if total.get("order_sum",0) else 0), "ДРР", delta_text(total.get("ad_spend_total",0)/total.get("order_sum",1), total.get("ad_spend_total_prev",0)/total.get("order_sum_prev",1) if total.get("order_sum_prev",0) else None))
+    card(940, 610, 260, 120, _fmt_rub(total.get("ad_spend_total",0)), "Расход РК", delta_text(total.get("ad_spend_total",0), total.get("ad_spend_total_prev",0)))
+    card(1230, 610, 260, 120, _fmt_cpc_pdf(total.get("ad_spend_total",0)/total.get("ad_clicks_total",1) if total.get("ad_clicks_total",0) else 0), "CPC")
+    rows=[]
+    for _, r in cat_sum.sort_values("order_sum", ascending=False).iterrows():
+        gp = r.get("gp_fact", r.get("gross_profit_model", 0))
+        mar = gp / r.get("order_sum",1)*100 if r.get("order_sum",0) else 0
+        rows.append([cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(gp), delta_text(gp, r.get("gp_fact_prev", r.get("gross_profit_model_prev",0))), _fmt_pct_pdf(mar), _fmt_pct_pdf(r.get("drr_pct")), _fmt_cpc_pdf(r.get("cpc"))])
+    table_box(70, 90, 1460, 420, ["Категория", "Сумма", "Δ", "ВП", "Δ", "Маржа", "ДРР", "CPC"], rows, col_widths=[220,200,100,200,100,150,150,150], font_size=13, row_h=66)
+    c.showPage()
+
+    # Month placeholders simplified.
+    for key, title, sub in [("month", "Текущий месяц", "месяц неполный / темп к плану"), ("closed", "Последний закрытый месяц", "факт по доступным данным"), ("summary", "Сводка по месяцам", "категории / без лишней детализации")]:
+        bookmarks[key] = key; c.bookmarkPage(key)
+        bg(title, sub, title)
+        top_nav(key)
+        c.setFillColor(WHITE); c.roundRect(100, 300, 1400, 180, 20, fill=1, stroke=0)
+        c.setFillColor(BLACK); c.setFont(F_BOLD, 24); c.drawCentredString(800, 390, "Данные раздела формируются в Excel-расчёте; PDF использует этот блок как навигационный уровень.")
+        c.showPage()
+
+    # Category pages for previous week.
+    factor_summary = outputs.get("factor_summary_for_pdf", pd.DataFrame())
+    factor_bridge = outputs.get("factor_bridge", pd.DataFrame())
+    opt = outputs.get("optimal_benchmarks", pd.DataFrame())
+    detail_articles = []
+    cat_rows = cat_sum.sort_values("order_sum", ascending=False)
+    for _, catr in cat_rows.iterrows():
+        subject = catr.get("subject")
+        cat_name = cat_short.get(subject, subject)
+        cat_book = f"cat_{cat_name}"
+        bookmarks[cat_book] = cat_book; c.bookmarkPage(cat_book)
+        # Article/product rows from bridge/daily.
+        a_cur = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        a_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject", "product", "supplier_article", "nm_id"])
+        a = _merge_cur_prev(a_cur, a_prev, ["subject", "product", "supplier_article", "nm_id"])
+        agp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+        if not agp.empty: a = a.merge(agp, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        a = a[a["subject"] == subject].copy()
+        if a.empty:
+            continue
+        a["gp_use"] = a["gp_fact"].fillna(a.get("gross_profit_model", 0)) if "gp_fact" in a.columns else a.get("gross_profit_model", 0)
+        # ABC-80: only details contributing 80% positive GP; category table still shows visible rows.
+        apos = a[a["gp_use"] > 0].sort_values("gp_use", ascending=False).copy()
+        total_gp = apos["gp_use"].sum()
+        if total_gp > 0:
+            apos["cum_share"] = apos["gp_use"].cumsum() / total_gp
+            detail_articles += apos[apos["cum_share"] <= 0.80][["subject","product","supplier_article","nm_id"]].to_dict("records")
+        pages = [a.sort_values("order_sum", ascending=False).iloc[i:i+7] for i in range(0, len(a), 7)]
+        for pi, part in enumerate(pages, start=1):
+            bg(f"Категория: {cat_name}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / динамика к прошлой неделе / лист {pi} из {len(pages)}", "Категория")
+            button(1280, 800, 180, "← прошлая", "prev")
+            rows=[]
+            for _, r in part.iterrows():
+                gp = r.get("gp_use", 0); mar = gp / r.get("order_sum",1)*100 if r.get("order_sum",0) else 0
+                rows.append([r.get("supplier_article"), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(gp), _fmt_pct_pdf(mar), _fmt_pct_pdf(r.get("drr_pct")), _fmt_cpc_pdf(r.get("cpc")), _fmt_pct_pdf(r.get("search_traffic_capture_pct")), _fmt_pct_pdf(r.get("localization_with_replacements_pct"))])
+            table_box(80, 170, 1400, 520, ["Артикул", "Сумма", "Δ", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[190,180,90,180,140,130,120,140,140], font_size=13, row_h=62)
+            c.showPage()
+
+    # Article detail pages from ABC-80 only.
+    seen = set()
+    for rec in detail_articles:
+        key_tuple = (rec.get("subject"), str(rec.get("product")), str(rec.get("supplier_article")), rec.get("nm_id"))
+        if key_tuple in seen:
+            continue
+        seen.add(key_tuple)
+        subject, product, art, nm_id = key_tuple
+        a_cur = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        a_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject", "product", "supplier_article", "nm_id"])
+        a = _merge_cur_prev(a_cur, a_prev, ["subject", "product", "supplier_article", "nm_id"])
+        agp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+        if not agp.empty: a = a.merge(agp, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        rr = a[(a["subject"] == subject) & (a["supplier_article"].astype(str) == str(art))]
+        if rr.empty:
+            continue
+        r = rr.iloc[0]
+        page1 = f"article_{art}_1"; page2=f"article_{art}_2"
+        bookmarks[page1]=page1; c.bookmarkPage(page1)
+        bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / {week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}", "Артикул 1/2")
+        button(1240, 800, 170, "← категория", f"cat_{cat_short.get(subject,subject)}")
+        button(1430, 800, 100, "стр.2", page2)
+        c.setFillColor(RED_DARK); c.roundRect(80, 690, 1440, 44, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 705, "Блок 1. Продажи и экономика")
+        gp = _safe_float(r.get("gp_fact"), _safe_float(r.get("gross_profit_model")))
+        mar = gp / _safe_float(r.get("order_sum"),1)*100 if _safe_float(r.get("order_sum")) else 0
+        cards1 = [
+            (_fmt_rub(r.get("order_sum")), "Сумма заказов", delta_text(r.get("order_sum"), r.get("order_sum_prev"))),
+            (_fmt_rub(gp), "ВП факт ABC", ""),
+            (_fmt_pct_pdf(mar), "Маржинальность", ""),
+            (_fmt_rub(r.get("avg_order_price")), "Цена продажи", delta_text(r.get("avg_order_price"), r.get("avg_order_price_prev"))),
+            (_fmt_pct_pdf(r.get("spp", r.get("spp_funnel",0))), "СПП", delta_text(r.get("spp",0), r.get("spp_prev",0))),
+            (_fmt_rub(r.get("commission_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Комиссия/шт", ""),
+            (_fmt_rub((r.get("logistics_direct_model",0)+r.get("logistics_return_model",0))/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Логистика/шт", ""),
+            (_fmt_rub(r.get("storage_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Хранение/шт", ""),
+            (_fmt_rub(r.get("acquiring_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Эквайринг/шт", ""),
+            (_fmt_rub(r.get("cost_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Себест./шт", ""),
+            (_fmt_rub(r.get("other_costs_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Прочие/шт", ""),
+        ]
+        for idx, it in enumerate(cards1[:6]): card(80+idx*240, 570, 220, 96, *it)
+        for idx, it in enumerate(cards1[6:]): card(80+idx*240, 455, 220, 96, *it)
+        c.setFillColor(RED_DARK); c.roundRect(80, 385, 1440, 44, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 400, "Блок 2. Реклама, спрос и конверсии")
+        cards2 = [
+            (_fmt_rub(r.get("ad_spend_total")), "Расход РК", delta_text(r.get("ad_spend_total"), r.get("ad_spend_total_prev"))),
+            (_fmt_pct_pdf(r.get("drr_pct")), "ДРР", delta_text(r.get("drr_pct"), r.get("drr_pct_prev"))),
+            (_fmt_cpc_pdf(r.get("cpc")), "CPC", delta_text(r.get("cpc"), r.get("cpc_prev"))),
+            (_fmt_num_pdf(r.get("ad_impressions_total")), "Показы РК", delta_text(r.get("ad_impressions_total"), r.get("ad_impressions_total_prev"))),
+            (_fmt_num_pdf(r.get("ad_clicks_total")), "Клики РК", delta_text(r.get("ad_clicks_total"), r.get("ad_clicks_total_prev"))),
+            (_fmt_num_pdf(r.get("open_cards")), "Открытия", delta_text(r.get("open_cards"), r.get("open_cards_prev"))),
+            (_fmt_pct_pdf(r.get("cart_conv_pct")), "Конв. в корзину", delta_text(r.get("cart_conv_pct"), r.get("cart_conv_pct_prev"))),
+            (_fmt_pct_pdf(r.get("order_conv_pct")), "Корзина -> заказ", delta_text(r.get("order_conv_pct"), r.get("order_conv_pct_prev"))),
+            (_fmt_num_pdf(r.get("search_frequency")), "Спрос WB", delta_text(r.get("search_frequency"), r.get("search_frequency_prev"))),
+            (_fmt_pct_pdf(r.get("search_traffic_capture_pct")), "% поиска", delta_text(r.get("search_traffic_capture_pct"), r.get("search_traffic_capture_pct_prev"))),
+            (_fmt_pct_pdf(r.get("localization_with_replacements_pct")), "Локализация", ""),
+        ]
+        for idx, it in enumerate(cards2[:6]): card(80+idx*240, 260, 220, 96, *it)
+        for idx, it in enumerate(cards2[6:]): card(80+idx*240, 145, 220, 96, *it)
+        c.showPage()
+        bookmarks[page2]=page2; c.bookmarkPage(page2)
+        bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / точки входа и выводы", "Артикул 2/2")
+        button(1240, 800, 170, "← категория", f"cat_{cat_short.get(subject,subject)}")
+        button(1430, 800, 100, "стр.1", page1)
+        eb = outputs.get("entry_points_bridge", pd.DataFrame())
+        ep_rows=[]
+        if eb is not None and not eb.empty:
+            part = eb[(eb["subject"]==subject) & (eb["supplier_article"].astype(str)==str(art))].sort_values("orders", ascending=False).head(7)
+            for _, ebr in part.iterrows():
+                ep_rows.append([f"{ebr.get('entry_section','')} / {ebr.get('entry_point','')}", _fmt_num_pdf(ebr.get("transitions")), delta_text(ebr.get("transitions"), ebr.get("transitions_prev")), _fmt_num_pdf(ebr.get("orders")), delta_text(ebr.get("orders"), ebr.get("orders_prev")), _fmt_rub(ebr.get("effect_gp_rub"))])
+        if not ep_rows:
+            ep_rows=[['-', '-', '-', '-', '-', '-']]
+        table_box(90, 380, 1420, 340, ["Точка входа", "Переходы", "Δ", "Заказы", "Δ", "Вклад ВП"], ep_rows, col_widths=[570,160,100,140,100,180], font_size=13, row_h=42, first_col_red=False)
+        # Factor summary money.
+        fs = factor_summary[(factor_summary["level"]=="article") & (factor_summary["supplier_article"].astype(str)==str(art))] if factor_summary is not None and not factor_summary.empty else pd.DataFrame()
+        txt = fs.iloc[0]["summary_text"] if not fs.empty else "Факторный мост не выделил значимых денежных причин."
+        c.setFillColor(WHITE); c.roundRect(90, 130, 1420, 190, 18, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.setFont(F_BLACK, 22); c.drawString(120, 280, "Факторный вывод в деньгах")
+        c.setFillColor(BLACK); c.setFont(F_BOLD, 18)
+        # simple wrap
+        words = str(txt).split()
+        lines=[]; line=""
+        for w0 in words:
+            cand = (line + " " + w0).strip()
+            if stringWidth(cand, F_BOLD, 18) > 1320:
+                lines.append(line); line=w0
+            else:
+                line=cand
+        if line: lines.append(line)
+        yy=245
+        for line in lines[:6]:
+            c.drawString(120, yy, line); yy -= 26
+        c.showPage()
+    c.save()
+    return path
+
+
+def send_telegram_document(file_path: Path, caption: str = "") -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, отправка пропущена")
+        return False
+    import urllib.request
+    import uuid
+    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    fields = {"chat_id": chat_id, "caption": caption[:1000]}
+    thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+    if thread_id:
+        fields["message_thread_id"] = thread_id
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    data = file_path.read_bytes()
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="document"; filename="{file_path.name}"\r\n'.encode())
+    body.extend(b"Content-Type: application/pdf\r\n\r\n")
+    body.extend(data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            ok = 200 <= resp.status < 300
+            log(f"Telegram: {'sent' if ok else 'failed'} status={resp.status}")
+            return ok
+    except Exception as exc:
+        log(f"Telegram: ошибка отправки PDF: {exc}")
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", help="Local root used for local copies and local mode")
     parser.add_argument("--reports-root", default="Отчёты")
     parser.add_argument("--store", default="TOPFACE")
+    parser.add_argument("--no-pdf", action="store_true", help="Не формировать PDF")
+    parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
     args = parser.parse_args()
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
@@ -2025,14 +2811,30 @@ def main() -> None:
     pack = loader.load_all()
     builder = AnalyticsBuilder(pack)
     outputs = builder.build_all()
+    factor_outputs = build_factor_outputs(builder, outputs)
+    outputs.update(factor_outputs)
     local_dir = Path(args.root) / OUT_DIR
     paths = export_outputs(outputs, local_dir)
+    # Отдельный техфайл по денежному факторному мосту, чтобы не ломать основные Excel-структуры.
+    factor_path = local_dir / FACTOR_REPORT_NAME
+    write_factor_report(factor_path, factor_outputs)
+    paths.append(factor_path)
+    pdf_path = local_dir / PDF_REPORT_NAME
+    if not args.no_pdf:
+        global builder_global_for_pdf
+        builder_global_for_pdf = builder
+        pdf_created = generate_management_pdf(outputs, pdf_path)
+        if pdf_created:
+            paths.append(pdf_path)
     log(f"Saved local copies: {local_dir}")
     # Always save to S3 too when S3 is active. In local mode this overwrites same local files safely.
     if storage.is_s3:
         for p in paths:
             storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
             log(f"Saved: {OUT_DIR}/{p.name}")
+    if args.send_telegram and pdf_path.exists():
+        caption = f"TOPFACE WB: управленческий отчёт {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        send_telegram_document(pdf_path, caption)
     log("Done")
 
 
