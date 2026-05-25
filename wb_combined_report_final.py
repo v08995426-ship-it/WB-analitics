@@ -660,9 +660,10 @@ def make_storage(root: str) -> Storage:
     bucket = os.getenv("YC_BUCKET_NAME", "").strip()
     access = os.getenv("YC_ACCESS_KEY_ID", "").strip()
     secret = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
-    endpoint = os.getenv("YC_ENDPOINT_URL", "https://storage.yandexcloud.net").strip()
+    endpoint = os.getenv("YC_ENDPOINT_URL", "").strip() or "https://storage.yandexcloud.net"
+    # FIX_MARKER_20260525_ENDPOINT_FALLBACK: empty YC_ENDPOINT_URL must not break boto3.
     if bucket and access and secret:
-        log(f"Storage: Yandex Object Storage bucket={bucket}")
+        log(f"Storage: Yandex Object Storage bucket={bucket}; endpoint={endpoint}")
         return S3Storage(bucket, access, secret, endpoint)
     log(f"Storage: local root={Path(root).resolve()}")
     return LocalStorage(root)
