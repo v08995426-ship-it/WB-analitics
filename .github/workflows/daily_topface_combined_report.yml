@@ -1,47 +1,75 @@
-name: Daily TOPFACE Combined Report
+name: TOPFACE management report
 
 on:
   workflow_dispatch:
+    inputs:
+      send_telegram:
+        description: 'Send PDF to Telegram'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      no_pdf:
+        description: 'Skip PDF generation'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
   schedule:
-    - cron: "10 6 * * *"
+    # 06:00 Moscow time = 03:00 UTC
+    - cron: '0 3 * * *'
 
 jobs:
-  build-combined-report:
+  build-report:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+      WB_MAX_STOCK_FILES: '16'
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl boto3 numpy
+          pip install -r requirements.txt
 
-      - name: Verify files
+      - name: Run TOPFACE report
+        shell: bash
         run: |
-          pwd
-          ls -la
-          test -f wb_combined_report_final.py
+          ARGS="--root ."
+          if [[ "${{ github.event.inputs.no_pdf || 'false' }}" == "true" ]]; then
+            ARGS="$ARGS --no-pdf"
+          fi
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event.inputs.send_telegram || 'true' }}" == "true" ]]; then
+            ARGS="$ARGS --send-telegram"
+          fi
+          python wb_combined_report_final.py $ARGS
 
-      - name: Run combined report
-        run: |
-          python wb_combined_report_final.py --root .
-
-      - name: Upload generated reports
-        if: always()
+      - name: Upload report artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: topface-combined-report
+          name: topface-management-report
           path: |
             Отчёты/Объединенный отчет/TOPFACE/**/*.xlsx
-          if-no-files-found: warn
+            Отчёты/Объединенный отчет/TOPFACE/**/*.pdf
+          if-no-files-found: error
+          retention-days: 30
