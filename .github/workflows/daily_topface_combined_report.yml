@@ -35,7 +35,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-      WB_MAX_STOCK_FILES: '16'
+      WB_MAX_SEARCH_QUERY_FILES: '8'
+      WB_MAX_ENTRY_POINT_FILES: '8'
+      WB_MAX_STOCK_FILES: '10'
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Checkout
