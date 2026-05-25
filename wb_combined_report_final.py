@@ -316,6 +316,45 @@ def filter_recent_report_files(files: List[str], latest_day: pd.Timestamp, lookb
         log(f"recent_file_filter: input={len(set(files))}, kept={len(out)}, skipped_old={skipped_old}, skipped_unknown={skipped_unknown}, cutoff={cutoff.date()}")
     return out
 
+
+
+def limit_recent_report_files(files: List[str], max_files: int) -> List[str]:
+    """Keep unknown support files and the newest dated report files by parsed period end.
+
+    Using lexical sorting for names like "7-4-2026 ..." and "29-3-2026 ..." can pull
+    old weeks instead of the latest ones. This helper uses dates parsed from the file
+    name, so max-file limits reduce runtime without accidentally keeping older reports.
+    """
+    unique = sorted(set(files))
+    if max_files is None or int(max_files) <= 0 or len(unique) <= int(max_files):
+        known = []
+        unknown = []
+        for f in unique:
+            start, end = parse_period_from_name(Path(f).name)
+            if start is None or end is None:
+                unknown.append(f)
+            else:
+                known.append((pd.Timestamp(end).normalize(), pd.Timestamp(start).normalize(), f))
+        return sorted(unknown) + [f for _, _, f in sorted(known)]
+
+    max_files = int(max_files)
+    known = []
+    unknown = []
+    for f in unique:
+        start, end = parse_period_from_name(Path(f).name)
+        if start is None or end is None:
+            unknown.append(f)
+        else:
+            known.append((pd.Timestamp(end).normalize(), pd.Timestamp(start).normalize(), f))
+    known_sorted = [f for _, _, f in sorted(known)]
+
+    # Preserve service/reference files without dates when possible; use the remaining
+    # quota for the latest dated weekly/monthly files.
+    if len(unknown) >= max_files:
+        return sorted(unknown)[-max_files:]
+    keep_known = max_files - len(unknown)
+    return sorted(unknown) + known_sorted[-keep_known:]
+
 def is_month_file(start: pd.Timestamp, end: pd.Timestamp) -> bool:
     if start is None or end is None or pd.isna(start) or pd.isna(end):
         return False
@@ -826,9 +865,8 @@ class Loader:
     def load_search_queries(self, latest_day: Optional[pd.Timestamp] = None) -> pd.DataFrame:
         files_all = self.list_reports("Поисковые запросы", self.store, "Недельные")
         files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=False)
-        max_files = int(os.getenv("WB_MAX_SEARCH_QUERY_FILES", "18"))
-        if len(files) > max_files:
-            files = files[-max_files:]
+        max_files = int(os.getenv("WB_MAX_SEARCH_QUERY_FILES", "8"))
+        files = limit_recent_report_files(files, max_files)
         log(f"search_queries: start, files_all={len(files_all)}, files_to_read={len(files)}")
         frames = []
         for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
@@ -884,9 +922,8 @@ class Loader:
         if not files_all:
             files_all += [f for f in self.storage.list_files(self.reports_root) if "Точки входа" in f and f.lower().endswith((".xlsx", ".zip"))]
         files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=True)
-        max_files = int(os.getenv("WB_MAX_ENTRY_POINT_FILES", "12"))
-        if len(files) > max_files:
-            files = files[-max_files:]
+        max_files = int(os.getenv("WB_MAX_ENTRY_POINT_FILES", "8"))
+        files = limit_recent_report_files(files, max_files)
         log(f"entry_points: start, files_all={len(files_all)}, files_to_read={len(files)}")
         frames = []
         for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
@@ -928,9 +965,8 @@ class Loader:
         for parts in [("Остатки", self.store), ("Остатки", self.store, "Недельные"), ("Остатки",), ("Остатки и товары в пути", self.store), ("Остатки и товары в пути",)]:
             files_all += self.list_reports(*parts)
         files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=True)
-        max_files = int(os.getenv("WB_MAX_STOCK_FILES", "16"))
-        if len(files) > max_files:
-            files = files[-max_files:]
+        max_files = int(os.getenv("WB_MAX_STOCK_FILES", "10"))
+        files = limit_recent_report_files(files, max_files)
         log(f"stock: start, files_all={len(files_all)}, files_to_read={len(files)}")
         frames = []
         for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
@@ -2041,17 +2077,7 @@ def _period_bounds_from_daily(daily: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Tim
 
 
 def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
-    if daily is None or daily.empty:
-        return pd.DataFrame(columns=group_cols)
-    x = daily.copy()
-    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
-    x = x[(x["day"] >= start) & (x["day"] <= end)].copy()
-    if x.empty:
-        return pd.DataFrame(columns=group_cols)
-    for c in group_cols:
-        if c not in x.columns:
-            x[c] = ""
-    sum_cols = [c for c in [
+    base_sum_cols = [
         "orders", "order_sum", "open_cards", "add_to_cart", "buyouts_count", "cancels_count",
         "manual_impressions", "manual_clicks", "manual_spend", "manual_orders", "manual_order_sum",
         "unified_impressions", "unified_clicks", "unified_spend", "unified_orders", "unified_order_sum",
@@ -2060,8 +2086,25 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
         "ad_spend_model", "gross_profit_model", "buyout_qty_model", "revenue_model",
         "commission_model", "acquiring_model", "logistics_direct_model", "logistics_return_model",
         "storage_model", "other_costs_model", "cost_model"
-    ] if c in x.columns]
-    mean_cols = [c for c in ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "localization_with_replacements_pct"] if c in x.columns]
+    ]
+    base_mean_cols = ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "localization_with_replacements_pct"]
+    derived_cols = ["ad_spend_total", "ad_clicks_total", "ad_impressions_total", "drr_pct", "cpc", "ctr_pct", "cart_conv_pct", "order_conv_pct", "card_to_order_pct", "search_traffic_capture_pct", "avg_order_price"]
+
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=group_cols + base_sum_cols + base_mean_cols + derived_cols)
+    x = daily.copy()
+    for c in group_cols:
+        if c not in x.columns:
+            x[c] = ""
+    sum_cols = [c for c in base_sum_cols if c in x.columns]
+    mean_cols = [c for c in base_mean_cols if c in x.columns]
+    empty_cols = group_cols + sum_cols + mean_cols + derived_cols
+
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    x = x[(x["day"] >= start) & (x["day"] <= end)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=empty_cols)
+
     agg = {c: (c, "sum") for c in sum_cols}
     for c in mean_cols:
         agg[c] = (c, "mean")
@@ -2073,14 +2116,26 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
         g["ad_spend_total"] = channel_spend
     g["ad_clicks_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_clicks", "unified_clicks", "unknown_clicks"])
     g["ad_impressions_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_impressions", "unified_impressions", "unknown_impressions"])
-    g["drr_pct"] = np.where(g.get("order_sum", 0) > 0, g["ad_spend_total"] / g["order_sum"] * 100, np.nan)
+
+    zero = pd.Series(0.0, index=g.index)
+    def _num_col(col: str) -> pd.Series:
+        return pd.to_numeric(g[col], errors="coerce").fillna(0) if col in g.columns else zero
+
+    order_sum = _num_col("order_sum")
+    orders = _num_col("orders")
+    open_cards = _num_col("open_cards")
+    add_to_cart = _num_col("add_to_cart")
+    search_frequency = _num_col("search_frequency")
+    search_transitions = _num_col("search_transitions")
+
+    g["drr_pct"] = np.where(order_sum > 0, g["ad_spend_total"] / order_sum * 100, np.nan)
     g["cpc"] = np.where(g["ad_clicks_total"] > 0, g["ad_spend_total"] / g["ad_clicks_total"], np.nan)
     g["ctr_pct"] = np.where(g["ad_impressions_total"] > 0, g["ad_clicks_total"] / g["ad_impressions_total"] * 100, np.nan)
-    g["cart_conv_pct"] = np.where(g.get("open_cards", 0) > 0, g.get("add_to_cart", 0) / g.get("open_cards", 0) * 100, np.nan)
-    g["order_conv_pct"] = np.where(g.get("add_to_cart", 0) > 0, g.get("orders", 0) / g.get("add_to_cart", 0) * 100, np.nan)
-    g["card_to_order_pct"] = np.where(g.get("open_cards", 0) > 0, g.get("orders", 0) / g.get("open_cards", 0) * 100, np.nan)
-    g["search_traffic_capture_pct"] = np.where(g.get("search_frequency", 0) > 0, g.get("search_transitions", 0) / g.get("search_frequency", 0) * 100, np.nan)
-    g["avg_order_price"] = np.where(g.get("orders", 0) > 0, g.get("order_sum", 0) / g.get("orders", 0), np.nan)
+    g["cart_conv_pct"] = np.where(open_cards > 0, add_to_cart / open_cards * 100, np.nan)
+    g["order_conv_pct"] = np.where(add_to_cart > 0, orders / add_to_cart * 100, np.nan)
+    g["card_to_order_pct"] = np.where(open_cards > 0, orders / open_cards * 100, np.nan)
+    g["search_traffic_capture_pct"] = np.where(search_frequency > 0, search_transitions / search_frequency * 100, np.nan)
+    g["avg_order_price"] = np.where(orders > 0, order_sum / orders, np.nan)
     return g
 
 
@@ -2110,7 +2165,25 @@ def _abc_gp_for_period(builder: AnalyticsBuilder, start: pd.Timestamp, end: pd.T
 def _merge_cur_prev(cur: pd.DataFrame, prev: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
     cur = cur.copy() if cur is not None else pd.DataFrame(columns=keys)
     prev = prev.copy() if prev is not None else pd.DataFrame(columns=keys)
-    return cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev")).fillna(0)
+    for k in keys:
+        if k not in cur.columns:
+            cur[k] = ""
+        if k not in prev.columns:
+            prev[k] = ""
+    value_cols = sorted(set([c for c in cur.columns if c not in keys]) | set([c for c in prev.columns if c not in keys]))
+    for c in value_cols:
+        if c not in cur.columns:
+            cur[c] = np.nan
+        if c not in prev.columns:
+            prev[c] = np.nan
+    out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+    for c in value_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+        pc = f"{c}_prev"
+        if pc not in out.columns:
+            out[pc] = np.nan
+    return out.fillna(0)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -2267,10 +2340,11 @@ def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timest
     e = e.copy()
     e["day"] = pd.to_datetime(e["day"], errors="coerce").dt.normalize()
     group_cols = ["subject", "product", "supplier_article", "nm_id", "entry_section", "entry_point"]
+    metric_cols = ["impressions", "transitions", "add_to_cart", "orders", "ctr_pct", "cart_conv_pct", "order_conv_pct"]
     def agg(start, end):
         x = e[(e["day"] >= start) & (e["day"] <= end)].copy()
         if x.empty:
-            return pd.DataFrame(columns=group_cols)
+            return pd.DataFrame(columns=group_cols + metric_cols)
         g = x.groupby(group_cols, dropna=False, as_index=False).agg(
             impressions=("impressions", "sum"), transitions=("transitions", "sum"),
             add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
@@ -2282,6 +2356,13 @@ def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timest
     cur = agg(week_start, week_end)
     prev = agg(prev_start, prev_end)
     out = _merge_cur_prev(cur, prev, group_cols)
+    for c in metric_cols:
+        if c not in out.columns:
+            out[c] = 0.0
+        if f"{c}_prev" not in out.columns:
+            out[f"{c}_prev"] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+        out[f"{c}_prev"] = pd.to_numeric(out[f"{c}_prev"], errors="coerce").fillna(0)
     # Join article margin and avg price from daily data for ₽ effect.
     daily = outputs_global_for_bridge.get("article_day_fact", pd.DataFrame()) if "outputs_global_for_bridge" in globals() else pd.DataFrame()
     if daily is not None and not daily.empty:
