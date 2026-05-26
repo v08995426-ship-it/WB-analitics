@@ -4080,7 +4080,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 search_unique_demand["product_code"] = ""
         if "supplier_article" in search_unique_demand.columns:
             search_unique_demand["supplier_article"] = search_unique_demand["supplier_article"].map(_clean_article_local)
-        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed"]:
+        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed", "raw_query_rows"]:
             if _c not in search_unique_demand.columns:
                 search_unique_demand[_c] = 0
             search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
@@ -4897,7 +4897,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 search_unique_demand["product_code"] = ""
         if "supplier_article" in search_unique_demand.columns:
             search_unique_demand["supplier_article"] = search_unique_demand["supplier_article"].map(_clean_article_local)
-        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed"]:
+        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed", "raw_query_rows"]:
             if _c not in search_unique_demand.columns:
                 search_unique_demand[_c] = 0
             search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
@@ -5029,6 +5029,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             demand_unique=("unique_search_frequency", "sum"),
             unique_queries=("unique_search_queries", "sum"),
             duplicate_query_rows_removed=("duplicate_query_rows_removed", "sum"),
+            raw_query_rows=("raw_query_rows", "sum"),
         )
         return g
 
@@ -5040,6 +5041,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if x.empty:
             return pd.DataFrame(columns=keys)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
+            daily_rows=("order_sum", "size"),
+            active_days=("day", "nunique"),
             order_sum=("order_sum", "sum"),
             orders=("orders", "sum"),
             gp_model=("gross_profit_model", "sum"),
@@ -5062,6 +5065,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             other_per_unit=("other_costs", _safe_mean),
             cost_per_unit=("cost", _safe_mean),
         )
+        # Store the old duplicated demand for diagnostics before replacing it with unique-query demand.
+        g["demand_daily_sum"] = g["demand"]
         # Demand for category/product/article levels must be unique by search query.
         # Fallback: old article_day_fact sum only when the new search_unique_demand sheet is absent.
         du = _unique_demand_period(start, end, keys)
@@ -5073,6 +5078,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             g["demand_source"] = "daily_sum_fallback"
             g["unique_queries"] = 0
             g["duplicate_query_rows_removed"] = 0
+            g["raw_query_rows"] = 0
         # % поиска = все открытия карточки / Спрос WB.
         g["search_share"] = np.where(g["demand"] > 0, g["opens"] / g["demand"] * 100, np.nan)
         g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
@@ -5091,7 +5097,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
         out = out.merge(abc_prev, on=keys, how="left")
         # fill numeric values
-        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "search_share", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv"]:
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv"]:
             if col not in out.columns: out[col] = 0.0
             if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
@@ -5782,27 +5788,354 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     c.save()
 
     # ---------- audit/trace workbook ----------
+    # Делает не короткую сводку, а подробный след расчёта: откуда взялась каждая
+    # метрика в PDF, какие строки/периоды были использованы и какие формулы дали
+    # итоговые значения. Это нужно, чтобы быстро ловить смешение ABC/daily/search.
     try:
         trace_path = path.parent / PDF_CALC_TRACE_NAME
-        trace_rows=[]
-        def add_trace(contour, level, period, row, metric, value, source, formula):
-            trace_rows.append({"contour": contour, "level": level, "period": period, "subject": row.get("subject_disp", ""), "product": row.get("product_code", ""), "article": row.get("supplier_article", ""), "metric": metric, "value": value, "source": source, "formula": formula})
+
+        trace_rows: List[Dict[str, Any]] = []
+        sample_rows: List[Dict[str, Any]] = []
+        demand_rows: List[Dict[str, Any]] = []
+        formula_rows: List[Dict[str, Any]] = []
+        factor_rows_out: List[Dict[str, Any]] = []
+        source_rows: List[Dict[str, Any]] = []
+        nav_rows: List[Dict[str, Any]] = []
+        raw_sample_rows: List[Dict[str, Any]] = []
+
+        sample_category = os.getenv("PDF_TRACE_SAMPLE_CATEGORY", "Кисти").strip() or "Кисти"
+        sample_product = os.getenv("PDF_TRACE_SAMPLE_PRODUCT", "901").strip() or "901"
+        sample_article_env = os.getenv("PDF_TRACE_SAMPLE_ARTICLE", "").strip()
+
+        def _trace_entity_id(level: str, row: pd.Series) -> str:
+            cat = str(row.get("subject_disp", ""))
+            prod = str(row.get("product_code", ""))
+            art = str(row.get("supplier_article", ""))
+            nm = str(row.get("nm_id", ""))
+            if level == "category":
+                return cat
+            if level == "product":
+                return f"{cat} / {prod}"
+            if nm and nm != "0" and nm.lower() != "nan":
+                return f"{cat} / {prod} / {art} / nm={nm}"
+            return f"{cat} / {prod} / {art}"
+
+        def _trace_source(row: pd.Series, metric: str, current: bool = True) -> Tuple[str, str, str, bool, str]:
+            has = bool(row.get("has_abc" if current else "has_abc_prev", False))
+            suffix = "" if current else "_prev"
+            if metric in ["Сумма", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "Комиссия, %", "Эквайринг, %"]:
+                if has:
+                    col_map = {
+                        "Сумма": "gross_revenue / revenue_abc",
+                        "ВП ABC": "gross_profit / gp_abc",
+                        "Рентабельность": "gp_abc / revenue_abc",
+                        "Расход РК": "gross_revenue * abc_drr_pct / 100 / abc_ad_spend",
+                        "ДРР": "abc_ad_spend / revenue_abc",
+                        "Комиссия, %": "abc_commission_amount / revenue_abc",
+                        "Эквайринг, %": "abc_acquiring_amount / revenue_abc",
+                    }
+                    return "ABC exact", "ABC weekly/monthly from Object Storage", col_map.get(metric, ""), False, "ABC exact найден для периода"
+                # fallback
+                fallback_cols = {
+                    "Сумма": "article_day_fact.order_sum",
+                    "ВП ABC": "article_day_fact.gross_profit_model",
+                    "Рентабельность": "gross_profit_model / order_sum",
+                    "Расход РК": "article_day_fact.ad_spend_total",
+                    "ДРР": "ad_spend_total / order_sum",
+                    "Комиссия, %": "article_day_fact.commission_%",
+                    "Эквайринг, %": "article_day_fact.acquiring_%",
+                }
+                return "daily/model fallback", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", fallback_cols.get(metric, ""), True, "ABC exact не найден, использован оперативный/модельный расчёт"
+            if metric == "CPC":
+                spend_src = "ABC ad_spend" if has else "daily ad_spend_total"
+                return "mixed allowed", "ABC/daily + article_day_fact", f"{spend_src}; clicks=article_day_fact.ad_clicks_total", False, "CPC = Расход РК выбранного источника / клики рекламы"
+            if metric in ["Спрос WB", "% поиска"]:
+                ds = str(row.get("demand_source" + suffix, row.get("demand_source", "")))
+                if ds == "unique_queries":
+                    return "unique search queries", "Технические_расчеты_TOPFACE.xlsx / search_unique_demand", "unique_search_frequency, unique_search_queries, duplicate_query_rows_removed", False, "спрос дедублирован по нормализованным поисковым запросам"
+                return "daily_sum_fallback", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "search_frequency", True, "нет листа search_unique_demand или нет строк уровня; спрос может быть завышен дублями"
+            if metric in ["Открытия", "Конв. в корзину", "Корзина → заказ", "Заказы", "Логистика/шт", "Хранение/шт", "Себест./шт", "Прочие/шт", "СПП"]:
+                return "daily operational", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "open_cards/add_to_cart/orders/cost fields", False, "оперативные карточные/юнит-метрики"
+            return "unknown", "", "", True, "источник не классифицирован"
+
+        def _value_pair(row: pd.Series, metric: str) -> Tuple[Any, Any, str, str]:
+            mapping = {
+                "Сумма": ("sum_use", "sum_prev_use", "sum_use = ABC gross_revenue если exact ABC найден, иначе SUM(order_sum)", "₽"),
+                "ВП ABC": ("gp_use", "gp_prev_use", "gp_use = ABC gross_profit если exact ABC найден, иначе gross_profit_model", "₽"),
+                "Рентабельность": ("margin", "margin_prev", "Рентабельность = ВП / Сумма * 100", "%"),
+                "Расход РК": ("ad_spend", "ad_spend_prev", "Расход РК = ABC promotion/ABC revenue*drr если ABC, иначе SUM(ad_spend_total)", "₽"),
+                "ДРР": ("drr", "drr_prev", "ДРР = Расход РК / Сумма * 100", "%"),
+                "CPC": ("cpc", "cpc_prev", "CPC = Расход РК / Клики РК", "₽"),
+                "Спрос WB": ("demand", "demand_prev", "Спрос WB = SUM(unique_search_frequency) по уникальным запросам; fallback=SUM(search_frequency)", "шт"),
+                "% поиска": ("search_share", "search_share_prev", "% поиска = Открытия карточки / Спрос WB * 100", "%"),
+                "Открытия": ("opens", "opens_prev", "Открытия = SUM(open_cards)", "шт"),
+                "Конв. в корзину": ("cart_conv", "cart_conv_prev", "Конв. в корзину = Корзины / Открытия * 100", "%"),
+                "Корзина → заказ": ("order_conv", "order_conv_prev", "Корзина → заказ = Заказы / Корзины * 100", "%"),
+                "Заказы": ("orders", "orders_prev", "Заказы = ABC orders если exact ABC найден, иначе SUM(orders)", "шт"),
+                "Комиссия, %": ("commission_pct", "commission_pct_prev", "Комиссия, % = ABC commission / ABC revenue * 100 если ABC, иначе commission_%", "%"),
+                "Эквайринг, %": ("acquiring_pct", "acquiring_pct_prev", "Эквайринг, % = ABC acquiring / ABC revenue * 100 если ABC, иначе acquiring_%", "%"),
+                "Логистика/шт": ("logistics_per_unit", "logistics_per_unit_prev", "Логистика/шт = среднее logistics_direct из daily", "₽/шт"),
+                "Хранение/шт": ("storage_per_unit", "storage_per_unit_prev", "Хранение/шт = среднее storage из daily", "₽/шт"),
+                "Себест./шт": ("cost_per_unit", "cost_per_unit_prev", "Себест./шт = среднее cost из daily", "₽/шт"),
+                "Прочие/шт": ("other_per_unit", "other_per_unit_prev", "Прочие/шт = среднее other_costs из daily", "₽/шт"),
+                "СПП": ("spp", "spp_prev", "СПП = среднее spp из daily", "%"),
+            }
+            cur_col, prev_col, formula, unit = mapping[metric]
+            return row.get(cur_col, np.nan), row.get(prev_col, np.nan), formula, unit
+
+        metrics_for_trace = [
+            "Сумма", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "CPC",
+            "Спрос WB", "% поиска", "Открытия", "Конв. в корзину", "Корзина → заказ", "Заказы",
+            "Комиссия, %", "Эквайринг, %", "Логистика/шт", "Хранение/шт", "Себест./шт", "Прочие/шт", "СПП",
+        ]
+
+        # Determine one sample article: env override first, otherwise top GP article inside sample product.
+        sample_article = sample_article_env
+        if not sample_article and isinstance(prev_art, pd.DataFrame) and not prev_art.empty:
+            qsa = prev_art[(prev_art.get("subject_disp", "").astype(str).eq(sample_category)) & (prev_art.get("product_code", "").astype(str).eq(sample_product))].copy()
+            if not qsa.empty:
+                qsa["_gp"] = pd.to_numeric(qsa.get("gp_use"), errors="coerce").fillna(0)
+                qsa = qsa.sort_values("_gp", ascending=False)
+                sample_article = str(qsa.iloc[0].get("supplier_article", ""))
+        if not sample_article:
+            sample_article = "901/5"
+
+        frame_specs = [
+            ("current_week", "category", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y}", cur_cat),
+            ("current_month", "category", f"{cur_start.replace(day=1):%d.%m}-{cur_actual_end:%d.%m.%Y}", current_month_cat),
+        ]
         for cname, info in contours.items():
-            for level_name, df in [("category", info["cat_df"]), ("product", info["prod_df"]), ("article", info["art_df"] if info["art_df"] is not None else pd.DataFrame())]:
-                if df is None or df.empty: continue
-                for _, r in df.iterrows():
-                    add_trace(cname, level_name, info["period"], r, "sum_use", r.get("sum_use"), "ABC gross_revenue if exact exists else article_day_fact order_sum", "sum_use = ABC[Валовая выручка] OR SUM(article_day_fact[Сумма заказов])")
-                    add_trace(cname, level_name, info["period"], r, "gp_use", r.get("gp_use"), "ABC exact if exists else gross_profit_model", "gp_use = ABC[Валовая прибыль] OR SUM(article_day_fact[gross_profit_model])")
-                    add_trace(cname, level_name, info["period"], r, "margin", r.get("margin"), "ABC gross_revenue/gross_profit", "margin = gp_use / sum_use")
-                    add_trace(cname, level_name, info["period"], r, "drr", r.get("drr"), "ABC ДРР if exact exists else ad_spend/order_sum", "drr = ABC[ДРР] OR Расход РК / Сумма")
+            frame_specs.extend([
+                (cname, "category", info["period"], info.get("cat_df", pd.DataFrame())),
+                (cname, "product", info["period"], info.get("prod_df", pd.DataFrame())),
+                (cname, "article", info["period"], info.get("art_df", pd.DataFrame())),
+            ])
+
+        def _is_sample(level: str, row: pd.Series) -> bool:
+            cat = str(row.get("subject_disp", ""))
+            prod = str(row.get("product_code", ""))
+            art = str(row.get("supplier_article", ""))
+            if level == "category":
+                return cat == sample_category
+            if level == "product":
+                return cat == sample_category and prod == sample_product
+            if level == "article":
+                return cat == sample_category and prod == sample_product and art == sample_article
+            return False
+
+        for contour_name, level_name, period_label, df in frame_specs:
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            for _, row in df.iterrows():
+                row_s = row if isinstance(row, pd.Series) else pd.Series(row)
+                for metric in metrics_for_trace:
+                    cur_val, prev_val, formula, unit = _value_pair(row_s, metric)
+                    delta = _delta(cur_val, prev_val)
+                    src, src_file, src_cols, fallback, reason = _trace_source(row_s, metric, current=True)
+                    prev_src, prev_src_file, prev_src_cols, prev_fallback, prev_reason = _trace_source(row_s, metric, current=False)
+                    base_name = "прошлая неделя" if contour_name in ["prev", "current_week"] else "предыдущий месяц" if contour_name == "closed" else "прошлый период"
+                    rec = {
+                        "contour": contour_name,
+                        "level": level_name,
+                        "period": period_label,
+                        "entity": _trace_entity_id(level_name, row_s),
+                        "category": row_s.get("subject_disp", ""),
+                        "product": row_s.get("product_code", ""),
+                        "article": row_s.get("supplier_article", ""),
+                        "nm_id": row_s.get("nm_id", ""),
+                        "metric": metric,
+                        "current_value": cur_val,
+                        "base_value": prev_val,
+                        "base_name": base_name,
+                        "delta_pct": delta,
+                        "unit": unit,
+                        "source_current": src,
+                        "source_current_file_sheet": src_file,
+                        "source_current_columns": src_cols,
+                        "source_base": prev_src,
+                        "source_base_file_sheet": prev_src_file,
+                        "source_base_columns": prev_src_cols,
+                        "formula": formula,
+                        "fallback_used_current": fallback,
+                        "fallback_used_base": prev_fallback,
+                        "source_reason_current": reason,
+                        "source_reason_base": prev_reason,
+                        "daily_rows_current": row_s.get("daily_rows", np.nan),
+                        "daily_rows_base": row_s.get("daily_rows_prev", np.nan),
+                        "active_days_current": row_s.get("active_days", np.nan),
+                        "active_days_base": row_s.get("active_days_prev", np.nan),
+                        "abc_rows_current": row_s.get("abc_rows", np.nan),
+                        "abc_rows_base": row_s.get("abc_rows_prev_abc", np.nan),
+                        "has_abc_current": row_s.get("has_abc", False),
+                        "has_abc_base": row_s.get("has_abc_prev", False),
+                        "demand_source_current": row_s.get("demand_source", ""),
+                        "demand_source_base": row_s.get("demand_source_prev", ""),
+                        "unique_queries_current": row_s.get("unique_queries", np.nan),
+                        "unique_queries_base": row_s.get("unique_queries_prev", np.nan),
+                        "raw_query_rows_current": row_s.get("raw_query_rows", np.nan),
+                        "raw_query_rows_base": row_s.get("raw_query_rows_prev", np.nan),
+                        "duplicate_query_rows_removed_current": row_s.get("duplicate_query_rows_removed", np.nan),
+                        "duplicate_query_rows_removed_base": row_s.get("duplicate_query_rows_removed_prev", np.nan),
+                        "daily_demand_sum_before_unique_current": row_s.get("demand_daily_sum", np.nan),
+                        "daily_demand_sum_before_unique_base": row_s.get("demand_daily_sum_prev", np.nan),
+                    }
+                    trace_rows.append(rec)
+                    if _is_sample(level_name, row_s):
+                        sample_rows.append(rec)
+
+                # Demand-specific trace row per entity.
+                demand_rows.append({
+                    "contour": contour_name,
+                    "level": level_name,
+                    "period": period_label,
+                    "entity": _trace_entity_id(level_name, row_s),
+                    "category": row_s.get("subject_disp", ""),
+                    "product": row_s.get("product_code", ""),
+                    "article": row_s.get("supplier_article", ""),
+                    "demand_final": row_s.get("demand", np.nan),
+                    "demand_base": row_s.get("demand_prev", np.nan),
+                    "demand_source": row_s.get("demand_source", ""),
+                    "demand_source_base": row_s.get("demand_source_prev", ""),
+                    "unique_queries": row_s.get("unique_queries", np.nan),
+                    "unique_queries_base": row_s.get("unique_queries_prev", np.nan),
+                    "raw_query_rows": row_s.get("raw_query_rows", np.nan),
+                    "raw_query_rows_base": row_s.get("raw_query_rows_prev", np.nan),
+                    "duplicates_removed": row_s.get("duplicate_query_rows_removed", np.nan),
+                    "duplicates_removed_base": row_s.get("duplicate_query_rows_removed_prev", np.nan),
+                    "old_sum_by_articles_current": row_s.get("demand_daily_sum", np.nan),
+                    "old_sum_by_articles_base": row_s.get("demand_daily_sum_prev", np.nan),
+                    "formula": "unique demand: SUM(MAX(frequency) by date+level+normalized query); fallback: SUM(article_day_fact.search_frequency)",
+                    "WARNING": "если demand_source=daily_sum_fallback, спрос может быть задвоен по артикулам",
+                })
+
+                # Formula checks for key metrics.
+                sum_v = _num(row_s.get("sum_use")); gp_v = _num(row_s.get("gp_use")); ad_v = _num(row_s.get("ad_spend")); clicks_v = _num(row_s.get("clicks")); opens_v = _num(row_s.get("opens")); demand_v = _num(row_s.get("demand")); carts_v = _num(row_s.get("carts")); orders_v = _num(row_s.get("orders"))
+                checks = [
+                    ("Рентабельность", _num(row_s.get("margin")), gp_v / sum_v * 100 if abs(sum_v) > 1e-9 else np.nan, "gp_use / sum_use * 100"),
+                    ("ДРР", _num(row_s.get("drr")), ad_v / sum_v * 100 if abs(sum_v) > 1e-9 else np.nan, "ad_spend / sum_use * 100"),
+                    ("CPC", _num(row_s.get("cpc")), ad_v / clicks_v if clicks_v > 0 else 0.0, "ad_spend / clicks"),
+                    ("% поиска", _num(row_s.get("search_share")), opens_v / demand_v * 100 if demand_v > 0 else np.nan, "opens / demand * 100"),
+                    ("Конв. в корзину", _num(row_s.get("cart_conv")), carts_v / opens_v * 100 if opens_v > 0 else np.nan, "carts / opens * 100"),
+                    ("Корзина → заказ", _num(row_s.get("order_conv")), orders_v / carts_v * 100 if carts_v > 0 else np.nan, "orders / carts * 100"),
+                ]
+                for metric, shown, recomputed, formula in checks:
+                    diff = shown - recomputed if not pd.isna(recomputed) else np.nan
+                    formula_rows.append({
+                        "contour": contour_name,
+                        "level": level_name,
+                        "period": period_label,
+                        "entity": _trace_entity_id(level_name, row_s),
+                        "metric": metric,
+                        "shown_value": shown,
+                        "recomputed_value": recomputed,
+                        "diff": diff,
+                        "status": "OK" if (pd.isna(diff) or abs(diff) < 0.05) else "CHECK",
+                        "formula": formula,
+                        "sum_use": sum_v,
+                        "gp_use": gp_v,
+                        "ad_spend": ad_v,
+                        "clicks": clicks_v,
+                        "opens": opens_v,
+                        "demand": demand_v,
+                        "carts": carts_v,
+                        "orders": orders_v,
+                    })
+
+                if _is_sample(level_name, row_s):
+                    for fr in _factor_rows(row_s, level_name):
+                        rr = dict(fr)
+                        rr.update({
+                            "contour": contour_name,
+                            "level": level_name,
+                            "period": period_label,
+                            "entity": _trace_entity_id(level_name, row_s),
+                            "category": row_s.get("subject_disp", ""),
+                            "product": row_s.get("product_code", ""),
+                            "article": row_s.get("supplier_article", ""),
+                        })
+                        factor_rows_out.append(rr)
+
+        # Raw daily rows for the sample category/product/article; helps find where wrong values enter.
+        try:
+            raw_periods = [
+                ("current_week", cur_start, cur_actual_end),
+                ("prev_week", prev_start, prev_end),
+                ("prev_base_week", prev2_start, prev2_end),
+                ("closed_month", closed_start, closed_end),
+                ("closed_base_month", closed_prev_start, closed_prev_end),
+            ]
+            for pname, ps, pe in raw_periods:
+                rx = daily[(daily["day"] >= ps) & (daily["day"] <= pe)].copy()
+                for lvl, mask in [
+                    ("category", rx["subject_disp"].astype(str).eq(sample_category)),
+                    ("product", rx["subject_disp"].astype(str).eq(sample_category) & rx["product_code"].astype(str).eq(sample_product)),
+                    ("article", rx["subject_disp"].astype(str).eq(sample_category) & rx["product_code"].astype(str).eq(sample_product) & rx["supplier_article"].astype(str).map(_clean_article_local).eq(sample_article)),
+                ]:
+                    part = rx[mask].copy()
+                    raw_sample_rows.append({
+                        "period_name": pname,
+                        "level": lvl,
+                        "period_start": ps,
+                        "period_end": pe,
+                        "sample_category": sample_category,
+                        "sample_product": sample_product,
+                        "sample_article": sample_article,
+                        "raw_rows": len(part),
+                        "active_days": part["day"].nunique() if not part.empty else 0,
+                        "order_sum_sum": pd.to_numeric(part.get("order_sum", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "ad_spend_total_sum": pd.to_numeric(part.get("ad_spend_total", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "open_cards_sum": pd.to_numeric(part.get("open_cards", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "search_frequency_sum_raw_daily": pd.to_numeric(part.get("search_frequency", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "orders_sum": pd.to_numeric(part.get("orders", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                    })
+        except Exception as exc:
+            raw_sample_rows.append({"error": str(exc)})
+
+        # Sources + exact ABC usage overview.
+        source_rows.extend([
+            {"source": "article_day_fact", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "used_for": "оперативная сумма, реклама, клики, открытия, корзины, конверсии, daily fallback", "risk": "не использовать как финансы закрытого периода при наличии ABC"},
+            {"source": "search_unique_demand", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / search_unique_demand", "used_for": "Спрос WB на уровнях категория/товар/артикул", "risk": "если лист отсутствует, PDF падает в fallback и спрос может быть задвоен"},
+            {"source": "abc_weekly", "file_sheet": "ABC weekly from Object Storage", "used_for": "закрытая неделя: выручка, ВП, рентабельность, ДРР, комиссия, эквайринг", "risk": "должен быть exact period"},
+            {"source": "abc_monthly", "file_sheet": "ABC monthly from Object Storage", "used_for": "закрытый месяц: выручка, ВП, рентабельность, ДРР, комиссия, эквайринг", "risk": "должен быть exact month"},
+            {"source": "entry_points_bridge", "file_sheet": "Факторный_мост_ВП_TOPFACE.xlsx / entry_points_bridge", "used_for": "точки входа на странице артикула 2/2", "risk": "пока недельный контур"},
+        ])
+
+        for cname, info in contours.items():
+            for cat in CATEGORY_ORDER:
+                nav_rows.append({"contour": cname, "page_type": "category", "category": cat, "bookmark": _cat_key(cname, cat), "back_target": info["summary_key"], "list_target": _cat_key(cname, cat)+"_list", "factor_target": _cat_factor_key(cname, cat)})
+            pdfp = info.get("prod_df", pd.DataFrame())
+            if isinstance(pdfp, pd.DataFrame) and not pdfp.empty:
+                for _, pr in pdfp.iterrows():
+                    cat = str(pr.get("subject_disp", "")); prod = str(pr.get("product_code", ""))
+                    nav_rows.append({"contour": cname, "page_type": "product", "category": cat, "product": prod, "bookmark": _prod_key(cname, cat, prod), "back_target": _cat_key(cname, cat)+"_list", "list_target": _prod_key(cname, cat, prod)+"_list", "factor_target": _prod_factor_key(cname, cat, prod)})
+
         with pd.ExcelWriter(trace_path, engine="openpyxl") as writer:
-            pd.DataFrame(trace_rows).to_excel(writer, sheet_name="Расчет_показателей", index=False)
+            pd.DataFrame([{
+                "description": "Подробный лог расчётов PDF: каждая метрика, источник, формула, fallback и проверка формул.",
+                "sample_category": sample_category,
+                "sample_product": sample_product,
+                "sample_article": sample_article,
+                "important": "Если source_current=daily_sum_fallback для Спрос WB, значит нет search_unique_demand и спрос может быть неверным.",
+            }]).to_excel(writer, sheet_name="README", index=False)
+            pd.DataFrame(source_rows).to_excel(writer, sheet_name="sources", index=False)
+            pd.DataFrame(trace_rows).to_excel(writer, sheet_name="metric_trace_all", index=False)
+            pd.DataFrame(sample_rows).to_excel(writer, sheet_name="metric_trace_sample", index=False)
+            pd.DataFrame(demand_rows).to_excel(writer, sheet_name="demand_trace", index=False)
+            pd.DataFrame(formula_rows).to_excel(writer, sheet_name="formula_checks", index=False)
+            pd.DataFrame(factor_rows_out).to_excel(writer, sheet_name="factor_effects_sample", index=False)
+            pd.DataFrame(raw_sample_rows).to_excel(writer, sheet_name="raw_daily_sample", index=False)
+            pd.DataFrame(nav_rows).to_excel(writer, sheet_name="navigation_expected", index=False)
+            # Rendered product rows for quick category/product inspection.
             for cname, info in contours.items():
-                if info["prod_df"] is not None and not info["prod_df"].empty:
+                if isinstance(info.get("prod_df"), pd.DataFrame) and not info["prod_df"].empty:
                     info["prod_df"].to_excel(writer, sheet_name=(cname + "_products")[:31], index=False)
-        log(f"Saved PDF calc trace: {trace_path} rows={len(trace_rows):,}")
+                if isinstance(info.get("cat_df"), pd.DataFrame) and not info["cat_df"].empty:
+                    info["cat_df"].to_excel(writer, sheet_name=(cname + "_categories")[:31], index=False)
+
+        log(f"Saved detailed PDF metric trace: {trace_path} trace_rows={len(trace_rows):,}; sample_rows={len(sample_rows):,}; demand_rows={len(demand_rows):,}")
+        log(f"PDF TRACE SAMPLE: category={sample_category}; product={sample_product}; article={sample_article}")
     except Exception as exc:
-        log(f"WARN PDF calc trace was not saved: {exc}")
+        log(f"WARN PDF detailed calc trace was not saved: {exc}")
     log(f"PDF v11 three-contour report created: pages={page_num}")
     return path
 
