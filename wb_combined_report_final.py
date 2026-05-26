@@ -4028,8 +4028,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if sub2:
             c.setFillColor(tone_color(sub2_tone)); c.setFont(F_BOLD, 12); c.drawCentredString(x+w/2, y+18, sub2)
 
-    def draw_table(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=44, first_col_red=True, align_left_cols=None):
+    def draw_table(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=44, first_col_red=True, align_left_cols=None, lower_better_cols=None):
         align_left_cols = set(align_left_cols or [])
+        lower_better_cols = set(lower_better_cols or [])
         if col_widths is None:
             col_widths = [w/len(headers)]*len(headers)
         c.setFillColor(WHITE); c.roundRect(x, y, w, h, 18, fill=1, stroke=0)
@@ -4065,7 +4066,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     if arrow_pos >= 0:
                         main_part = raw[:arrow_pos].rstrip()
                         delta_part = raw[arrow_pos:].strip()
-                        dcolor = GREEN if delta_part.startswith("↑") else BAD if delta_part.startswith("↓") else GRAY
+                        is_lower = i in lower_better_cols
+                        if delta_part.startswith("↑"):
+                            dcolor = BAD if is_lower else GREEN
+                        elif delta_part.startswith("↓"):
+                            dcolor = GREEN if is_lower else BAD
+                        else:
+                            dcolor = GRAY
                         if i in align_left_cols:
                             start_x = xx + 12
                         else:
@@ -4083,6 +4090,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     line_y -= 16
                     c.setFillColor(BLACK)
                 xx += col_widths[i]
+            yy -= row_h
+
+
+    def add_table_row_links(x, y, w, h, row_h, targets, header_h=50):
+        """Overlay clickable areas on table body rows. Targets may point to bookmarks created later."""
+        yy = y + h - header_h - row_h
+        for target in targets:
+            if target:
+                c.linkRect("", str(target), (x, yy, x + w, yy + row_h), relative=0)
             yy -= row_h
 
     def agg(start, end, keys):
@@ -4152,7 +4168,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     draw_metric_card(360, 610, 260, 120, _fmt_rub(cur_gp_total), "ВП факт ABC" if cur_gp_fact_flag else "ВП расч.", dt, tone)
     dt, tone = _pdf_color_delta_value(drr_cur, drr_prev, True)
     opt_txt = f"опт. {_fmt_pct_pdf(opt_drr_total)}" if pd.notna(opt_drr_total) else "опт. —"
-    draw_metric_card(650, 610, 260, 120, _fmt_pct_pdf(drr_cur), "ДРР", dt, tone, opt_txt, "neutral")
+    draw_metric_card(650, 610, 260, 120, _fmt_pct_pdf(drr_cur), "ДРР", dt, tone)
     dt, tone = _pdf_color_delta_value(cur_total.get("ad_spend_total",0), prev_total.get("ad_spend_total",0), True)
     draw_metric_card(940, 610, 260, 120, _fmt_rub(cur_total.get("ad_spend_total", 0)), "Расход РК", dt, tone)
     plan_day = max(0, _pdf_num(cur_total.get("order_sum"), 0) / max(1, (latest-cur_monday).days+1) * 1.1)
@@ -4174,7 +4190,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 rp = pp.iloc[0] if not pp.empty else pd.Series(dtype=object)
                 dt_sum = dyn_text(r.get("order_sum"), rp.get("order_sum"), False)
                 vals.append(f"{_fmt_rub(r.get('order_sum'), True)} {dt_sum}\n{_fmt_rub(r.get('gp_use'), True)}\n{_fmt_rub(r.get('ad_spend_total'), True)}\n{_fmt_pct_pdf(r.get('drr_pct'))}")
-        vals.append(f"{_fmt_rub(plan_day/4, True)}\n—\n—\nопт. ДРР")
+        vals.append(f"{_fmt_rub(plan_day/4, True)}\n—\n—\n—")
         rows.append(vals)
     draw_table(70, 80, 1460, 470, headers, rows, col_widths=[190]+[145]*7+[255], font_size=12, row_h=92)
     c.showPage()
@@ -4192,13 +4208,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
             f"{_fmt_rub(r.get('gp_use'))}",
             _fmt_pct_pdf(r.get("margin_pct")),
-            f"{_fmt_pct_pdf(r.get('drr_pct'))}\nопт. {_fmt_pct_pdf(opt_r.get('optimal_drr_pct', np.nan))}",
+            f"{_fmt_pct_pdf(r.get('drr_pct'))}\n{dyn_text(r.get('drr_pct'), r.get('drr_pct_prev'), True)}",
             f"{_fmt_rub(r.get('ad_spend_total'))}",
             f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
             _fmt_pct_pdf(r.get("search_traffic_capture_pct")),
         ])
     cur_gp_label = "ВП факт ABC" if bool(cat_cur.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) else "ВП расч."
-    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", cur_gp_label, "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74)
+    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", cur_gp_label, "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74, lower_better_cols={4,5,6})
+    # Category rows are clickable: category -> products; brushes -> article list on the category page.
+    selected_subjects_for_nav = set(selected["subject"].astype(str)) if selected is not None and not selected.empty and "subject" in selected.columns else set()
+    cat_targets = [f"cat_{cat_short.get(str(r.get('subject')), str(r.get('subject')))}" if str(r.get("subject")) in selected_subjects_for_nav else None for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows()]
+    add_table_row_links(80, 260, 1440, 400, 74, cat_targets)
     c.showPage()
 
     # Previous week, current month, closed month, monthly summary.
@@ -4221,7 +4241,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 f"{_fmt_rub(r.get('ad_spend_total'))}\n{dyn_text(r.get('ad_spend_total'), r.get('ad_spend_total_prev'), True)}",
                 f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
             ])
-        draw_table(80, 235, 1440, 460, ["Категория", "Сумма", gp_fact_label, "Маржа", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,230,230,150,180,230,150], font_size=14, row_h=80)
+        draw_table(80, 235, 1440, 460, ["Категория", "Сумма", gp_fact_label, "Маржа", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,230,230,150,180,230,150], font_size=14, row_h=80, lower_better_cols={4,5,6})
         c.showPage()
 
     prev_report_start = cur_monday - pd.Timedelta(days=7)
@@ -4282,47 +4302,80 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cp = cp[cp["product"].astype(str).map(lambda p: (subject, p) in selected_set)].copy() if selected_set else cp
         if cp.empty:
             continue
-        cat_key = f"cat_{cat_short.get(subject, subject)}"
-        bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
-        page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / товары 90% стабильной ВП", "Категория")
-        button(1220, 800, 240, "← прошлая неделя", "prev")
-        rows=[]
-        for _, r in cp.sort_values("gp_use", ascending=False).iterrows():
-            opt_r = _find_optimal_row(opt, "product", subject, r.get("product"))
-            rows.append([
-                str(r.get("product")),
-                f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
-                f"{_fmt_rub(r.get('gp_use'))}\n{dyn_text(r.get('gp_use'), r.get('gp_use_prev'))}",
-                _fmt_pct_pdf(r.get("margin_pct")),
-                f"{_fmt_pct_pdf(r.get('drr_pct'))}\nопт. {_fmt_pct_pdf(opt_r.get('optimal_drr_pct', np.nan))}",
-                f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
-                f"{_fmt_pct_pdf(r.get('search_traffic_capture_pct'))}\n{dyn_text(r.get('search_traffic_capture_pct'), r.get('search_traffic_capture_pct_prev'))}",
-                _fmt_pct_pdf(r.get("localization_with_replacements_pct")),
-            ])
-        draw_table(90, 150, 1420, 500, ["Товар", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[190,210,210,140,180,150,180,150], font_size=14, row_h=74)
-        c.showPage()
-
-        # For categories with a single product (brushes 901), skip intermediate product page and show articles directly.
         products = list(cp["product"].astype(str).unique())
         skip_product_level = (len(products) == 1 and products[0] == "901")
+        cat_key = f"cat_{cat_short.get(subject, subject)}"
+        bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
+
+        def article_keep_for_product(product_value: str) -> pd.DataFrame:
+            aw0 = article_week[(article_week["subject"].astype(str).eq(subject)) & (article_week["product"].astype(str).eq(product_value))].copy()
+            if aw0.empty:
+                return aw0
+            aw0 = aw0[(pd.to_numeric(aw0.get("order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw0.get("orders"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw0["gp_use"], errors="coerce").fillna(0) > 0)].copy()
+            if aw0.empty:
+                return aw0
+            total_gp0 = pd.to_numeric(aw0["gp_use"], errors="coerce").fillna(0).sum()
+            aw0 = aw0.sort_values("gp_use", ascending=False).copy()
+            aw0["share"] = np.where(total_gp0 > 0, aw0["gp_use"] / total_gp0 * 100, 0)
+            aw0["cum"] = aw0["share"].cumsum()
+            keep0 = aw0[(aw0["cum"] <= 90) | (aw0.index == aw0.index[0])].copy()
+            if len(keep0) < len(aw0):
+                first_out0 = aw0[~aw0.index.isin(keep0.index)].head(1)
+                if not first_out0.empty and _pdf_num(first_out0.iloc[0].get("gp_use"), 0) > 1000:
+                    keep0 = pd.concat([keep0, first_out0])
+            return keep0.head(14)
+
+        if skip_product_level:
+            # Brushes have only one meaningful product (901), so category page is immediately an article list.
+            product = products[0]
+            aw_cat = article_keep_for_product(product)
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / артикулы товара {product} / 90% ВП", "Категория")
+            button(1220, 800, 240, "← прошлая неделя", "prev")
+            rows=[]; row_targets=[]
+            for _, ar in aw_cat.iterrows():
+                art = str(ar.get("supplier_article"))
+                page1 = f"article_{art}_1".replace("/", "_").replace(" ", "_")
+                row_targets.append(page1)
+                rows.append([
+                    art,
+                    f"{_fmt_rub(ar.get('order_sum'))}\n{dyn_text(ar.get('order_sum'), ar.get('order_sum_prev'))}",
+                    f"{_fmt_rub(ar.get('gp_use'))}\n{dyn_text(ar.get('gp_use'), ar.get('gp_use_prev'))}",
+                    _fmt_pct_pdf(ar.get("margin_pct")),
+                    f"{_fmt_pct_pdf(ar.get('drr_pct'))}\n{dyn_text(ar.get('drr_pct'), ar.get('drr_pct_prev'), True)}",
+                    f"{_fmt_cpc_pdf(ar.get('cpc'))}\n{dyn_text(ar.get('cpc'), ar.get('cpc_prev'), True)}",
+                    f"{_fmt_pct_pdf(ar.get('search_traffic_capture_pct'))}\n{dyn_text(ar.get('search_traffic_capture_pct'), ar.get('search_traffic_capture_pct_prev'))}",
+                    _fmt_pct_pdf(ar.get("localization_with_replacements_pct")),
+                ])
+            draw_table(90, 150, 1420, 500, ["Артикул", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[220,200,200,130,130,130,170,150], font_size=13, row_h=58, lower_better_cols={4,5})
+            add_table_row_links(90, 150, 1420, 500, 58, row_targets)
+            c.showPage()
+        else:
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / товары 90% стабильной ВП", "Категория")
+            button(1220, 800, 240, "← прошлая неделя", "prev")
+            rows=[]; row_targets=[]
+            for _, r in cp.sort_values("gp_use", ascending=False).iterrows():
+                product_value = str(r.get("product"))
+                prod_key_tmp = f"prod_{subject}_{product_value}".replace(" ", "_")
+                row_targets.append(prod_key_tmp)
+                rows.append([
+                    product_value,
+                    f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
+                    f"{_fmt_rub(r.get('gp_use'))}\n{dyn_text(r.get('gp_use'), r.get('gp_use_prev'))}",
+                    _fmt_pct_pdf(r.get("margin_pct")),
+                    f"{_fmt_pct_pdf(r.get('drr_pct'))}\n{dyn_text(r.get('drr_pct'), r.get('drr_pct_prev'), True)}",
+                    f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
+                    f"{_fmt_pct_pdf(r.get('search_traffic_capture_pct'))}\n{dyn_text(r.get('search_traffic_capture_pct'), r.get('search_traffic_capture_pct_prev'))}",
+                    _fmt_pct_pdf(r.get("localization_with_replacements_pct")),
+                ])
+            draw_table(90, 150, 1420, 500, ["Товар", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[190,210,210,140,180,150,180,150], font_size=14, row_h=74, lower_better_cols={4,5})
+            add_table_row_links(90, 150, 1420, 500, 74, row_targets)
+            c.showPage()
+
         for product in products:
-            aw = article_week[(article_week["subject"].astype(str).eq(subject)) & (article_week["product"].astype(str).eq(product))].copy()
-            # Detail pages only for articles with current real sales and positive GP.
-            # This prevents impossible rows like "0 ₽ sales but positive ABC GP" from getting pages.
-            aw = aw[(pd.to_numeric(aw.get("order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw.get("orders"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw["gp_use"], errors="coerce").fillna(0) > 0)].copy()
+            aw = article_keep_for_product(product)
             if aw.empty:
                 continue
-            total_gp = pd.to_numeric(aw["gp_use"], errors="coerce").fillna(0).sum()
-            aw = aw.sort_values("gp_use", ascending=False).copy()
-            aw["share"] = np.where(total_gp > 0, aw["gp_use"] / total_gp * 100, 0)
-            aw["cum"] = aw["share"].cumsum()
-            aw_keep = aw[(aw["cum"] <= 90) | (aw.index == aw.index[0])].copy()
-            if len(aw_keep) < len(aw):
-                first_out = aw[~aw.index.isin(aw_keep.index)].head(1)
-                # include crossing item if it carries relevant money
-                if not first_out.empty and _pdf_num(first_out.iloc[0].get("gp_use"), 0) > 1000:
-                    aw_keep = pd.concat([aw_keep, first_out])
-            aw_keep = aw_keep.head(14)
+            aw_keep = aw.copy()
 
             prod_key = f"prod_{subject}_{product}".replace(" ", "_")
             if not skip_product_level:
@@ -4336,13 +4389,25 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 dt, tone = _pdf_color_delta_value(pr.get("gp_use"), pr.get("gp_use_prev"), False)
                 draw_metric_card(340, 620, 230, 100, _fmt_rub(pr.get("gp_use")), "ВП", dt, tone)
                 dt, tone = _pdf_color_delta_value(pr.get("drr_pct"), pr.get("drr_pct_prev"), True)
-                draw_metric_card(590, 620, 230, 100, _fmt_pct_pdf(pr.get("drr_pct")), "ДРР", dt, tone, "опт. ДРР")
+                draw_metric_card(590, 620, 230, 100, _fmt_pct_pdf(pr.get("drr_pct")), "ДРР", dt, tone)
                 dt, tone = _pdf_color_delta_value(pr.get("cpc"), pr.get("cpc_prev"), True)
                 draw_metric_card(840, 620, 230, 100, _fmt_cpc_pdf(pr.get("cpc")), "CPC", dt, tone)
-                rows2=[]
+                rows2=[]; art_targets=[]
                 for _, ar in aw_keep.iterrows():
-                    rows2.append([str(ar.get("supplier_article")), f"{_fmt_rub(ar.get('order_sum'))}\n{dyn_text(ar.get('order_sum'), ar.get('order_sum_prev'))}", f"{_fmt_rub(ar.get('gp_use'))}\n{dyn_text(ar.get('gp_use'), ar.get('gp_use_prev'))}", _fmt_pct_pdf(ar.get("margin_pct")), _fmt_pct_pdf(ar.get("drr_pct")), _fmt_cpc_pdf(ar.get("cpc")), _fmt_pct_pdf(ar.get("search_traffic_capture_pct")), _fmt_pct_pdf(ar.get("localization_with_replacements_pct"))])
-                draw_table(90, 150, 1420, 410, ["Артикул", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows2, col_widths=[220,200,200,130,130,130,170,150], font_size=13, row_h=58)
+                    art = str(ar.get("supplier_article"))
+                    art_targets.append(f"article_{art}_1".replace("/", "_").replace(" ", "_"))
+                    rows2.append([
+                        art,
+                        f"{_fmt_rub(ar.get('order_sum'))}\n{dyn_text(ar.get('order_sum'), ar.get('order_sum_prev'))}",
+                        f"{_fmt_rub(ar.get('gp_use'))}\n{dyn_text(ar.get('gp_use'), ar.get('gp_use_prev'))}",
+                        _fmt_pct_pdf(ar.get("margin_pct")),
+                        f"{_fmt_pct_pdf(ar.get('drr_pct'))}\n{dyn_text(ar.get('drr_pct'), ar.get('drr_pct_prev'), True)}",
+                        f"{_fmt_cpc_pdf(ar.get('cpc'))}\n{dyn_text(ar.get('cpc'), ar.get('cpc_prev'), True)}",
+                        f"{_fmt_pct_pdf(ar.get('search_traffic_capture_pct'))}\n{dyn_text(ar.get('search_traffic_capture_pct'), ar.get('search_traffic_capture_pct_prev'))}",
+                        _fmt_pct_pdf(ar.get("localization_with_replacements_pct")),
+                    ])
+                draw_table(90, 150, 1420, 410, ["Артикул", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], rows2, col_widths=[220,200,200,130,130,130,170,150], font_size=13, row_h=58, lower_better_cols={4,5})
+                add_table_row_links(90, 150, 1420, 410, 58, art_targets)
                 c.showPage()
 
             # Article pages for top 90% GP inside selected product.
@@ -4363,7 +4428,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 def unit(col):
                     qty = max(_pdf_num(ar.get("buyout_qty_model"), _pdf_num(ar.get("orders"), 1)), 1)
                     return _pdf_num(ar.get(col), 0) / qty
-                opt_ar = _find_optimal_row(opt, "article", subject, product, art)
+                def pct_of_sales(col, suffix=""):
+                    denom = _pdf_num(ar.get("order_sum" + suffix), 0)
+                    return (_pdf_num(ar.get(col + suffix), 0) / denom * 100) if denom else np.nan
                 gp = _pdf_num(ar.get("gp_use"), 0)
                 gp_label = "ВП факт ABC" if bool(ar.get("gp_is_fact", False)) else "ВП расч."
                 cards1 = [
@@ -4373,10 +4440,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     (_fmt_rub(ar.get("avg_order_price")), "Цена продажи", ar.get("avg_order_price"), ar.get("avg_order_price_prev"), False, ""),
                     (_fmt_rub(ar.get("price_with_disc")), "Цена покупателя", ar.get("price_with_disc"), ar.get("price_with_disc_prev"), False, ""),
                     (_fmt_pct_pdf(ar.get("spp", ar.get("spp_funnel",0))), "СПП", ar.get("spp", ar.get("spp_funnel",0)), ar.get("spp_prev", ar.get("spp_funnel_prev",0)), False, ""),
-                    (_fmt_rub(unit("commission_model")), "Комиссия/шт", "", "", True, ""),
+                    (_fmt_pct_pdf(pct_of_sales("commission_model")), "Комиссия, %", pct_of_sales("commission_model"), pct_of_sales("commission_model", "_prev"), True, ""),
                     (_fmt_rub(unit("logistics_direct_model")+unit("logistics_return_model")), "Логистика/шт", "", "", True, ""),
                     (_fmt_rub(unit("storage_model")), "Хранение/шт", "", "", True, ""),
-                    (_fmt_rub(unit("acquiring_model")), "Эквайринг/шт", "", "", True, ""),
+                    (_fmt_pct_pdf(pct_of_sales("acquiring_model")), "Эквайринг, %", pct_of_sales("acquiring_model"), pct_of_sales("acquiring_model", "_prev"), True, ""),
                     (_fmt_rub(unit("cost_model")), "Себест./шт", "", "", True, ""),
                     (_fmt_rub(unit("other_costs_model")), "Прочие/шт", "", "", True, ""),
                 ]
@@ -4385,11 +4452,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     dt, tone = _pdf_color_delta_value(curv, prevv, lower) if curv != "" else ("", "neutral")
                     draw_metric_card(80+idx*240, 535, 220, 96, val, lab, dt, tone, sub2)
                 for idx, (val, lab, curv, prevv, lower, sub2) in enumerate(cards1[6:]):
-                    draw_metric_card(80+idx*240, 420, 220, 96, val, lab)
+                    dt, tone = _pdf_color_delta_value(curv, prevv, lower) if curv != "" else ("", "neutral")
+                    draw_metric_card(80+idx*240, 420, 220, 96, val, lab, dt, tone)
                 c.setFillColor(RED_DARK); c.roundRect(80, 350, 1440, 42, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 364, "Блок 2. Спрос, точки входа и конверсии")
                 cards2 = [
                     (_fmt_rub(ar.get("ad_spend_total")), "Расход РК", ar.get("ad_spend_total"), ar.get("ad_spend_total_prev"), True, ""),
-                    (_fmt_pct_pdf(ar.get("drr_pct")), "ДРР", ar.get("drr_pct"), ar.get("drr_pct_prev"), True, f"опт. {_fmt_pct_pdf(opt_ar.get('optimal_drr_pct', np.nan))}"),
+                    (_fmt_pct_pdf(ar.get("drr_pct")), "ДРР", ar.get("drr_pct"), ar.get("drr_pct_prev"), True, ""),
                     (_fmt_cpc_pdf(ar.get("cpc")), "CPC", ar.get("cpc"), ar.get("cpc_prev"), True, ""),
                     (_fmt_num_pdf(ar.get("ad_impressions_total")), "Показы РК", ar.get("ad_impressions_total"), ar.get("ad_impressions_total_prev"), False, ""),
                     (_fmt_num_pdf(ar.get("ad_clicks_total")), "Клики РК", ar.get("ad_clicks_total"), ar.get("ad_clicks_total_prev"), False, ""),
