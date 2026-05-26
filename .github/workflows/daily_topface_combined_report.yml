@@ -11,6 +11,14 @@ on:
         options:
           - 'true'
           - 'false'
+      pdf_only:
+        description: 'Generate only PDF from existing Excel reports'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
       no_pdf:
         description: 'Skip PDF generation'
         required: false
@@ -31,7 +39,7 @@ jobs:
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || 'https://storage.yandexcloud.net' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
@@ -53,18 +61,42 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          # PDF generation is mandatory for this report.
+          # The script skips PDF when reportlab is missing, so install it explicitly
+          # even if requirements.txt in the repo was not updated yet.
+          pip install "reportlab>=4.2.0"
+          python - <<'PY'
+          import reportlab
+          print('reportlab OK:', reportlab.Version)
+          PY
 
       - name: Run TOPFACE report
         shell: bash
         run: |
           ARGS="--root ."
+          if [[ "${{ github.event.inputs.pdf_only || 'false' }}" == "true" ]]; then
+            ARGS="$ARGS --pdf-only"
+          fi
           if [[ "${{ github.event.inputs.no_pdf || 'false' }}" == "true" ]]; then
             ARGS="$ARGS --no-pdf"
           fi
           if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event.inputs.send_telegram || 'true' }}" == "true" ]]; then
             ARGS="$ARGS --send-telegram"
           fi
+          echo "Running: python wb_combined_report_final.py $ARGS"
           python wb_combined_report_final.py $ARGS
+
+      - name: Check PDF exists
+        shell: bash
+        run: |
+          PDF="Отчёты/Объединенный отчет/TOPFACE/Управленческий_отчет_TOPFACE.pdf"
+          if [[ "${{ github.event.inputs.no_pdf || 'false' }}" != "true" && ! -f "$PDF" ]]; then
+            echo "PDF was not created: $PDF"
+            exit 1
+          fi
+          if [[ -f "$PDF" ]]; then
+            ls -lh "$PDF"
+          fi
 
       - name: Upload report artifacts
         uses: actions/upload-artifact@v4
