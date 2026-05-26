@@ -430,10 +430,52 @@ def read_excel_table(data: bytes, preferred_sheet: Optional[str] = None, header_
                     score += 1
             if score > best_score:
                 best_score = score
+                aliased.attrs["source_sheet"] = sheet
+                aliased.attrs["header_row_0based"] = h
+                aliased.attrs["header_row_excel"] = h + 1
                 best_df = aliased
     if best_df is None:
         return pd.DataFrame()
     return best_df
+
+
+def _source_column_name(df: pd.DataFrame, logical_name: str) -> str:
+    """Return the original source column name used for a logical alias when possible."""
+    if df is None or df.empty:
+        return ""
+    variants = ALIASES.get(logical_name, []) + [logical_name]
+    by_key = {norm_key(c): c for c in df.columns}
+    # Prefer non-canonical original columns, then canonical alias.
+    for v in variants:
+        k = norm_key(v)
+        if k in by_key and by_key[k] != logical_name:
+            return by_key[k]
+    if logical_name in df.columns:
+        return logical_name
+    for v in variants:
+        k = norm_key(v)
+        if k in by_key:
+            return by_key[k]
+    return ""
+
+
+def _source_cell_ref(df: pd.DataFrame, logical_name: str, row_index: Any) -> str:
+    """Return Excel-like cell reference for a logical value after read_excel_table.
+
+    Header detection is done by read_excel_table; row_index is the parsed dataframe row index.
+    This is used only for audit/debug logs, not for calculations.
+    """
+    try:
+        col_name = _source_column_name(df, logical_name)
+        if not col_name or col_name not in df.columns:
+            return ""
+        col_no = list(df.columns).index(col_name) + 1
+        h0 = int(df.attrs.get("header_row_0based", 0) or 0)
+        # pandas row index starts from 0 for the first data row after the header.
+        excel_row = int(row_index) + h0 + 2
+        return f"{get_column_letter(col_no)}{excel_row}"
+    except Exception:
+        return ""
 
 
 def safe_sheet_name(name: str, used: set) -> str:
@@ -1010,6 +1052,9 @@ class Loader:
                 df = read_excel_table(data)
                 if df.empty:
                     continue
+                source_sheet = df.attrs.get("source_sheet", "")
+                header_row_excel = df.attrs.get("header_row_excel", "")
+                source_rows = pd.Series(df.index, index=df.index).map(lambda i: int(i) + int(df.attrs.get("header_row_0based", 0) or 0) + 2)
                 out = pd.DataFrame({
                     "period_start": start,
                     "period_end": end,
@@ -1023,6 +1068,12 @@ class Loader:
                     "gross_revenue": num_series(get_col(df, "gross_revenue")).fillna(0),
                     "orders": num_series(get_col(df, "orders")).fillna(0),
                     "source_file": key,
+                    "source_sheet": source_sheet,
+                    "header_row_excel": header_row_excel,
+                    "source_row_excel": source_rows,
+                    "cell_gross_profit": [_source_cell_ref(df, "gross_profit", i) for i in df.index],
+                    "cell_gross_revenue": [_source_cell_ref(df, "gross_revenue", i) for i in df.index],
+                    "cell_orders": [_source_cell_ref(df, "orders", i) for i in df.index],
                 })
                 out["product"] = out["supplier_article"].map(product_code)
                 if is_month_file(start, end) and start.year == current_year:
@@ -2688,6 +2739,7 @@ def _register_topface_fonts():
 
 
 PRODUCT_GROUP_AUDIT_NAME = "Проверить_товарные_группы_TOPFACE.xlsx"
+PDF_CALC_TRACE_NAME = "Лог_расчетов_PDF_TOPFACE.xlsx"
 
 # Строгий справочник для PDF. Он важнее автоматического product_code():
 # если товар/артикул не подтвержден здесь, в управленческий PDF он не попадает.
@@ -3710,11 +3762,19 @@ def _gp_from_abc_frames(outputs: Dict[str, pd.DataFrame], start: pd.Timestamp, e
     if not frames:
         return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
     exact = pd.concat(frames, ignore_index=True)
+    def _join_unique(s):
+        vals = [normalize_text(v) for v in s.dropna().astype(str).tolist() if normalize_text(v)]
+        vals = list(dict.fromkeys(vals))
+        return " | ".join(vals[:20])
     return exact.groupby(group_cols, dropna=False, as_index=False).agg(
         gp_fact=("gross_profit", "sum"),
         gross_revenue_fact=("gross_revenue", "sum"),
         sales_qty_fact=("orders", "sum"),
         gp_source=("gp_source", "first"),
+        gp_source_file=("source_file", _join_unique),
+        gp_source_sheet=("source_sheet", _join_unique),
+        gp_source_rows=("source_row_excel", _join_unique),
+        gp_source_cells=("cell_gross_profit", _join_unique),
     )
 
 
@@ -3891,6 +3951,28 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     if opt is None:
         opt = pd.DataFrame()
 
+    trace_rows: List[Dict[str, Any]] = []
+    log(f"PDF_DEBUG: article_day_fact rows={len(daily):,}, period={daily['day'].min().date() if not daily.empty else '-'}..{daily['day'].max().date() if not daily.empty else '-'}, cols={len(daily.columns):,}")
+    log(f"PDF_DEBUG: abc_weekly rows={len(outputs.get('abc_weekly', pd.DataFrame())):,}, abc_monthly rows={len(outputs.get('abc_monthly', pd.DataFrame())):,}")
+
+    def add_trace(block: str, level: str, period_start: Any, period_end: Any, metric: str, value: Any, source: str, source_columns: str, filters: str = "", formula: str = "", source_file: str = "", source_sheet: str = "", source_rows: str = "", source_cells: str = ""):
+        trace_rows.append({
+            "block": block,
+            "level": level,
+            "period_start": str(pd.Timestamp(period_start).date()) if pd.notna(period_start) else "",
+            "period_end": str(pd.Timestamp(period_end).date()) if pd.notna(period_end) else "",
+            "metric": metric,
+            "value": value,
+            "source": source,
+            "source_file": source_file,
+            "source_sheet": source_sheet,
+            "source_rows": source_rows,
+            "source_cells": source_cells,
+            "source_columns": source_columns,
+            "filters": filters,
+            "formula": formula,
+        })
+
     c = canvas.Canvas(str(path), pagesize=(W, H))
     bookmarks: Dict[str, str] = {}
     page_num = 0
@@ -3930,12 +4012,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     def draw_metric_card(x, y, w, h, value, label, dyn="", tone="neutral", sub2="", sub2_tone="neutral"):
         c.setFillColor(WHITE); c.roundRect(x, y, w, h, 16, fill=1, stroke=0)
-        c.setFillColor(BLACK); c.setFont(F_BLACK, 27); c.drawCentredString(x+w/2, y+h-42, str(value))
-        c.setFillColor(GRAY); c.setFont(F_REG, 14); c.drawCentredString(x+w/2, y+h-72, str(label))
+        val = str(value)
+        c.setFont(F_BLACK, 27)
+        val_w = stringWidth(val, F_BLACK, 27)
+        base_x = x + w/2 - (val_w/2 if dyn else val_w/2)
+        # When there is dynamic, reserve space to the right so the arrow is not drawn below.
         if dyn:
-            c.setFillColor(tone_color(tone)); c.setFont(F_BOLD, 12); c.drawCentredString(x+w/2, y+34, dyn)
+            dyn_w = stringWidth(str(dyn), F_BOLD, 12)
+            total_w = val_w + 12 + dyn_w
+            base_x = max(x + 14, x + w/2 - total_w/2)
+        c.setFillColor(BLACK); c.setFont(F_BLACK, 27); c.drawString(base_x, y+h-42, val)
+        if dyn:
+            c.setFillColor(tone_color(tone)); c.setFont(F_BOLD, 12); c.drawString(base_x + val_w + 12, y+h-39, str(dyn))
+        c.setFillColor(GRAY); c.setFont(F_REG, 14); c.drawCentredString(x+w/2, y+h-72, str(label))
         if sub2:
-            c.setFillColor(tone_color(sub2_tone)); c.setFont(F_BOLD, 12); c.drawCentredString(x+w/2, y+17, sub2)
+            c.setFillColor(tone_color(sub2_tone)); c.setFont(F_BOLD, 12); c.drawCentredString(x+w/2, y+18, sub2)
 
     def draw_table(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=44, first_col_red=True, align_left_cols=None):
         align_left_cols = set(align_left_cols or [])
@@ -3964,16 +4055,31 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     c.setFillColor(RED_DARK); c.setFont(F_BLACK, font_size)
                 else:
                     c.setFillColor(BLACK); c.setFont(F_BOLD, font_size)
+                # If the value is written as two lines: value + arrow, render the arrow to the right.
+                if len(lines) >= 2 and lines[1].strip().startswith(("↑", "↓", "→")):
+                    lines = [lines[0] + " " + lines[1].strip()] + lines[2:]
                 line_y = yy + row_h/2 + (len(lines)-1)*8
                 for line in lines:
-                    raw = line[:58]
-                    # Color whole delta lines when the line starts with an arrow.
-                    if raw.strip().startswith(("↑", "↓", "→")):
-                        c.setFillColor(GREEN if raw.strip().startswith("↑") else BAD if raw.strip().startswith("↓") else GRAY)
-                    if i in align_left_cols:
-                        c.drawString(xx+12, line_y, raw)
+                    raw = line[:70]
+                    arrow_pos = min([p for p in [raw.find("↑"), raw.find("↓"), raw.find("→")] if p >= 0], default=-1)
+                    if arrow_pos >= 0:
+                        main_part = raw[:arrow_pos].rstrip()
+                        delta_part = raw[arrow_pos:].strip()
+                        dcolor = GREEN if delta_part.startswith("↑") else BAD if delta_part.startswith("↓") else GRAY
+                        if i in align_left_cols:
+                            start_x = xx + 12
+                        else:
+                            total_w = stringWidth(main_part, F_BOLD, font_size) + 8 + stringWidth(delta_part, F_BOLD, max(font_size-1, 9))
+                            start_x = xx + col_widths[i]/2 - total_w/2
+                        c.setFillColor(BLACK); c.setFont(F_BOLD, font_size); c.drawString(start_x, line_y, main_part)
+                        c.setFillColor(dcolor); c.setFont(F_BOLD, max(font_size-1, 9)); c.drawString(start_x + stringWidth(main_part, F_BOLD, font_size) + 8, line_y, delta_part)
                     else:
-                        c.drawCentredString(xx+col_widths[i]/2, line_y, raw)
+                        if raw.strip().startswith(("↑", "↓", "→")):
+                            c.setFillColor(GREEN if raw.strip().startswith("↑") else BAD if raw.strip().startswith("↓") else GRAY)
+                        if i in align_left_cols:
+                            c.drawString(xx+12, line_y, raw)
+                        else:
+                            c.drawCentredString(xx+col_widths[i]/2, line_y, raw)
                     line_y -= 16
                     c.setFillColor(BLACK)
                 xx += col_widths[i]
@@ -3989,13 +4095,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         a = a.copy() if a is not None else pd.DataFrame(columns=keys)
         period_start = pd.Timestamp(start).normalize()
         period_end = pd.Timestamp(end).normalize()
-        # Current report week is operational: use calculated daily GP consistently.
-        # ABC fact is used only for previous closed week / closed full month pages.
-        is_current_report_week = (period_start == pd.Timestamp(cur_monday).normalize() and period_end == pd.Timestamp(latest).normalize()) or (period_start == pd.Timestamp(week_start).normalize() and period_end == pd.Timestamp(week_end).normalize())
-        if not is_current_report_week:
-            gp = gp_week(keys, start, end)
-            if gp is not None and not gp.empty:
-                a = a.merge(gp, on=keys, how="left")
+        # Use exact ABC for any exact closed week/month that exists, including the current report week
+        # when WB ABC has already been exported. If exact ABC is absent, fallback is model GP.
+        gp = gp_week(keys, start, end)
+        if gp is not None and not gp.empty:
+            a = a.merge(gp, on=keys, how="left")
         if "gp_fact" not in a.columns:
             a["gp_fact"] = np.nan
         if len(a.index):
@@ -4005,6 +4109,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             a["gp_is_fact"] = fact_gp.notna()
             order_sum_num = pd.to_numeric(a.get("order_sum", 0), errors="coerce").fillna(0)
             a["margin_pct"] = np.where(order_sum_num > 0, pd.to_numeric(a["gp_use"], errors="coerce") / order_sum_num * 100, np.nan)
+            try:
+                source_cnt = int(a["gp_is_fact"].fillna(False).sum())
+                source_txt = "ABC exact" if source_cnt else "model gross_profit_model"
+                log(f"PDF_GP: period={period_start.date()}..{period_end.date()} group={keys} rows={len(a):,} abc_rows={source_cnt:,} gp_sum={pd.to_numeric(a['gp_use'], errors='coerce').fillna(0).sum():,.0f} source={source_txt}")
+                for _, tr in a.iterrows():
+                    key_filter = "; ".join([f"{k}={tr.get(k, '')}" for k in keys])
+                    if bool(tr.get("gp_is_fact", False)):
+                        add_trace("gross_profit", "+".join(keys), period_start, period_end, "ВП", float(_pdf_num(tr.get("gp_use"), 0)), "ABC exact", "Валовая прибыль", key_filter, "SUM(ABC[Валовая прибыль]) по exact period_start/period_end и ключам", str(tr.get("gp_source_file", "")), str(tr.get("gp_source_sheet", "")), str(tr.get("gp_source_rows", "")), str(tr.get("gp_source_cells", "")))
+                    else:
+                        add_trace("gross_profit", "+".join(keys), period_start, period_end, "ВП", float(_pdf_num(tr.get("gp_use"), 0)), "article_day_fact model", "gross_profit_model", key_filter, "SUM(article_day_fact[gross_profit_model]) по периоду и ключам")
+            except Exception as exc:
+                log(f"WARN PDF_TRACE with_gp failed: {exc}")
         else:
             a["gp_use"] = pd.Series(dtype=float)
             a["gp_is_fact"] = pd.Series(dtype=bool)
@@ -4019,16 +4135,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     top_nav("cur")
     cur_period = agg(cur_monday, latest, ["subject"])
     prev_same = agg(cur_monday-pd.Timedelta(days=7), latest-pd.Timedelta(days=7), ["subject"])
+    cur_period_gp = with_gp(cur_period, ["subject"], cur_monday, cur_week_end if latest >= cur_week_end else latest)
+    prev_same_gp = with_gp(prev_same, ["subject"], cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7) if latest >= cur_week_end else latest-pd.Timedelta(days=7))
     cur_total = cur_period.sum(numeric_only=True)
     prev_total = prev_same.sum(numeric_only=True) if not prev_same.empty else pd.Series(dtype=float)
+    cur_gp_total = pd.to_numeric(cur_period_gp.get("gp_use", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if not cur_period_gp.empty else _pdf_num(cur_total.get("gross_profit_model"),0)
+    prev_gp_total = pd.to_numeric(prev_same_gp.get("gp_use", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if not prev_same_gp.empty else _pdf_num(prev_total.get("gross_profit_model"),0)
+    cur_gp_fact_flag = bool(cur_period_gp.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) if not cur_period_gp.empty else False
     drr_cur = _pdf_num(cur_total.get("ad_spend_total"), 0) / _pdf_num(cur_total.get("order_sum"), 1) * 100 if _pdf_num(cur_total.get("order_sum"), 0) else np.nan
     drr_prev = _pdf_num(prev_total.get("ad_spend_total"), 0) / _pdf_num(prev_total.get("order_sum"), 1) * 100 if _pdf_num(prev_total.get("order_sum"), 0) else np.nan
     opt_cat = opt[opt.get("level", "") == "category"] if not opt.empty and "level" in opt.columns else pd.DataFrame()
     opt_drr_total = pd.to_numeric(opt_cat.get("optimal_drr_pct", pd.Series(dtype=float)), errors="coerce").mean() if not opt_cat.empty else np.nan
     dt, tone = _pdf_color_delta_value(cur_total.get("order_sum",0), prev_total.get("order_sum",0), False)
     draw_metric_card(70, 610, 260, 120, _fmt_rub(cur_total.get("order_sum", 0)), "Сумма заказов", dt, tone)
-    dt, tone = _pdf_color_delta_value(cur_total.get("gross_profit_model",0), prev_total.get("gross_profit_model",0), False)
-    draw_metric_card(360, 610, 260, 120, _fmt_rub(cur_total.get("gross_profit_model", 0)), "ВП расч.", dt, tone)
+    dt, tone = _pdf_color_delta_value(cur_gp_total, prev_gp_total, False)
+    draw_metric_card(360, 610, 260, 120, _fmt_rub(cur_gp_total), "ВП факт ABC" if cur_gp_fact_flag else "ВП расч.", dt, tone)
     dt, tone = _pdf_color_delta_value(drr_cur, drr_prev, True)
     opt_txt = f"опт. {_fmt_pct_pdf(opt_drr_total)}" if pd.notna(opt_drr_total) else "опт. —"
     draw_metric_card(650, 610, 260, 120, _fmt_pct_pdf(drr_cur), "ДРР", dt, tone, opt_txt, "neutral")
@@ -4041,7 +4162,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     day_agg = with_gp(agg(cur_monday, cur_week_end, ["day", "subject"]), ["day", "subject"], cur_monday, cur_week_end)
     day_prev = with_gp(agg(cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7), ["day", "subject"]), ["day", "subject"], cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7))
     for cat in cats:
-        vals=[f"{cat_short.get(cat,cat)}\nСумма\nВП\nРасх. РК\nДРР"]
+        vals=[f"{cat_short.get(cat,cat)}\nСумма\nВП расч.\nРасх. РК\nДРР"]
         for i in range(7):
             day = cur_monday + pd.Timedelta(days=i)
             p = day_agg[(day_agg["day"] == day) & (day_agg["subject"] == cat)] if not day_agg.empty else pd.DataFrame()
@@ -4076,7 +4197,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
             _fmt_pct_pdf(r.get("search_traffic_capture_pct")),
         ])
-    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", "ВП расч.", "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74)
+    cur_gp_label = "ВП факт ABC" if bool(cat_cur.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) else "ВП расч."
+    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", cur_gp_label, "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74)
     c.showPage()
 
     # Previous week, current month, closed month, monthly summary.
@@ -4332,6 +4454,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 c.showPage()
 
     c.save()
+    try:
+        trace_path = path.parent / PDF_CALC_TRACE_NAME
+        with pd.ExcelWriter(trace_path, engine="openpyxl") as writer:
+            trace_df = pd.DataFrame(trace_rows) if trace_rows else pd.DataFrame(columns=["block", "level", "period_start", "period_end", "metric", "value", "source", "source_file", "source_sheet", "source_rows", "source_cells", "source_columns", "filters", "formula"])
+            trace_df.to_excel(writer, sheet_name="Расчет_ВП", index=False)
+            if selected is not None and not selected.empty:
+                selected.to_excel(writer, sheet_name="Выбранные_товары", index=False)
+            if product_stability is not None and not product_stability.empty:
+                product_stability.to_excel(writer, sheet_name="Отбор_товаров", index=False)
+        log(f"Saved PDF calc trace: {trace_path} rows={len(trace_rows):,}")
+    except Exception as exc:
+        log(f"WARN PDF calc trace was not saved: {exc}")
     return path
 
 
@@ -4399,6 +4533,10 @@ def main() -> None:
             if audit_path.exists():
                 storage.write_bytes(f"{OUT_DIR}/{audit_path.name}", audit_path.read_bytes())
                 log(f"Saved: {OUT_DIR}/{audit_path.name}")
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
+                log(f"Saved: {OUT_DIR}/{trace_path.name}")
         if args.send_telegram:
             caption = f"TOPFACE WB: управленческий отчёт {datetime.now().strftime('%d.%m.%Y %H:%M')}"
             send_telegram_document(pdf_path, caption)
@@ -4428,6 +4566,9 @@ def main() -> None:
             audit_path = pdf_path.parent / PRODUCT_GROUP_AUDIT_NAME
             if audit_path.exists():
                 paths.append(audit_path)
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                paths.append(trace_path)
     log(f"Saved local copies: {local_dir}")
     # Always save to S3 too when S3 is active. In local mode this overwrites same local files safely.
     if storage.is_s3:
