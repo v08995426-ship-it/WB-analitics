@@ -33,6 +33,7 @@ import io
 import math
 import os
 import re
+import hashlib
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -5214,7 +5215,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     }
 
     def _slug(x):
-        return re.sub(r"[^A-Za-z0-9]+", "_", str(x))[:80]
+        # Bookmark names must be unique. Cyrillic category names used to collapse to the same "_" slug,
+        # so all category links could jump to the last category page. Use a stable hash.
+        raw = str(x)
+        latin = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")[:30]
+        h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+        return f"{latin}_{h}" if latin else h
     def _cat_key(contour, cat): return f"{contour}_cat_{_slug(cat)}"
     def _prod_key(contour, cat, prod): return f"{contour}_prod_{_slug(cat)}_{_slug(prod)}"
     def _art_key(contour, cat, prod, art, n=1): return f"{contour}_art{n}_{_slug(cat)}_{_slug(prod)}_{_slug(art)}"
@@ -5252,7 +5258,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prev_margin_rate = prev_margin/100 if abs(prev_margin) > 1e-9 else (cur_margin/100 if abs(cur_margin)>1e-9 else 0)
         add("Объём / сумма заказов", "Экономика и продажи", cur_sum, prev_sum, _fmt_money, (cur_sum - prev_sum) * prev_margin_rate, False, "эффект изменения выручки при прежней рентабельности")
         add("Рентабельность", "Экономика и продажи", cur_margin, prev_margin, _fmt_pct, cur_sum * (cur_margin - prev_margin) / 100.0, False, "изменение рентабельности в деньгах")
-        add("ДРР", "Экономика и продажи", row.get("drr"), row.get("drr_prev"), _fmt_pct, -cur_sum * (_num(row.get("drr")) - _num(row.get("drr_prev"))) / 100.0, True, "рост ДРР забирает ВП")
         add("Расход РК", "Экономика и продажи", row.get("ad_spend"), row.get("ad_spend_prev"), _fmt_money, -(_num(row.get("ad_spend")) - _num(row.get("ad_spend_prev"))), True, "изменение рекламных расходов")
         add("CPC", "Экономика и продажи", row.get("cpc"), row.get("cpc_prev"), _fmt_rub1, -(_num(row.get("cpc")) - _num(row.get("cpc_prev"))) * max(_num(row.get("clicks")), 0), True, "изменение стоимости клика")
         add("СПП", "Экономика и продажи", row.get("spp"), row.get("spp_prev"), _fmt_pct, -cur_sum * (_num(row.get("spp_prev")) - _num(row.get("spp"))) / 100.0, True, "изменение скидки покупателя")
@@ -5265,13 +5270,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         demand_eff = 0.0
         if _num(row.get("demand_prev")) > 0:
             demand_eff = (_num(row.get("demand")) / _num(row.get("demand_prev")) - 1.0) * prev_sum * prev_margin_rate
-        add("Спрос WB", "Спрос / точки входа / конверсии", row.get("demand"), row.get("demand_prev"), _fmt_num, demand_eff, False, "изменение внешнего спроса")
-        add("% поискового трафика", "Спрос / точки входа / конверсии", row.get("search_share"), row.get("search_share_prev"), _fmt_pct, cur_sum * (cur_margin/100) * (_num(row.get("search_share")) - _num(row.get("search_share_prev"))) / 100.0, False, "сколько трафика карточка забрала из поиска")
         add("Открытия карточки", "Спрос / точки входа / конверсии", row.get("opens"), row.get("opens_prev"), _fmt_num, (_num(row.get("opens")) - _num(row.get("opens_prev"))) * (_num(row.get("cart_conv_prev"))/100) * (_num(row.get("order_conv_prev"))/100) * gp_per_order, False, "изменение входящего карточного трафика")
         add("Конверсия в корзину", "Спрос / точки входа / конверсии", row.get("cart_conv"), row.get("cart_conv_prev"), _fmt_pct, _num(row.get("opens")) * ((_num(row.get("cart_conv")) - _num(row.get("cart_conv_prev"))) / 100.0) * (_num(row.get("order_conv_prev"))/100) * gp_per_order, False, "потеря/прирост на добавлении в корзину")
         add("Корзина → заказ", "Спрос / точки входа / конверсии", row.get("order_conv"), row.get("order_conv_prev"), _fmt_pct, _num(row.get("carts")) * ((_num(row.get("order_conv")) - _num(row.get("order_conv_prev"))) / 100.0) * gp_per_order, False, "потеря/прирост на переходе корзина→заказ")
-        add("Локализация", "Спрос / точки входа / конверсии", row.get("localization"), row.get("localization_prev"), _fmt_pct, cur_sum * (cur_margin/100) * ((_num(row.get("localization")) - _num(row.get("localization_prev"))) / 100.0) * 0.25, False, "влияние наличия и географии")
-        # Sort: biggest losses first, then biggest gains.
+        # Sort: biggest losses first, then biggest gains. Drop insignificant factors: less than 10%
+        # of the biggest absolute effect. This keeps the factor page focused on money, not noise.
+        if rows:
+            max_abs = max(abs(_num(r.get("Эффект ВП"))) for r in rows)
+            min_effect = max_abs * 0.10
+            rows = [r for r in rows if abs(_num(r.get("Эффект ВП"))) >= min_effect]
         losses = sorted([r for r in rows if _num(r["Эффект ВП"]) < 0], key=lambda r: _num(r["Эффект ВП"]))
         gains = sorted([r for r in rows if _num(r["Эффект ВП"]) >= 0], key=lambda r: _num(r["Эффект ВП"]), reverse=True)
         return losses + gains
@@ -5371,16 +5378,25 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     def _draw_table(x, y, w, headers, widths, rows, row_h=36, font_size=11, link_col=None, max_rows=None):
         rows = rows[:max_rows] if max_rows else rows
+        # Scale columns to the real table width so the right side is not empty.
+        total_width = float(sum(widths)) if widths else w
+        if total_width > 0 and abs(total_width - w) > 1:
+            widths = [ww * w / total_width for ww in widths]
         h = 42 + row_h*len(rows)
         c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
         c.setFillColor(RED_DARK); c.roundRect(x, y+h-42, w, 42, 11, fill=1, stroke=0)
+        # column separators
+        c.setStrokeColor(LINE); c.setLineWidth(0.6)
         xx = x
         for head, ww in zip(headers, widths):
-            _draw_text(head, xx+4, y+h-26, ww-8, F_BOLD, 11, WHITE, align="center")
+            _draw_text(head, xx+4, y+h-26, ww-8, F_BOLD, max(11, font_size), WHITE, align="center")
+            if xx > x + 1:
+                c.line(xx, y, xx, y+h)
             xx += ww
         for ri, row in enumerate(rows):
             ry = y+h-42-(ri+1)*row_h
             c.setFillColor(SOFT if ri%2 else WHITE); c.rect(x, ry, w, row_h, fill=1, stroke=0)
+            c.setStrokeColor(LINE); c.setLineWidth(0.4); c.line(x, ry, x+w, ry)
             xx=x
             target = row.get("_target") if isinstance(row, dict) else None
             cells = row.get("cells") if isinstance(row, dict) else row
@@ -5388,40 +5404,81 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 ww = widths[ci]
                 if isinstance(cell, tuple):
                     val, delta, metric = cell
-                    _draw_cell_value(xx+2, ry+row_h/2-5, ww-4, val, delta, metric, font_size, align="center" if ci>0 else "left")
+                    _draw_cell_value(xx+2, ry+row_h/2-5, ww-4, val, delta, metric, font_size, align="center")
                 else:
-                    _draw_text(cell, xx+5, ry+row_h/2-5, ww-10, F_BOLD if ci==0 else F_REG, font_size, BLACK if ci else RED_DARK)
+                    _draw_text(cell, xx+5, ry+row_h/2-5, ww-10, F_BOLD if ci==0 else F_REG, font_size, RED_DARK if ci==0 else BLACK, align="center")
                 xx += ww
             if target:
                 _link(target, (x, ry, x+w, ry+row_h))
+        c.setStrokeColor(LINE); c.setLineWidth(0.8); c.roundRect(x, y, w, h, 14, fill=0, stroke=1)
         return h
 
     def _period_label(s,e): return f"{s:%d.%m}-{e:%d.%m.%Y}"
 
     def _summary_category_page(key, title, subtitle, section, df, target_contour=None):
         _start(title, subtitle, section or title, key=key, top_menu=True)
-        rows=[]
         x = df.copy()
         x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
         x = x.sort_values("_cat_order")
+
+        def _summary_total_row(rows_df, current_only=False):
+            s = float(pd.to_numeric(rows_df.get("sum_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            sp = float(pd.to_numeric(rows_df.get("sum_prev_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            ad = float(pd.to_numeric(rows_df.get("ad_spend"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            adp = float(pd.to_numeric(rows_df.get("ad_spend_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            clk = float(pd.to_numeric(rows_df.get("clicks"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            clkp = float(pd.to_numeric(rows_df.get("clicks_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            dem = float(pd.to_numeric(rows_df.get("demand"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            demp = float(pd.to_numeric(rows_df.get("demand_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            opens = float(pd.to_numeric(rows_df.get("opens"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            opensp = float(pd.to_numeric(rows_df.get("opens_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            gp = float(pd.to_numeric(rows_df.get("gp_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            gpp = float(pd.to_numeric(rows_df.get("gp_prev_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            drr = ad/s*100 if s else 0
+            drrp = adp/sp*100 if sp else 0
+            cpc = ad/clk if clk else 0
+            cpcp = adp/clkp if clkp else 0
+            ss = opens/dem*100 if dem else np.nan
+            ssp = opensp/demp*100 if demp else np.nan
+            rent = gp/s*100 if s else 0
+            rentp = gpp/sp*100 if sp else 0
+            return dict(subject_disp="ИТОГО", sum_use=s, sum_prev_use=sp, gp_use=gp, gp_prev_use=gpp, margin=rent, margin_prev=rentp, ad_spend=ad, ad_spend_prev=adp, drr=drr, drr_prev=drrp, cpc=cpc, cpc_prev=cpcp, demand=dem, demand_prev=demp, search_share=ss, search_share_prev=ssp)
+
+        if key == "cur_categories":
+            rows=[]
+            for _, r in x.iterrows():
+                rows.append({"cells": [
+                    str(r["subject_disp"]),
+                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                    (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
+                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                ]})
+            t = _summary_total_row(x, current_only=True)
+            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["ad_spend"]), _delta(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
+            _draw_table(75, 330, W-150, ["Категория", "Сумма", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [250,220,220,170,160,240,200], rows, row_h=72, font_size=15)
+            return
+
+        rows=[]
         for _, r in x.iterrows():
             cat = r["subject_disp"]
-            tgt = _cat_key(target_contour, cat) if target_contour else None
+            tgt = _cat_key(target_contour, cat) if target_contour and _has_category_detail(target_contour, cat) else None
             rows.append({"_target": tgt, "cells": [
                 cat,
                 (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
                 (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
                 (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
-                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                 (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                 (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
                 (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
-                (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
             ]})
-        _draw_table(75, 360, W-150, ["Категория", "Сумма", "ВП", "Рент.", "ДРР", "Расход РК", "CPC", "% поиска", "Локал."], [145,170,155,125,120,150,110,125,120], rows, row_h=58, font_size=12)
-        if target_contour:
-            _draw_text("Клик по строке категории открывает детальный контур: категория → товар → артикул. Для кистей: категория сразу открывает артикулы 901.", 80, 315, W-160, F_BOLD, 14, WHITE)
-
+        t = _summary_total_row(x)
+        rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
+        _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Рент.", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [190,170,160,125,170,115,100,170,140], rows, row_h=68, font_size=14)
     def _current_week_overview():
         _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / оперативный обзор без детализации", "Текущая неделя", key="cur_overview", top_menu=True)
         total = cur_cat.copy()
@@ -5429,7 +5486,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         total_ad = total["ad_spend"].sum(); total_ad_prev = total["ad_spend_prev"].sum()
         drr = total_ad/total_sum*100 if total_sum else 0; drr_prev = total_ad_prev/total_prev*100 if total_prev else 0
         demand = total["demand"].sum(); demand_prev = total["demand_prev"].sum()
-        search_share = total["search_share"].mean(); search_prev = total["search_share_prev"].mean()
+        opens_total = total["opens"].sum() if "opens" in total.columns else 0
+        opens_prev_total = total["opens_prev"].sum() if "opens_prev" in total.columns else 0
+        search_share = opens_total / demand * 100 if demand else np.nan
+        search_prev = opens_prev_total / demand_prev * 100 if demand_prev else np.nan
         cards = [
             (_fmt_money(total_sum), "Сумма заказов", _delta(total_sum,total_prev), "Сумма", ""),
             (_fmt_money(total_ad), "Расход РК", _delta(total_ad,total_ad_prev), "Расход РК", ""),
@@ -5443,13 +5503,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         dates = pd.date_range(cur_start, cur_end)
         rows=[]
         for dt in dates:
-            cur = daily[daily["day"].eq(dt)]
-            prev = daily[daily["day"].eq(dt-pd.Timedelta(days=7))]
-            osum = cur["order_sum"].sum(); psum = prev["order_sum"].sum()
-            ad = cur["ad_spend_total"].sum(); pad = prev["ad_spend_total"].sum()
-            ddemand = cur["search_frequency"].sum(); pdemand = prev["search_frequency"].sum()
-            ss = _safe_mean(cur["search_traffic_capture_pct"]) if not cur.empty else 0
-            pss = _safe_mean(prev["search_traffic_capture_pct"]) if not prev.empty else 0
+            cur = _agg_daily(dt, dt, ["subject_disp"])
+            prev = _agg_daily(dt-pd.Timedelta(days=7), dt-pd.Timedelta(days=7), ["subject_disp"])
+            osum = cur["order_sum"].sum() if not cur.empty else 0; psum = prev["order_sum"].sum() if not prev.empty else 0
+            ad = cur["ad_spend"].sum() if not cur.empty else 0; pad = prev["ad_spend"].sum() if not prev.empty else 0
+            ddemand = cur["demand"].sum() if not cur.empty else 0; pdemand = prev["demand"].sum() if not prev.empty else 0
+            opens = cur["opens"].sum() if not cur.empty else 0; opens_prev = prev["opens"].sum() if not prev.empty else 0
+            ss = opens/ddemand*100 if ddemand else np.nan
+            pss = opens_prev/pdemand*100 if pdemand else np.nan
             d = ad/osum*100 if osum else 0; pdrr = pad/psum*100 if psum else 0
             # Будущие/пустые дни не показываем как падение на 100%.
             if dt > cur_actual_end or (abs(osum) < 1e-9 and abs(ad) < 1e-9 and abs(ddemand) < 1e-9):
@@ -5465,7 +5526,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 ]})
         widths=[180,250,230,180,250,230]
         _draw_table(120, 170, W-240, ["День", "Сумма заказов", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=13)
-        _draw_text("Текущая неделя - только обзор. Провалы в категории начинаются с контура «Прошлая неделя» и «Закрытый месяц».", 120, 115, W-240, F_BOLD, 15, WHITE)
 
     def _current_week_categories():
         _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
@@ -5474,20 +5534,33 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _summary_category_page("current_month", "Текущий месяц", f"{cur_start.replace(day=1):%d.%m}-{cur_actual_end:%d.%m.%Y} / неполный месяц", "Текущий месяц", current_month_cat, target_contour=None)
 
     def _summary_page():
-        _start("Сводка", "Логика отчёта и источники", "Сводка", key="summary", top_menu=True)
-        c.setFillColor(WHITE); c.roundRect(75, 165, W-150, 560, 18, fill=1, stroke=0)
-        lines = [
-            "1. Текущая неделя: только обзор по дням и категориям, без провала в детализацию.",
-            "2. Прошлая полная неделя: полный управленческий контур — категория → товар → артикул.",
-            "3. Последний закрытый месяц: такой же полный контур на месячных ABC/оперативных данных.",
-            "Для закрытых периодов финансовый блок берётся из exact ABC: валовая выручка, ВП, рентабельность, ДРР и расход РК = выручка ABC × ДРР ABC.",
-            "Факторный вывод — таблица денежных эффектов: сначала потери ВП, затем положительные факторы.",
-            "Справочник карандашей включает 605, 611, 613, 614, 617, 618. 405/406 исключены как подводки/лайнеры.",
-        ]
-        yy=680
-        for line in lines:
-            _draw_text(line, 110, yy, W-220, F_BOLD, 18 if line.startswith(("1.","2.","3.")) else 15, BLACK)
-            yy -= 48
+        _start("Помесячная динамика", f"{closed_start.year} год / ABC по закрытым месяцам", "Годовая динамика", key="summary", top_menu=True)
+        src = outputs.get("abc_monthly", pd.DataFrame()).copy()
+        rows=[]
+        if src is not None and not src.empty and "period_start" in src.columns:
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src = src[src["period_start"].dt.year.eq(int(closed_start.year))].copy()
+            for col in ["gross_revenue", "gross_profit", "abc_drr_pct"]:
+                if col not in src.columns:
+                    src[col] = 0
+                src[col] = pd.to_numeric(src[col], errors="coerce").fillna(0)
+            src["_ad"] = src["gross_revenue"] * src["abc_drr_pct"] / 100.0
+            mon = src.groupby("period_start", as_index=False).agg(sum_use=("gross_revenue","sum"), gp_use=("gross_profit","sum"), ad_spend=("_ad","sum"))
+            mon = mon.sort_values("period_start")
+            mon["sum_prev"] = mon["sum_use"].shift(1); mon["gp_prev"] = mon["gp_use"].shift(1); mon["ad_prev"] = mon["ad_spend"].shift(1)
+            mon["drr"] = np.where(mon["sum_use"]>0, mon["ad_spend"]/mon["sum_use"]*100, 0)
+            mon["drr_prev"] = mon["drr"].shift(1)
+            for _, r in mon.iterrows():
+                rows.append({"cells":[
+                    r["period_start"].strftime("%m.%Y"),
+                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                ]})
+        if not rows:
+            rows=[{"cells":["—","—","—","—","—"]}]
+        _draw_table(120, 330, W-240, ["Месяц", "Сумма заказов", "ВП", "Расход РК", "ДРР"], [220,300,300,300,220], rows, row_h=64, font_size=15, max_rows=10)
 
     def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
         info = contours[contour]
@@ -5504,16 +5577,27 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if prod_row.empty: return pd.DataFrame()
         return _select_articles(info["art_df"], prod_row.iloc[0])
 
+    def _has_category_detail(contour: str, cat: str) -> bool:
+        if cat == "Кисти":
+            return not _articles_for_product(contour, cat, "901").empty
+        return not _children_for_category(contour, cat).empty
+
     def _draw_factor_table_page(key, title, subtitle, section, row, back_buttons):
         _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
         factors = _factor_rows(row, section)
+        loss_total = sum(_num(fr.get("Эффект ВП")) for fr in factors if _num(fr.get("Эффект ВП")) < 0)
+        gain_total = sum(_num(fr.get("Эффект ВП")) for fr in factors if _num(fr.get("Эффект ВП")) > 0)
+        net_total = loss_total + gain_total
+        # Top money summary, not a decorative overlay.
+        _metric_card(90, 610, 310, 90, _fmt_signed_money(loss_total), "Всего потерь ВП", None, "", "")
+        _metric_card(430, 610, 310, 90, _fmt_signed_money(gain_total), "Положительный вклад", None, "", "")
+        _metric_card(770, 610, 310, 90, _fmt_signed_money(net_total), "Итоговый эффект", None, "", "")
         rows=[]
         for fr in factors:
             rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"]), fr["Вывод"]]})
         if not rows:
             rows=[{"cells":["—", "—", "—", "—", "—", "0 ₽", "значимых денежных факторов нет"]}]
-        # На факторной странице дополнительная плашка не нужна: она перекрывала заголовок.
-        _draw_table(75, 115, W-150, ["Фактор", "Блок", "Текущее", "База", "Изм.", "Эффект ВП", "Вывод"], [245,260,145,145,120,150,455], rows, row_h=34, font_size=10, max_rows=17)
+        _draw_table(75, 95, W-150, ["Фактор", "Блок", "Текущее", "Прошлая неделя", "Изм.", "Эффект ВП", "Вывод"], [235,250,140,165,110,145,455], rows, row_h=34, font_size=10, max_rows=13)
 
     def _draw_level_overview(title, subtitle, section, key, row, back_buttons, next_button=None):
         _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
@@ -5541,10 +5625,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
             (_fmt_pct(row.get("cart_conv")), "Конв. в корзину", _delta(row.get("cart_conv"), row.get("cart_conv_prev")), "Конверсия", ""),
             (_fmt_pct(row.get("order_conv")), "Корзина → заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
-            (_fmt_pct(row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
         ]
         for i, card in enumerate(cards2):
-            _metric_card(85+i*245, 330, 225, 95, *card)
+            _metric_card(105+i*285, 330, 260, 95, *card)
         _section_bar(260, "Блок 3. Расходы на единицу / доля расходов")
         cards3 = [
             (_fmt_pct(row.get("commission_pct")), "Комиссия, %", _delta(row.get("commission_pct"), row.get("commission_pct_prev")), "Комиссия", ""),
@@ -5576,14 +5659,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     art,
                     (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
                     (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
-                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
-                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
-                    (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
                 ]})
-            headers=["Артикул", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."]
-            widths=[190,180,165,130,130,115,130,130]
+            headers=["Артикул", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"]
+            widths=[240,250,250,250,210,210]
         else:
             prods = _children_for_category(contour, cat)
             for _, r in prods.iterrows():
@@ -5592,15 +5673,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     prod,
                     (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
                     (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
-                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
-                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
-                    (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
                 ]})
-            headers=["Товар", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."]
-            widths=[190,180,165,130,130,115,130,130]
-        _draw_table(75, 130, W-150, headers, widths, rows, row_h=46, font_size=11, max_rows=11)
+            headers=["Товар", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"]
+            widths=[240,250,250,250,210,210]
+        _draw_table(75, 215, W-150, headers, widths, rows, row_h=52, font_size=14, max_rows=10)
         _draw_factor_table_page(cat_factor, f"Категория: {cat}", f"{info['period']} / факторная таблица", "Категория факторы", row_df.iloc[0], [(1190,798,220,"← категория",cat_key+"_list"),(1430,798,90,"стр.1",cat_key)])
 
     def _draw_product_detail(contour: str, prod_row: pd.Series):
@@ -5621,13 +5700,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 art,
                 (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
                 (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                 (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                 (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
-                (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
-                (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
-                (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
             ]})
-        _draw_table(75, 130, W-150, ["Артикул", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."], [190,180,165,130,130,115,130,130], rows, row_h=46, font_size=11, max_rows=11)
+        _draw_table(75, 215, W-150, ["Артикул", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"], [240,250,250,250,210,210], rows, row_h=52, font_size=14, max_rows=10)
         _draw_factor_table_page(pf, f"Товар: {prod}", f"{cat} / {info['period']} / факторная таблица", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
 
     def _draw_article_pages(contour: str, art_row: pd.Series):
@@ -5636,14 +5713,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         a1 = _art_key(contour, cat, prod, art, 1); a2 = _art_key(contour, cat, prod, art, 2)
         cat_list_key = _cat_key(contour, cat)+"_list"
         product_back = cat_list_key if cat == "Кисти" else _prod_key(contour, cat, prod)+"_list"
-        back_buttons = [(1120,798,170,"← товар" if cat != "Кисти" else "← категория", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
+        if cat == "Кисти":
+            back_buttons = [(1230,798,210,"← категория", product_back), (1480,798,80,"стр.2",a2)]
+        else:
+            back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
         _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
         # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
         for bx,by,bw,label,target in back_buttons:
             c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
             _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center"); _link(target, (bx,by,bx+bw,by+44))
         # Page 2: entry points and full factor table.
-        _start(f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", key=a2, top_menu=False, back_buttons=[(1120,798,170,"← товар" if cat != "Кисти" else "← категория", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)])
+        if cat == "Кисти":
+            page2_buttons = [(1230,798,210,"← категория", product_back),(1480,798,80,"стр.1",a1)]
+        else:
+            page2_buttons = [(1120,798,170,"← товар", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)]
+        _start(f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", key=a2, top_menu=False, back_buttons=page2_buttons)
         ep_rows=[]
         if contour == "prev" and not entry_bridge.empty:
             q = entry_bridge[(entry_bridge["subject_disp"].astype(str).eq(cat)) & (entry_bridge["product_code"].astype(str).eq(prod)) & (entry_bridge["supplier_article"].astype(str).eq(art))].copy()
@@ -5678,17 +5762,22 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     for contour in ["prev", "closed"]:
         for cat in CATEGORY_ORDER:
-            # skip empty categories
             if contours[contour]["cat_df"][contours[contour]["cat_df"]["subject_disp"].astype(str).eq(cat)].empty:
                 continue
+            if not _has_category_detail(contour, cat):
+                continue
             _draw_category_detail(contour, cat)
-        for _, prow in contours[contour]["prod_df"].iterrows():
-            _draw_product_detail(contour, prow)
-        # Article detail pages: Кисти from category; others from product pages.
-        for _, prow in contours[contour]["prod_df"].iterrows():
-            arts = _articles_for_product(contour, str(prow["subject_disp"]), str(prow["product_code"]))
-            for _, ar in arts.iterrows():
-                _draw_article_pages(contour, ar)
+            if cat == "Кисти":
+                arts = _articles_for_product(contour, cat, "901")
+                for _, ar in arts.iterrows():
+                    _draw_article_pages(contour, ar)
+            else:
+                prods = _children_for_category(contour, cat)
+                for _, prow in prods.iterrows():
+                    _draw_product_detail(contour, prow)
+                    arts = _articles_for_product(contour, str(prow["subject_disp"]), str(prow["product_code"]))
+                    for _, ar in arts.iterrows():
+                        _draw_article_pages(contour, ar)
 
     c.save()
 
