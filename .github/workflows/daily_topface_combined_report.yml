@@ -4,106 +4,191 @@ on:
   workflow_dispatch:
     inputs:
       send_telegram:
-        description: 'Send PDF to Telegram'
+        description: "Send PDF to Telegram"
         required: false
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
+          - "true"
+          - "false"
       pdf_only:
-        description: 'Generate only PDF from existing Excel reports'
+        description: "Generate only PDF from existing Excel files"
         required: false
-        default: 'false'
+        default: "false"
         type: choice
         options:
-          - 'false'
-          - 'true'
+          - "false"
+          - "true"
       no_pdf:
-        description: 'Skip PDF generation'
+        description: "Skip PDF generation"
         required: false
-        default: 'false'
+        default: "false"
         type: choice
         options:
-          - 'false'
-          - 'true'
+          - "false"
+          - "true"
   schedule:
     # 06:00 Moscow time = 03:00 UTC
-    - cron: '0 3 * * *'
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: topface-management-report
+  cancel-in-progress: false
 
 jobs:
   build-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+
     env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+      # Yandex Object Storage. YC_ENDPOINT_URL may be empty: the Python code defaults to https://storage.yandexcloud.net.
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || 'https://storage.yandexcloud.net' }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+
+      # Telegram. If token/chat are empty, the script skips sending.
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-      WB_MAX_SEARCH_QUERY_FILES: '8'
-      WB_MAX_ENTRY_POINT_FILES: '8'
-      WB_MAX_STOCK_FILES: '10'
-      PYTHONUNBUFFERED: '1'
+
+      # Source limits.
+      WB_MAX_SEARCH_QUERY_FILES: "8"
+      WB_MAX_ENTRY_POINT_FILES: "8"
+      WB_MAX_STOCK_FILES: "10"
+
+      # Strict report checks: do not silently build PDF from invalid fallback sources.
+      PDF_ALLOW_DEMAND_FALLBACK: "0"
+      PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
+      PDF_TRACE_SAMPLE_PRODUCT: "901"
+      PDF_TRACE_SAMPLE_ARTICLE: ""
+      PDF_DETAIL_MIN_ORDER_SUM: "5000"
+      PDF_DETAIL_MIN_GP: "1000"
+      PDF_MIN_PRODUCT_GP_SHARE_PCT: "1.0"
+      PDF_MIN_PRODUCT_CURRENT_WEEK_GP: "1000"
+      PDF_MIN_PRODUCT_CURRENT_WEEK_ORDER_SUM: "10000"
+      PDF_FORCE_INCLUDE_PRODUCTS: "901,605,611,613,614,617,618,154,155,156,157"
+      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+
+      # Workflow inputs. These are empty on schedule; bash below applies defaults.
+      SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram }}
+      PDF_ONLY_INPUT: ${{ github.event.inputs.pdf_only }}
+      NO_PDF_INPUT: ${{ github.event.inputs.no_pdf }}
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          # PDF generation is mandatory for this report.
-          # The script skips PDF when reportlab is missing, so install it explicitly
-          # even if requirements.txt in the repo was not updated yet.
-          pip install "reportlab>=4.2.0"
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          fi
+          # Install explicit runtime dependencies so the workflow does not depend on an outdated requirements.txt.
+          pip install pandas numpy openpyxl requests boto3 botocore reportlab pyyaml pillow XlsxWriter
           python - <<'PY'
-          import reportlab
-          print('reportlab OK:', reportlab.Version)
+          import sys
+          import pandas, numpy, openpyxl, requests, boto3, reportlab
+          print("python:", sys.version)
+          print("pandas:", pandas.__version__)
+          print("numpy:", numpy.__version__)
+          print("openpyxl:", openpyxl.__version__)
+          print("reportlab:", reportlab.Version)
           PY
 
-      - name: Run TOPFACE report
+      - name: Check required files
         shell: bash
         run: |
-          ARGS="--root ."
-          if [[ "${{ github.event.inputs.pdf_only || 'false' }}" == "true" ]]; then
-            ARGS="$ARGS --pdf-only"
-          fi
-          if [[ "${{ github.event.inputs.no_pdf || 'false' }}" == "true" ]]; then
-            ARGS="$ARGS --no-pdf"
-          fi
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event.inputs.send_telegram || 'true' }}" == "true" ]]; then
-            ARGS="$ARGS --send-telegram"
-          fi
-          echo "Running: python wb_combined_report_final.py $ARGS"
-          python wb_combined_report_final.py $ARGS
+          set -euo pipefail
+          test -f wb_combined_report_final.py || { echo "Missing wb_combined_report_final.py in repository root"; exit 1; }
+          python -m py_compile wb_combined_report_final.py
+          echo "wb_combined_report_final.py compile OK"
 
-      - name: Check PDF exists
+      - name: Run TOPFACE management report
         shell: bash
         run: |
+          set -euo pipefail
+
+          SEND_TELEGRAM="${SEND_TELEGRAM_INPUT:-true}"
+          PDF_ONLY="${PDF_ONLY_INPUT:-false}"
+          NO_PDF="${NO_PDF_INPUT:-false}"
+
+          # Scheduled runs should send Telegram by default.
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            SEND_TELEGRAM="true"
+            PDF_ONLY="false"
+            NO_PDF="false"
+          fi
+
+          ARGS=("--root" ".")
+
+          if [[ "${PDF_ONLY}" == "true" ]]; then
+            ARGS+=("--pdf-only")
+          fi
+
+          if [[ "${NO_PDF}" == "true" ]]; then
+            ARGS+=("--no-pdf")
+          fi
+
+          if [[ "${SEND_TELEGRAM}" == "true" ]]; then
+            ARGS+=("--send-telegram")
+          fi
+
+          echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME}"
+          echo "SEND_TELEGRAM=${SEND_TELEGRAM}"
+          echo "PDF_ONLY=${PDF_ONLY}"
+          echo "NO_PDF=${NO_PDF}"
+          printf 'Running: python wb_combined_report_final.py'
+          printf ' %q' "${ARGS[@]}"
+          printf '\n'
+
+          python wb_combined_report_final.py "${ARGS[@]}"
+
+      - name: Check generated outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
           PDF="Отчёты/Объединенный отчет/TOPFACE/Управленческий_отчет_TOPFACE.pdf"
-          if [[ "${{ github.event.inputs.no_pdf || 'false' }}" != "true" && ! -f "$PDF" ]]; then
-            echo "PDF was not created: $PDF"
-            exit 1
+          TRACE="Отчёты/Объединенный отчет/TOPFACE/Лог_расчетов_PDF_TOPFACE.xlsx"
+          CHECK_GROUPS="Отчёты/Объединенный отчет/TOPFACE/Проверить_товарные_группы_TOPFACE.xlsx"
+
+          echo "Expected PDF:   $PDF"
+          echo "Expected trace: $TRACE"
+
+          if [[ "${NO_PDF_INPUT:-false}" != "true" ]]; then
+            [[ -f "$PDF" ]] || { echo "PDF was not created"; exit 1; }
+            [[ -f "$TRACE" ]] || { echo "Calculation trace was not created"; exit 1; }
           fi
-          if [[ -f "$PDF" ]]; then
-            ls -lh "$PDF"
-          fi
+
+          [[ -f "$PDF" ]] && ls -lh "$PDF"
+          [[ -f "$TRACE" ]] && ls -lh "$TRACE"
+          [[ -f "$CHECK_GROUPS" ]] && ls -lh "$CHECK_GROUPS"
 
       - name: Upload report artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: topface-management-report
           path: |
             Отчёты/Объединенный отчет/TOPFACE/**/*.xlsx
             Отчёты/Объединенный отчет/TOPFACE/**/*.pdf
-          if-no-files-found: error
+            Отчёты/Объединенный отчет/TOPFACE/**/*.json
+          if-no-files-found: warn
           retention-days: 30
