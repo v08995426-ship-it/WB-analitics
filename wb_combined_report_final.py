@@ -2713,6 +2713,13 @@ PDF_EXCLUDED_PRODUCT_REASONS: Dict[str, str] = {
     "406": "Подводки/лайнеры: не включать в категорию 'Косметические карандаши' для PDF",
 }
 
+# Products can remain in top category totals, but must not receive detailed PDF pages.
+# Defaults reflect the current management rule: low-tail products 206/207/209/210/211
+# are not detailed objects in the PDF. Override with PDF_FORCE_EXCLUDE_PRODUCTS if needed.
+PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS = set(
+    p.strip() for p in os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(",") if p.strip()
+)
+
 
 def _pdf_product_code_from_value(value: Any) -> str:
     """Return a strict product code candidate for PDF category validation."""
@@ -3712,13 +3719,14 @@ def _gp_from_abc_frames(outputs: Dict[str, pd.DataFrame], start: pd.Timestamp, e
 
 
 def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold: float = 0.90) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Select product groups for PDF by stable GP at product level.
+    """Select product groups for detailed PDF pages by stable GP at PRODUCT level.
 
-    Strict rule from the checklist/user comments:
-    - selection is done at product level, not article level;
-    - only confirmed product groups from PDF_PRODUCT_REFERENCE are eligible;
-    - current product must be profitable and historically stable;
-    - keep products inside the cumulative 90% GP bucket; do not add a weak tail product just to cross 90%.
+    Final rule:
+    - select products first, never articles directly;
+    - selection is global across approved products, not category-by-category, so weak tails
+      do not receive pages just because their category is small;
+    - exclude products with no current sales/profit and explicit low-value tails;
+    - keep products inside 90% of stable GP, subject to materiality guards.
     """
     daily = outputs.get("article_day_fact", pd.DataFrame())
     if daily is None or daily.empty:
@@ -3731,16 +3739,23 @@ def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold:
     latest = x["day"].max()
     if pd.notna(latest):
         x = x[x["day"] >= latest - pd.Timedelta(days=89)].copy()
-    gp_col = "gp_fact" if "gp_fact" in x.columns else "gross_profit_model"
+    gp_col = "gross_profit_model"
     if gp_col not in x.columns:
         x[gp_col] = 0.0
     for c0 in [gp_col, "order_sum", "orders"]:
         if c0 not in x.columns:
             x[c0] = 0.0
         x[c0] = pd.to_numeric(x[c0], errors="coerce").fillna(0)
+    x = x[x["subject"].astype(str).isin(TARGET_SUBJECTS)].copy()
+    allowed_pairs = {(subj, prod) for prod, subj in PDF_PRODUCT_CATEGORY_REFERENCE.items()}
+    x = x[x.apply(lambda r: (str(r.get("subject")), str(r.get("product"))) in allowed_pairs, axis=1)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["subject", "product", "selected_for_pdf"]), pd.DataFrame()
     x["week"] = x["day"].map(lambda v: week_code(v) if pd.notna(v) else "")
     cur_monday = latest - pd.Timedelta(days=int(latest.weekday())) if pd.notna(latest) else None
-    week_gp = x.groupby(["subject", "product", "week"], dropna=False, as_index=False).agg(week_gp=(gp_col, "sum"), week_orders=("orders", "sum"))
+    week_gp = x.groupby(["subject", "product", "week"], dropna=False, as_index=False).agg(
+        week_gp=(gp_col, "sum"), week_order_sum=("order_sum", "sum"), week_orders=("orders", "sum")
+    )
     agg = x.groupby(["subject", "product"], dropna=False, as_index=False).agg(
         gp_90=(gp_col, "sum"), order_sum_90=("order_sum", "sum"), orders_90=("orders", "sum"),
         active_days=("day", "nunique"), articles=("supplier_article", "nunique"),
@@ -3752,46 +3767,49 @@ def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold:
     )
     agg = agg.merge(pos, on=["subject", "product"], how="left")
     if cur_monday is not None:
-        cur_week = x[x["day"] >= cur_monday].groupby(["subject", "product"], dropna=False, as_index=False).agg(current_week_gp=(gp_col, "sum"), current_week_orders=("orders", "sum"))
+        cur_week = x[x["day"] >= cur_monday].groupby(["subject", "product"], dropna=False, as_index=False).agg(
+            current_week_gp=(gp_col, "sum"), current_week_order_sum=("order_sum", "sum"), current_week_orders=("orders", "sum")
+        )
         agg = agg.merge(cur_week, on=["subject", "product"], how="left")
     else:
         agg["current_week_gp"] = np.nan
+        agg["current_week_order_sum"] = np.nan
         agg["current_week_orders"] = np.nan
     agg["selected_for_pdf"] = False
-    agg["selection_reason"] = "Не входит в 90% стабильной ВП категории / неприбыльный товар"
-    selected_rows = []
-    min_share_pct = float(os.getenv("PDF_MIN_PRODUCT_GP_SHARE_PCT", "5") or 5)
-    for subject, part in agg.groupby("subject", dropna=False):
-        if subject not in TARGET_SUBJECTS:
-            continue
-        p = part.copy()
-        # Product must be explicitly allowed in the reference.
-        allowed_products = {prod for prod, subj in PDF_PRODUCT_CATEGORY_REFERENCE.items() if subj == subject}
-        p = p[p["product"].astype(str).isin(allowed_products)].copy()
-        if p.empty:
-            continue
-        p = p[p["gp_90"] > 0].copy()
-        p = p[p["current_week_gp"].fillna(p["gp_90"]) > 0].copy()
-        p = p[(p["positive_weeks"].fillna(0) >= 3) & (p["negative_weeks"].fillna(0) <= 1)].copy()
-        if p.empty:
-            continue
-        p = p.sort_values("gp_90", ascending=False).copy()
-        total = p["gp_90"].sum()
-        p["gp_share_pct"] = np.where(total > 0, p["gp_90"] / total * 100, 0)
-        p["cum_gp_share_pct"] = p["gp_share_pct"].cumsum()
-        keep = (p["cum_gp_share_pct"] <= threshold * 100) & (p["gp_share_pct"] >= min_share_pct)
-        if not keep.any() and not p.empty:
-            keep.iloc[0] = True
-        p.loc[:, "selected_for_pdf"] = keep
-        p.loc[:, "selection_reason"] = np.where(keep, "Входит в стабильные товары 90% ВП категории", "Хвост вне 90% ВП / слабая доля")
-        selected_rows.append(p)
-    result = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=list(agg.columns) + ["gp_share_pct", "cum_gp_share_pct"])
-    audit = agg.merge(result[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel")) if not result.empty else agg
+    agg["selection_reason"] = "Не входит в глобальные 90% стабильной ВП / хвостовой товар"
+    min_share_pct = float(os.getenv("PDF_MIN_PRODUCT_GP_SHARE_PCT", "1.0") or 1.0)
+    min_current_gp = float(os.getenv("PDF_MIN_PRODUCT_CURRENT_WEEK_GP", "1000") or 1000)
+    min_current_order_sum = float(os.getenv("PDF_MIN_PRODUCT_CURRENT_WEEK_ORDER_SUM", "10000") or 10000)
+    force_excl = set(PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS)
+    eligible = agg.copy()
+    eligible = eligible[~eligible["product"].astype(str).isin(force_excl)].copy()
+    eligible = eligible[pd.to_numeric(eligible["gp_90"], errors="coerce").fillna(0) > 0].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_gp"], errors="coerce").fillna(0) >= min_current_gp].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_order_sum"], errors="coerce").fillna(0) >= min_current_order_sum].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_orders"], errors="coerce").fillna(0) > 0].copy()
+    eligible = eligible[(eligible["positive_weeks"].fillna(0) >= 3) & (eligible["negative_weeks"].fillna(0) <= 1)].copy()
+    if eligible.empty:
+        audit = agg.copy()
+        audit.loc[audit["product"].astype(str).isin(force_excl), "selection_reason"] = "Исключен как хвостовой товар по правилу PDF_FORCE_EXCLUDE_PRODUCTS"
+        return pd.DataFrame(columns=list(agg.columns) + ["gp_share_pct", "cum_gp_share_pct"]), audit
+    eligible = eligible.sort_values("gp_90", ascending=False).copy()
+    total = pd.to_numeric(eligible["gp_90"], errors="coerce").fillna(0).sum()
+    eligible["gp_share_pct"] = np.where(total > 0, eligible["gp_90"] / total * 100, 0)
+    eligible["cum_gp_share_pct"] = eligible["gp_share_pct"].cumsum()
+    eligible["cum_before_pct"] = eligible["cum_gp_share_pct"] - eligible["gp_share_pct"]
+    keep = (eligible["cum_before_pct"] < threshold * 100) & (eligible["gp_share_pct"] >= min_share_pct)
+    if not keep.any() and not eligible.empty:
+        keep.iloc[0] = True
+    selected = eligible[keep].copy()
+    selected["selected_for_pdf"] = True
+    selected["selection_reason"] = "Входит в глобальные 90% стабильной ВП товаров"
+    audit = agg.merge(selected[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel"))
     if "selected_for_pdf_sel" in audit.columns:
         audit["selected_for_pdf"] = audit["selected_for_pdf_sel"].fillna(False)
-        audit["selection_reason"] = audit["selection_reason_sel"].fillna("Не входит в 90% стабильной ВП категории / неприбыльный товар")
+        audit["selection_reason"] = audit["selection_reason_sel"].fillna("Не входит в глобальные 90% стабильной ВП / хвостовой товар")
         audit = audit.drop(columns=[c for c in ["selected_for_pdf_sel", "selection_reason_sel"] if c in audit.columns])
-    return result[result.get("selected_for_pdf", False) == True].copy() if not result.empty else result, audit
+    audit.loc[audit["product"].astype(str).isin(force_excl), "selection_reason"] = "Исключен как хвостовой товар по правилу PDF_FORCE_EXCLUDE_PRODUCTS"
+    return selected, audit
 
 
 def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
@@ -3823,7 +3841,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     outputs = _filter_outputs_by_pdf_product_reference(outputs, path.parent)
     selected, product_stability = _selected_products_by_stable_gp(outputs, threshold=0.90)
-    outputs = _filter_to_selected_products(outputs, selected)
+    # Do NOT filter article_day_fact globally: top pages must show category totals for all approved products.
+    # The selected product set is applied only when building detailed category/product/article pages.
 
     daily = outputs.get("article_day_fact", pd.DataFrame()).copy()
     if daily is None or daily.empty:
@@ -3967,13 +3986,29 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         return _gp_from_abc_frames(outputs, start, end, keys)
 
     def with_gp(a: pd.DataFrame, keys: List[str], start=week_start, end=week_end) -> pd.DataFrame:
-        gp = gp_week(keys, start, end)
-        if gp is not None and not gp.empty:
-            a = a.merge(gp, on=keys, how="left")
+        a = a.copy() if a is not None else pd.DataFrame(columns=keys)
+        period_start = pd.Timestamp(start).normalize()
+        period_end = pd.Timestamp(end).normalize()
+        # Current report week is operational: use calculated daily GP consistently.
+        # ABC fact is used only for previous closed week / closed full month pages.
+        is_current_report_week = (period_start == pd.Timestamp(cur_monday).normalize() and period_end == pd.Timestamp(latest).normalize()) or (period_start == pd.Timestamp(week_start).normalize() and period_end == pd.Timestamp(week_end).normalize())
+        if not is_current_report_week:
+            gp = gp_week(keys, start, end)
+            if gp is not None and not gp.empty:
+                a = a.merge(gp, on=keys, how="left")
         if "gp_fact" not in a.columns:
             a["gp_fact"] = np.nan
-        a["gp_use"] = a["gp_fact"].fillna(a.get("gross_profit_model", 0))
-        a["margin_pct"] = np.where(pd.to_numeric(a.get("order_sum", 0), errors="coerce") > 0, pd.to_numeric(a["gp_use"], errors="coerce") / pd.to_numeric(a.get("order_sum", 0), errors="coerce") * 100, np.nan)
+        if len(a.index):
+            model_gp = pd.to_numeric(a.get("gross_profit_model", 0), errors="coerce").fillna(0)
+            fact_gp = pd.to_numeric(a["gp_fact"], errors="coerce")
+            a["gp_use"] = fact_gp.where(fact_gp.notna(), model_gp)
+            a["gp_is_fact"] = fact_gp.notna()
+            order_sum_num = pd.to_numeric(a.get("order_sum", 0), errors="coerce").fillna(0)
+            a["margin_pct"] = np.where(order_sum_num > 0, pd.to_numeric(a["gp_use"], errors="coerce") / order_sum_num * 100, np.nan)
+        else:
+            a["gp_use"] = pd.Series(dtype=float)
+            a["gp_is_fact"] = pd.Series(dtype=bool)
+            a["margin_pct"] = pd.Series(dtype=float)
         return a
 
     # ------------------------------------------------------------------
@@ -4041,7 +4076,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
             _fmt_pct_pdf(r.get("search_traffic_capture_pct")),
         ])
-    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", "ВП", "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74)
+    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", "ВП расч.", "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74)
     c.showPage()
 
     # Previous week, current month, closed month, monthly summary.
@@ -4088,7 +4123,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     monthly_rows=[]
     mm = daily.copy()
     mm["month"] = mm["day"].dt.strftime("%m.%Y")
-    m_agg = mm.groupby(["month", "subject"], as_index=False).agg(order_sum=("order_sum", "sum"), gp=("gross_profit_model", "sum"), ad=("ad_spend_total", "sum"))
+    m_agg = mm.groupby(["month", "subject"], as_index=False).agg(order_sum=("order_sum", "sum"), gp_model=("gross_profit_model", "sum"), ad=("ad_spend_total", "sum"))
+    # Closed months must use exact ABC fact, otherwise this page disagrees with the closed-month page.
+    abc_m = outputs.get("abc_monthly", pd.DataFrame())
+    if abc_m is not None and not abc_m.empty:
+        am = abc_m.copy()
+        am["period_start"] = pd.to_datetime(am.get("period_start"), errors="coerce").dt.normalize()
+        am["period_end"] = pd.to_datetime(am.get("period_end"), errors="coerce").dt.normalize()
+        am = am[am["period_end"] < month_start].copy()
+        if not am.empty:
+            am["month"] = am["period_start"].dt.strftime("%m.%Y")
+            am_gp = am.groupby(["month", "subject"], as_index=False).agg(gp_fact=("gross_profit", "sum"))
+            m_agg = m_agg.merge(am_gp, on=["month", "subject"], how="left")
+    if "gp_fact" not in m_agg.columns:
+        m_agg["gp_fact"] = np.nan
+    m_agg["gp"] = pd.to_numeric(m_agg["gp_fact"], errors="coerce").where(pd.to_numeric(m_agg["gp_fact"], errors="coerce").notna(), pd.to_numeric(m_agg["gp_model"], errors="coerce").fillna(0))
     for _, r in m_agg.sort_values(["month", "subject"]).iterrows():
         drr = _pdf_num(r.get("ad"), 0) / _pdf_num(r.get("order_sum"), 1) * 100 if _pdf_num(r.get("order_sum"), 0) else np.nan
         monthly_rows.append([r.get("month"), cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), _fmt_rub(r.get("gp")), _fmt_pct_pdf(drr)])
@@ -4136,7 +4185,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         skip_product_level = (len(products) == 1 and products[0] == "901")
         for product in products:
             aw = article_week[(article_week["subject"].astype(str).eq(subject)) & (article_week["product"].astype(str).eq(product))].copy()
-            aw = aw[pd.to_numeric(aw["gp_use"], errors="coerce").fillna(0) > 0].copy()
+            # Detail pages only for articles with current real sales and positive GP.
+            # This prevents impossible rows like "0 ₽ sales but positive ABC GP" from getting pages.
+            aw = aw[(pd.to_numeric(aw.get("order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw.get("orders"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw["gp_use"], errors="coerce").fillna(0) > 0)].copy()
             if aw.empty:
                 continue
             total_gp = pd.to_numeric(aw["gp_use"], errors="coerce").fillna(0).sum()
@@ -4192,9 +4243,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     return _pdf_num(ar.get(col), 0) / qty
                 opt_ar = _find_optimal_row(opt, "article", subject, product, art)
                 gp = _pdf_num(ar.get("gp_use"), 0)
+                gp_label = "ВП факт ABC" if bool(ar.get("gp_is_fact", False)) else "ВП расч."
                 cards1 = [
                     (_fmt_rub(ar.get("order_sum")), "Сумма заказов", ar.get("order_sum"), ar.get("order_sum_prev"), False, ""),
-                    (_fmt_rub(gp), "ВП факт ABC", gp, ar.get("gp_use_prev"), False, ""),
+                    (_fmt_rub(gp), gp_label, gp, ar.get("gp_use_prev"), False, ""),
                     (_fmt_pct_pdf(ar.get("margin_pct")), "Маржинальность", ar.get("margin_pct"), ar.get("margin_pct_prev"), False, ""),
                     (_fmt_rub(ar.get("avg_order_price")), "Цена продажи", ar.get("avg_order_price"), ar.get("avg_order_price_prev"), False, ""),
                     (_fmt_rub(ar.get("price_with_disc")), "Цена покупателя", ar.get("price_with_disc"), ar.get("price_with_disc_prev"), False, ""),
