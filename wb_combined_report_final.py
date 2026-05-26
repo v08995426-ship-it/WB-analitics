@@ -116,7 +116,7 @@ ALIASES: Dict[str, Sequence[str]] = {
     "cr": ["CR", "cr"],
     "ad_orders": ["Заказы", "Заказы РК", "Заказы из рекламы", "orders"],
     "ad_order_sum": ["Сумма заказов", "Сумма заказов РК", "ordersSumRub"],
-    "drr": ["ДРР", "drr"],
+    "drr": ["ДРР", "ДРР, %", "drr", "drr_pct"],
     "campaign_id": ["ID кампании", "advertId", "campaignId"],
     "bid_type": ["Тип ставки", "bidType"],
     "search_query": ["Поисковый запрос", "Запрос", "Ключевой запрос", "Ключевая фраза", "keyword", "query"],
@@ -132,6 +132,9 @@ ALIASES: Dict[str, Sequence[str]] = {
     "stock": ["Доступно для продажи", "Остаток", "Остатки", "Доступный остаток", "Остаток, шт", "Количество", "Полное количество", "Всего", "stock", "quantity", "qty"],
     "gross_profit": ["Валовая прибыль", "Валовая прибыль, руб", "Валовая прибыль, руб/ед"],
     "gross_revenue": ["Валовая выручка", "Валовая выручка, руб", "Выручка"],
+    "margin_pct": ["Маржинальность, %", "Маржинальность", "margin_pct"],
+    "commission_amount": ["Комиссия", "Комиссия WB", "Комиссия ВБ"],
+    "acquiring_amount": ["Эквайринг", "Эквайринг WB"],
     "commission_pct": ["Комиссия WB, %", "Комиссия ВБ, %", "Комиссия, %"],
     "acquiring_pct": ["Эквайринг, %", "Эквайринг WB, %"],
     "logistics_direct": ["Логистика прямая, руб/ед", "Логистика прямая"],
@@ -1067,6 +1070,10 @@ class Loader:
                     "gross_profit": num_series(get_col(df, "gross_profit")).fillna(0),
                     "gross_revenue": num_series(get_col(df, "gross_revenue")).fillna(0),
                     "orders": num_series(get_col(df, "orders")).fillna(0),
+                    "abc_margin_pct": num_series(get_col(df, "margin_pct")),
+                    "abc_drr_pct": num_series(get_col(df, "drr")),
+                    "abc_commission_amount": num_series(get_col(df, "commission_amount")).fillna(0),
+                    "abc_acquiring_amount": num_series(get_col(df, "acquiring_amount")).fillna(0),
                     "source_file": key,
                     "source_sheet": source_sheet,
                     "header_row_excel": header_row_excel,
@@ -1074,6 +1081,8 @@ class Loader:
                     "cell_gross_profit": [_source_cell_ref(df, "gross_profit", i) for i in df.index],
                     "cell_gross_revenue": [_source_cell_ref(df, "gross_revenue", i) for i in df.index],
                     "cell_orders": [_source_cell_ref(df, "orders", i) for i in df.index],
+                    "cell_margin_pct": [_source_cell_ref(df, "margin_pct", i) for i in df.index],
+                    "cell_drr_pct": [_source_cell_ref(df, "drr", i) for i in df.index],
                 })
                 out["product"] = out["supplier_article"].map(product_code)
                 if is_month_file(start, end) and start.year == current_year:
@@ -2746,6 +2755,9 @@ PDF_CALC_TRACE_NAME = "Лог_расчетов_PDF_TOPFACE.xlsx"
 # Так подводки 405/406 не будут попадать в "Карандаши", а случайные товары вроде 552 уйдут в техлист.
 PDF_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
     "901": "Кисти косметические",
+    "605": "Косметические карандаши",
+    "611": "Косметические карандаши",
+    "613": "Косметические карандаши",
     "614": "Косметические карандаши",
     "617": "Косметические карандаши",
     "618": "Косметические карандаши",
@@ -2770,6 +2782,12 @@ PDF_EXCLUDED_PRODUCT_REASONS: Dict[str, str] = {
 # are not detailed objects in the PDF. Override with PDF_FORCE_EXCLUDE_PRODUCTS if needed.
 PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS = set(
     p.strip() for p in os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(",") if p.strip()
+)
+
+# Products that must appear in the detailed PDF when they have current-week sales/GP.
+# This prevents useful pencil groups 605/611/613 from disappearing due to global 90% trimming.
+PDF_FORCE_INCLUDE_DETAIL_PRODUCTS = set(
+    p.strip() for p in os.getenv("PDF_FORCE_INCLUDE_PRODUCTS", "901,605,611,613,614,617,618,154,155,156,157").split(",") if p.strip()
 )
 
 
@@ -3762,20 +3780,36 @@ def _gp_from_abc_frames(outputs: Dict[str, pd.DataFrame], start: pd.Timestamp, e
     if not frames:
         return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
     exact = pd.concat(frames, ignore_index=True)
+    for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct", "abc_commission_amount", "abc_acquiring_amount"]:
+        if c0 not in exact.columns:
+            exact[c0] = np.nan if c0 == "abc_drr_pct" else 0.0
+        exact[c0] = pd.to_numeric(exact[c0], errors="coerce")
+    exact["_abc_ad_spend"] = np.where(exact["gross_revenue"].fillna(0) > 0, exact["gross_revenue"].fillna(0) * exact["abc_drr_pct"].fillna(0) / 100.0, 0.0)
+    exact["_abc_commission_abs"] = exact["abc_commission_amount"].abs().fillna(0)
+    exact["_abc_acquiring_abs"] = exact["abc_acquiring_amount"].abs().fillna(0)
     def _join_unique(s):
         vals = [normalize_text(v) for v in s.dropna().astype(str).tolist() if normalize_text(v)]
         vals = list(dict.fromkeys(vals))
         return " | ".join(vals[:20])
-    return exact.groupby(group_cols, dropna=False, as_index=False).agg(
+    g = exact.groupby(group_cols, dropna=False, as_index=False).agg(
         gp_fact=("gross_profit", "sum"),
         gross_revenue_fact=("gross_revenue", "sum"),
         sales_qty_fact=("orders", "sum"),
+        abc_ad_spend_fact=("_abc_ad_spend", "sum"),
+        abc_commission_amount_fact=("_abc_commission_abs", "sum"),
+        abc_acquiring_amount_fact=("_abc_acquiring_abs", "sum"),
         gp_source=("gp_source", "first"),
         gp_source_file=("source_file", _join_unique),
         gp_source_sheet=("source_sheet", _join_unique),
         gp_source_rows=("source_row_excel", _join_unique),
         gp_source_cells=("cell_gross_profit", _join_unique),
     )
+    rev = pd.to_numeric(g["gross_revenue_fact"], errors="coerce").fillna(0)
+    g["abc_margin_pct"] = np.where(rev > 0, pd.to_numeric(g["gp_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_drr_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_ad_spend_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_commission_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_commission_amount_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_acquiring_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_acquiring_amount_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    return g
 
 
 def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold: float = 0.90) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -3861,8 +3895,18 @@ def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold:
     if not keep.any() and not eligible.empty:
         keep.iloc[0] = True
     selected = eligible[keep].copy()
+    # Force include user-confirmed product groups when they have current sales and positive current GP.
+    force_incl = set(PDF_FORCE_INCLUDE_DETAIL_PRODUCTS) - set(PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS)
+    forced = agg[agg["product"].astype(str).isin(force_incl)].copy()
+    forced = forced[(pd.to_numeric(forced.get("current_week_order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(forced.get("current_week_gp"), errors="coerce").fillna(0) > 0)].copy()
+    if not forced.empty:
+        if "gp_share_pct" not in forced.columns:
+            forced["gp_share_pct"] = np.where(total > 0, pd.to_numeric(forced["gp_90"], errors="coerce").fillna(0) / total * 100, 0)
+        if "cum_gp_share_pct" not in forced.columns:
+            forced["cum_gp_share_pct"] = np.nan
+        selected = pd.concat([selected, forced], ignore_index=True).drop_duplicates(["subject", "product"], keep="first")
     selected["selected_for_pdf"] = True
-    selected["selection_reason"] = "Входит в глобальные 90% стабильной ВП товаров"
+    selected["selection_reason"] = np.where(selected["product"].astype(str).isin(force_incl), "Включен принудительно как подтвержденная товарная группа PDF", "Входит в глобальные 90% стабильной ВП товаров")
     audit = agg.merge(selected[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel"))
     if "selected_for_pdf_sel" in audit.columns:
         audit["selected_for_pdf"] = audit["selected_for_pdf_sel"].fillna(False)
@@ -3934,6 +3978,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     if factor_bridge is None:
         factor_bridge = pd.DataFrame()
     if not factor_bridge.empty:
+        # In the PDF we compare factors to previous week / plan, not to an abstract optimum.
+        if "comparison" in factor_bridge.columns:
+            factor_bridge = factor_bridge[~factor_bridge["comparison"].astype(str).eq("optimal_best_days")].copy()
+        if "factor" in factor_bridge.columns:
+            factor_bridge = factor_bridge[~factor_bridge["factor"].astype(str).str.contains("оптим", case=False, na=False)].copy()
         factor_bridge["effect_gp_rub"] = pd.to_numeric(factor_bridge.get("effect_gp_rub"), errors="coerce").fillna(0)
         if "abs_effect_gp_rub" not in factor_bridge.columns:
             factor_bridge["abs_effect_gp_rub"] = factor_bridge["effect_gp_rub"].abs()
@@ -3978,6 +4027,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     page_num = 0
     cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
     cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
+    cat_code = {"Кисти косметические": "brushes", "Косметические карандаши": "pencils", "Помады": "lipsticks", "Блески": "glosses"}
+    def cat_bookmark(subject_value: Any) -> str:
+        return "cat_" + cat_code.get(str(subject_value), re.sub(r"[^A-Za-z0-9]+", "_", str(subject_value)))
+    def product_bookmark(subject_value: Any, product_value: Any) -> str:
+        return "prod_" + cat_code.get(str(subject_value), re.sub(r"[^A-Za-z0-9]+", "_", str(subject_value))) + "_" + re.sub(r"[^A-Za-z0-9]+", "_", str(product_value))
 
     def page_bg(title: str, subtitle: str = "", section: str = ""):
         nonlocal page_num
@@ -4116,6 +4170,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         gp = gp_week(keys, start, end)
         if gp is not None and not gp.empty:
             a = a.merge(gp, on=keys, how="left")
+        # Previous exact ABC for dynamics. For week pages this is the previous week.
+        prev_len = period_end - period_start + pd.Timedelta(days=1)
+        prev_period_start = period_start - prev_len
+        prev_period_end = period_start - pd.Timedelta(days=1)
+        gp_prev_exact = _gp_from_abc_frames(outputs, prev_period_start, prev_period_end, keys)
+        if gp_prev_exact is not None and not gp_prev_exact.empty:
+            rename_prev = {c: f"{c}_prev_abc" for c in gp_prev_exact.columns if c not in keys}
+            a = a.merge(gp_prev_exact.rename(columns=rename_prev), on=keys, how="left")
         if "gp_fact" not in a.columns:
             a["gp_fact"] = np.nan
         if len(a.index):
@@ -4123,8 +4185,32 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             fact_gp = pd.to_numeric(a["gp_fact"], errors="coerce")
             a["gp_use"] = fact_gp.where(fact_gp.notna(), model_gp)
             a["gp_is_fact"] = fact_gp.notna()
+            model_gp_prev = pd.to_numeric(a["gross_profit_model_prev"] if "gross_profit_model_prev" in a.columns else pd.Series(0.0, index=a.index), errors="coerce").fillna(0)
+            fact_gp_prev = pd.to_numeric(a["gp_fact_prev_abc"] if "gp_fact_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            a["gp_use_prev"] = fact_gp_prev.where(fact_gp_prev.notna(), model_gp_prev)
+            # ABC is source of truth for weekly margin and DRR when exact ABC exists.
+            if "abc_drr_pct" in a.columns:
+                a["drr_pct"] = pd.to_numeric(a["abc_drr_pct"], errors="coerce").where(pd.to_numeric(a["abc_drr_pct"], errors="coerce").notna(), pd.to_numeric(a["drr_pct"] if "drr_pct" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce"))
+            if "abc_drr_pct_prev_abc" in a.columns:
+                a["drr_pct_prev"] = pd.to_numeric(a["abc_drr_pct_prev_abc"], errors="coerce").where(pd.to_numeric(a["abc_drr_pct_prev_abc"], errors="coerce").notna(), pd.to_numeric(a["drr_pct_prev"] if "drr_pct_prev" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce"))
+            if "abc_commission_pct" in a.columns:
+                a["commission_pct_abc"] = pd.to_numeric(a["abc_commission_pct"], errors="coerce")
+            if "abc_commission_pct_prev_abc" in a.columns:
+                a["commission_pct_abc_prev"] = pd.to_numeric(a["abc_commission_pct_prev_abc"], errors="coerce")
+            if "abc_acquiring_pct" in a.columns:
+                a["acquiring_pct_abc"] = pd.to_numeric(a["abc_acquiring_pct"], errors="coerce")
+            if "abc_acquiring_pct_prev_abc" in a.columns:
+                a["acquiring_pct_abc_prev"] = pd.to_numeric(a["abc_acquiring_pct_prev_abc"], errors="coerce")
             order_sum_num = pd.to_numeric(a.get("order_sum", 0), errors="coerce").fillna(0)
-            a["margin_pct"] = np.where(order_sum_num > 0, pd.to_numeric(a["gp_use"], errors="coerce") / order_sum_num * 100, np.nan)
+            abc_margin = pd.to_numeric(a["abc_margin_pct"] if "abc_margin_pct" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            fact_rev = pd.to_numeric(a["gross_revenue_fact"] if "gross_revenue_fact" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            margin_calc = np.where(fact_rev.fillna(0) > 0, pd.to_numeric(a["gp_use"], errors="coerce") / fact_rev * 100, np.where(order_sum_num > 0, pd.to_numeric(a["gp_use"], errors="coerce") / order_sum_num * 100, np.nan))
+            a["margin_pct"] = abc_margin.where(abc_margin.notna(), margin_calc)
+            abc_margin_prev = pd.to_numeric(a["abc_margin_pct_prev_abc"] if "abc_margin_pct_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            fact_rev_prev = pd.to_numeric(a["gross_revenue_fact_prev_abc"] if "gross_revenue_fact_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            order_sum_prev_num = pd.to_numeric(a["order_sum_prev"] if "order_sum_prev" in a.columns else pd.Series(0.0, index=a.index), errors="coerce").fillna(0)
+            margin_prev_calc = np.where(fact_rev_prev.fillna(0) > 0, pd.to_numeric(a["gp_use_prev"], errors="coerce") / fact_rev_prev * 100, np.where(order_sum_prev_num > 0, pd.to_numeric(a["gp_use_prev"], errors="coerce") / order_sum_prev_num * 100, np.nan))
+            a["margin_pct_prev"] = abc_margin_prev.where(abc_margin_prev.notna(), margin_prev_calc)
             try:
                 source_cnt = int(a["gp_is_fact"].fillna(False).sum())
                 source_txt = "ABC exact" if source_cnt else "model gross_profit_model"
@@ -4160,14 +4246,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     cur_gp_fact_flag = bool(cur_period_gp.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) if not cur_period_gp.empty else False
     drr_cur = _pdf_num(cur_total.get("ad_spend_total"), 0) / _pdf_num(cur_total.get("order_sum"), 1) * 100 if _pdf_num(cur_total.get("order_sum"), 0) else np.nan
     drr_prev = _pdf_num(prev_total.get("ad_spend_total"), 0) / _pdf_num(prev_total.get("order_sum"), 1) * 100 if _pdf_num(prev_total.get("order_sum"), 0) else np.nan
-    opt_cat = opt[opt.get("level", "") == "category"] if not opt.empty and "level" in opt.columns else pd.DataFrame()
-    opt_drr_total = pd.to_numeric(opt_cat.get("optimal_drr_pct", pd.Series(dtype=float)), errors="coerce").mean() if not opt_cat.empty else np.nan
     dt, tone = _pdf_color_delta_value(cur_total.get("order_sum",0), prev_total.get("order_sum",0), False)
     draw_metric_card(70, 610, 260, 120, _fmt_rub(cur_total.get("order_sum", 0)), "Сумма заказов", dt, tone)
     dt, tone = _pdf_color_delta_value(cur_gp_total, prev_gp_total, False)
     draw_metric_card(360, 610, 260, 120, _fmt_rub(cur_gp_total), "ВП факт ABC" if cur_gp_fact_flag else "ВП расч.", dt, tone)
     dt, tone = _pdf_color_delta_value(drr_cur, drr_prev, True)
-    opt_txt = f"опт. {_fmt_pct_pdf(opt_drr_total)}" if pd.notna(opt_drr_total) else "опт. —"
     draw_metric_card(650, 610, 260, 120, _fmt_pct_pdf(drr_cur), "ДРР", dt, tone)
     dt, tone = _pdf_color_delta_value(cur_total.get("ad_spend_total",0), prev_total.get("ad_spend_total",0), True)
     draw_metric_card(940, 610, 260, 120, _fmt_rub(cur_total.get("ad_spend_total", 0)), "Расход РК", dt, tone)
@@ -4202,7 +4285,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     cat_cur = with_gp(_merge_cur_prev(cur_period, prev_same, ["subject"]), ["subject"], cur_monday, latest)
     rows=[]
     for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows():
-        opt_r = _find_optimal_row(opt, "category", r.get("subject"))
         rows.append([
             cat_short.get(r.get("subject"), r.get("subject")),
             f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
@@ -4216,8 +4298,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     cur_gp_label = "ВП факт ABC" if bool(cat_cur.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) else "ВП расч."
     draw_table(80, 260, 1440, 400, ["Категория", "Сумма", cur_gp_label, "Маржа", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74, lower_better_cols={4,5,6})
     # Category rows are clickable: category -> products; brushes -> article list on the category page.
-    selected_subjects_for_nav = set(selected["subject"].astype(str)) if selected is not None and not selected.empty and "subject" in selected.columns else set()
-    cat_targets = [f"cat_{cat_short.get(str(r.get('subject')), str(r.get('subject')))}" if str(r.get("subject")) in selected_subjects_for_nav else None for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows()]
+    cat_targets = [cat_bookmark(str(r.get("subject"))) for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows()]
     add_table_row_links(80, 260, 1440, 400, 74, cat_targets)
     c.showPage()
 
@@ -4300,11 +4381,16 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     for subject in cats:
         cp = product_week[product_week["subject"].astype(str).eq(subject)].copy()
         cp = cp[cp["product"].astype(str).map(lambda p: (subject, p) in selected_set)].copy() if selected_set else cp
+        cat_key = cat_bookmark(subject)
         if cp.empty:
+            bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / нет товаров для детализации по правилу отбора", "Категория")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
+            draw_table(180, 330, 1240, 220, ["Статус", "Комментарий"], [["Не детализируем", "Товары категории не прошли отбор стабильной ВП / исключены как хвостовые"]], col_widths=[260, 980], font_size=16, row_h=80, first_col_red=True, align_left_cols={1})
+            c.showPage()
             continue
         products = list(cp["product"].astype(str).unique())
         skip_product_level = (len(products) == 1 and products[0] == "901")
-        cat_key = f"cat_{cat_short.get(subject, subject)}"
         bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
 
         def article_keep_for_product(product_value: str) -> pd.DataFrame:
@@ -4330,7 +4416,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             product = products[0]
             aw_cat = article_keep_for_product(product)
             page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / артикулы товара {product} / 90% ВП", "Категория")
-            button(1220, 800, 240, "← прошлая неделя", "prev")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
             rows=[]; row_targets=[]
             for _, ar in aw_cat.iterrows():
                 art = str(ar.get("supplier_article"))
@@ -4351,11 +4437,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             c.showPage()
         else:
             page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / товары 90% стабильной ВП", "Категория")
-            button(1220, 800, 240, "← прошлая неделя", "prev")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
             rows=[]; row_targets=[]
             for _, r in cp.sort_values("gp_use", ascending=False).iterrows():
                 product_value = str(r.get("product"))
-                prod_key_tmp = f"prod_{subject}_{product_value}".replace(" ", "_")
+                prod_key_tmp = product_bookmark(subject, product_value)
                 row_targets.append(prod_key_tmp)
                 rows.append([
                     product_value,
@@ -4377,7 +4463,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 continue
             aw_keep = aw.copy()
 
-            prod_key = f"prod_{subject}_{product}".replace(" ", "_")
+            prod_key = product_bookmark(subject, product)
             if not skip_product_level:
                 product_pages[(subject, product)] = prod_key
                 bookmarks[prod_key] = prod_key; c.bookmarkPage(prod_key)
@@ -4440,10 +4526,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     (_fmt_rub(ar.get("avg_order_price")), "Цена продажи", ar.get("avg_order_price"), ar.get("avg_order_price_prev"), False, ""),
                     (_fmt_rub(ar.get("price_with_disc")), "Цена покупателя", ar.get("price_with_disc"), ar.get("price_with_disc_prev"), False, ""),
                     (_fmt_pct_pdf(ar.get("spp", ar.get("spp_funnel",0))), "СПП", ar.get("spp", ar.get("spp_funnel",0)), ar.get("spp_prev", ar.get("spp_funnel_prev",0)), False, ""),
-                    (_fmt_pct_pdf(pct_of_sales("commission_model")), "Комиссия, %", pct_of_sales("commission_model"), pct_of_sales("commission_model", "_prev"), True, ""),
+                    (_fmt_pct_pdf(ar.get("commission_pct_abc", pct_of_sales("commission_model"))), "Комиссия, %", ar.get("commission_pct_abc", pct_of_sales("commission_model")), ar.get("commission_pct_abc_prev", pct_of_sales("commission_model", "_prev")), True, ""),
                     (_fmt_rub(unit("logistics_direct_model")+unit("logistics_return_model")), "Логистика/шт", "", "", True, ""),
                     (_fmt_rub(unit("storage_model")), "Хранение/шт", "", "", True, ""),
-                    (_fmt_pct_pdf(pct_of_sales("acquiring_model")), "Эквайринг, %", pct_of_sales("acquiring_model"), pct_of_sales("acquiring_model", "_prev"), True, ""),
+                    (_fmt_pct_pdf(ar.get("acquiring_pct_abc", pct_of_sales("acquiring_model"))), "Эквайринг, %", ar.get("acquiring_pct_abc", pct_of_sales("acquiring_model")), ar.get("acquiring_pct_abc_prev", pct_of_sales("acquiring_model", "_prev")), True, ""),
                     (_fmt_rub(unit("cost_model")), "Себест./шт", "", "", True, ""),
                     (_fmt_rub(unit("other_costs_model")), "Прочие/шт", "", "", True, ""),
                 ]
@@ -4536,6 +4622,885 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         log(f"WARN PDF calc trace was not saved: {exc}")
     return path
 
+
+
+# The PDF/report logic must not introduce artificial "optimum" comparison rows.
+def _append_optimal_factor_rows(level: str, g: pd.DataFrame, keys: List[str], optimal: pd.DataFrame) -> List[Dict[str, Any]]:
+    return []
+
+
+# ================================================================
+# PDF v11: three-contour management report
+# Контуры:
+# 1) текущая неделя — только обзор, без провала в детализацию;
+# 2) прошлая полная неделя — категория → товар → артикул;
+# 3) последний закрытый месяц — категория → товар → артикул.
+# ================================================================
+
+def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception as exc:
+        log(f"WARN: reportlab недоступен, PDF не создан: {exc}")
+        return None
+
+    F_REG, F_BOLD, F_BLACK = _register_topface_fonts()
+    W, H = 1600, 900
+    RED = HexColor("#c90022")
+    RED_DARK = HexColor("#9d0018")
+    WHITE = colors.white
+    BLACK = HexColor("#111111")
+    GRAY = HexColor("#595959")
+    GREEN = HexColor("#087a38")
+    BAD = HexColor("#b00020")
+    SOFT = HexColor("#fff4f5")
+    LINE = HexColor("#e6d8d8")
+
+    # 1) строгий справочник товарных групп + аудит.
+    outputs = _filter_outputs_by_pdf_product_reference(outputs, path.parent)
+
+    daily = outputs.get("article_day_fact", pd.DataFrame()).copy()
+    if daily is None or daily.empty:
+        raise RuntimeError("PDF невозможен: пустой article_day_fact")
+
+    # ---------- basic normalization ----------
+    SUBJECT_DISPLAY = {
+        "Кисти косметические": "Кисти",
+        "Кисти": "Кисти",
+        "Косметические карандаши": "Карандаши",
+        "Карандаши": "Карандаши",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    DISPLAY_TO_CANON = {
+        "Кисти": "Кисти косметические",
+        "Карандаши": "Косметические карандаши",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    CATEGORY_ORDER = ["Кисти", "Карандаши", "Помады", "Блески"]
+    PRODUCT_ORDER = {
+        "Кисти": ["901"],
+        "Карандаши": ["605", "611", "613", "614", "617", "618"],
+        "Помады": ["154", "155", "156", "157", "206"],
+        "Блески": ["207", "209", "210", "211"],
+    }
+    DETAIL_EXCLUDE = set(os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(","))
+    DETAIL_EXCLUDE = {x.strip() for x in DETAIL_EXCLUDE if x.strip()}
+
+    def _num(x, default=0.0):
+        try:
+            if pd.isna(x):
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _clean_article_local(x):
+        try:
+            return clean_article(x)
+        except Exception:
+            return "" if pd.isna(x) else str(x).strip()
+
+    def _prod(x):
+        return _pdf_product_code_from_value(x)
+
+    def _fmt_money(x):
+        x = _num(x, 0)
+        sign = "-" if x < 0 else ""
+        return f"{sign}{int(round(abs(x))):,} ₽".replace(",", " ")
+
+    def _fmt_money_short(x):
+        x = _num(x, 0)
+        sign = "-" if x < 0 else ""
+        ax = abs(x)
+        if ax >= 1_000_000:
+            return f"{sign}{ax/1_000_000:.1f} млн ₽".replace(".", ",")
+        if ax >= 1000:
+            return f"{sign}{ax/1000:.0f}к ₽".replace(".", ",")
+        return f"{sign}{ax:.0f} ₽".replace(".", ",")
+
+    def _fmt_signed_money(x):
+        x = _num(x, 0)
+        if abs(x) < 0.5:
+            return "0 ₽"
+        return ("+" if x > 0 else "-") + f"{int(round(abs(x))):,} ₽".replace(",", " ")
+
+    def _fmt_pct(x, digits=1):
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{_num(x):.{digits}f}%".replace(".", ",")
+
+    def _fmt_num(x):
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{int(round(_num(x))):,}".replace(",", " ")
+
+    def _fmt_rub1(x):
+        return f"{_num(x):.1f} ₽".replace(".", ",")
+
+    def _delta(cur, prev):
+        cur, prev = _num(cur), _num(prev)
+        if abs(prev) < 1e-9:
+            if abs(cur) < 1e-9:
+                return 0.0
+            return None
+        return (cur / prev - 1.0) * 100.0
+
+    LOWER_BAD = {"ДРР", "CPC", "Расход РК", "Комиссия", "Эквайринг", "Логистика", "Хранение", "Себест", "Прочие", "СПП"}
+    def _lower_bad(metric: str) -> bool:
+        s = str(metric).lower()
+        return any(k.lower() in s for k in LOWER_BAD)
+
+    def _arrow(delta, lower_bad=False):
+        if delta is None:
+            return "—"
+        if abs(delta) < 0.05:
+            return "→ 0,0%"
+        return ("↑ " if delta > 0 else "↓ ") + f"{abs(delta):.1f}%".replace(".", ",")
+
+    def _tone(delta, lower_bad=False):
+        if delta is None or abs(delta) < 0.05:
+            return GRAY
+        good = (delta < 0) if lower_bad else (delta > 0)
+        return GREEN if good else BAD
+
+    def _subject_disp(x):
+        return SUBJECT_DISPLAY.get(normalize_text(x), normalize_text(x))
+
+    def _safe_mean(s):
+        s = pd.to_numeric(s, errors="coerce")
+        return float(s.dropna().mean()) if len(s.dropna()) else 0.0
+
+    for col in ["day", "subject", "product", "supplier_article", "nm_id"]:
+        if col not in daily.columns:
+            daily[col] = ""
+    daily["day"] = pd.to_datetime(daily["day"], errors="coerce").dt.normalize()
+    daily["subject_disp"] = daily["subject"].map(_subject_disp)
+    daily["product_code"] = daily.apply(lambda r: _prod(r.get("product")) or _prod(r.get("supplier_article")), axis=1)
+    # Keep approved products. 405/406 are removed by _filter_outputs_by_pdf_product_reference.
+    daily = daily[daily["subject_disp"].isin(CATEGORY_ORDER)].copy()
+
+    for col in ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency", "search_traffic_capture_pct", "localization_with_replacements_pct", "rating_reviews", "finished_price", "price_with_disc", "spp", "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost", "cart_conv_pct", "order_conv_pct"]:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_spend_total" not in daily.columns:
+        daily["ad_spend_total"] = 0.0
+        for col in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"]:
+            if col in daily.columns:
+                daily["ad_spend_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_clicks_total" not in daily.columns:
+        daily["ad_clicks_total"] = 0.0
+        for col in ["manual_clicks", "unified_clicks", "unknown_clicks"]:
+            if col in daily.columns:
+                daily["ad_clicks_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_impressions_total" not in daily.columns:
+        daily["ad_impressions_total"] = 0.0
+        for col in ["manual_impressions", "unified_impressions", "unknown_impressions"]:
+            if col in daily.columns:
+                daily["ad_impressions_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+
+    latest = pd.to_datetime(daily["day"], errors="coerce").max()
+    if pd.isna(latest):
+        latest = pd.Timestamp.today().normalize()
+    latest = pd.Timestamp(latest).normalize()
+    cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_end = cur_start + pd.Timedelta(days=6)
+    cur_actual_end = latest
+    prev_start = cur_start - pd.Timedelta(days=7)
+    prev_end = cur_start - pd.Timedelta(days=1)
+    prev2_start = cur_start - pd.Timedelta(days=14)
+    prev2_end = cur_start - pd.Timedelta(days=8)
+    closed_end = cur_start.replace(day=1) - pd.Timedelta(days=1)
+    closed_start = closed_end.replace(day=1)
+    closed_prev_end = closed_start - pd.Timedelta(days=1)
+    closed_prev_start = closed_prev_end.replace(day=1)
+
+    # ---------- ABC helpers ----------
+    def _prepare_abc(src: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        if src is None or src.empty:
+            return pd.DataFrame()
+        x = src.copy()
+        if "period_start" not in x.columns or "period_end" not in x.columns:
+            return pd.DataFrame()
+        x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+        x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+        x = x[(x["period_start"] == pd.Timestamp(start).normalize()) & (x["period_end"] == pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return x
+        if "subject_disp" not in x.columns:
+            x["subject_disp"] = x.get("subject", "").map(_subject_disp) if "subject" in x.columns else ""
+        if "product_code" not in x.columns:
+            x["product_code"] = x.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in x.columns:
+            x["supplier_article"] = x["supplier_article"].map(_clean_article_local)
+        for col in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct", "abc_commission_amount", "abc_acquiring_amount"]:
+            if col not in x.columns:
+                x[col] = 0.0
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0)
+        return x[x["subject_disp"].isin(CATEGORY_ORDER)].copy()
+
+    def _abc_exact(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        frames = []
+        for nm in ["abc_weekly", "abc_monthly"]:
+            src = _prepare_abc(outputs.get(nm, pd.DataFrame()), start, end)
+            if not src.empty:
+                frames.append(src)
+        if not frames:
+            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "orders_abc", "abc_drr_pct", "abc_commission_pct", "abc_acquiring_pct", "abc_rows"])
+        x = pd.concat(frames, ignore_index=True)
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
+        x["_comm_abs"] = x["abc_commission_amount"].abs()
+        x["_acq_abs"] = x["abc_acquiring_amount"].abs()
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            gp_abc=("gross_profit", "sum"),
+            revenue_abc=("gross_revenue", "sum"),
+            orders_abc=("orders", "sum"),
+            abc_ad_spend=("_abc_ad", "sum"),
+            abc_commission_amount=("_comm_abs", "sum"),
+            abc_acquiring_amount=("_acq_abs", "sum"),
+            abc_rows=("gross_profit", "size"),
+        )
+        rev = pd.to_numeric(g["revenue_abc"], errors="coerce").fillna(0)
+        g["abc_margin_pct"] = np.where(rev > 0, g["gp_abc"] / rev * 100, np.nan)
+        g["abc_drr_pct"] = np.where(rev > 0, g["abc_ad_spend"] / rev * 100, np.nan)
+        g["abc_commission_pct"] = np.where(rev > 0, g["abc_commission_amount"] / rev * 100, np.nan)
+        g["abc_acquiring_pct"] = np.where(rev > 0, g["abc_acquiring_amount"] / rev * 100, np.nan)
+        return g
+
+    def _agg_daily(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        x = daily[(daily["day"] >= pd.Timestamp(start).normalize()) & (daily["day"] <= pd.Timestamp(end).normalize())].copy()
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        if x.empty:
+            return pd.DataFrame(columns=keys)
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            order_sum=("order_sum", "sum"),
+            orders=("orders", "sum"),
+            gp_model=("gross_profit_model", "sum"),
+            ad_spend=("ad_spend_total", "sum"),
+            clicks=("ad_clicks_total", "sum"),
+            impressions=("ad_impressions_total", "sum"),
+            opens=("open_cards", "sum"),
+            carts=("add_to_cart", "sum"),
+            demand=("search_frequency", "sum"),
+            search_share=("search_traffic_capture_pct", _safe_mean),
+            localization=("localization_with_replacements_pct", _safe_mean),
+            rating=("rating_reviews", _safe_mean),
+            price_sale=("finished_price", _safe_mean),
+            buyer_price=("price_with_disc", _safe_mean),
+            spp=("spp", _safe_mean),
+            commission_pct_model=("commission_%", _safe_mean),
+            acquiring_pct_model=("acquiring_%", _safe_mean),
+            logistics_per_unit=("logistics_direct", _safe_mean),
+            storage_per_unit=("storage", _safe_mean),
+            other_per_unit=("other_costs", _safe_mean),
+            cost_per_unit=("cost", _safe_mean),
+        )
+        g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
+        g["cpc"] = np.where(g["clicks"] > 0, g["ad_spend"] / g["clicks"], 0.0)
+        g["cart_conv"] = np.where(g["opens"] > 0, g["carts"] / g["opens"] * 100, 0.0)
+        g["order_conv"] = np.where(g["carts"] > 0, g["orders"] / g["carts"] * 100, 0.0)
+        return g
+
+    def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        cur = _agg_daily(start, end, keys)
+        prev = _agg_daily(prev_s, prev_e, keys)
+        out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+        abc = _abc_exact(start, end, keys)
+        abc_prev = _abc_exact(prev_s, prev_e, keys)
+        out = out.merge(abc, on=keys, how="left")
+        abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
+        out = out.merge(abc_prev, on=keys, how="left")
+        # fill numeric values
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "search_share", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv"]:
+            if col not in out.columns: out[col] = 0.0
+            if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+            out[col + "_prev"] = pd.to_numeric(out[col + "_prev"], errors="coerce").fillna(0.0)
+        # ABC is source of truth for closed periods when exact ABC exists.
+        out["sum_use"] = np.where(pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0), out["order_sum"])
+        out["sum_prev_use"] = np.where(pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0), out["order_sum_prev"])
+        out["gp_use"] = np.where(pd.to_numeric(out.get("gp_abc", 0), errors="coerce").fillna(0).abs() > 1e-9, pd.to_numeric(out.get("gp_abc", 0), errors="coerce").fillna(0), out["gp_model"])
+        out["gp_prev_use"] = np.where(pd.to_numeric(out.get("gp_abc_prev_abc", 0), errors="coerce").fillna(0).abs() > 1e-9, pd.to_numeric(out.get("gp_abc_prev_abc", 0), errors="coerce").fillna(0), out["gp_model_prev"])
+        out["margin"] = np.where(out["sum_use"].abs() > 1e-9, out["gp_use"] / out["sum_use"] * 100, 0.0)
+        out["margin_prev"] = np.where(out["sum_prev_use"].abs() > 1e-9, out["gp_prev_use"] / out["sum_prev_use"] * 100, 0.0)
+        out["drr"] = np.where(pd.to_numeric(out.get("abc_drr_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_drr_pct", 0), errors="coerce"), out["drr_model"])
+        out["drr_prev"] = np.where(pd.to_numeric(out.get("abc_drr_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_drr_pct_prev_abc", 0), errors="coerce"), out["drr_model_prev"])
+        out["commission_pct"] = np.where(pd.to_numeric(out.get("abc_commission_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_commission_pct", 0), errors="coerce"), out["commission_pct_model"])
+        out["commission_pct_prev"] = np.where(pd.to_numeric(out.get("abc_commission_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_commission_pct_prev_abc", 0), errors="coerce"), out["commission_pct_model_prev"])
+        out["acquiring_pct"] = np.where(pd.to_numeric(out.get("abc_acquiring_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_acquiring_pct", 0), errors="coerce"), out["acquiring_pct_model"])
+        out["acquiring_pct_prev"] = np.where(pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", 0), errors="coerce"), out["acquiring_pct_model_prev"])
+        out["has_abc"] = pd.to_numeric(out.get("abc_rows", 0), errors="coerce").fillna(0) > 0
+        return out
+
+    cur_cat = _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"])
+    prev_cat = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp"])
+    closed_cat = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
+    current_month_cat = _metrics_period(cur_start.replace(day=1), cur_actual_end, (cur_start.replace(day=1)-pd.offsets.MonthBegin(1)).normalize(), cur_start.replace(day=1)-pd.Timedelta(days=1), ["subject_disp"])
+
+    # Details per contour.
+    prev_prod = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp", "product_code"])
+    prev_art = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+    closed_prod = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp", "product_code"])
+    closed_art = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+
+    def _filter_detail_products(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
+        x = df.copy()
+        x["product_code"] = x["product_code"].astype(str)
+        x = x[x["product_code"].ne("") & ~x["product_code"].isin(DETAIL_EXCLUDE)].copy()
+        x = x[(pd.to_numeric(x["sum_use"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(x["gp_use"], errors="coerce").fillna(0) > 0)].copy()
+        # Sort by category order then product order then GP.
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        x["_prod_order"] = x.apply(lambda r: PRODUCT_ORDER.get(r["subject_disp"], []).index(r["product_code"]) if r["product_code"] in PRODUCT_ORDER.get(r["subject_disp"], []) else 99, axis=1)
+        return x.sort_values(["_cat_order", "_prod_order", "gp_use"], ascending=[True, True, False])
+
+    prev_prod_detail = _filter_detail_products(prev_prod)
+    closed_prod_detail = _filter_detail_products(closed_prod)
+
+    def _select_articles(df: pd.DataFrame, prod_row: pd.Series) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
+        q = df[(df["subject_disp"].astype(str) == str(prod_row["subject_disp"])) & (df["product_code"].astype(str) == str(prod_row["product_code"]))].copy()
+        q = q[(pd.to_numeric(q["sum_use"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(q["gp_use"], errors="coerce").fillna(0) > 0)].copy()
+        if q.empty: return q
+        q["_gp_pos"] = pd.to_numeric(q["gp_use"], errors="coerce").fillna(0).clip(lower=0)
+        q = q.sort_values(["_gp_pos", "sum_use"], ascending=False)
+        total = q["_gp_pos"].sum()
+        if total > 0:
+            q["_cum"] = q["_gp_pos"].cumsum() / total
+            selected = q[(q["_cum"] <= 0.90) | (q.index == q.index[0])].copy()
+            # keep at least 4 rows when available, because otherwise товарные группы look empty.
+            if len(selected) < min(4, len(q)):
+                selected = q.head(min(4, len(q))).copy()
+            return selected
+        return q.head(min(6, len(q))).copy()
+
+    # Build contour dictionaries and planned bookmarks.
+    contours = {
+        "prev": {
+            "label": "Прошлая неделя",
+            "period": f"{prev_start:%d.%m}-{prev_end:%d.%m.%Y}",
+            "start": prev_start, "end": prev_end, "prev_start": prev2_start, "prev_end": prev2_end,
+            "summary_key": "prev_summary", "cat_df": prev_cat, "prod_df": prev_prod_detail, "art_df": prev_art,
+            "back_label": "← прошлая неделя",
+        },
+        "closed": {
+            "label": "Закрытый месяц",
+            "period": f"{closed_start:%d.%m}-{closed_end:%d.%m.%Y}",
+            "start": closed_start, "end": closed_end, "prev_start": closed_prev_start, "prev_end": closed_prev_end,
+            "summary_key": "closed_summary", "cat_df": closed_cat, "prod_df": closed_prod_detail, "art_df": closed_art,
+            "back_label": "← закр. месяц",
+        },
+    }
+
+    def _slug(x):
+        return re.sub(r"[^A-Za-z0-9]+", "_", str(x))[:80]
+    def _cat_key(contour, cat): return f"{contour}_cat_{_slug(cat)}"
+    def _prod_key(contour, cat, prod): return f"{contour}_prod_{_slug(cat)}_{_slug(prod)}"
+    def _art_key(contour, cat, prod, art, n=1): return f"{contour}_art{n}_{_slug(cat)}_{_slug(prod)}_{_slug(art)}"
+    def _cat_factor_key(contour, cat): return f"{contour}_cat_factor_{_slug(cat)}"
+    def _prod_factor_key(contour, cat, prod): return f"{contour}_prod_factor_{_slug(cat)}_{_slug(prod)}"
+
+    # Entry points are weekly only. Use them only for prev contour.
+    entry_bridge = outputs.get("entry_points_bridge", pd.DataFrame()).copy()
+    if entry_bridge is None: entry_bridge = pd.DataFrame()
+    if not entry_bridge.empty:
+        if "subject_disp" not in entry_bridge.columns:
+            entry_bridge["subject_disp"] = entry_bridge.get("subject", "").map(_subject_disp) if "subject" in entry_bridge.columns else ""
+        if "product_code" not in entry_bridge.columns:
+            entry_bridge["product_code"] = entry_bridge.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in entry_bridge.columns:
+            entry_bridge["supplier_article"] = entry_bridge["supplier_article"].map(_clean_article_local)
+        for col in ["transitions", "orders", "cart_conv_pct", "order_conv_pct", "transitions_prev", "orders_prev", "orders_share_pct", "effect_gp_rub"]:
+            if col not in entry_bridge.columns:
+                entry_bridge[col] = 0
+            entry_bridge[col] = pd.to_numeric(entry_bridge[col], errors="coerce").fillna(0)
+
+    # ---------- factor table ----------
+    def _factor_rows(row: pd.Series, level: str) -> List[Dict[str, Any]]:
+        cur_sum = _num(row.get("sum_use")); prev_sum = _num(row.get("sum_prev_use"))
+        cur_gp = _num(row.get("gp_use")); prev_gp = _num(row.get("gp_prev_use"))
+        cur_margin = _num(row.get("margin")); prev_margin = _num(row.get("margin_prev"))
+        cur_orders = _num(row.get("orders")); prev_orders = _num(row.get("orders_prev"))
+        gp_per_order = cur_gp / cur_orders if cur_orders > 0 else (prev_gp / prev_orders if prev_orders > 0 else 0)
+        rows = []
+        def add(factor, block, cur, prev, fmt, effect, lower=False, comment=""):
+            if abs(_num(effect)) < 50 and abs(_num(cur)-_num(prev)) < 1e-9:
+                return
+            d = _delta(cur, prev)
+            rows.append({"Фактор": factor, "Блок": block, "Текущее": fmt(cur), "База": fmt(prev), "Изменение": _arrow(d, lower), "Эффект ВП": effect, "Вывод": comment or ("потеря" if effect < 0 else "прирост" if effect > 0 else "нейтрально")})
+        prev_margin_rate = prev_margin/100 if abs(prev_margin) > 1e-9 else (cur_margin/100 if abs(cur_margin)>1e-9 else 0)
+        add("Объём / сумма заказов", "Экономика и продажи", cur_sum, prev_sum, _fmt_money, (cur_sum - prev_sum) * prev_margin_rate, False, "эффект изменения выручки при прежней марже")
+        add("Маржинальность", "Экономика и продажи", cur_margin, prev_margin, _fmt_pct, cur_sum * (cur_margin - prev_margin) / 100.0, False, "изменение маржи в деньгах")
+        add("ДРР", "Экономика и продажи", row.get("drr"), row.get("drr_prev"), _fmt_pct, -cur_sum * (_num(row.get("drr")) - _num(row.get("drr_prev"))) / 100.0, True, "рост ДРР забирает ВП")
+        add("Расход РК", "Экономика и продажи", row.get("ad_spend"), row.get("ad_spend_prev"), _fmt_money, -(_num(row.get("ad_spend")) - _num(row.get("ad_spend_prev"))), True, "изменение рекламных расходов")
+        add("CPC", "Экономика и продажи", row.get("cpc"), row.get("cpc_prev"), _fmt_rub1, -(_num(row.get("cpc")) - _num(row.get("cpc_prev"))) * max(_num(row.get("clicks")), 0), True, "изменение стоимости клика")
+        add("СПП", "Экономика и продажи", row.get("spp"), row.get("spp_prev"), _fmt_pct, -cur_sum * (_num(row.get("spp_prev")) - _num(row.get("spp"))) / 100.0, True, "изменение скидки покупателя")
+        add("Комиссия, %", "Экономика и продажи", row.get("commission_pct"), row.get("commission_pct_prev"), _fmt_pct, -cur_sum * (_num(row.get("commission_pct")) - _num(row.get("commission_pct_prev"))) / 100.0, True, "комиссия как доля выручки")
+        add("Эквайринг, %", "Экономика и продажи", row.get("acquiring_pct"), row.get("acquiring_pct_prev"), _fmt_pct, -cur_sum * (_num(row.get("acquiring_pct")) - _num(row.get("acquiring_pct_prev"))) / 100.0, True, "эквайринг как доля выручки")
+        add("Логистика/шт", "Экономика и продажи", row.get("logistics_per_unit"), row.get("logistics_per_unit_prev"), _fmt_rub1, -(_num(row.get("logistics_per_unit")) - _num(row.get("logistics_per_unit_prev"))) * max(cur_orders, 0), True, "стоимость логистики на продажу")
+        add("Хранение/шт", "Экономика и продажи", row.get("storage_per_unit"), row.get("storage_per_unit_prev"), _fmt_rub1, -(_num(row.get("storage_per_unit")) - _num(row.get("storage_per_unit_prev"))) * max(cur_orders, 0), True, "стоимость хранения на продажу")
+        add("Себестоимость/шт", "Экономика и продажи", row.get("cost_per_unit"), row.get("cost_per_unit_prev"), _fmt_rub1, -(_num(row.get("cost_per_unit")) - _num(row.get("cost_per_unit_prev"))) * max(cur_orders, 0), True, "изменение себестоимости")
+        add("Прочие/шт", "Экономика и продажи", row.get("other_per_unit"), row.get("other_per_unit_prev"), _fmt_rub1, -(_num(row.get("other_per_unit")) - _num(row.get("other_per_unit_prev"))) * max(cur_orders, 0), True, "прочие расходы")
+        demand_eff = 0.0
+        if _num(row.get("demand_prev")) > 0:
+            demand_eff = (_num(row.get("demand")) / _num(row.get("demand_prev")) - 1.0) * prev_sum * prev_margin_rate
+        add("Спрос WB", "Спрос / точки входа / конверсии", row.get("demand"), row.get("demand_prev"), _fmt_num, demand_eff, False, "изменение внешнего спроса")
+        add("% поискового трафика", "Спрос / точки входа / конверсии", row.get("search_share"), row.get("search_share_prev"), _fmt_pct, cur_sum * (cur_margin/100) * (_num(row.get("search_share")) - _num(row.get("search_share_prev"))) / 100.0, False, "сколько трафика карточка забрала из поиска")
+        add("Открытия карточки", "Спрос / точки входа / конверсии", row.get("opens"), row.get("opens_prev"), _fmt_num, (_num(row.get("opens")) - _num(row.get("opens_prev"))) * (_num(row.get("cart_conv_prev"))/100) * (_num(row.get("order_conv_prev"))/100) * gp_per_order, False, "изменение входящего карточного трафика")
+        add("Конверсия в корзину", "Спрос / точки входа / конверсии", row.get("cart_conv"), row.get("cart_conv_prev"), _fmt_pct, _num(row.get("opens")) * ((_num(row.get("cart_conv")) - _num(row.get("cart_conv_prev"))) / 100.0) * (_num(row.get("order_conv_prev"))/100) * gp_per_order, False, "потеря/прирост на добавлении в корзину")
+        add("Корзина → заказ", "Спрос / точки входа / конверсии", row.get("order_conv"), row.get("order_conv_prev"), _fmt_pct, _num(row.get("carts")) * ((_num(row.get("order_conv")) - _num(row.get("order_conv_prev"))) / 100.0) * gp_per_order, False, "потеря/прирост на переходе корзина→заказ")
+        add("Локализация", "Спрос / точки входа / конверсии", row.get("localization"), row.get("localization_prev"), _fmt_pct, cur_sum * (cur_margin/100) * ((_num(row.get("localization")) - _num(row.get("localization_prev"))) / 100.0) * 0.25, False, "влияние наличия и географии")
+        # Sort: biggest losses first, then biggest gains.
+        losses = sorted([r for r in rows if _num(r["Эффект ВП"]) < 0], key=lambda r: _num(r["Эффект ВП"]))
+        gains = sorted([r for r in rows if _num(r["Эффект ВП"]) >= 0], key=lambda r: _num(r["Эффект ВП"]), reverse=True)
+        return losses + gains
+
+    # ---------- drawing ----------
+    c = canvas.Canvas(str(path), pagesize=(W, H))
+    page_num = 0
+    def _link(target, rect):
+        if target:
+            c.linkRect("", str(target), rect, relative=0, thickness=0)
+
+    def _draw_text(txt, x, y, max_w, font=F_REG, size=12, color=BLACK, align="left", min_size=7):
+        txt = "" if txt is None else str(txt)
+        s = size
+        while s > min_size and stringWidth(txt, font, s) > max_w:
+            s -= 0.5
+        c.setFont(font, s); c.setFillColor(color)
+        if align == "right": c.drawRightString(x+max_w, y, txt)
+        elif align == "center": c.drawCentredString(x+max_w/2, y, txt)
+        else: c.drawString(x, y, txt)
+
+    def _wrap(txt, font, size, max_w, max_lines=5):
+        words = str(txt).split()
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if stringWidth(test, font, size) <= max_w:
+                cur = test
+            else:
+                if cur: lines.append(cur)
+                cur = w
+            if len(lines) >= max_lines:
+                break
+        if cur and len(lines) < max_lines:
+            lines.append(cur)
+        return lines
+
+    def _start(title, subtitle="", section="", key=None, top_menu=False, back_buttons=None):
+        nonlocal page_num
+        if page_num > 0:
+            c.showPage()
+        page_num += 1
+        c.setFillColor(RED); c.rect(0,0,W,H,fill=1,stroke=0)
+        if key:
+            c.bookmarkPage(key)
+        c.setFillColor(WHITE); c.setFont(F_REG, 32); c.drawString(70, 835, "topface")
+        _draw_text(title, 70, 765, 820, F_BLACK, 46, WHITE)
+        if subtitle:
+            _draw_text(subtitle, 70, 722, 900, F_BOLD, 19, WHITE)
+        if section:
+            _draw_text(section, W-330, 720, 260, F_BOLD, 14, WHITE, align="right")
+        _draw_text(f"Страница {page_num}", W-210, 36, 140, F_BOLD, 13, WHITE, align="right")
+        if top_menu:
+            buttons=[("Текущая", "cur_overview"), ("Прошлая", "prev_summary"), ("Закр. месяц", "closed_summary"), ("Сводка", "summary")]
+            bx = W - 620; by = 798
+            for lab, target in buttons:
+                bw = 135 if lab != "Закр. месяц" else 160
+                c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+                _draw_text(lab, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+                _link(target, (bx,by,bx+bw,by+44)); bx += bw + 18
+        for b in back_buttons or []:
+            bx, by, bw, label, target = b
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+            _link(target, (bx,by,bx+bw,by+44))
+
+    def _metric_card(x, y, w, h, value, label, delta=None, metric="", sub=""):
+        c.setFillColor(WHITE); c.roundRect(x,y,w,h,14,fill=1,stroke=0)
+        val = str(value)
+        c.setFont(F_BLACK, 26); val_w = stringWidth(val, F_BLACK, 26)
+        total_w = val_w
+        dtext = _arrow(delta, _lower_bad(metric)) if delta is not None else ""
+        if dtext:
+            total_w += 14 + stringWidth(dtext, F_BOLD, 11)
+        vx = x + w/2 - total_w/2
+        c.setFillColor(BLACK); c.setFont(F_BLACK, 26); c.drawString(vx, y+h-40, val)
+        if dtext:
+            c.setFillColor(_tone(delta, _lower_bad(metric))); c.setFont(F_BOLD, 11); c.drawString(vx + val_w + 14, y+h-37, dtext)
+        _draw_text(label, x+10, y+h-68, w-20, F_REG, 13, GRAY, align="center")
+        if sub:
+            _draw_text(sub, x+10, y+14, w-20, F_REG, 10, GRAY, align="center")
+
+    def _section_bar(y, text):
+        c.setFillColor(RED_DARK); c.roundRect(75, y, W-150, 42, 10, fill=1, stroke=0)
+        _draw_text(text, 105, y+14, W-210, F_BLACK, 20, WHITE)
+
+    def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
+        txt = str(value)
+        if align == "center":
+            _draw_text(txt, x, y, w*0.65 if delta is not None else w, F_BOLD, size, BLACK, align="center")
+            vx = x + w*0.58
+        else:
+            _draw_text(txt, x+5, y, w*0.63 if delta is not None else w-10, F_BOLD, size, BLACK)
+            vx = x + w*0.62
+        if delta is not None:
+            _draw_text(_arrow(delta, _lower_bad(metric)), vx, y, w*0.35-4, F_BOLD, max(8, size-2), _tone(delta, _lower_bad(metric)), align="right")
+
+    def _draw_table(x, y, w, headers, widths, rows, row_h=36, font_size=11, link_col=None, max_rows=None):
+        rows = rows[:max_rows] if max_rows else rows
+        h = 42 + row_h*len(rows)
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.roundRect(x, y+h-42, w, 42, 11, fill=1, stroke=0)
+        xx = x
+        for head, ww in zip(headers, widths):
+            _draw_text(head, xx+4, y+h-26, ww-8, F_BOLD, 11, WHITE, align="center")
+            xx += ww
+        for ri, row in enumerate(rows):
+            ry = y+h-42-(ri+1)*row_h
+            c.setFillColor(SOFT if ri%2 else WHITE); c.rect(x, ry, w, row_h, fill=1, stroke=0)
+            xx=x
+            target = row.get("_target") if isinstance(row, dict) else None
+            cells = row.get("cells") if isinstance(row, dict) else row
+            for ci, cell in enumerate(cells):
+                ww = widths[ci]
+                if isinstance(cell, tuple):
+                    val, delta, metric = cell
+                    _draw_cell_value(xx+2, ry+row_h/2-5, ww-4, val, delta, metric, font_size, align="center" if ci>0 else "left")
+                else:
+                    _draw_text(cell, xx+5, ry+row_h/2-5, ww-10, F_BOLD if ci==0 else F_REG, font_size, BLACK if ci else RED_DARK)
+                xx += ww
+            if target:
+                _link(target, (x, ry, x+w, ry+row_h))
+        return h
+
+    def _period_label(s,e): return f"{s:%d.%m}-{e:%d.%m.%Y}"
+
+    def _summary_category_page(key, title, subtitle, section, df, target_contour=None):
+        _start(title, subtitle, section or title, key=key, top_menu=True)
+        rows=[]
+        x = df.copy()
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        x = x.sort_values("_cat_order")
+        for _, r in x.iterrows():
+            cat = r["subject_disp"]
+            tgt = _cat_key(target_contour, cat) if target_contour else None
+            rows.append({"_target": tgt, "cells": [
+                cat,
+                (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Маржа"),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
+            ]})
+        _draw_table(75, 360, W-150, ["Категория", "Сумма", "ВП", "Маржа", "ДРР", "Расход РК", "CPC", "% поиска", "Локал."], [145,170,155,125,120,150,110,125,120], rows, row_h=58, font_size=12)
+        if target_contour:
+            _draw_text("Клик по строке категории открывает детальный контур: категория → товар → артикул. Для кистей: категория сразу открывает артикулы 901.", 80, 315, W-160, F_BOLD, 14, WHITE)
+
+    def _current_week_overview():
+        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / оперативный обзор без детализации", "Текущая неделя", key="cur_overview", top_menu=True)
+        total = cur_cat.copy()
+        total_sum = total["sum_use"].sum(); total_prev = total["sum_prev_use"].sum()
+        total_ad = total["ad_spend"].sum(); total_ad_prev = total["ad_spend_prev"].sum()
+        drr = total_ad/total_sum*100 if total_sum else 0; drr_prev = total_ad_prev/total_prev*100 if total_prev else 0
+        demand = total["demand"].sum(); demand_prev = total["demand_prev"].sum()
+        search_share = total["search_share"].mean(); search_prev = total["search_share_prev"].mean()
+        cards = [
+            (_fmt_money(total_sum), "Сумма заказов", _delta(total_sum,total_prev), "Сумма", ""),
+            (_fmt_money(total_ad), "Расход РК", _delta(total_ad,total_ad_prev), "Расход РК", ""),
+            (_fmt_pct(drr), "ДРР", _delta(drr,drr_prev), "ДРР", ""),
+            (_fmt_num(demand), "Спрос WB", _delta(demand,demand_prev), "Спрос", ""),
+            (_fmt_pct(search_share), "% поискового трафика", _delta(search_share,search_prev), "% поиска", ""),
+        ]
+        for i, card in enumerate(cards):
+            _metric_card(75+i*295, 590, 270, 105, *card)
+        # Daily overview by day, not deep category navigation.
+        dates = pd.date_range(cur_start, cur_end)
+        rows=[]
+        for dt in dates:
+            cur = daily[daily["day"].eq(dt)]
+            prev = daily[daily["day"].eq(dt-pd.Timedelta(days=7))]
+            osum = cur["order_sum"].sum(); psum = prev["order_sum"].sum()
+            ad = cur["ad_spend_total"].sum(); pad = prev["ad_spend_total"].sum()
+            ddemand = cur["search_frequency"].sum(); pdemand = prev["search_frequency"].sum()
+            ss = _safe_mean(cur["search_traffic_capture_pct"]) if not cur.empty else 0
+            pss = _safe_mean(prev["search_traffic_capture_pct"]) if not prev.empty else 0
+            d = ad/osum*100 if osum else 0; pdrr = pad/psum*100 if psum else 0
+            rows.append({"cells": [
+                dt.strftime("%a %d.%m"),
+                (_fmt_money(osum), _delta(osum, psum), "Сумма"),
+                (_fmt_money(ad), _delta(ad, pad), "Расход РК"),
+                (_fmt_pct(d), _delta(d, pdrr), "ДРР"),
+                (_fmt_num(ddemand), _delta(ddemand, pdemand), "Спрос"),
+                (_fmt_pct(ss), _delta(ss, pss), "% поиска"),
+            ]})
+        widths=[180,250,230,180,250,230]
+        _draw_table(120, 170, W-240, ["День", "Сумма заказов", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=13)
+        _draw_text("Текущая неделя - только обзор. Провалы в категории начинаются с контура «Прошлая неделя» и «Закрытый месяц».", 120, 115, W-240, F_BOLD, 15, WHITE)
+
+    def _current_week_categories():
+        _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
+
+    def _current_month_page():
+        _summary_category_page("current_month", "Текущий месяц", f"{cur_start.replace(day=1):%d.%m}-{cur_actual_end:%d.%m.%Y} / неполный месяц", "Текущий месяц", current_month_cat, target_contour=None)
+
+    def _summary_page():
+        _start("Сводка", "Логика отчёта и источники", "Сводка", key="summary", top_menu=True)
+        c.setFillColor(WHITE); c.roundRect(75, 165, W-150, 560, 18, fill=1, stroke=0)
+        lines = [
+            "1. Текущая неделя: только обзор по дням и категориям, без провала в детализацию.",
+            "2. Прошлая полная неделя: полный управленческий контур — категория → товар → артикул.",
+            "3. Последний закрытый месяц: такой же полный контур на месячных ABC/оперативных данных.",
+            "Маржа и ДРР для закрытых периодов берутся из exact ABC, если файл ABC найден. Если ABC нет — показатель помечается расчётным в логе.",
+            "Факторный вывод — таблица денежных эффектов: сначала потери ВП, затем положительные факторы.",
+            "Справочник карандашей включает 605, 611, 613, 614, 617, 618. 405/406 исключены как подводки/лайнеры.",
+        ]
+        yy=680
+        for line in lines:
+            _draw_text(line, 110, yy, W-220, F_BOLD, 18 if line.startswith(("1.","2.","3.")) else 15, BLACK)
+            yy -= 48
+
+    def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
+        info = contours[contour]
+        prod = info["prod_df"]
+        if prod is None or prod.empty: return pd.DataFrame()
+        q = prod[prod["subject_disp"].astype(str).eq(cat)].copy()
+        q["_prod_order"] = q["product_code"].astype(str).map({p:i for i,p in enumerate(PRODUCT_ORDER.get(cat, []))}).fillna(99)
+        return q.sort_values(["_prod_order", "gp_use"], ascending=[True, False])
+
+    def _articles_for_product(contour: str, cat: str, prod_code: str) -> pd.DataFrame:
+        info = contours[contour]
+        prod_df = info["prod_df"]
+        prod_row = prod_df[(prod_df["subject_disp"].astype(str).eq(cat)) & (prod_df["product_code"].astype(str).eq(str(prod_code)))]
+        if prod_row.empty: return pd.DataFrame()
+        return _select_articles(info["art_df"], prod_row.iloc[0])
+
+    def _draw_factor_table_page(key, title, subtitle, section, row, back_buttons):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        factors = _factor_rows(row, section)
+        rows=[]
+        for fr in factors:
+            rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"]), fr["Вывод"]]})
+        if not rows:
+            rows=[{"cells":["—", "—", "—", "—", "—", "0 ₽", "значимых денежных факторов нет"]}]
+        _section_bar(770, "Факторный вывод в деньгах — все параметры")
+        _draw_table(75, 100, W-150, ["Фактор", "Блок", "Текущее", "База", "Изм.", "Эффект ВП", "Вывод"], [245,260,145,145,120,150,455], rows, row_h=34, font_size=10, max_rows=17)
+
+    def _draw_level_overview(title, subtitle, section, key, row, back_buttons, next_button=None):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        if next_button:
+            label, target = next_button
+            bx, by, bw = 1380, 798, 120
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+            _link(target, (bx,by,bx+bw,by+44))
+        _section_bar(640, "Блок 1. Экономика и продажи")
+        cards1 = [
+            (_fmt_money(row.get("sum_use")), "Сумма", _delta(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
+            (_fmt_money(row.get("gp_use")), "ВП ABC", _delta(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
+            (_fmt_pct(row.get("margin")), "Маржинальность", _delta(row.get("margin"), row.get("margin_prev")), "Маржа", ""),
+            (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
+            (_fmt_money(row.get("ad_spend")), "Расход РК", _delta(row.get("ad_spend"), row.get("ad_spend_prev")), "Расход РК", ""),
+            (_fmt_rub1(row.get("cpc")), "CPC", _delta(row.get("cpc"), row.get("cpc_prev")), "CPC", ""),
+        ]
+        for i, card in enumerate(cards1):
+            _metric_card(85+i*245, 520, 225, 95, *card)
+        _section_bar(450, "Блок 2. Спрос, точки входа и конверсии")
+        cards2 = [
+            (_fmt_num(row.get("demand")), "Спрос WB", _delta(row.get("demand"), row.get("demand_prev")), "Спрос", ""),
+            (_fmt_pct(row.get("search_share")), "% поиска", _delta(row.get("search_share"), row.get("search_share_prev")), "% поиска", ""),
+            (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
+            (_fmt_pct(row.get("cart_conv")), "Конв. в корзину", _delta(row.get("cart_conv"), row.get("cart_conv_prev")), "Конверсия", ""),
+            (_fmt_pct(row.get("order_conv")), "Корзина → заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
+            (_fmt_pct(row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
+        ]
+        for i, card in enumerate(cards2):
+            _metric_card(85+i*245, 330, 225, 95, *card)
+        _section_bar(260, "Блок 3. Расходы на единицу / доля расходов")
+        cards3 = [
+            (_fmt_pct(row.get("commission_pct")), "Комиссия, %", _delta(row.get("commission_pct"), row.get("commission_pct_prev")), "Комиссия", ""),
+            (_fmt_pct(row.get("acquiring_pct")), "Эквайринг, %", _delta(row.get("acquiring_pct"), row.get("acquiring_pct_prev")), "Эквайринг", ""),
+            (_fmt_rub1(row.get("logistics_per_unit")), "Логистика/шт", _delta(row.get("logistics_per_unit"), row.get("logistics_per_unit_prev")), "Логистика", ""),
+            (_fmt_rub1(row.get("storage_per_unit")), "Хранение/шт", _delta(row.get("storage_per_unit"), row.get("storage_per_unit_prev")), "Хранение", ""),
+            (_fmt_rub1(row.get("cost_per_unit")), "Себест./шт", _delta(row.get("cost_per_unit"), row.get("cost_per_unit_prev")), "Себест", ""),
+            (_fmt_rub1(row.get("other_per_unit")), "Прочие/шт", _delta(row.get("other_per_unit"), row.get("other_per_unit_prev")), "Прочие", ""),
+        ]
+        for i, card in enumerate(cards3):
+            _metric_card(85+i*245, 140, 225, 95, *card)
+
+    def _draw_category_detail(contour: str, cat: str):
+        info = contours[contour]
+        row_df = info["cat_df"][info["cat_df"]["subject_disp"].astype(str).eq(cat)]
+        if row_df.empty: return
+        cat_key = _cat_key(contour, cat)
+        cat_factor = _cat_factor_key(contour, cat)
+        _draw_level_overview(f"Категория: {cat}", f"{info['period']} / управленческий разбор", "Категория 1/2", cat_key, row_df.iloc[0], [(1220, 798, 210, info["back_label"], info["summary_key"])], ("факторы", cat_factor))
+        # children list below metric cards, separate wide table replacing lower area if needed
+        # Add second content page with products/articles and factor table button.
+        _start(f"Категория: {cat}", f"{info['period']} / переход на следующий уровень", "Категория 2/2", key=cat_key+"_list", top_menu=False, back_buttons=[(1190,798,220,info["back_label"],info["summary_key"]),(1430,798,90,"стр.1",cat_key)])
+        rows=[]
+        if cat == "Кисти":
+            arts = _articles_for_product(contour, cat, "901")
+            for _, r in arts.iterrows():
+                art = _clean_article_local(r.get("supplier_article"))
+                rows.append({"_target": _art_key(contour, cat, "901", art, 1), "cells": [
+                    art,
+                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Маржа"),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                    (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
+                ]})
+            headers=["Артикул", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."]
+            widths=[190,180,165,130,130,115,130,130]
+        else:
+            prods = _children_for_category(contour, cat)
+            for _, r in prods.iterrows():
+                prod = str(r.get("product_code"))
+                rows.append({"_target": _prod_key(contour, cat, prod), "cells": [
+                    prod,
+                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Маржа"),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                    (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
+                ]})
+            headers=["Товар", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."]
+            widths=[190,180,165,130,130,115,130,130]
+        _draw_table(75, 130, W-150, headers, widths, rows, row_h=46, font_size=11, max_rows=11)
+        _draw_factor_table_page(cat_factor, f"Категория: {cat}", f"{info['period']} / факторная таблица", "Категория факторы", row_df.iloc[0], [(1190,798,220,"← категория",cat_key+"_list"),(1430,798,90,"стр.1",cat_key)])
+
+    def _draw_product_detail(contour: str, prod_row: pd.Series):
+        info = contours[contour]
+        cat = str(prod_row["subject_disp"]); prod = str(prod_row["product_code"])
+        if cat == "Кисти":
+            return
+        pk = _prod_key(contour, cat, prod)
+        pf = _prod_factor_key(contour, cat, prod)
+        cat_list_key = _cat_key(contour, cat)+"_list"
+        _draw_level_overview(f"Товар: {prod}", f"{cat} / {info['period']}", "Товар 1/2", pk, prod_row, [(1160,798,220,"← категория",cat_list_key)], ("факторы", pf))
+        _start(f"Товар: {prod}", f"{cat} / {info['period']} / артикулы", "Товар 2/2", key=pk+"_list", top_menu=False, back_buttons=[(1160,798,220,"← категория",cat_list_key),(1400,798,100,"стр.1",pk)])
+        arts = _articles_for_product(contour, cat, prod)
+        rows=[]
+        for _, r in arts.iterrows():
+            art = _clean_article_local(r.get("supplier_article"))
+            rows.append({"_target": _art_key(contour, cat, prod, art, 1), "cells": [
+                art,
+                (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Маржа"),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                (_fmt_pct(r.get("localization")), _delta(r.get("localization"), r.get("localization_prev")), "Локализация"),
+            ]})
+        _draw_table(75, 130, W-150, ["Артикул", "Сумма", "ВП", "Маржа", "ДРР", "CPC", "% поиска", "Локал."], [190,180,165,130,130,115,130,130], rows, row_h=46, font_size=11, max_rows=11)
+        _draw_factor_table_page(pf, f"Товар: {prod}", f"{cat} / {info['period']} / факторная таблица", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
+
+    def _draw_article_pages(contour: str, art_row: pd.Series):
+        info = contours[contour]
+        cat = str(art_row["subject_disp"]); prod = str(art_row["product_code"]); art = _clean_article_local(art_row.get("supplier_article"))
+        a1 = _art_key(contour, cat, prod, art, 1); a2 = _art_key(contour, cat, prod, art, 2)
+        cat_list_key = _cat_key(contour, cat)+"_list"
+        product_back = cat_list_key if cat == "Кисти" else _prod_key(contour, cat, prod)+"_list"
+        back_buttons = [(1120,798,170,"← товар" if cat != "Кисти" else "← категория", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
+        _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
+        # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
+        for bx,by,bw,label,target in back_buttons:
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center"); _link(target, (bx,by,bx+bw,by+44))
+        # Page 2: entry points and full factor table.
+        _start(f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", key=a2, top_menu=False, back_buttons=[(1120,798,170,"← товар" if cat != "Кисти" else "← категория", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)])
+        ep_rows=[]
+        if contour == "prev" and not entry_bridge.empty:
+            q = entry_bridge[(entry_bridge["subject_disp"].astype(str).eq(cat)) & (entry_bridge["product_code"].astype(str).eq(prod)) & (entry_bridge["supplier_article"].astype(str).eq(art))].copy()
+            if not q.empty:
+                q = q.sort_values(["orders", "transitions"], ascending=False).head(8)
+                for _, er in q.iterrows():
+                    ep_rows.append({"cells": [
+                        f"{er.get('entry_section','')} / {er.get('entry_point','')}",
+                        (_fmt_num(er.get("transitions")), _delta(er.get("transitions"), er.get("transitions_prev")), "Переходы"),
+                        (_fmt_num(er.get("orders")), _delta(er.get("orders"), er.get("orders_prev")), "Заказы"),
+                        _fmt_pct(er.get("cart_conv_pct")),
+                        _fmt_pct(er.get("order_conv_pct")),
+                        _fmt_pct(er.get("orders_share_pct")),
+                        _fmt_signed_money(er.get("effect_gp_rub")),
+                    ]})
+        if not ep_rows:
+            ep_rows=[{"cells":["Нет данных по точкам входа для этого периода", "—", "—", "—", "—", "—", "0 ₽"]}]
+        _draw_table(75, 440, W-150, ["Канал / точка входа", "Переходы", "Заказы", "Конв. корз.", "Корз.→заказ", "Доля заказов", "Вклад ВП"], [450,160,140,150,150,150,150], ep_rows, row_h=32, font_size=10, max_rows=8)
+        factors = _factor_rows(art_row, "Артикул")
+        factor_rows=[]
+        for fr in factors[:9]:
+            factor_rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"])]})
+        _draw_table(75, 75, W-150, ["Фактор", "Блок", "Текущее", "База", "Изм.", "Эффект ВП"], [280,390,180,180,150,180], factor_rows, row_h=31, font_size=10, max_rows=9)
+
+    # ---------- build pages ----------
+    _current_week_overview()
+    _current_week_categories()
+    _summary_category_page("prev_summary", "Прошлая полная неделя", f"{_period_label(prev_start, prev_end)} / клики ведут в детализацию", "Прошлая неделя", prev_cat, target_contour="prev")
+    _current_month_page()
+    _summary_category_page("closed_summary", "Последний закрытый месяц", f"{_period_label(closed_start, closed_end)} / клики ведут в детализацию", "Закрытый месяц", closed_cat, target_contour="closed")
+    _summary_page()
+
+    for contour in ["prev", "closed"]:
+        for cat in CATEGORY_ORDER:
+            # skip empty categories
+            if contours[contour]["cat_df"][contours[contour]["cat_df"]["subject_disp"].astype(str).eq(cat)].empty:
+                continue
+            _draw_category_detail(contour, cat)
+        for _, prow in contours[contour]["prod_df"].iterrows():
+            _draw_product_detail(contour, prow)
+        # Article detail pages: Кисти from category; others from product pages.
+        for _, prow in contours[contour]["prod_df"].iterrows():
+            arts = _articles_for_product(contour, str(prow["subject_disp"]), str(prow["product_code"]))
+            for _, ar in arts.iterrows():
+                _draw_article_pages(contour, ar)
+
+    c.save()
+
+    # ---------- audit/trace workbook ----------
+    try:
+        trace_path = path.parent / PDF_CALC_TRACE_NAME
+        trace_rows=[]
+        def add_trace(contour, level, period, row, metric, value, source, formula):
+            trace_rows.append({"contour": contour, "level": level, "period": period, "subject": row.get("subject_disp", ""), "product": row.get("product_code", ""), "article": row.get("supplier_article", ""), "metric": metric, "value": value, "source": source, "formula": formula})
+        for cname, info in contours.items():
+            for level_name, df in [("category", info["cat_df"]), ("product", info["prod_df"]), ("article", info["art_df"] if info["art_df"] is not None else pd.DataFrame())]:
+                if df is None or df.empty: continue
+                for _, r in df.iterrows():
+                    add_trace(cname, level_name, info["period"], r, "sum_use", r.get("sum_use"), "ABC gross_revenue if exact exists else article_day_fact order_sum", "sum_use = ABC[Валовая выручка] OR SUM(article_day_fact[Сумма заказов])")
+                    add_trace(cname, level_name, info["period"], r, "gp_use", r.get("gp_use"), "ABC exact if exists else gross_profit_model", "gp_use = ABC[Валовая прибыль] OR SUM(article_day_fact[gross_profit_model])")
+                    add_trace(cname, level_name, info["period"], r, "margin", r.get("margin"), "ABC gross_revenue/gross_profit", "margin = gp_use / sum_use")
+                    add_trace(cname, level_name, info["period"], r, "drr", r.get("drr"), "ABC ДРР if exact exists else ad_spend/order_sum", "drr = ABC[ДРР] OR Расход РК / Сумма")
+        with pd.ExcelWriter(trace_path, engine="openpyxl") as writer:
+            pd.DataFrame(trace_rows).to_excel(writer, sheet_name="Расчет_показателей", index=False)
+            for cname, info in contours.items():
+                if info["prod_df"] is not None and not info["prod_df"].empty:
+                    info["prod_df"].to_excel(writer, sheet_name=(cname + "_products")[:31], index=False)
+        log(f"Saved PDF calc trace: {trace_path} rows={len(trace_rows):,}")
+    except Exception as exc:
+        log(f"WARN PDF calc trace was not saved: {exc}")
+    log(f"PDF v11 three-contour report created: pages={page_num}")
+    return path
 
 def send_telegram_document(file_path: Path, caption: str = "") -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
