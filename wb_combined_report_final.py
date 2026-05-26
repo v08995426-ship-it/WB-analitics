@@ -2267,26 +2267,57 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
 
 
 def _abc_gp_for_period(builder: AnalyticsBuilder, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
-    abc = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
-    if abc is None or abc.empty:
+    """Strict ABC gross-profit lookup for PDF/reporting.
+
+    Important: do NOT use overlapping weekly ABC files for arbitrary periods.
+    The previous implementation silently summed every ABC week overlapping the requested
+    period; for monthly / partial periods this double-counted days outside the period and
+    made PDF gross profit disagree with ABC. Now ABC fact is used only for exact weekly
+    periods, or exact closed monthly periods. Other periods must use the model and be
+    labelled as calculated GP.
+    """
+    if builder is None:
         return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact"])
-    x = abc.copy()
-    x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
-    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
-    # Exact weekly file if available; otherwise overlap fallback.
-    exact = x[(x["period_start"] == start) & (x["period_end"] == end)].copy()
-    if exact.empty:
-        exact = x[(x["period_start"] <= end) & (x["period_end"] >= start)].copy()
-    if exact.empty:
-        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact"])
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    # There is no daily ABC fact in the source files; never try to merge weekly ABC into day rows.
+    if "day" in group_cols:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+
+    frames = []
+    # Exact weekly fact.
+    abc_w = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
+    if abc_w is not None and not abc_w.empty:
+        w = abc_w.copy()
+        w["period_start"] = pd.to_datetime(w["period_start"], errors="coerce").dt.normalize()
+        w["period_end"] = pd.to_datetime(w["period_end"], errors="coerce").dt.normalize()
+        w = w[(w["period_start"] == start) & (w["period_end"] == end)].copy()
+        if not w.empty:
+            w["gp_source"] = "ABC_weekly_exact"
+            frames.append(w)
+    # Exact monthly fact for closed full months.
+    abc_m = builder.enrich(builder.pack.abc_monthly, "abc_monthly")
+    if abc_m is not None and not abc_m.empty:
+        m = abc_m.copy()
+        m["period_start"] = pd.to_datetime(m["period_start"], errors="coerce").dt.normalize()
+        m["period_end"] = pd.to_datetime(m["period_end"], errors="coerce").dt.normalize()
+        m = m[(m["period_start"] == start) & (m["period_end"] == end)].copy()
+        if not m.empty:
+            m["gp_source"] = "ABC_monthly_exact"
+            frames.append(m)
+    if not frames:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    exact = pd.concat(frames, ignore_index=True)
     for c in group_cols:
         if c not in exact.columns:
             exact[c] = ""
-    return exact.groupby(group_cols, dropna=False, as_index=False).agg(
+    g = exact.groupby(group_cols, dropna=False, as_index=False).agg(
         gp_fact=("gross_profit", "sum"),
         gross_revenue_fact=("gross_revenue", "sum"),
         sales_qty_fact=("orders", "sum"),
+        gp_source=("gp_source", "first"),
     )
+    return g
 
 
 def _merge_cur_prev(cur: pd.DataFrame, prev: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
@@ -2642,8 +2673,8 @@ def _register_topface_fonts():
     from reportlab.pdfbase.ttfonts import TTFont
     candidates = [
         (os.getenv("TOPFACE_FONT_REGULAR"), os.getenv("TOPFACE_FONT_BOLD"), os.getenv("TOPFACE_FONT_BLACK")),
-        ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Black.ttf"),
         ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Black.ttf"),
     ]
     for reg, bold, black in candidates:
         if reg and bold and black and Path(reg).exists() and Path(bold).exists() and Path(black).exists():
@@ -2850,8 +2881,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def button(x, y, w, label, target=None):
         c.setFillColor(WHITE); c.roundRect(x, y, w, 44, 14, fill=1, stroke=0)
         c.setFillColor(RED_DARK); c.setFont(F_BOLD, 13); c.drawCentredString(x+w/2, y+17, label)
-        if target and target in bookmarks:
-            c.linkRect("", bookmarks[target], (x, y, x+w, y+44), relative=0)
+        if target:
+            c.linkRect("", str(target), (x, y, x+w, y+44), relative=0)
 
     def top_nav(active=""):
         labels = [("cur", "Текущая"), ("prev", "Прошлая"), ("month", "Месяц"), ("closed", "Закр. месяц"), ("summary", "Сводка")]
@@ -3587,6 +3618,182 @@ def _find_optimal_row(opt: pd.DataFrame, level: str, subject: Any = "", product:
     return x.iloc[0] if not x.empty else pd.Series(dtype=object)
 
 
+
+# ------------------------- FINAL PDF/GROSS PROFIT FIXES 2026-05-26 -------------------------
+def _load_abc_for_pdf_only(storage: Storage, reports_root: str, store: str, diagnostics: Optional[Diagnostics] = None, latest_year: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load only ABC reports for PDF-only mode.
+
+    This is much faster than the full report rebuild and prevents PDF-only from falling back to
+    model GP while the captions say "ВП факт ABC".
+    """
+    diag = diagnostics or Diagnostics()
+    try:
+        loader = Loader(storage, reports_root, store, diag)
+        year = int(latest_year or datetime.today().year)
+        weekly, monthly = loader.load_abc(year)
+        return weekly, monthly
+    except Exception as exc:
+        log(f"WARN pdf_only: ABC fact was not loaded, GP fact pages will use calculated model where needed: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def load_existing_outputs_for_pdf(storage: Storage, local_dir: Path, reports_root: str = "Отчёты", store: str = "TOPFACE", diagnostics: Optional[Diagnostics] = None) -> Dict[str, pd.DataFrame]:
+    """Load generated Excel files for PDF-only plus ABC fact files for correct GP.
+
+    Old PDF-only mode used only article_day_fact and factor sheets; therefore gross profit in
+    the PDF was often a model value while the page title said ABC fact. This function also loads
+    weekly/monthly ABC from S3/local storage and stores it in outputs.
+    """
+    outputs: Dict[str, pd.DataFrame] = {}
+    for file_name, sheets in PDF_ONLY_SHEETS.items():
+        data = _read_existing_report_bytes(storage, local_dir, file_name)
+        xls = pd.ExcelFile(io.BytesIO(data))
+        for sheet_name in sheets:
+            if sheet_name not in xls.sheet_names:
+                log(f"WARN pdf_only: sheet {sheet_name} missing in {file_name}")
+                outputs[sheet_name] = pd.DataFrame()
+                continue
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            outputs[sheet_name] = _normalize_pdf_only_df(df)
+            log(f"pdf_only: loaded {file_name}/{sheet_name}: rows={len(outputs[sheet_name]):,}, cols={len(outputs[sheet_name].columns):,}")
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily.empty:
+        raise RuntimeError("PDF-only режим невозможен: пустой article_day_fact в техническом файле")
+    required = ["day", "subject", "product", "supplier_article", "nm_id", "order_sum", "gross_profit_model"]
+    missing = [c for c in required if c not in daily.columns]
+    if missing:
+        raise RuntimeError(f"PDF-only режим невозможен: в article_day_fact нет колонок {missing}")
+    latest = pd.to_datetime(daily.get("day"), errors="coerce").max()
+    latest_year = int(pd.Timestamp(latest).year) if pd.notna(latest) else datetime.today().year
+    abc_weekly, abc_monthly = _load_abc_for_pdf_only(storage, reports_root, store, diagnostics, latest_year)
+    outputs["abc_weekly"] = abc_weekly
+    outputs["abc_monthly"] = abc_monthly
+    return outputs
+
+
+def _gp_from_abc_frames(outputs: Dict[str, pd.DataFrame], start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    """Return exact ABC GP for weekly/monthly periods from outputs, never overlap-prorated."""
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    if "day" in group_cols:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    frames = []
+    for src_name, tag in [("abc_weekly", "ABC_weekly_exact"), ("abc_monthly", "ABC_monthly_exact")]:
+        src = outputs.get(src_name, pd.DataFrame())
+        if src is None or src.empty:
+            continue
+        x = src.copy()
+        if "period_start" not in x.columns or "period_end" not in x.columns:
+            continue
+        x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+        x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+        x = x[(x["period_start"] == start) & (x["period_end"] == end)].copy()
+        if x.empty:
+            continue
+        for c in group_cols:
+            if c not in x.columns:
+                x[c] = ""
+        x["gp_source"] = tag
+        frames.append(x)
+    if not frames and "builder_global_for_pdf" in globals():
+        try:
+            return _abc_gp_for_period(builder_global_for_pdf, start, end, group_cols)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    exact = pd.concat(frames, ignore_index=True)
+    return exact.groupby(group_cols, dropna=False, as_index=False).agg(
+        gp_fact=("gross_profit", "sum"),
+        gross_revenue_fact=("gross_revenue", "sum"),
+        sales_qty_fact=("orders", "sum"),
+        gp_source=("gp_source", "first"),
+    )
+
+
+def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold: float = 0.90) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Select product groups for PDF by stable GP at product level.
+
+    Strict rule from the checklist/user comments:
+    - selection is done at product level, not article level;
+    - only confirmed product groups from PDF_PRODUCT_REFERENCE are eligible;
+    - current product must be profitable and historically stable;
+    - keep products inside the cumulative 90% GP bucket; do not add a weak tail product just to cross 90%.
+    """
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["subject", "product", "selected_for_pdf"]), pd.DataFrame()
+    x = daily.copy()
+    for col in ["subject", "product", "supplier_article"]:
+        if col not in x.columns:
+            x[col] = ""
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    latest = x["day"].max()
+    if pd.notna(latest):
+        x = x[x["day"] >= latest - pd.Timedelta(days=89)].copy()
+    gp_col = "gp_fact" if "gp_fact" in x.columns else "gross_profit_model"
+    if gp_col not in x.columns:
+        x[gp_col] = 0.0
+    for c0 in [gp_col, "order_sum", "orders"]:
+        if c0 not in x.columns:
+            x[c0] = 0.0
+        x[c0] = pd.to_numeric(x[c0], errors="coerce").fillna(0)
+    x["week"] = x["day"].map(lambda v: week_code(v) if pd.notna(v) else "")
+    cur_monday = latest - pd.Timedelta(days=int(latest.weekday())) if pd.notna(latest) else None
+    week_gp = x.groupby(["subject", "product", "week"], dropna=False, as_index=False).agg(week_gp=(gp_col, "sum"), week_orders=("orders", "sum"))
+    agg = x.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        gp_90=(gp_col, "sum"), order_sum_90=("order_sum", "sum"), orders_90=("orders", "sum"),
+        active_days=("day", "nunique"), articles=("supplier_article", "nunique"),
+    )
+    pos = week_gp.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        active_weeks=("week", "nunique"),
+        positive_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") > 0).sum())),
+        negative_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") < 0).sum())),
+    )
+    agg = agg.merge(pos, on=["subject", "product"], how="left")
+    if cur_monday is not None:
+        cur_week = x[x["day"] >= cur_monday].groupby(["subject", "product"], dropna=False, as_index=False).agg(current_week_gp=(gp_col, "sum"), current_week_orders=("orders", "sum"))
+        agg = agg.merge(cur_week, on=["subject", "product"], how="left")
+    else:
+        agg["current_week_gp"] = np.nan
+        agg["current_week_orders"] = np.nan
+    agg["selected_for_pdf"] = False
+    agg["selection_reason"] = "Не входит в 90% стабильной ВП категории / неприбыльный товар"
+    selected_rows = []
+    min_share_pct = float(os.getenv("PDF_MIN_PRODUCT_GP_SHARE_PCT", "5") or 5)
+    for subject, part in agg.groupby("subject", dropna=False):
+        if subject not in TARGET_SUBJECTS:
+            continue
+        p = part.copy()
+        # Product must be explicitly allowed in the reference.
+        allowed_products = {prod for prod, subj in PDF_PRODUCT_CATEGORY_REFERENCE.items() if subj == subject}
+        p = p[p["product"].astype(str).isin(allowed_products)].copy()
+        if p.empty:
+            continue
+        p = p[p["gp_90"] > 0].copy()
+        p = p[p["current_week_gp"].fillna(p["gp_90"]) > 0].copy()
+        p = p[(p["positive_weeks"].fillna(0) >= 3) & (p["negative_weeks"].fillna(0) <= 1)].copy()
+        if p.empty:
+            continue
+        p = p.sort_values("gp_90", ascending=False).copy()
+        total = p["gp_90"].sum()
+        p["gp_share_pct"] = np.where(total > 0, p["gp_90"] / total * 100, 0)
+        p["cum_gp_share_pct"] = p["gp_share_pct"].cumsum()
+        keep = (p["cum_gp_share_pct"] <= threshold * 100) & (p["gp_share_pct"] >= min_share_pct)
+        if not keep.any() and not p.empty:
+            keep.iloc[0] = True
+        p.loc[:, "selected_for_pdf"] = keep
+        p.loc[:, "selection_reason"] = np.where(keep, "Входит в стабильные товары 90% ВП категории", "Хвост вне 90% ВП / слабая доля")
+        selected_rows.append(p)
+    result = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=list(agg.columns) + ["gp_share_pct", "cum_gp_share_pct"])
+    audit = agg.merge(result[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel")) if not result.empty else agg
+    if "selected_for_pdf_sel" in audit.columns:
+        audit["selected_for_pdf"] = audit["selected_for_pdf_sel"].fillna(False)
+        audit["selection_reason"] = audit["selection_reason_sel"].fillna("Не входит в 90% стабильной ВП категории / неприбыльный товар")
+        audit = audit.drop(columns=[c for c in ["selected_for_pdf_sel", "selection_reason_sel"] if c in audit.columns])
+    return result[result.get("selected_for_pdf", False) == True].copy() if not result.empty else result, audit
+
+
 def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
     """Generate the strict management PDF report.
 
@@ -3686,8 +3893,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def button(x, y, w, label, target=None):
         c.setFillColor(WHITE); c.roundRect(x, y, w, 42, 14, fill=1, stroke=0)
         c.setFillColor(RED_DARK); c.setFont(F_BOLD, 13); c.drawCentredString(x+w/2, y+16, label)
-        if target and target in bookmarks:
-            c.linkRect("", bookmarks[target], (x, y, x+w, y+42), relative=0)
+        if target:
+            c.linkRect("", str(target), (x, y, x+w, y+42), relative=0)
 
     def top_nav(active=""):
         labels = [("cur", "Текущая"), ("prev", "Прошлая"), ("month", "Месяц"), ("closed", "Закр. месяц"), ("summary", "Сводка")]
@@ -3757,9 +3964,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         return _agg_daily_for_bridge(daily, pd.Timestamp(start), pd.Timestamp(end), keys)
 
     def gp_week(keys, start=week_start, end=week_end):
-        if "builder_global_for_pdf" in globals():
-            return _abc_gp_for_period(builder_global_for_pdf, start, end, keys)
-        return pd.DataFrame()
+        return _gp_from_abc_frames(outputs, start, end, keys)
 
     def with_gp(a: pd.DataFrame, keys: List[str], start=week_start, end=week_end) -> pd.DataFrame:
         gp = gp_week(keys, start, end)
@@ -3862,7 +4067,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         draw_table(80, 235, 1440, 460, ["Категория", "Сумма", gp_fact_label, "Маржа", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,230,230,150,180,230,150], font_size=14, row_h=80)
         c.showPage()
 
-    draw_period_category_page("prev", "Прошлая неделя", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / сравнение с {prev_start.strftime('%d.%m')}-{prev_end.strftime('%d.%m.%Y')}", "Прошлая неделя", week_start, week_end, prev_start, prev_end)
+    prev_report_start = cur_monday - pd.Timedelta(days=7)
+    prev_report_end = cur_monday - pd.Timedelta(days=1)
+    prev_report_cmp_start = cur_monday - pd.Timedelta(days=14)
+    prev_report_cmp_end = cur_monday - pd.Timedelta(days=8)
+    draw_period_category_page("prev", "Прошлая неделя", f"{prev_report_start.strftime('%d.%m')}-{prev_report_end.strftime('%d.%m.%Y')} / сравнение с {prev_report_cmp_start.strftime('%d.%m')}-{prev_report_cmp_end.strftime('%d.%m.%Y')}", "Прошлая неделя", prev_report_start, prev_report_end, prev_report_cmp_start, prev_report_cmp_end)
 
     month_start = pd.Timestamp(latest.replace(day=1))
     prev_month_end = month_start - pd.Timedelta(days=1)
@@ -4125,7 +4334,7 @@ def main() -> None:
         if args.no_pdf:
             raise SystemExit("Нельзя одновременно использовать --pdf-only и --no-pdf")
         local_dir.mkdir(parents=True, exist_ok=True)
-        outputs = load_existing_outputs_for_pdf(storage, local_dir)
+        outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
         pdf_path = local_dir / PDF_REPORT_NAME
         pdf_created = generate_management_pdf(outputs, pdf_path)
         if not pdf_created or not pdf_path.exists():
@@ -4147,6 +4356,8 @@ def main() -> None:
     pack = loader.load_all()
     builder = AnalyticsBuilder(pack)
     outputs = builder.build_all()
+    outputs["abc_weekly"] = builder.pack.abc_weekly
+    outputs["abc_monthly"] = builder.pack.abc_monthly
     factor_outputs = build_factor_outputs(builder, outputs)
     outputs.update(factor_outputs)
     local_dir = Path(args.root) / OUT_DIR
